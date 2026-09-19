@@ -99,6 +99,27 @@ python -m keymgr --data-dir ./keymgr_data serve --host 127.0.0.1 --port 8080
   `{"key_id", "algorithm", "public_key"}`，并保留原 `key_id`、全部版本号、
   `current`、`label` 与吊销状态。该租户已有同一 `key_id` 返回 `409` 且原
   记录不变；`key_id` 已被其他租户占用时返回 `404`，跨租户不泄露存在性。
+- `POST /v1/backup`：租户级加密备份。请求体 JSON 含非空字符串
+  `tenant_id`、`passphrase`；可附与 body 一致的 `X-Tenant-Id` /
+  `?tenant_id=`（冲突返回 `400` 且指明 `tenant_id`）。受 `export` 动作
+  约束。成功返回 `200`：`{"format":"tenant-backup-v1","bundle": <不透明
+  base64>}`。bundle 以 passphrase 经 scrypt 派生密钥后用 AES-256-GCM
+  认证加密，载荷为 `{format, tenant_id, keys, policy}`：每个 key 条目为
+  `{key_id, label, current_version, status, reason, operator,
+  revoked_at, versions:[版本对象]}`（含私有材料，只存在于加密包内）；
+  `policy` 为 `null` 或 `{"rules":[{subject, actions, effect}]}`。
+  空租户备份得到 `keys=[]`、`policy=null`。
+- `POST /v1/restore`：从租户备份包原子恢复。请求体 JSON 含非空字符串
+  `tenant_id`、`passphrase`、`bundle`；同样接受与 body 一致的
+  `X-Tenant-Id` / `?tenant_id=`。校验顺序：参数与解密/格式校验（`400`，
+  指明具体字段）→ `import` 授权（`403`）→ 包内 `tenant_id` 与请求不一致
+  （`404`）。包中任一 `key_id` 已被本租户占用、或本租户已有策略文档
+  （即使包内 `policy` 为 `null`）返回 `409` 且不做任何修改；`key_id`
+  被其他租户占用返回 `404`。否则全部密钥与策略在一个逻辑事务中原子
+  恢复（账本写失败回滚全部文件并返回 `500`），成功返回 `201`：
+  `{"tenant_id", "key_ids", "policy_restored"}`；空包（`keys=[]`、
+  `policy=null`）同样恢复成功。备份与恢复分别记 `export` / `import`
+  审计事件，`key_id` 为 `null`。
 - `GET /v1/audit`：查询本租户的审计事件。租户由**单一** `X-Tenant-Id`
   头或**单一** `?tenant_id=` 参数提供；缺失、重复、为空或两者冲突均返回
   `400` 且错误信息指出 `tenant_id`。可选筛选：`key_id`（非 UUID4 返回
@@ -213,6 +234,22 @@ python -m keymgr --data-dir ./keymgr_data import \
 ```
 
 导出、导入分别写 `action=export` / `action=import` 的审计事件。
+
+租户级备份 / 恢复同样打印单行 JSON，字段与对应 HTTP 响应一致：
+
+```bash
+# 备份：输出 {"format":"tenant-backup-v1","bundle"}，bundle 为不透明 base64
+python -m keymgr --data-dir ./keymgr_data backup \
+  --tenant-id tenant-a --passphrase 'hunter2' --operator alice
+# 恢复：输出 {"tenant_id","key_ids","policy_restored"}
+python -m keymgr --data-dir ./keymgr_data restore \
+  --tenant-id tenant-a --passphrase 'hunter2' --bundle '<bundle>' --operator alice
+```
+
+备份写 `action=export`、恢复写 `action=import` 的审计事件，`key_id`
+均为 `null`。恢复时包内 `tenant_id` 与 `--tenant-id` 不一致以退出码
+`4` 报错；同租户 `key_id` 冲突或已有策略（HTTP `409`）以退出码 `3`
+报错；账本写失败回滚全部已写文件并以退出码 `1` 失败。
 
 审计查询同样打印单行 JSON，字段与 `GET /v1/audit` 响应一致
 （`{"events","next_cursor"}`）：

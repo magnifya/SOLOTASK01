@@ -66,8 +66,13 @@ def _derive_key(passphrase: str, salt: bytes) -> bytes:
     return kdf.derive(passphrase.encode("utf-8"))
 
 
-def encode_bundle(payload: dict, passphrase: str) -> str:
-    """Authenticated-encrypt an export payload into an opaque base64 token."""
+def seal(payload: dict, passphrase: str, fmt: str = FORMAT) -> str:
+    """Authenticated-encrypt a payload into an opaque base64 token.
+
+    The envelope records ``fmt`` and it is also the GCM additional
+    authenticated data, so a token sealed under one format never opens
+    under another.
+    """
     salt = os.urandom(16)
     nonce = os.urandom(_NONCE_LEN)
     key = _derive_key(passphrase, salt)
@@ -75,7 +80,7 @@ def encode_bundle(payload: dict, passphrase: str) -> str:
         payload, separators=(",", ":"), sort_keys=True
     ).encode("utf-8")
     envelope = {
-        "format": FORMAT,
+        "format": fmt,
         "version": _ENVELOPE_VERSION,
         "kdf": "scrypt",
         "salt": _b64e(salt),
@@ -83,13 +88,18 @@ def encode_bundle(payload: dict, passphrase: str) -> str:
         "r": _SCRYPT_R,
         "p": _SCRYPT_P,
         "nonce": _b64e(nonce),
-        "data": _b64e(AESGCM(key).encrypt(nonce, plaintext, FORMAT.encode("ascii"))),
+        "data": _b64e(AESGCM(key).encrypt(nonce, plaintext, fmt.encode("ascii"))),
     }
     raw = json.dumps(envelope, separators=(",", ":"), sort_keys=True).encode("utf-8")
     return _b64e(raw)
 
 
-def _load_envelope(bundle: str) -> dict:
+def encode_bundle(payload: dict, passphrase: str) -> str:
+    """Authenticated-encrypt an export payload into an opaque base64 token."""
+    return seal(payload, passphrase, FORMAT)
+
+
+def _load_envelope(bundle: str, fmt: str = FORMAT) -> dict:
     raw = _b64d(bundle)
     try:
         envelope = json.loads(raw.decode("utf-8"))
@@ -97,9 +107,9 @@ def _load_envelope(bundle: str) -> dict:
         raise InvalidBundle("field bundle does not contain valid JSON") from exc
     if not isinstance(envelope, dict):
         raise InvalidBundle("field bundle must be a JSON object")
-    if envelope.get("format") != FORMAT:
+    if envelope.get("format") != fmt:
         raise InvalidBundle(
-            "field format must be %r" % FORMAT
+            "field format must be %r" % fmt
         )
     if envelope.get("version") != _ENVELOPE_VERSION:
         raise InvalidBundle(
@@ -142,17 +152,14 @@ def _require(data: dict, field: str, types) -> object:
     return data[field]
 
 
-def validate_payload(data: dict) -> dict:
-    """Validate the decrypted export payload and return a cleaned copy.
+def validate_key_entry(data: dict) -> dict:
+    """Validate one full key record (no envelope format field).
 
-    Raises InvalidBundle naming the offending field on any structural
-    problem or missing field.
+    Shared by the single-key export payload and the tenant backup's
+    per-key entries. Raises InvalidBundle naming the offending field.
     """
     if not isinstance(data, dict):
-        raise InvalidBundle("bundle payload must be a JSON object")
-    if data.get("format") != FORMAT:
-        raise InvalidBundle("field format must be %r" % FORMAT)
-
+        raise InvalidBundle("key entry must be a JSON object")
     key_id = _require(data, "key_id", str)
     from .store import is_valid_key_id
 
@@ -248,7 +255,6 @@ def validate_payload(data: dict) -> dict:
         )
 
     return {
-        "format": FORMAT,
         "key_id": key_id,
         "label": label,
         "current_version": current_version,
@@ -260,14 +266,29 @@ def validate_payload(data: dict) -> dict:
     }
 
 
-def decode_bundle(bundle: str, passphrase: str) -> dict:
-    """Decrypt and validate a bundle.
+def validate_payload(data: dict) -> dict:
+    """Validate the decrypted export payload and return a cleaned copy.
+
+    Raises InvalidBundle naming the offending field on any structural
+    problem or missing field.
+    """
+    if not isinstance(data, dict):
+        raise InvalidBundle("bundle payload must be a JSON object")
+    if data.get("format") != FORMAT:
+        raise InvalidBundle("field format must be %r" % FORMAT)
+    entry = validate_key_entry(data)
+    entry["format"] = FORMAT
+    return entry
+
+
+def unseal(bundle: str, passphrase: str, fmt: str = FORMAT) -> dict:
+    """Decrypt a sealed envelope and return the raw payload (unvalidated).
 
     Raises WrongPassphrase for authentication failures (wrong passphrase or
-    tampered ciphertext) and InvalidBundle for structural, format/version and
-    missing-field problems.
+    tampered ciphertext) and InvalidBundle for envelope, format/version and
+    JSON problems. Payload validation is the caller's job.
     """
-    params = _load_envelope(bundle)
+    params = _load_envelope(bundle, fmt)
     if not isinstance(passphrase, str) or not passphrase:
         raise InvalidBundle("field passphrase must be a non-empty string")
     try:
@@ -283,14 +304,23 @@ def decode_bundle(bundle: str, passphrase: str) -> dict:
         raise InvalidBundle("invalid kdf parameters in field bundle") from exc
     try:
         plaintext = AESGCM(key).decrypt(
-            params["nonce"], params["data"], FORMAT.encode("ascii")
+            params["nonce"], params["data"], fmt.encode("ascii")
         )
     except InvalidTag as exc:
         raise WrongPassphrase(
             "field passphrase is incorrect or bundle is tampered"
         ) from exc
     try:
-        data = json.loads(plaintext.decode("utf-8"))
+        return json.loads(plaintext.decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as exc:
         raise InvalidBundle("bundle payload is not valid JSON") from exc
-    return validate_payload(data)
+
+
+def decode_bundle(bundle: str, passphrase: str) -> dict:
+    """Decrypt and validate a bundle.
+
+    Raises WrongPassphrase for authentication failures (wrong passphrase or
+    tampered ciphertext) and InvalidBundle for structural, format/version and
+    missing-field problems.
+    """
+    return validate_payload(unseal(bundle, passphrase, FORMAT))

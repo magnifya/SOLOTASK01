@@ -6,7 +6,7 @@ import re
 import tempfile
 import threading
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterator, Optional
@@ -221,6 +221,16 @@ class KeyRecord:
             "revoked_at": self.revoked_at,
             "versions": [ver.to_json() for ver in self.versions],
         }
+
+    def to_backup_entry(self) -> dict:
+        """Full record as one tenant-backup entry (no envelope format).
+
+        Like to_export_payload but without the single-key format marker;
+        only ever sealed inside the authenticated tenant backup bundle.
+        """
+        payload = self.to_export_payload()
+        del payload["format"]
+        return payload
 
 
 class KeyStore:
@@ -592,4 +602,64 @@ class KeyStore:
             )
             self._commit_mutation(path, record, event, None)
         return IMPORT_CREATED, record
+
+    # -- tenant backup / restore primitives --------------------------------
+    def list_tenant_records(self, tenant_id: str) -> list:
+        """Return every record owned by the tenant, ordered by key_id."""
+        try:
+            names = os.listdir(self.data_dir)
+        except OSError:
+            return []
+        records = []
+        for name in names:
+            if not (name.endswith(".json") and is_valid_key_id(name[:-5])):
+                continue
+            record = self._read_record(os.path.join(self.data_dir, name))
+            if record is not None and record.tenant_id == tenant_id:
+                records.append(record)
+        records.sort(key=lambda rec: rec.key_id)
+        return records
+
+    def peek(self, key_id: str) -> Optional[KeyRecord]:
+        """Return the record for key_id regardless of tenant, or None.
+
+        Used by tenant restore to distinguish a same-tenant conflict (409)
+        from a cross-tenant occupancy (404); callers must not leak the
+        result to other tenants.
+        """
+        if not _KEY_ID_RE.fullmatch(key_id):
+            return None
+        return self._read_record(self._path_for(key_id))
+
+    @contextmanager
+    def restore_lock(self, key_ids) -> Iterator[None]:
+        """Hold every per-key lock (process + file) for the given key_ids.
+
+        Locks are acquired in sorted order so a multi-key restore and a
+        single-key import/rotate can never deadlock.
+        """
+        ordered = sorted(set(key_ids))
+        with ExitStack() as stack:
+            for key_id in ordered:
+                stack.enter_context(self._key_lock(key_id))
+            for key_id in ordered:
+                stack.enter_context(self._file_lock(key_id))
+            yield
+
+    def write_pending_record(self, record: KeyRecord, event: AuditEvent) -> str:
+        """Atomically write a new key file carrying the pending event.
+
+        The caller must hold the key's locks (see restore_lock) and must
+        have verified the file does not exist yet. Returns the file path so
+        the caller can roll back (unlink) or clear the marker afterwards.
+        """
+        record.pending_event = event.to_json()
+        path = self._path_for(record.key_id)
+        self._write_atomic(path, record.to_json())
+        return path
+
+    def clear_pending_record(self, record: KeyRecord) -> None:
+        """Rewrite a restored key file without its outbox marker."""
+        record.pending_event = None
+        self._write_atomic(self._path_for(record.key_id), record.to_json())
 

@@ -334,6 +334,34 @@ class PolicyStore:
         )
         self.audit.append(event)
 
+    # -- tenant restore primitives ------------------------------------------
+    def write_pending_doc(self, tenant_id: str, rules: List[Rule],
+                          event: AuditEvent) -> str:
+        """Atomically write a new document carrying the pending event.
+
+        Part of the tenant-restore transaction: the caller holds
+        ``_write_lock``, has verified no document exists, and will either
+        roll back (unlink the returned path) or clear the marker after the
+        shared ledger append.
+        """
+        path = self._path_for(tenant_id)
+        self._write_atomic(
+            path,
+            {"tenant_id": tenant_id,
+             "rules": [r.to_json() for r in rules],
+             "pending_event": event.to_json()},
+        )
+        return path
+
+    def clear_pending_doc(self, tenant_id: str, rules: List[Rule]) -> None:
+        """Rewrite a restored document without its outbox marker."""
+        self._write_atomic(
+            self._path_for(tenant_id),
+            {"tenant_id": tenant_id,
+             "rules": [r.to_json() for r in rules],
+             "pending_event": None},
+        )
+
     def is_allowed(self, tenant_id: str, action: str, subject: str) -> bool:
         """Enforce the tenant document for (subject, action).
 
