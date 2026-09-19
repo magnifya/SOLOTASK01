@@ -7,9 +7,11 @@ import re
 import sys
 from typing import List, Optional
 
+from . import audit as audit_mod
+from .audit import InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
 from .server import serve
-from .store import KeyStore
+from .store import KeyStore, is_valid_key_id
 
 DEFAULT_DATA_DIR = os.environ.get("KEYMGR_DATA_DIR", "keymgr_data")
 
@@ -74,6 +76,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_status.add_argument("--tenant-id", required=True)
     p_status.add_argument("--key-id", required=True)
 
+    p_audit = sub.add_parser("audit", help="list a tenant's audit events")
+    p_audit.add_argument("--tenant-id", required=True)
+    p_audit.add_argument("--key-id", default=None,
+                         help="filter to one key_id (must be a UUID4)")
+    p_audit.add_argument("--action", default=None,
+                         help="one of: %s" % ", ".join(audit_mod.ACTIONS))
+    p_audit.add_argument("--limit", type=int, default=100,
+                         help="page size, 1-1000 (default: %(default)s)")
+    p_audit.add_argument("--cursor", default=None,
+                         help="pagination cursor from a previous response")
+
     p_serve = sub.add_parser("serve", help="run the HTTP server")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8080)
@@ -92,6 +105,35 @@ def _fail(message: str, exit_code: int) -> int:
     return exit_code
 
 
+def _ledger_fail(exc: Exception) -> int:
+    return _fail("audit ledger failure: %s" % exc, 1)
+
+
+def _attempt(store, tenant_id, key_id, action, outcome) -> bool:
+    """Record one attempt; False means a ledger failure was reported."""
+    try:
+        store.audit_attempt(tenant_id, key_id, action, outcome)
+    except LedgerError as exc:
+        _ledger_fail(exc)
+        return False
+    return True
+
+
+def _conflict(store) -> bool:
+    """Record an invisible tenant_conflict; False on ledger failure."""
+    try:
+        store.audit_conflict()
+    except LedgerError as exc:
+        _ledger_fail(exc)
+        return False
+    return True
+
+
+def _identifiers_ok(tenant_id, key_id) -> bool:
+    """Whether both identifiers are usable for a tenant-visible event."""
+    return bool(tenant_id) and (key_id is None or is_valid_key_id(key_id))
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """CLI entry point; returns a process exit code."""
     args = build_parser().parse_args(argv)
@@ -103,32 +145,81 @@ def main(argv: Optional[List[str]] = None) -> int:
     store = KeyStore(args.data_dir)
 
     if args.command == "gen":
-        if args.algorithm not in SUPPORTED_ALGORITHMS:
+        if not args.tenant_id or args.algorithm not in SUPPORTED_ALGORITHMS:
+            if not _identifiers_ok(args.tenant_id, None):
+                if not _conflict(store):
+                    return 1
+            elif not _attempt(
+                store, args.tenant_id, None,
+                audit_mod.ACTION_CREATE, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            if not args.tenant_id:
+                return _fail("field tenant_id must be a non-empty string", 2)
             return _fail(
                 "unsupported value for field algorithm: %r (supported: %s)"
                 % (args.algorithm, ", ".join(SUPPORTED_ALGORITHMS)),
                 2,
             )
-        record = store.create(args.tenant_id, args.algorithm, args.label)
+        try:
+            record = store.create(args.tenant_id, args.algorithm, args.label)
+        except LedgerError as exc:
+            return _ledger_fail(exc)
         _print(record.to_create_response())
         return 0
 
-    if args.command == "show":
+    if args.command in ("show", "current"):
         record = store.get(args.key_id, args.tenant_id)
         if record is None:
+            if not _identifiers_ok(args.tenant_id, args.key_id):
+                if not _conflict(store):
+                    return 1
+            elif not _attempt(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_READ, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
             return _fail("key not found", 4)
-        _print(record.to_get_response())
+        if not _attempt(
+            store, args.tenant_id, args.key_id,
+            audit_mod.ACTION_READ, audit_mod.OUTCOME_SUCCESS,
+        ):
+            return 1
+        if args.command == "show":
+            _print(record.to_get_response())
+        else:
+            _print(record.current.to_version_response(args.key_id))
         return 0
 
     if args.command == "rotate":
-        if args.algorithm not in SUPPORTED_ALGORITHMS:
+        if not args.tenant_id or args.algorithm not in SUPPORTED_ALGORITHMS:
+            if not _identifiers_ok(args.tenant_id, args.key_id):
+                if not _conflict(store):
+                    return 1
+            elif not _attempt(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_ROTATE, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            if not args.tenant_id:
+                return _fail("field tenant_id must be a non-empty string", 2)
             return _fail(
                 "unsupported value for field algorithm: %r (supported: %s)"
                 % (args.algorithm, ", ".join(SUPPORTED_ALGORITHMS)),
                 2,
             )
-        record = store.rotate(args.key_id, args.tenant_id, args.algorithm)
+        try:
+            record = store.rotate(
+                args.key_id, args.tenant_id, args.algorithm
+            )
+        except LedgerError as exc:
+            return _ledger_fail(exc)
         if record is None:
+            if not _attempt(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_ROTATE, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
             return _fail("key not found", 4)
         _print(record.to_rotate_response())
         return 0
@@ -138,28 +229,52 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.key_id, args.tenant_id, args.version
         )
         if result is None:
+            if not _identifiers_ok(args.tenant_id, args.key_id):
+                if not _conflict(store):
+                    return 1
+            elif not _attempt(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_READ, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
             return _fail("version not found", 4)
+        if not _attempt(
+            store, args.tenant_id, args.key_id,
+            audit_mod.ACTION_READ, audit_mod.OUTCOME_SUCCESS,
+        ):
+            return 1
         _record, ver = result
         _print(ver.to_version_response(args.key_id))
         return 0
 
-    if args.command == "current":
-        record = store.get(args.key_id, args.tenant_id)
-        if record is None:
-            return _fail("key not found", 4)
-        _print(record.current.to_version_response(args.key_id))
-        return 0
-
     if args.command == "revoke":
-        for field in ("reason", "operator"):
-            if not getattr(args, field):
-                return _fail(
-                    "field %s must be a non-empty string" % field, 2
-                )
-        record = store.revoke(
-            args.key_id, args.tenant_id, args.reason, args.operator
-        )
+        if not args.tenant_id or not args.reason or not args.operator:
+            if not _identifiers_ok(args.tenant_id, args.key_id):
+                if not _conflict(store):
+                    return 1
+            elif not _attempt(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_REVOKE, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            if not args.tenant_id:
+                return _fail("field tenant_id must be a non-empty string", 2)
+            field = "reason" if not args.reason else "operator"
+            return _fail(
+                "field %s must be a non-empty string" % field, 2
+            )
+        try:
+            record = store.revoke(
+                args.key_id, args.tenant_id, args.reason, args.operator
+            )
+        except LedgerError as exc:
+            return _ledger_fail(exc)
         if record is None:
+            if not _attempt(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_REVOKE, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
             return _fail("key not found", 4)
         _print(record.to_status_response())
         return 0
@@ -167,8 +282,56 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "status":
         record = store.get(args.key_id, args.tenant_id)
         if record is None:
+            if not _identifiers_ok(args.tenant_id, args.key_id):
+                if not _conflict(store):
+                    return 1
+            elif not _attempt(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_READ, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
             return _fail("key not found", 4)
+        if not _attempt(
+            store, args.tenant_id, args.key_id,
+            audit_mod.ACTION_READ, audit_mod.OUTCOME_SUCCESS,
+        ):
+            return 1
         _print(record.to_status_response())
+        return 0
+
+    if args.command == "audit":
+        if not args.tenant_id:
+            return _fail("field tenant_id must be a non-empty string", 2)
+        if args.key_id is not None and not is_valid_key_id(args.key_id):
+            return _fail("field key_id must be a UUID4", 2)
+        if args.action is not None and args.action not in audit_mod.ACTIONS:
+            return _fail(
+                "field action must be one of: %s"
+                % ", ".join(audit_mod.ACTIONS),
+                2,
+            )
+        if not 1 <= args.limit <= 1000:
+            return _fail(
+                "field limit must be an integer between 1 and 1000", 2
+            )
+        try:
+            page = store.audit.query(
+                args.tenant_id,
+                key_id=args.key_id,
+                action=args.action,
+                limit=args.limit,
+                cursor=args.cursor,
+            )
+        except InvalidCursor:
+            return _fail("invalid or expired cursor", 2)
+        except LedgerError as exc:
+            return _ledger_fail(exc)
+        _print(
+            {
+                "events": [e.to_response() for e in page.events],
+                "next_cursor": page.next_cursor,
+            }
+        )
         return 0
 
     return 2  # pragma: no cover - argparse enforces choices

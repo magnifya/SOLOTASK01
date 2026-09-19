@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterator, Optional
 
+from . import audit as audit_mod
+from .audit import AuditEvent, AuditLog
 from .crypto import generate_key
 
 try:  # fcntl is POSIX-only; rotation still works without cross-process locks.
@@ -23,6 +25,11 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 _KEY_ID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 )
+
+
+def is_valid_key_id(key_id) -> bool:
+    """True only for a canonical lowercase UUID4 string."""
+    return isinstance(key_id, str) and bool(_KEY_ID_RE.fullmatch(key_id))
 
 
 @dataclass
@@ -81,6 +88,11 @@ class KeyRecord:
     reason: Optional[str] = None
     operator: Optional[str] = None
     revoked_at: Optional[str] = None
+    # Outbox: when set, this event is committed to the audit ledger as part of
+    # the same logical transaction as the record on disk. A value surviving a
+    # restart means the process crashed between the key-file commit and the
+    # ledger append; KeyStore recovers it on open.
+    pending_event: Optional[dict] = None
 
     @property
     def created_at(self) -> str:
@@ -112,6 +124,7 @@ class KeyRecord:
             "reason": self.reason,
             "operator": self.operator,
             "revoked_at": self.revoked_at,
+            "pending_event": self.pending_event,
             "versions": [ver.to_json() for ver in self.versions],
         }
 
@@ -142,6 +155,7 @@ class KeyRecord:
             reason=data.get("reason"),
             operator=data.get("operator"),
             revoked_at=data.get("revoked_at"),
+            pending_event=data.get("pending_event"),
         )
 
     def to_create_response(self) -> dict:
@@ -187,12 +201,119 @@ class KeyRecord:
 class KeyStore:
     """File-backed key store with one JSON file per key."""
 
-    def __init__(self, data_dir: str) -> None:
+    def __init__(self, data_dir: str, audit_log: Optional[AuditLog] = None) -> None:
         self.data_dir = data_dir
         os.makedirs(self.data_dir, exist_ok=True)
         # One lock per key_id serializes read-modify-write within a process.
         self._locks_lock = threading.Lock()
         self._locks: dict = {}
+        self.audit = audit_log if audit_log is not None else AuditLog(data_dir)
+        # Commit any change whose key file landed but whose ledger append was
+        # interrupted by a crash, so a mutation and its event never diverge.
+        self._recover_pending_events()
+
+    # -- audit bookkeeping -------------------------------------------------
+    def audit_conflict(self) -> None:
+        """Record an invisible tenant_conflict event (both ids null)."""
+        self.audit.append(
+            self.audit.new_event(
+                None,
+                audit_mod.ACTION_TENANT_CONFLICT,
+                None,
+                audit_mod.OUTCOME_REJECTED,
+            )
+        )
+
+    def audit_attempt(
+        self,
+        tenant_id,
+        key_id,
+        action: str,
+        outcome: str,
+    ) -> None:
+        """Record one attempt against a key.
+
+        When the tenant is known and non-empty and the key_id is either
+        absent (create) or a legal UUID4, both identifiers are recorded and
+        the event is visible to that tenant only. A missing/empty/illegal
+        identifier collapses to an invisible tenant_conflict with null ids.
+        """
+        if (
+            isinstance(tenant_id, str)
+            and tenant_id
+            and (key_id is None or is_valid_key_id(key_id))
+            and action in (
+                audit_mod.ACTION_CREATE,
+                audit_mod.ACTION_READ,
+                audit_mod.ACTION_ROTATE,
+                audit_mod.ACTION_REVOKE,
+            )
+        ):
+            event = self.audit.new_event(tenant_id, action, key_id, outcome)
+        else:
+            event = self.audit.new_event(
+                None,
+                audit_mod.ACTION_TENANT_CONFLICT,
+                None,
+                audit_mod.OUTCOME_REJECTED,
+            )
+        self.audit.append(event)
+
+    def _recover_pending_events(self) -> None:
+        """Commit outbox events left pending by a crashed process."""
+        try:
+            names = os.listdir(self.data_dir)
+        except OSError:
+            return
+        for name in names:
+            if not (name.endswith(".json") and is_valid_key_id(name[:-5])):
+                continue
+            path = os.path.join(self.data_dir, name)
+            key_id = name[:-5]
+            with self._key_lock(key_id), self._file_lock(key_id):
+                record = self._read_record(path)
+                if record is None or not record.pending_event:
+                    continue
+                # append() is idempotent on event_id, so this is safe whether
+                # the crash happened before or after the ledger write.
+                event = AuditEvent.from_json(record.pending_event)
+                self.audit.append(event)
+                record.pending_event = None
+                self._write_atomic(path, record.to_json())
+
+    def _commit_mutation(
+        self,
+        path: str,
+        record: KeyRecord,
+        event: AuditEvent,
+        previous: Optional[dict],
+    ) -> None:
+        """Commit a key-file change and its event as one logical transaction.
+
+        The record is first written carrying the pending event (an outbox
+        marker), the event is then appended durably to the ledger, and the
+        marker is cleared in a second atomic write. If the ledger append
+        fails the key file is rolled back (deleted for a brand-new key whose
+        ``previous`` is None, restored to its prior bytes otherwise), so a
+        failed ledger write never leaves a single-sided change. A crash at
+        any point is repaired idempotently by _recover_pending_events on the
+        next open.
+        """
+        record.pending_event = event.to_json()
+        self._write_atomic(path, record.to_json())
+        try:
+            self.audit.append(event)
+        except BaseException:
+            if previous is None:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            else:
+                self._write_atomic(path, previous)
+            raise
+        record.pending_event = None
+        self._write_atomic(path, record.to_json())
 
     def _key_lock(self, key_id: str) -> threading.Lock:
         with self._locks_lock:
@@ -256,9 +377,15 @@ class KeyStore:
             return None
 
     def create(self, tenant_id: str, algorithm: str, label: str) -> KeyRecord:
-        """Generate, persist and return a new key record (version 1)."""
+        """Generate, persist and return a new key record (version 1).
+
+        The create event is committed in the same transaction as the key
+        file; a ledger failure removes the just-written key file and raises
+        LedgerError, so the change and its event never land separately.
+        """
         generated = generate_key(algorithm)
         key_id = str(uuid.uuid4())
+        created_at = datetime.now(timezone.utc).isoformat()
         record = KeyRecord(
             key_id=key_id,
             tenant_id=tenant_id,
@@ -266,7 +393,7 @@ class KeyStore:
             versions=[
                 VersionRecord(
                     version=1,
-                    created_at=datetime.now(timezone.utc).isoformat(),
+                    created_at=created_at,
                     algorithm=algorithm,
                     public_key=generated.public_material,
                     private_material=generated.private_material,
@@ -274,10 +401,14 @@ class KeyStore:
             ],
             current_version=1,
         )
+        event = self.audit.new_event(
+            tenant_id, audit_mod.ACTION_CREATE, key_id,
+            audit_mod.OUTCOME_SUCCESS, timestamp=created_at,
+        )
         # The key_id is fresh, but take the same locks as rotation so a
         # concurrent rotate cannot observe a half-written create.
         with self._key_lock(key_id), self._file_lock(key_id):
-            self._write_atomic(self._path_for(key_id), record.to_json())
+            self._commit_mutation(self._path_for(key_id), record, event, None)
         return record
 
     def get(self, key_id: str, tenant_id: str) -> Optional[KeyRecord]:
@@ -306,18 +437,24 @@ class KeyStore:
             record = self._read_record(path)
             if record is None or record.tenant_id != tenant_id:
                 return None
+            previous = record.to_json()
             next_number = record.current_version + 1
+            created_at = datetime.now(timezone.utc).isoformat()
             generated = generate_key(algorithm)
             record.append_version(
                 VersionRecord(
                     version=next_number,
-                    created_at=datetime.now(timezone.utc).isoformat(),
+                    created_at=created_at,
                     algorithm=algorithm,
                     public_key=generated.public_material,
                     private_material=generated.private_material,
                 )
             )
-            self._write_atomic(path, record.to_json())
+            event = self.audit.new_event(
+                tenant_id, audit_mod.ACTION_ROTATE, key_id,
+                audit_mod.OUTCOME_SUCCESS, timestamp=created_at,
+            )
+            self._commit_mutation(path, record, event, previous)
         return record
 
     def revoke(
@@ -337,12 +474,21 @@ class KeyStore:
             record = self._read_record(path)
             if record is None or record.tenant_id != tenant_id:
                 return None
+            event = self.audit.new_event(
+                tenant_id, audit_mod.ACTION_REVOKE, key_id,
+                audit_mod.OUTCOME_SUCCESS,
+            )
             if record.status != "revoked":
+                previous = record.to_json()
                 record.status = "revoked"
                 record.reason = reason
                 record.operator = operator
-                record.revoked_at = datetime.now(timezone.utc).isoformat()
-                self._write_atomic(path, record.to_json())
+                record.revoked_at = event.timestamp
+                self._commit_mutation(path, record, event, previous)
+            else:
+                # Idempotent repeat: nothing changes, but the successful
+                # revoke call is still written to the ledger.
+                self.audit.append(event)
         return record
 
     def get_version(

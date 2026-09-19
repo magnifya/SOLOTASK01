@@ -46,6 +46,16 @@ python -m keymgr --data-dir ./keymgr_data serve --host 127.0.0.1 --port 8080
   或 `?tenant_id=`（两者同时给出必须一致）。返回 `200`：
   `{"key_id", "status", "reason", "operator", "revoked_at"}`；
   `active`（含无状态字段的旧记录）时后三项为 `null`。
+- `GET /v1/audit`：查询本租户的审计事件。租户由**单一** `X-Tenant-Id`
+  头或**单一** `?tenant_id=` 参数提供；缺失、重复、为空或两者冲突均返回
+  `400` 且错误信息指出 `tenant_id`。可选筛选：`key_id`（非 UUID4 返回
+  `400`）、`action`（`create` / `read` / `rotate` / `revoke` /
+  `tenant_conflict` 五值之一）、`limit`（默认 `100`，范围 `1–1000`）、
+  `cursor`（上一页返回的不透明游标）。返回
+  `{"events", "next_cursor"}`，事件按 `timestamp`、`event_id` 升序；
+  `next_cursor` 为 `null` 表示到末页。未知但合法的 `key_id` 返回空列表。
+  游标绑定租户、筛选条件与快照：失效、被篡改或改变筛选/租户均返回 `400`
+  且错误指出 `cursor`；分页保证不重不漏。审计查询本身不记账。
 - 缺少必填字段、algorithm 不支持、version 非正整数、或
   header/query/body 提供了互相冲突的租户参数，返回 `400`，错误信息指明
   具体字段；未知 key、未知版本及跨租户访问统一返回 `404`。任何响应均不含
@@ -58,6 +68,27 @@ python -m keymgr --data-dir ./keymgr_data serve --host 127.0.0.1 --port 8080
 per-key 锁（进程内锁 + `fcntl` 跨进程锁）保护下做读-改-写并原子落盘，
 因此并发轮换不会丢版本、不会留下悬空指针；写入失败只丢弃临时文件，
 旧数据保持完整。重启后版本历史、当前指针、`label`、各版本时间与公钥均可读。
+
+## 审计
+
+密钥的生成、读取（含当前版本、历史版本、状态查询）、轮换、吊销都会写入
+持久化审计账。每条事件字段为 `event_id`、`tenant_id`、`action`、`key_id`、
+`outcome`、`timestamp`（UTC）；`action` 为 `create` / `read` / `rotate` /
+`revoke`，`outcome` 为 `success` / `rejected`。
+
+- 租户已确定且 `key_id` 合法时，事件同时记录两个标识，且仅该请求租户可见。
+  未知或跨租户的访问记为 `outcome=rejected`，只对请求租户可见，不泄露密钥
+  归属。未知但合法的 `key_id` 在审计查询中返回空。
+- 租户缺失、为空、标识非法（`key_id` 非 UUID4）或头/查询/体提供的租户互相
+  不一致时，记一条 `action=tenant_conflict`、`outcome=rejected` 的事件，
+  其 `tenant_id` 与 `key_id` 均为 `null`，任何租户都查不到它。
+- 审计账只追加，存于数据目录的 `audit.log`（每行一个 JSON）。变更（生成 /
+  轮换 / 吊销）与其事件在同一逻辑事务提交：先把事件作为待提交标记随密钥文件
+  原子落盘，再 durable 追加账本，最后清除标记；账本写失败则回滚密钥文件并对
+  HTTP 返回 `500`、CLI 以退出码 `1` 失败，绝不允许单边落盘。进程在两步之间
+  崩溃时，下次启动依据待提交标记幂等补记账本（按 `event_id` 去重）。
+- 事件与查询投影均不含任何私钥材料。`GET /v1/audit` 自身不产生审计事件。
+
 
 ## 命令行
 
@@ -95,8 +126,25 @@ python -m keymgr --data-dir ./keymgr_data status \
   --tenant-id tenant-a --key-id <key_id>
 ```
 
+审计查询同样打印单行 JSON，字段与 `GET /v1/audit` 响应一致
+（`{"events","next_cursor"}`）：
+
+```bash
+# 查询本租户事件；--key-id / --action / --limit / --cursor 均可选
+python -m keymgr --data-dir ./keymgr_data audit \
+  --tenant-id tenant-a --action rotate --limit 100
+# 用上一页输出里的 next_cursor 继续翻页（其为空串/null 时即末页）
+python -m keymgr --data-dir ./keymgr_data audit \
+  --tenant-id tenant-a --cursor '<next_cursor>'
+```
+
+非法的 `--key-id` / `--action` / `--limit` 或失效篡改的 `--cursor` 以
+退出码 `2` 报错，错误信息指出具体字段。
+
 未知 key/版本或跨租户访问以退出码 `4` 报错；非法 algorithm / version
-（非正整数）以退出码 `2` 报错，错误信息指明字段。
+（非正整数）、非法 `--key-id` / `--action` / `--limit` 或失效篡改的
+`--cursor` 以退出码 `2` 报错，错误信息指明字段；审计账写失败以退出码
+`1` 失败（对应 HTTP `500`）。
 
 ## 基础测试
 
@@ -123,3 +171,13 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   无状态字段的旧记录按 `active` 处理。
 - `key_id` 为 UUID4，读取时校验格式以杜绝路径穿越；未知 key、未知版本与
   跨租户访问一律 `404`，不泄露密钥是否存在。
+- 审计账为数据目录下的 `audit.log`（每行一个 JSON，只追加），追加由进程内锁
+  + `audit.log.lock` 上的 `fcntl` 排他锁串行化并 fsync，`seq` 单调不乱序。
+  生成 / 轮换 / 吊销采用“密钥文件携带待提交事件 → 追加账本 → 清除标记”的
+  outbox 事务：账本写失败回滚密钥文件，HTTP 返回 `500`、CLI 退出 `1`，
+  变更与事件绝不单边落盘；崩溃后启动按标记幂等补记（按 `event_id` 去重）。
+- 审计游标是 HMAC 签名的不透明令牌，密钥存于数据目录 `audit.secret`
+  （权限 `0600`），绑定租户、筛选、`limit` 与该可见结果集的快照指纹；
+  篡改、改租户/筛选或可见事件集变化都会令游标失效（`400` / 退出 `2`），
+  其他租户的活动不影响本租户游标。事件按 `timestamp`、`event_id` 升序，
+  分页不重不漏。审计事件与响应投影均不含私钥材料。
