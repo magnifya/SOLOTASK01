@@ -9,8 +9,9 @@ from typing import List, Optional
 
 from . import audit as audit_mod
 from . import keybundle
-from .audit import InvalidCursor, LedgerError
+from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
+from .policy import PolicyError, PolicyStore, validate_rules
 from .server import serve
 from .store import IMPORT_CONFLICT, KeyStore, is_valid_key_id
 
@@ -42,53 +43,51 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_gen = sub.add_parser("gen", help="generate a new key")
-    p_gen.add_argument("--tenant-id", required=True)
+    def tenant_parser(name, **kwargs):
+        p = sub.add_parser(name, **kwargs)
+        p.add_argument("--tenant-id", required=True)
+        p.add_argument(
+            "--operator", required=True,
+            help="non-empty X-Operator-Id of the caller",
+        )
+        return p
+
+    p_gen = tenant_parser("gen", help="generate a new key")
     p_gen.add_argument("--algorithm", required=True,
                        help="one of: %s" % ", ".join(SUPPORTED_ALGORITHMS))
     p_gen.add_argument("--label", required=True)
 
-    p_show = sub.add_parser("show", help="show an existing key")
-    p_show.add_argument("--tenant-id", required=True)
+    p_show = tenant_parser("show", help="show an existing key")
     p_show.add_argument("--key-id", required=True)
 
-    p_rotate = sub.add_parser("rotate", help="rotate a key to a new version")
-    p_rotate.add_argument("--tenant-id", required=True)
+    p_rotate = tenant_parser("rotate", help="rotate a key to a new version")
     p_rotate.add_argument("--key-id", required=True)
     p_rotate.add_argument("--algorithm", required=True,
                           help="one of: %s" % ", ".join(SUPPORTED_ALGORITHMS))
 
-    p_version = sub.add_parser("version", help="show a specific key version")
-    p_version.add_argument("--tenant-id", required=True)
+    p_version = tenant_parser("version", help="show a specific key version")
     p_version.add_argument("--key-id", required=True)
     p_version.add_argument("--version", required=True, type=_positive_int)
 
-    p_current = sub.add_parser("current", help="show the current key version")
-    p_current.add_argument("--tenant-id", required=True)
+    p_current = tenant_parser("current", help="show the current key version")
     p_current.add_argument("--key-id", required=True)
 
-    p_revoke = sub.add_parser("revoke", help="revoke a key")
-    p_revoke.add_argument("--tenant-id", required=True)
+    p_revoke = tenant_parser("revoke", help="revoke a key")
     p_revoke.add_argument("--key-id", required=True)
     p_revoke.add_argument("--reason", required=True)
-    p_revoke.add_argument("--operator", required=True)
 
-    p_status = sub.add_parser("status", help="show a key's revocation status")
-    p_status.add_argument("--tenant-id", required=True)
+    p_status = tenant_parser("status", help="show a key's revocation status")
     p_status.add_argument("--key-id", required=True)
 
-    p_export = sub.add_parser("export", help="export a key as an encrypted bundle")
-    p_export.add_argument("--tenant-id", required=True)
+    p_export = tenant_parser("export", help="export a key as an encrypted bundle")
     p_export.add_argument("--key-id", required=True)
     p_export.add_argument("--passphrase", required=True)
 
-    p_import = sub.add_parser("import", help="import a key from an encrypted bundle")
-    p_import.add_argument("--tenant-id", required=True)
+    p_import = tenant_parser("import", help="import a key from an encrypted bundle")
     p_import.add_argument("--passphrase", required=True)
     p_import.add_argument("--bundle", required=True)
 
-    p_audit = sub.add_parser("audit", help="list a tenant's audit events")
-    p_audit.add_argument("--tenant-id", required=True)
+    p_audit = tenant_parser("audit", help="list a tenant's audit events")
     p_audit.add_argument("--key-id", default=None,
                          help="filter to one key_id (must be a UUID4)")
     p_audit.add_argument("--action", default=None,
@@ -97,6 +96,31 @@ def build_parser() -> argparse.ArgumentParser:
                          help="page size, 1-1000 (default: %(default)s)")
     p_audit.add_argument("--cursor", default=None,
                          help="pagination cursor from a previous response")
+
+    p_policy = sub.add_parser("policy", help="manage a tenant's action policy")
+    p_policy.add_argument(
+        "--operator", required=True,
+        help="non-empty X-Operator-Id of the caller",
+    )
+    policy_sub = p_policy.add_subparsers(
+        dest="policy_command", required=True
+    )
+    p_policy_show = policy_sub.add_parser(
+        "show", help="show a tenant's policy"
+    )
+    p_policy_show.add_argument("--tenant-id", required=True)
+    p_policy_set = policy_sub.add_parser(
+        "set", help="replace a tenant's policy"
+    )
+    p_policy_set.add_argument("--tenant-id", required=True)
+    p_policy_set.add_argument(
+        "--rules", required=True,
+        help='JSON array of {"subject","actions","effect"} rules',
+    )
+    p_policy_delete = policy_sub.add_parser(
+        "delete", help="delete a tenant's policy"
+    )
+    p_policy_delete.add_argument("--tenant-id", required=True)
 
     p_serve = sub.add_parser("serve", help="run the HTTP server")
     p_serve.add_argument("--host", default="127.0.0.1")
@@ -145,6 +169,17 @@ def _identifiers_ok(tenant_id, key_id) -> bool:
     return bool(tenant_id) and (key_id is None or is_valid_key_id(key_id))
 
 
+def _deny(store, tenant_id, key_id, action) -> int:
+    """Audit and report a policy rejection (HTTP 403 -> exit code 3)."""
+    if not _identifiers_ok(tenant_id, key_id):
+        if not _conflict(store):
+            return 1
+    elif not _attempt(store, tenant_id, key_id, action,
+                      audit_mod.OUTCOME_REJECTED):
+        return 1
+    return _fail("action not permitted by policy", 3)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """CLI entry point; returns a process exit code."""
     args = build_parser().parse_args(argv)
@@ -153,7 +188,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         serve(args.host, args.port, args.data_dir)
         return 0
 
-    store = KeyStore(args.data_dir)
+    audit_log = AuditLog(args.data_dir)
+    store = KeyStore(args.data_dir, audit_log)
+    policies = PolicyStore(args.data_dir, audit_log)
+
+    if not getattr(args, "operator", None):
+        return _fail(
+            "field operator must be a non-empty string", 2
+        )
+
+    def allowed(action, key_id=None) -> bool:
+        """Policy gate; on denial the response/audit was already handled."""
+        if policies.is_allowed(args.tenant_id, action, args.operator):
+            return True
+        return False  # caller returns _deny(...)
 
     if args.command == "gen":
         if not args.tenant_id or args.algorithm not in SUPPORTED_ALGORITHMS:
@@ -172,6 +220,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 % (args.algorithm, ", ".join(SUPPORTED_ALGORITHMS)),
                 2,
             )
+        if not allowed(audit_mod.ACTION_CREATE):
+            return _deny(store, args.tenant_id, None, audit_mod.ACTION_CREATE)
         try:
             record = store.create(args.tenant_id, args.algorithm, args.label)
         except LedgerError as exc:
@@ -180,12 +230,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.command in ("show", "current"):
-        record = store.get(args.key_id, args.tenant_id)
-        if record is None:
+        if not is_valid_key_id(args.key_id):
             if not _identifiers_ok(args.tenant_id, args.key_id):
                 if not _conflict(store):
                     return 1
-            elif not _attempt(
+            return _fail("key not found", 4)
+        if not allowed(audit_mod.ACTION_READ):
+            return _deny(store, args.tenant_id, args.key_id,
+                         audit_mod.ACTION_READ)
+        record = store.get(args.key_id, args.tenant_id)
+        if record is None:
+            if not _attempt(
                 store, args.tenant_id, args.key_id,
                 audit_mod.ACTION_READ, audit_mod.OUTCOME_REJECTED,
             ):
@@ -219,6 +274,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                 % (args.algorithm, ", ".join(SUPPORTED_ALGORITHMS)),
                 2,
             )
+        if not is_valid_key_id(args.key_id):
+            if not _conflict(store):
+                return 1
+            return _fail("key not found", 4)
+        if not allowed(audit_mod.ACTION_ROTATE):
+            return _deny(store, args.tenant_id, args.key_id,
+                         audit_mod.ACTION_ROTATE)
         try:
             record = store.rotate(
                 args.key_id, args.tenant_id, args.algorithm
@@ -236,14 +298,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.command == "version":
+        if not is_valid_key_id(args.key_id):
+            if not _identifiers_ok(args.tenant_id, args.key_id):
+                if not _conflict(store):
+                    return 1
+            return _fail("version not found", 4)
+        if not allowed(audit_mod.ACTION_READ):
+            return _deny(store, args.tenant_id, args.key_id,
+                         audit_mod.ACTION_READ)
         result = store.get_version(
             args.key_id, args.tenant_id, args.version
         )
         if result is None:
-            if not _identifiers_ok(args.tenant_id, args.key_id):
-                if not _conflict(store):
-                    return 1
-            elif not _attempt(
+            if not _attempt(
                 store, args.tenant_id, args.key_id,
                 audit_mod.ACTION_READ, audit_mod.OUTCOME_REJECTED,
             ):
@@ -259,7 +326,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.command == "revoke":
-        if not args.tenant_id or not args.reason or not args.operator:
+        if not args.tenant_id or not args.reason:
             if not _identifiers_ok(args.tenant_id, args.key_id):
                 if not _conflict(store):
                     return 1
@@ -270,10 +337,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 1
             if not args.tenant_id:
                 return _fail("field tenant_id must be a non-empty string", 2)
-            field = "reason" if not args.reason else "operator"
-            return _fail(
-                "field %s must be a non-empty string" % field, 2
-            )
+            return _fail("field reason must be a non-empty string", 2)
+        if not is_valid_key_id(args.key_id):
+            if not _conflict(store):
+                return 1
+            return _fail("key not found", 4)
+        if not allowed(audit_mod.ACTION_REVOKE):
+            return _deny(store, args.tenant_id, args.key_id,
+                         audit_mod.ACTION_REVOKE)
         try:
             record = store.revoke(
                 args.key_id, args.tenant_id, args.reason, args.operator
@@ -291,12 +362,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.command == "status":
-        record = store.get(args.key_id, args.tenant_id)
-        if record is None:
+        if not is_valid_key_id(args.key_id):
             if not _identifiers_ok(args.tenant_id, args.key_id):
                 if not _conflict(store):
                     return 1
-            elif not _attempt(
+            return _fail("key not found", 4)
+        if not allowed(audit_mod.ACTION_READ):
+            return _deny(store, args.tenant_id, args.key_id,
+                         audit_mod.ACTION_READ)
+        record = store.get(args.key_id, args.tenant_id)
+        if record is None:
+            if not _attempt(
                 store, args.tenant_id, args.key_id,
                 audit_mod.ACTION_READ, audit_mod.OUTCOME_REJECTED,
             ):
@@ -323,6 +399,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _fail(
                 "field passphrase must be a non-empty string", 2
             )
+        if not is_valid_key_id(args.key_id):
+            if not _conflict(store):
+                return 1
+            return _fail("key not found", 4)
+        if not allowed(audit_mod.ACTION_EXPORT):
+            return _deny(store, args.tenant_id, args.key_id,
+                         audit_mod.ACTION_EXPORT)
         try:
             bundle = store.export_bundle(
                 args.key_id, args.tenant_id, args.passphrase
@@ -330,10 +413,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         except LedgerError as exc:
             return _ledger_fail(exc)
         if bundle is None:
-            if not _identifiers_ok(args.tenant_id, args.key_id):
-                if not _conflict(store):
-                    return 1
-            elif not _attempt(
+            if not _attempt(
                 store, args.tenant_id, args.key_id,
                 audit_mod.ACTION_EXPORT, audit_mod.OUTCOME_REJECTED,
             ):
@@ -376,6 +456,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             ):
                 return 1
             return _fail(str(exc), 2)
+        if not allowed(audit_mod.ACTION_IMPORT):
+            return _deny(store, args.tenant_id, payload["key_id"],
+                         audit_mod.ACTION_IMPORT)
         try:
             status, record = store.import_bundle(args.tenant_id, payload)
         except LedgerError as exc:
@@ -410,6 +493,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _fail(
                 "field limit must be an integer between 1 and 1000", 2
             )
+        if not allowed(audit_mod.ACTION_AUDIT):
+            if not _attempt(
+                store, args.tenant_id, None,
+                audit_mod.ACTION_AUDIT, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            return _fail("action not permitted by policy", 3)
         try:
             page = store.audit.query(
                 args.tenant_id,
@@ -430,4 +520,56 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         return 0
 
+    if args.command == "policy":
+        return _policy_command(args, policies)
+
     return 2  # pragma: no cover - argparse enforces choices
+
+
+def _policy_command(args, policies: PolicyStore) -> int:
+    """Handle `policy show|set|delete`; management is exempt from policy."""
+    tenant_id = args.tenant_id
+    if not tenant_id:
+        return _fail("field tenant_id must be a non-empty string", 2)
+
+    if args.policy_command == "show":
+        rules = policies.get(tenant_id)
+        if rules is None:
+            return _fail("policy not found", 4)
+        try:
+            policies.audit_read(tenant_id)
+        except LedgerError as exc:
+            return _ledger_fail(exc)
+        _print(
+            {"tenant_id": tenant_id,
+             "rules": [r.to_json() for r in rules]}
+        )
+        return 0
+
+    if args.policy_command == "set":
+        try:
+            raw = json.loads(args.rules)
+        except ValueError:
+            return _fail("field rules must be valid JSON", 2)
+        try:
+            rules = validate_rules(raw)
+        except PolicyError as exc:
+            return _fail(str(exc), 2)
+        try:
+            policies.put(tenant_id, rules)
+        except LedgerError as exc:
+            return _ledger_fail(exc)
+        _print(
+            {"tenant_id": tenant_id,
+             "rules": [r.to_json() for r in rules]}
+        )
+        return 0
+
+    # policy delete
+    try:
+        policies.delete(tenant_id)
+    except LedgerError as exc:
+        return _ledger_fail(exc)
+    _print({"tenant_id": tenant_id, "deleted": True})
+    return 0
+

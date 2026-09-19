@@ -9,9 +9,11 @@ from . import audit as audit_mod
 from . import keybundle
 from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
+from .policy import PolicyError, PolicyStore, validate_rules
 from .store import IMPORT_CONFLICT, KeyStore, is_valid_key_id
 
 _AUDIT_PATH = "/v1/audit"
+_POLICY_PATH = "/v1/policy"
 _IMPORT_PATH = "/v1/keys/import"
 _KEY_PATH_RE = re.compile(r"^/v1/keys/([^/]+)$")
 _ROTATE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/rotate$")
@@ -24,8 +26,8 @@ _POSITIVE_INT_RE = re.compile(r"[0-9]+")
 _MISSING = object()
 
 
-def make_handler(store: KeyStore) -> type:
-    """Build a BaseHTTPRequestHandler subclass bound to the store."""
+def make_handler(store: KeyStore, policy_store: PolicyStore) -> type:
+    """Build a BaseHTTPRequestHandler subclass bound to the stores."""
 
     class KeyHandler(BaseHTTPRequestHandler):
         server_version = "KeyMgr/1.0"
@@ -67,6 +69,45 @@ def make_handler(store: KeyStore) -> type:
                 self._server_error(exc)
                 return False
             return True
+
+        # -- operator / policy -------------------------------------------
+        def _operator(self):
+            """Return the single non-empty X-Operator-Id, else send 400.
+
+            Duplicate headers are a 400 as well. A missing/empty operator is
+            rejected before any tenant-scoped work happens.
+            """
+            values = self.headers.get_all("X-Operator-Id") or []
+            if len(values) > 1:
+                self._bad_request(
+                    "duplicate X-Operator-Id (provide a single header)"
+                )
+                return None
+            operator = values[0] if values else None
+            if not operator:
+                self._bad_request(
+                    "missing required header: X-Operator-Id"
+                    if operator is None
+                    else "header X-Operator-Id must be a non-empty string"
+                )
+                return None
+            return operator
+
+        def _enforce(self, tenant_id, key_id, action, operator) -> bool:
+            """Enforce the tenant policy. True to proceed; else response sent.
+
+            A rejection is a 403 carrying a rejected audit event that records
+            the original action and key_id; unknown/cross-tenant keys remain
+            404 and are handled by callers after enforcement.
+            """
+            if policy_store.is_allowed(tenant_id, action, operator):
+                return True
+            if not self._record_attempt(
+                tenant_id, key_id, action, audit_mod.OUTCOME_REJECTED
+            ):
+                return False
+            self._send_json(403, {"error": "action not permitted by policy"})
+            return False
 
         # -- parsing helpers ---------------------------------------------
         def _read_json_object(self):
@@ -200,28 +241,31 @@ def make_handler(store: KeyStore) -> type:
         def do_POST(self) -> None:
             parts = urlsplit(self.path)
             path = parts.path
+            operator = self._operator()
+            if operator is None:
+                return
             try:
                 if path == "/v1/keys":
-                    self._create_key()
+                    self._create_key(operator)
                     return
 
                 rotate_match = _ROTATE_PATH_RE.match(path)
                 if rotate_match is not None:
-                    self._rotate_key(rotate_match.group(1), parts)
+                    self._rotate_key(rotate_match.group(1), parts, operator)
                     return
 
                 revoke_match = _REVOKE_PATH_RE.match(path)
                 if revoke_match is not None:
-                    self._revoke_key(revoke_match.group(1), parts)
+                    self._revoke_key(revoke_match.group(1), parts, operator)
                     return
 
                 export_match = _EXPORT_PATH_RE.match(path)
                 if export_match is not None:
-                    self._export_key(export_match.group(1), parts)
+                    self._export_key(export_match.group(1), parts, operator)
                     return
 
                 if path == _IMPORT_PATH:
-                    self._import_key(parts)
+                    self._import_key(parts, operator)
                     return
             except LedgerError as exc:
                 self._server_error(exc)
@@ -229,7 +273,7 @@ def make_handler(store: KeyStore) -> type:
 
             self._send_json(404, {"error": "not found"})
 
-        def _create_key(self) -> None:
+        def _create_key(self, operator: str) -> None:
             payload = self._read_json_object()
             if payload is None:
                 # Conflict (if any) was already recorded by the body parser.
@@ -269,6 +313,10 @@ def make_handler(store: KeyStore) -> type:
                     % (algorithm, ", ".join(SUPPORTED_ALGORITHMS))
                 )
                 return
+            if not self._enforce(
+                tenant_id, None, audit_mod.ACTION_CREATE, operator
+            ):
+                return
             record = store.create(
                 tenant_id=tenant_id,
                 algorithm=algorithm,
@@ -276,7 +324,7 @@ def make_handler(store: KeyStore) -> type:
             )
             self._send_json(201, record.to_create_response())
 
-        def _rotate_key(self, key_id: str, parts) -> None:
+        def _rotate_key(self, key_id: str, parts, operator: str) -> None:
             payload = self._read_json_object()
             if payload is None:
                 return
@@ -312,6 +360,12 @@ def make_handler(store: KeyStore) -> type:
                     % (algorithm, ", ".join(SUPPORTED_ALGORITHMS))
                 )
                 return
+            # Authorization follows request validation (400) and precedes the
+            # existence check, so a denial is a 403 even for an unknown key.
+            if not self._enforce(
+                tenant_id, key_id, audit_mod.ACTION_ROTATE, operator
+            ):
+                return
             record = store.rotate(key_id, tenant_id, algorithm)
             if record is None:
                 # Unknown key or another tenant's key look identical; the
@@ -325,7 +379,7 @@ def make_handler(store: KeyStore) -> type:
                 return
             self._send_json(201, record.to_rotate_response())
 
-        def _revoke_key(self, key_id: str, parts) -> None:
+        def _revoke_key(self, key_id: str, parts, operator: str) -> None:
             payload = self._read_json_object()
             if payload is None:
                 return
@@ -355,6 +409,10 @@ def make_handler(store: KeyStore) -> type:
                         else "missing required field: %s" % field
                     )
                     return
+            if not self._enforce(
+                tenant_id, key_id, audit_mod.ACTION_REVOKE, operator
+            ):
+                return
             record = store.revoke(
                 key_id, tenant_id, payload["reason"], payload["operator"]
             )
@@ -368,7 +426,7 @@ def make_handler(store: KeyStore) -> type:
                 return
             self._send_json(200, record.to_status_response())
 
-        def _export_key(self, key_id: str, parts) -> None:
+        def _export_key(self, key_id: str, parts, operator: str) -> None:
             """POST /v1/keys/{key_id}/export.
 
             The body must carry a non-empty tenant_id and passphrase; an
@@ -401,6 +459,10 @@ def make_handler(store: KeyStore) -> type:
                     "field passphrase must be a non-empty string"
                 )
                 return
+            if not self._enforce(
+                tenant_id, key_id, audit_mod.ACTION_EXPORT, operator
+            ):
+                return
             # The record is read before the success event, but nothing is
             # persisted by an export, so a ledger failure after this point
             # simply fails the request with 500.
@@ -423,7 +485,7 @@ def make_handler(store: KeyStore) -> type:
                 200, {"format": keybundle.FORMAT, "bundle": bundle}
             )
 
-        def _import_key(self, parts) -> None:
+        def _import_key(self, parts, operator: str) -> None:
             """POST /v1/keys/import.
 
             Decryption/tamper/format errors are 400s naming passphrase or
@@ -482,6 +544,13 @@ def make_handler(store: KeyStore) -> type:
                     return
                 self._bad_request(str(exc))
                 return
+            # The bundle authenticated; authorization now, before the
+            # existence conflict check (deny is a 403 even when the key_id
+            # already exists for another tenant).
+            if not self._enforce(
+                tenant_id, decoded["key_id"], audit_mod.ACTION_IMPORT, operator
+            ):
+                return
             # The bundle authenticated; its key_id is a validated UUID4. The
             # existence check and the create happen atomically in the store.
             status, record = store.import_bundle(tenant_id, decoded)
@@ -508,10 +577,21 @@ def make_handler(store: KeyStore) -> type:
             parts = urlsplit(self.path)
             path = parts.path
 
+            operator = self._operator()
+            if operator is None:
+                return
+
             if path == _AUDIT_PATH:
                 # Audit failures are 500, not audited themselves.
                 try:
-                    self._get_audit(parts)
+                    self._get_audit(parts, operator)
+                except LedgerError as exc:
+                    self._server_error(exc)
+                return
+
+            if path == _POLICY_PATH:
+                try:
+                    self._get_policy(parts)
                 except LedgerError as exc:
                     self._server_error(exc)
                 return
@@ -520,29 +600,34 @@ def make_handler(store: KeyStore) -> type:
                 version_match = _VERSION_PATH_RE.match(path)
                 if version_match is not None:
                     self._get_version(
-                        version_match.group(1), version_match.group(2), parts
+                        version_match.group(1), version_match.group(2),
+                        parts, operator,
                     )
                     return
 
                 current_match = _CURRENT_PATH_RE.match(path)
                 if current_match is not None:
-                    self._get_current(current_match.group(1), parts)
+                    self._get_current(
+                        current_match.group(1), parts, operator
+                    )
                     return
 
                 status_match = _STATUS_PATH_RE.match(path)
                 if status_match is not None:
-                    self._get_status(status_match.group(1), parts)
+                    self._get_status(
+                        status_match.group(1), parts, operator
+                    )
                     return
 
                 key_match = _KEY_PATH_RE.match(path)
                 if key_match is not None:
-                    self._get_key(key_match.group(1), parts)
+                    self._get_key(key_match.group(1), parts, operator)
                     return
             except LedgerError as exc:
                 self._server_error(exc)
                 return
 
-            self._send_json(404, {"error": "not found"})
+            self._send_json(404, {"error": "not found" })
 
         def _reject_read(self, tenant_id, key_id, status, message) -> None:
             if not self._record_attempt(
@@ -552,11 +637,15 @@ def make_handler(store: KeyStore) -> type:
                 return
             self._send_json(status, {"error": message})
 
-        def _get_key(self, key_id: str, parts) -> None:
+        def _get_key(self, key_id: str, parts, operator: str) -> None:
             tenant_id = self._tenant(parts)
             if tenant_id is None:
                 return
             if self._bad_key_id(key_id):
+                return
+            if not self._enforce(
+                tenant_id, key_id, audit_mod.ACTION_READ, operator
+            ):
                 return
             record = store.get(key_id, tenant_id)
             if record is None:
@@ -571,7 +660,8 @@ def make_handler(store: KeyStore) -> type:
                 return
             self._send_json(200, record.to_get_response())
 
-        def _get_version(self, key_id: str, raw_version: str, parts) -> None:
+        def _get_version(self, key_id: str, raw_version: str, parts,
+                         operator: str) -> None:
             tenant_id = self._tenant(parts)
             if tenant_id is None:
                 return
@@ -585,6 +675,10 @@ def make_handler(store: KeyStore) -> type:
                     tenant_id, key_id, 400,
                     "field version must be a positive integer",
                 )
+                return
+            if not self._enforce(
+                tenant_id, key_id, audit_mod.ACTION_READ, operator
+            ):
                 return
             result = store.get_version(key_id, tenant_id, version)
             if result is None:
@@ -602,11 +696,15 @@ def make_handler(store: KeyStore) -> type:
             _record, ver = result
             self._send_json(200, ver.to_version_response(key_id))
 
-        def _get_current(self, key_id: str, parts) -> None:
+        def _get_current(self, key_id: str, parts, operator: str) -> None:
             tenant_id = self._tenant(parts)
             if tenant_id is None:
                 return
             if self._bad_key_id(key_id):
+                return
+            if not self._enforce(
+                tenant_id, key_id, audit_mod.ACTION_READ, operator
+            ):
                 return
             record = store.get(key_id, tenant_id)
             if record is None:
@@ -619,11 +717,15 @@ def make_handler(store: KeyStore) -> type:
                 return
             self._send_json(200, record.current.to_version_response(key_id))
 
-        def _get_status(self, key_id: str, parts) -> None:
+        def _get_status(self, key_id: str, parts, operator: str) -> None:
             tenant_id = self._tenant(parts)
             if tenant_id is None:
                 return
             if self._bad_key_id(key_id):
+                return
+            if not self._enforce(
+                tenant_id, key_id, audit_mod.ACTION_READ, operator
+            ):
                 return
             record = store.get(key_id, tenant_id)
             if record is None:
@@ -645,7 +747,7 @@ def make_handler(store: KeyStore) -> type:
                 return None, True
             return values, False
 
-        def _get_audit(self, parts) -> None:
+        def _get_audit(self, parts, operator: str) -> None:
             tenant_id = self._audit_tenant(parts)
             if tenant_id is None:
                 return
@@ -693,6 +795,14 @@ def make_handler(store: KeyStore) -> type:
                 return
             cursor = values[0] if values else None
 
+            # Parameter validation (400) precedes authorization; a policy
+            # rejection of an audit query is recorded with the original
+            # action ("audit") and outcome rejected, key_id null.
+            if not self._enforce(
+                tenant_id, None, audit_mod.ACTION_AUDIT, operator
+            ):
+                return
+
             try:
                 page = store.audit.query(
                     tenant_id,
@@ -712,6 +822,127 @@ def make_handler(store: KeyStore) -> type:
                 },
             )
 
+        # -- policy management --------------------------------------------
+        def _strict_tenant(self, parts):
+            """Single header or single query tenant, with conflict auditing.
+
+            Same rules as _audit_tenant (simultaneous/duplicate/empty/missing
+            is a 400 naming tenant_id), but the failure is also written to the
+            ledger as an invisible tenant_conflict event. Used by the policy
+            management endpoints.
+            """
+            headers = self.headers.get_all("X-Tenant-Id") or []
+            query_values = parse_qs(
+                parts.query, keep_blank_values=True
+            ).get("tenant_id", [])
+
+            def fail(message: str) -> None:
+                if self._record_conflict():
+                    self._bad_request(message)
+
+            if len(headers) > 1:
+                fail("duplicate tenant_id (provide a single X-Tenant-Id header)")
+                return None
+            if len(query_values) > 1:
+                fail("duplicate tenant_id (provide a single tenant_id parameter)")
+                return None
+            if headers and query_values:
+                fail(
+                    "conflicting tenant_id parameters (use header or query, not both)"
+                )
+                return None
+            tenant = headers[0] if headers else (
+                query_values[0] if query_values else None
+            )
+            if tenant is None:
+                fail("missing required field: tenant_id")
+                return None
+            if not tenant:
+                fail("field tenant_id must be a non-empty string")
+                return None
+            return tenant
+
+        def do_PUT(self) -> None:
+            parts = urlsplit(self.path)
+            if parts.path != _POLICY_PATH:
+                self._send_json(404, {"error": "not found"})
+                return
+            operator = self._operator()
+            if operator is None:
+                return
+            try:
+                self._put_policy(parts)
+            except LedgerError as exc:
+                self._server_error(exc)
+
+        def do_DELETE(self) -> None:
+            parts = urlsplit(self.path)
+            if parts.path != _POLICY_PATH:
+                self._send_json(404, {"error": "not found"})
+                return
+            operator = self._operator()
+            if operator is None:
+                return
+            try:
+                self._delete_policy(parts)
+            except LedgerError as exc:
+                self._server_error(exc)
+
+        def _get_policy(self, parts) -> None:
+            tenant_id = self._strict_tenant(parts)
+            if tenant_id is None:
+                return
+            rules = policy_store.get(tenant_id)
+            if rules is None:
+                self._send_json(404, {"error": "policy not found"})
+                return
+            policy_store.audit_read(tenant_id)
+            self._send_json(
+                200,
+                {
+                    "tenant_id": tenant_id,
+                    "rules": [r.to_json() for r in rules],
+                },
+            )
+
+        def _put_policy(self, parts) -> None:
+            payload = self._read_json_object()
+            if payload is None:
+                return
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                if self._record_conflict():
+                    self._bad_request(
+                        "field tenant_id must be a non-empty string"
+                    )
+                return
+            tenant_id = self._tenant(parts, payload)
+            if tenant_id is None:
+                return
+            if "rules" not in payload:
+                self._bad_request("missing required field: rules")
+                return
+            try:
+                rules = validate_rules(payload["rules"])
+            except PolicyError as exc:
+                self._bad_request(str(exc))
+                return
+            policy_store.put(tenant_id, rules)
+            self._send_json(
+                200,
+                {
+                    "tenant_id": tenant_id,
+                    "rules": [r.to_json() for r in rules],
+                },
+            )
+
+        def _delete_policy(self, parts) -> None:
+            tenant_id = self._strict_tenant(parts)
+            if tenant_id is None:
+                return
+            policy_store.delete(tenant_id)
+            self._send_json(200, {"tenant_id": tenant_id, "deleted": True})
+
     return KeyHandler
 
 
@@ -719,7 +950,10 @@ def serve(host: str, port: int, data_dir: str) -> None:
     """Run the HTTP server until interrupted."""
     audit_log = AuditLog(data_dir)
     store = KeyStore(data_dir, audit_log)
-    httpd = ThreadingHTTPServer((host, port), make_handler(store))
+    policy_store = PolicyStore(data_dir, audit_log)
+    httpd = ThreadingHTTPServer(
+        (host, port), make_handler(store, policy_store)
+    )
     httpd.daemon_threads = True
     try:
         httpd.serve_forever()

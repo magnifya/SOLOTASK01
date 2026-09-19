@@ -274,6 +274,7 @@ class KeyStore:
                 audit_mod.ACTION_REVOKE,
                 audit_mod.ACTION_IMPORT,
                 audit_mod.ACTION_EXPORT,
+                audit_mod.ACTION_AUDIT,
             )
         ):
             event = self.audit.new_event(tenant_id, action, key_id, outcome)

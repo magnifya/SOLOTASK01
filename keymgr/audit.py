@@ -23,7 +23,13 @@ ACTION_ROTATE = "rotate"
 ACTION_REVOKE = "revoke"
 ACTION_IMPORT = "import"
 ACTION_EXPORT = "export"
+ACTION_AUDIT = "audit"
 ACTION_TENANT_CONFLICT = "tenant_conflict"
+# Policy management actions. These are audited but are never themselves
+# governed by a tenant policy (management is exempt from enforcement).
+ACTION_POLICY_READ = "policy_read"
+ACTION_POLICY_UPDATE = "policy_update"
+ACTION_POLICY_DELETE = "policy_delete"
 ACTIONS = (
     ACTION_CREATE,
     ACTION_READ,
@@ -31,7 +37,11 @@ ACTIONS = (
     ACTION_REVOKE,
     ACTION_IMPORT,
     ACTION_EXPORT,
+    ACTION_AUDIT,
     ACTION_TENANT_CONFLICT,
+    ACTION_POLICY_READ,
+    ACTION_POLICY_UPDATE,
+    ACTION_POLICY_DELETE,
 )
 
 OUTCOME_SUCCESS = "success"

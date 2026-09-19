@@ -18,6 +18,43 @@ python -m keymgr --data-dir ./keymgr_data serve --host 127.0.0.1 --port 8080
 
 数据目录也可用环境变量 `KEYMGR_DATA_DIR` 指定。
 
+### 操作者标识
+
+除 `serve` 外，每个 HTTP 请求都必须携带**单一非空**请求头
+`X-Operator-Id: <operator>`（CLI 对应全局的 `--operator`，每个子命令都必填）；
+缺失、为空或重复均返回 `400`（CLI 退出 `2`）。该标识既用于审计，也作为租户
+策略中的 `subject` 参与鉴权。
+
+### 租户策略
+
+- `GET /v1/policy`：读取一个租户的策略。租户由**单一** `X-Tenant-Id` 头或
+  **单一** `?tenant_id=` 参数提供；两者同时给出、重复、缺失或为空均为 `400`
+  且错误指明 `tenant_id`（这类参数错误同时记一条不可见的 `tenant_conflict`
+  事件）。策略不存在返回 `404`。成功返回 `200`：
+  `{"tenant_id", "rules"}`，并记一条 `policy_read` 事件。
+- `PUT /v1/policy`：新建或整体替换策略。请求体 JSON 必须含非空字符串
+  `tenant_id` 与数组 `rules`；`X-Tenant-Id` 头 / `?tenant_id=` 可选但必须与
+  body 的 `tenant_id` 一致，冲突为 `400`。成功返回 `200`：
+  `{"tenant_id", "rules"}`，并记一条 `policy_update` 事件。
+- `DELETE /v1/policy`：删除策略。租户来源与 `GET` 相同（单一头或单一参数）。
+  成功（含策略本不存在的幂等删除）返回 `200`：
+  `{"tenant_id", "deleted": true}`，并记一条 `policy_delete` 事件。
+- `rules` 的每个元素含 `subject`、`actions`、`effect`：
+  - `subject` 为非空字符串且**区分大小写**；
+  - `actions` 为非空数组，元素只能是
+    `create` / `read` / `rotate` / `revoke` / `import` / `export` / `audit`，
+    元素须非空，单条规则内重复的动作会去重；
+  - `effect` 只能是 `allow` 或 `deny`；
+  - 出现未知字段、字段类型错误、或存在同 `subject` + 同 `effect` +
+    无序 `actions` 集合相同的重复规则，均为 `400`。`rules: []` 合法，表示
+    该租户的所有动作都被拒绝。
+- **执行规则**（作用于 create/read/rotate/revoke/import/export/audit 七个动作，
+  管理端点 policy_* 免检）：租户没有策略时一律允许；有策略时，匹配当前
+  `X-Operator-Id` 与动作的规则里 **deny 优先于 allow**，没有任何规则匹配则
+  拒绝。被策略拒绝返回 `403`，并记原动作名（如 `read`）、`outcome=rejected`
+  与当时已知的 `key_id`（create/import 解密前/audit 查询为 `null`）。参数校验
+  （`400`）先于授权，授权先于存在性判断；未知 key / 跨租户访问仍为 `404`。
+
 ### 接口
 
 - `POST /v1/keys`，请求体 `{"tenant_id", "algorithm", "label"}`，
@@ -66,7 +103,8 @@ python -m keymgr --data-dir ./keymgr_data serve --host 127.0.0.1 --port 8080
   头或**单一** `?tenant_id=` 参数提供；缺失、重复、为空或两者冲突均返回
   `400` 且错误信息指出 `tenant_id`。可选筛选：`key_id`（非 UUID4 返回
   `400`）、`action`（`create` / `read` / `rotate` / `revoke` / `import` /
-  `export` / `tenant_conflict` 七值之一）、`limit`（默认 `100`，范围
+  `export` / `audit` / `tenant_conflict` / `policy_read` / `policy_update` /
+  `policy_delete` 十一值之一）、`limit`（默认 `100`，范围
   `1–1000`）、`cursor`（上一页返回的不透明游标）。返回
   `{"events", "next_cursor"}`，事件按 `timestamp`、`event_id` 升序；
   `next_cursor` 为 `null` 表示到末页。未知但合法的 `key_id` 返回空列表。
@@ -90,14 +128,22 @@ per-key 锁（进程内锁 + `fcntl` 跨进程锁）保护下做读-改-写并�
 密钥的生成、读取（含当前版本、历史版本、状态查询）、轮换、吊销、导入与导出
 都会写入持久化审计账。每条事件字段为 `event_id`、`tenant_id`、`action`、
 `key_id`、`outcome`、`timestamp`（UTC）；`action` 为 `create` / `read` /
-`rotate` / `revoke` / `import` / `export`，`outcome` 为 `success` /
-`rejected`。
+`rotate` / `revoke` / `import` / `export` / `audit` / `policy_read` /
+`policy_update` / `policy_delete`，`outcome` 为 `success` / `rejected`。
 
 - 租户已确定且 `key_id` 合法时，事件同时记录两个标识，且仅该请求租户可见。
   未知或跨租户的访问（含导出、跨租户导入冲突）记为 `outcome=rejected`，
   只对请求租户可见，不泄露密钥归属。导入在解密成功前尚不知 `key_id`，
   这类拒绝事件的 `key_id` 为 `null`；未知但合法的 `key_id` 在审计查询中
   返回空。
+- 被租户策略拒绝的动作记一条**原动作名**（不是策略动作）、
+  `outcome=rejected`、携带当时已知 `key_id` 的事件（如对未知 key 的
+  `read` 拒绝会带上该 key_id；create、成功解密前的 import、audit 查询为
+  `null`）。审计查询本身**成功时不记账**，仅在被策略拒绝时记一条
+  `action=audit`、`outcome=rejected`、`key_id=null` 的事件。
+- 策略管理记 `policy_read` / `policy_update` / `policy_delete` 三种
+  `success` 事件（`key_id` 为 `null`），仅该租户可见；这些管理动作本身
+  不受租户策略约束。
 - 租户缺失、为空、标识非法（`key_id` 非 UUID4）或头/查询/体提供的租户互相
   不一致时，记一条 `action=tenant_conflict`、`outcome=rejected` 的事件，
   其 `tenant_id` 与 `key_id` 均为 `null`，任何租户都查不到它。
@@ -107,18 +153,26 @@ per-key 锁（进程内锁 + `fcntl` 跨进程锁）保护下做读-改-写并�
   密钥文件并对 HTTP 返回 `500`、CLI 以退出码 `1` 失败，绝不允许单边落盘。
   导出只读，其审计事件随成功响应直接追加账本。进程在两步之间崩溃时，下次
   启动依据待提交标记幂等补记账本（按 `event_id` 去重）。
-- 事件与查询投影均不含任何私钥材料。`GET /v1/audit` 自身不产生审计事件。
+- 策略文档同样走 outbox 事务：`PUT` 先把策略文件（数据目录
+  `policies/<sha256(tenant_id)>.json`，权限 `0600`）连同待提交事件原子
+  落盘再追加账本；`DELETE` 用 `*.json.del` 墓碑标记包裹“删文件 → 记账本”
+  两步，崩溃后下次启动据墓碑幂等收尾（原文件仍在则回滚删除，否则补记并清理）。
+- 事件与查询投影均不含任何私钥材料。`GET /v1/audit` 成功时不产生审计事件。
 
 
 ## 命令行
+
+除 `serve` 外，每个子命令都必须提供非空的 `--operator`（对应 HTTP 的
+`X-Operator-Id`，同时作为策略匹配的 `subject`）；缺失由 argparse 报错、
+为空以退出码 `2` 报错。
 
 `gen` / `show` 与上述接口一一对应，均打印单行 JSON，字段名与 HTTP 响应完全一致：
 
 ```bash
 python -m keymgr --data-dir ./keymgr_data gen \
-  --tenant-id tenant-a --algorithm RSA2048 --label "my key"
+  --tenant-id tenant-a --algorithm RSA2048 --label "my key" --operator alice
 python -m keymgr --data-dir ./keymgr_data show \
-  --tenant-id tenant-a --key-id <key_id>
+  --tenant-id tenant-a --key-id <key_id> --operator alice
 ```
 
 版本与轮换命令同样打印单行 JSON，字段与对应 HTTP 响应一致：
@@ -126,24 +180,25 @@ python -m keymgr --data-dir ./keymgr_data show \
 ```bash
 # 轮换：输出 {"key_id","version","algorithm","public_key"}
 python -m keymgr --data-dir ./keymgr_data rotate \
-  --tenant-id tenant-a --key-id <key_id> --algorithm AES256
+  --tenant-id tenant-a --key-id <key_id> --algorithm AES256 --operator alice
 # 指定历史版本：输出 {"key_id","version","created_at","algorithm","public_key"}
 python -m keymgr --data-dir ./keymgr_data version \
-  --tenant-id tenant-a --key-id <key_id> --version 1
+  --tenant-id tenant-a --key-id <key_id> --version 1 --operator alice
 # 当前版本：字段同 version
 python -m keymgr --data-dir ./keymgr_data current \
-  --tenant-id tenant-a --key-id <key_id>
+  --tenant-id tenant-a --key-id <key_id> --operator alice
 ```
 
 吊销与状态查询同样打印单行 JSON，字段与对应 HTTP 响应一致：
 
 ```bash
 # 吊销：输出 {"key_id","status","reason","operator","revoked_at"}
+# --operator 既是调用者（策略 subject）也记录为吊销操作者
 python -m keymgr --data-dir ./keymgr_data revoke \
   --tenant-id tenant-a --key-id <key_id> --reason "compromised" --operator alice
 # 状态：字段同 revoke；active 时 reason/operator/revoked_at 为 null
 python -m keymgr --data-dir ./keymgr_data status \
-  --tenant-id tenant-a --key-id <key_id>
+  --tenant-id tenant-a --key-id <key_id> --operator alice
 ```
 
 加密导入 / 导出同样打印单行 JSON，字段与对应 HTTP 响应一致：
@@ -151,10 +206,10 @@ python -m keymgr --data-dir ./keymgr_data status \
 ```bash
 # 导出：输出 {"format","bundle"}，bundle 为不透明 base64
 python -m keymgr --data-dir ./keymgr_data export \
-  --tenant-id tenant-a --key-id <key_id> --passphrase 'hunter2'
+  --tenant-id tenant-a --key-id <key_id> --passphrase 'hunter2' --operator alice
 # 导入：输出 {"key_id","algorithm","public_key"}（201 的创建响应字段）
 python -m keymgr --data-dir ./keymgr_data import \
-  --tenant-id tenant-b --passphrase 'hunter2' --bundle '<bundle>'
+  --tenant-id tenant-b --passphrase 'hunter2' --bundle '<bundle>' --operator alice
 ```
 
 导出、导入分别写 `action=export` / `action=import` 的审计事件。
@@ -165,20 +220,39 @@ python -m keymgr --data-dir ./keymgr_data import \
 ```bash
 # 查询本租户事件；--key-id / --action / --limit / --cursor 均可选
 python -m keymgr --data-dir ./keymgr_data audit \
-  --tenant-id tenant-a --action rotate --limit 100
+  --tenant-id tenant-a --action rotate --limit 100 --operator alice
 # 用上一页输出里的 next_cursor 继续翻页（其为空串/null 时即末页）
 python -m keymgr --data-dir ./keymgr_data audit \
-  --tenant-id tenant-a --cursor '<next_cursor>'
+  --tenant-id tenant-a --cursor '<next_cursor>' --operator alice
+```
+
+策略管理用 `policy show|set|delete` 子命令，均需 `--operator` 与
+`--tenant-id`，输出与对应 HTTP 响应同形（`set` 另需 `--rules`，值为
+JSON 数组字符串）：
+
+```bash
+# 输出 {"tenant_id","rules"}
+python -m keymgr --data-dir ./keymgr_data policy --operator admin set \
+  --tenant-id tenant-a \
+  --rules '[{"subject":"alice","actions":["read","create"],"effect":"allow"}]'
+# 输出 {"tenant_id","rules"}
+python -m keymgr --data-dir ./keymgr_data policy --operator admin show \
+  --tenant-id tenant-a
+# 输出 {"tenant_id","deleted":true}
+python -m keymgr --data-dir ./keymgr_data policy --operator admin delete \
+  --tenant-id tenant-a
 ```
 
 非法的 `--key-id` / `--action` / `--limit` 或失效篡改的 `--cursor` 以
 退出码 `2` 报错，错误信息指出具体字段。导出/导入的口令缺失、口令错误或
-bundle 格式、版本、字段错误同样以退出码 `2` 报错。
+bundle 格式、版本、字段错误，以及策略 `--rules` 的任何校验错误同样以
+退出码 `2` 报错。
 
-未知 key/版本或跨租户访问以退出码 `4` 报错；非法 algorithm / version
-（非正整数）、非法 `--key-id` / `--action` / `--limit` 或失效篡改的
-`--cursor` 以退出码 `2` 报错，错误信息指明字段；同租户重复导入已存在的
-`key_id` 以退出码 `3` 报错（对应 HTTP `409`，原记录不变）；审计账写失败
+被租户策略拒绝（HTTP `403`）以退出码 `3` 报错；同租户重复导入已存在的
+`key_id` 也以退出码 `3` 报错（对应 HTTP `409`，原记录不变）。
+
+未知 key/版本/策略或跨租户访问以退出码 `4` 报错；非法 algorithm / version
+（非正整数）等参数错误以退出码 `2` 报错，错误信息指明字段；审计账写失败
 以退出码 `1` 失败（对应 HTTP `500`）。
 
 ## 基础测试
