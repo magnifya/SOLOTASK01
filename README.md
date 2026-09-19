@@ -22,21 +22,38 @@ python -m keymgr --data-dir ./keymgr_data serve --host 127.0.0.1 --port 8080
 
 - `POST /v1/keys`，请求体 `{"tenant_id", "algorithm", "label"}`，
   `algorithm` 仅支持 `AES256` / `RSA2048`。成功返回 `201`：
-  `{"key_id", "algorithm", "public_key"}`（RSA 返回 PEM 公钥，AES 返回 `null`）。
+  `{"key_id", "version", "algorithm", "public_key"}`（首版 `version` 为
+  `1`；RSA 返回 PEM 公钥，AES 返回 `null`）。
 - `GET /v1/keys/{key_id}`，用请求头 `X-Tenant-Id: <tenant>` 标识租户
   （也支持 `?tenant_id=<tenant>` 查询参数）。成功返回 `200`：
-  `{"algorithm", "label", "created_at", "public_key"}`。
-- 缺少必填字段或 algorithm 不支持返回 `400`，错误信息指明具体字段；
-  跨租户或不存在返回 `404`。任何响应均不含私钥材料。
+  `{"key_id", "version", "label", "created_at", "algorithm", "public_key"}`，
+  其中 `version`/时间/算法/公钥均取自当前版本。
+- `POST /v1/keys/{key_id}/rotate`，请求体 `{"tenant_id", "algorithm"}`，
+  生成新材料并追加一个不可变新版本、推进当前指针；`label` 沿用原 key。
+  成功返回 `201`：`{"key_id", "version", "algorithm", "public_key"}`。
+- `GET /v1/keys/{key_id}/versions/{version}` 取指定历史版本，
+  `GET /v1/keys/{key_id}/current` 取当前版本，均返回 `200`：
+  `{"key_id", "version", "created_at", "algorithm", "public_key"}`。
+  租户同样可由 `X-Tenant-Id` 头或 `tenant_id` 查询参数给出。
+- 缺少必填字段、algorithm 不支持、版本号非正整数、多个租户参数互相冲突
+  返回 `400`，错误信息指明具体字段；未知 key、未知版本或跨租户访问统一
+  返回 `404`。任何响应均不含私钥材料。
 
 ## 命令行
 
-`gen` / `show` 与上述两个接口一一对应，均打印单行 JSON，字段名与 HTTP 响应完全一致：
+`gen` / `show` / `rotate` / `version` / `current` 与上述接口一一对应，均打印
+单行 JSON，字段名与 HTTP 响应完全一致：
 
 ```bash
 python -m keymgr --data-dir ./keymgr_data gen \
   --tenant-id tenant-a --algorithm RSA2048 --label "my key"
 python -m keymgr --data-dir ./keymgr_data show \
+  --tenant-id tenant-a --key-id <key_id>
+python -m keymgr --data-dir ./keymgr_data rotate \
+  --tenant-id tenant-a --key-id <key_id> --algorithm AES256
+python -m keymgr --data-dir ./keymgr_data version \
+  --tenant-id tenant-a --key-id <key_id> --version 1
+python -m keymgr --data-dir ./keymgr_data current \
   --tenant-id tenant-a --key-id <key_id>
 ```
 
@@ -52,6 +69,13 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 
 ## 持久化与安全说明
 
-- 每个密钥以 `<key_id>.json` 原子落盘（权限 `0600`），重启后仍可查询，`created_at` 不随重启改变。
+- 每个密钥以 `<key_id>.json` 原子落盘（权限 `0600`），内含不可变版本数组
+  `versions`（每版保存创建时间、算法、公钥、私有材料）与当前指针
+  `current_version`；旧版本只读、永不覆盖。重启后历史版本、当前指针、
+  `label`、各版 `created_at` 与公钥均可读，且不随重启改变。旧版单版本
+  文件格式会在读取时自动迁移为版本 1。
+- 轮换在每 key 的互斥锁（进程内锁 + `flock`）下执行读-改-写，版本号严格
+  递增、材料重新生成且不复用；并发轮换不会丢版本或留下悬空指针。写入失败
+  只丢弃临时文件，旧数据保持不变。
 - 私钥仅保存在服务端：RSA 为 PKCS8 PEM、AES 为 base64；响应投影不包含私钥字段。
 - `key_id` 为 UUID4，读取时校验格式以杜绝路径穿越；跨租户访问一律 `404`，不泄露密钥是否存在。
