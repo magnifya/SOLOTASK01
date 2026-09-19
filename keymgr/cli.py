@@ -7,11 +7,16 @@ import re
 import sys
 from typing import List, Optional
 
+from .audit import ACTIONS, AuditError, CursorError
 from .crypto import SUPPORTED_ALGORITHMS
 from .server import serve
 from .store import KeyStore
 
 DEFAULT_DATA_DIR = os.environ.get("KEYMGR_DATA_DIR", "keymgr_data")
+
+_UUID4_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+)
 
 
 def _positive_int(value: str) -> int:
@@ -74,6 +79,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_status.add_argument("--tenant-id", required=True)
     p_status.add_argument("--key-id", required=True)
 
+    p_audit = sub.add_parser("audit", help="query the tenant's audit events")
+    p_audit.add_argument("--tenant-id", required=True)
+    p_audit.add_argument("--key-id", help="filter by key_id (UUID4)")
+    p_audit.add_argument("--action", choices=list(ACTIONS),
+                         help="filter by action")
+    p_audit.add_argument("--limit", type=int, default=100,
+                         help="page size, 1-1000 (default: %(default)s)")
+    p_audit.add_argument("--cursor", help="pagination cursor")
+
     p_serve = sub.add_parser("serve", help="run the HTTP server")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8080)
@@ -102,7 +116,19 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     store = KeyStore(args.data_dir)
 
+    try:
+        return _dispatch(args, store)
+    except AuditError as exc:
+        # The audit event could not be persisted; the mutation was rolled
+        # back, so nothing half-committed is on disk.
+        return _fail("audit log failure: %s" % exc, 1)
+
+
+def _dispatch(args, store: KeyStore) -> int:
     if args.command == "gen":
+        if not args.tenant_id:
+            store.record_tenant_conflict()
+            return _fail("field tenant_id must be a non-empty string", 2)
         if args.algorithm not in SUPPORTED_ALGORITHMS:
             return _fail(
                 "unsupported value for field algorithm: %r (supported: %s)"
@@ -114,13 +140,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.command == "show":
-        record = store.get(args.key_id, args.tenant_id)
+        if not args.tenant_id:
+            store.record_tenant_conflict()
+            return _fail("field tenant_id must be a non-empty string", 2)
+        record = store.get(args.key_id, args.tenant_id, audit=True)
         if record is None:
             return _fail("key not found", 4)
         _print(record.to_get_response())
         return 0
 
     if args.command == "rotate":
+        if not args.tenant_id:
+            store.record_tenant_conflict()
+            return _fail("field tenant_id must be a non-empty string", 2)
         if args.algorithm not in SUPPORTED_ALGORITHMS:
             return _fail(
                 "unsupported value for field algorithm: %r (supported: %s)"
@@ -134,8 +166,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.command == "version":
+        if not args.tenant_id:
+            store.record_tenant_conflict()
+            return _fail("field tenant_id must be a non-empty string", 2)
         result = store.get_version(
-            args.key_id, args.tenant_id, args.version
+            args.key_id, args.tenant_id, args.version, audit=True
         )
         if result is None:
             return _fail("version not found", 4)
@@ -144,13 +179,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.command == "current":
-        record = store.get(args.key_id, args.tenant_id)
+        if not args.tenant_id:
+            store.record_tenant_conflict()
+            return _fail("field tenant_id must be a non-empty string", 2)
+        record = store.get(args.key_id, args.tenant_id, audit=True)
         if record is None:
             return _fail("key not found", 4)
         _print(record.current.to_version_response(args.key_id))
         return 0
 
     if args.command == "revoke":
+        if not args.tenant_id:
+            store.record_tenant_conflict()
+            return _fail("field tenant_id must be a non-empty string", 2)
         for field in ("reason", "operator"):
             if not getattr(args, field):
                 return _fail(
@@ -169,6 +210,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         if record is None:
             return _fail("key not found", 4)
         _print(record.to_status_response())
+        return 0
+
+    if args.command == "audit":
+        if not args.tenant_id:
+            return _fail("field tenant_id must be a non-empty string", 2)
+        if args.key_id is not None and not _UUID4_RE.fullmatch(args.key_id):
+            return _fail("field key_id must be a UUID4", 2)
+        if not 1 <= args.limit <= 1000:
+            return _fail("field limit must be an integer between 1 and 1000", 2)
+        try:
+            result = store.audit.query(
+                args.tenant_id,
+                key_id=args.key_id,
+                action=args.action,
+                limit=args.limit,
+                cursor=args.cursor,
+            )
+        except CursorError as exc:
+            return _fail(str(exc), 2)
+        _print(result)
         return 0
 
     return 2  # pragma: no cover - argparse enforces choices

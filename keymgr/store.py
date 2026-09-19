@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterator, Optional
 
+from .audit import AuditLog
 from .crypto import generate_key
 
 try:  # fcntl is POSIX-only; rotation still works without cross-process locks.
@@ -193,6 +194,16 @@ class KeyStore:
         # One lock per key_id serializes read-modify-write within a process.
         self._locks_lock = threading.Lock()
         self._locks: dict = {}
+        self.audit = AuditLog(data_dir)
+
+    def record_tenant_conflict(self) -> None:
+        """Audit a request whose tenant was missing, empty or conflicting.
+
+        Both identifiers are null, so the event is never visible to any
+        tenant's audit query. Raises AuditError if the event cannot be
+        persisted.
+        """
+        self.audit.append("tenant_conflict", None, None, "rejected")
 
     def _key_lock(self, key_id: str) -> threading.Lock:
         with self._locks_lock:
@@ -278,10 +289,36 @@ class KeyStore:
         # concurrent rotate cannot observe a half-written create.
         with self._key_lock(key_id), self._file_lock(key_id):
             self._write_atomic(self._path_for(key_id), record.to_json())
+            try:
+                self.audit.append("create", tenant_id, key_id, "success")
+            except BaseException:
+                # The mutation and its audit event commit together: if the
+                # event cannot be persisted, the key must not persist either.
+                try:
+                    os.unlink(self._path_for(key_id))
+                except OSError:
+                    pass
+                raise
         return record
 
-    def get(self, key_id: str, tenant_id: str) -> Optional[KeyRecord]:
-        """Return the record only when it belongs to the tenant, else None."""
+    def get(
+        self, key_id: str, tenant_id: str, audit: bool = False
+    ) -> Optional[KeyRecord]:
+        """Return the record only when it belongs to the tenant, else None.
+
+        With audit=True a "read" event is written: success records both
+        identifiers, while an unknown or foreign key records only the
+        requesting tenant (key_id stays null).
+        """
+        record = self._get_unchecked(key_id, tenant_id)
+        if audit:
+            if record is None:
+                self.audit.append("read", tenant_id, None, "rejected")
+            else:
+                self.audit.append("read", tenant_id, key_id, "success")
+        return record
+
+    def _get_unchecked(self, key_id: str, tenant_id: str) -> Optional[KeyRecord]:
         if not _KEY_ID_RE.fullmatch(key_id):
             return None
         record = self._read_record(self._path_for(key_id))
@@ -297,15 +334,20 @@ class KeyStore:
         Returns None for an unknown or foreign key. Versions are strictly
         incrementing; the on-disk state is read, extended and written back
         atomically under per-key locks so concurrent rotations never lose a
-        version or leave a dangling current pointer.
+        version or leave a dangling current pointer. The rotation and its
+        audit event commit together: if the event cannot be persisted, the
+        previous on-disk state is restored.
         """
         if not _KEY_ID_RE.fullmatch(key_id):
+            self.audit.append("rotate", tenant_id, None, "rejected")
             return None
         path = self._path_for(key_id)
         with self._key_lock(key_id), self._file_lock(key_id):
             record = self._read_record(path)
             if record is None or record.tenant_id != tenant_id:
+                self.audit.append("rotate", tenant_id, None, "rejected")
                 return None
+            previous = record.to_json()
             next_number = record.current_version + 1
             generated = generate_key(algorithm)
             record.append_version(
@@ -318,6 +360,13 @@ class KeyStore:
                 )
             )
             self._write_atomic(path, record.to_json())
+            try:
+                self.audit.append("rotate", tenant_id, key_id, "success")
+            except BaseException:
+                # Roll back the rotation so no mutation persists without
+                # its audit event.
+                self._write_atomic(path, previous)
+                raise
         return record
 
     def revoke(
@@ -329,31 +378,55 @@ class KeyStore:
         runs under the same per-key locks as rotation and is committed
         atomically, so repeated or concurrent revokes are idempotent: the
         first reason/operator/revoked_at win and are never overwritten.
+        The revocation and its audit event commit together.
         """
         if not _KEY_ID_RE.fullmatch(key_id):
+            self.audit.append("revoke", tenant_id, None, "rejected")
             return None
         path = self._path_for(key_id)
         with self._key_lock(key_id), self._file_lock(key_id):
             record = self._read_record(path)
             if record is None or record.tenant_id != tenant_id:
+                self.audit.append("revoke", tenant_id, None, "rejected")
                 return None
             if record.status != "revoked":
+                previous = record.to_json()
                 record.status = "revoked"
                 record.reason = reason
                 record.operator = operator
                 record.revoked_at = datetime.now(timezone.utc).isoformat()
                 self._write_atomic(path, record.to_json())
+                try:
+                    self.audit.append("revoke", tenant_id, key_id, "success")
+                except BaseException:
+                    # Roll back so no mutation persists without its event.
+                    self._write_atomic(path, previous)
+                    raise
+            else:
+                # Idempotent re-revoke still counts as a successful revoke.
+                self.audit.append("revoke", tenant_id, key_id, "success")
         return record
 
     def get_version(
-        self, key_id: str, tenant_id: str, version: int
+        self, key_id: str, tenant_id: str, version: int, audit: bool = False
     ) -> Optional[tuple]:
-        """Return (record, version_record); None if key/version not accessible."""
-        record = self.get(key_id, tenant_id)
+        """Return (record, version_record); None if key/version not accessible.
+
+        With audit=True a "read" event is written. An unknown version of
+        the tenant's own key records both identifiers; an unknown or
+        foreign key records only the requesting tenant.
+        """
+        record = self._get_unchecked(key_id, tenant_id)
         if record is None:
+            if audit:
+                self.audit.append("read", tenant_id, None, "rejected")
             return None
         ver = record.get_version(version)
         if ver is None:
+            if audit:
+                self.audit.append("read", tenant_id, key_id, "rejected")
             return None
+        if audit:
+            self.audit.append("read", tenant_id, key_id, "success")
         return record, ver
 

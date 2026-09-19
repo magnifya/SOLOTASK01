@@ -46,6 +46,18 @@ python -m keymgr --data-dir ./keymgr_data serve --host 127.0.0.1 --port 8080
   或 `?tenant_id=`（两者同时给出必须一致）。返回 `200`：
   `{"key_id", "status", "reason", "operator", "revoked_at"}`；
   `active`（含无状态字段的旧记录）时后三项为 `null`。
+- `GET /v1/audit`：查询本租户的审计事件。租户由 **X-Tenant-Id 或
+  `?tenant_id=` 二者之一**提供；缺失、重复、为空或两者同时给出均返回
+  `400` 且错误指明 `tenant_id`。筛选参数：`key_id`（必须为 UUID4，否则
+  `400`；合法但未出现的 key_id 返回空列表）、`action`（`create` /
+  `read` / `rotate` / `revoke` / `tenant_conflict`）、`limit`
+  （默认 100，范围 1–1000）。响应 `200`：
+  `{"events": [...], "next_cursor": ...}`，事件按
+  `(timestamp, event_id)` 升序，字段为 `event_id`、`tenant_id`、
+  `action`、`key_id`、`outcome`、`timestamp`。`next_cursor` 非空时可作为
+  `cursor` 参数取下一页；游标绑定租户、筛选条件与快照（HMAC 签名），
+  失效、被篡改或筛选改变均返回 `400` 且错误指明 `cursor`，分页不重不漏。
+  查询审计本身不产生审计事件。
 - 缺少必填字段、algorithm 不支持、version 非正整数、或
   header/query/body 提供了互相冲突的租户参数，返回 `400`，错误信息指明
   具体字段；未知 key、未知版本及跨租户访问统一返回 `404`。任何响应均不含
@@ -95,8 +107,18 @@ python -m keymgr --data-dir ./keymgr_data status \
   --tenant-id tenant-a --key-id <key_id>
 ```
 
+审计查询输出与 `GET /v1/audit` 相同的单行 JSON：
+
+```bash
+# 输出 {"events":[...],"next_cursor":...}；筛选参数与 HTTP 接口一致
+python -m keymgr --data-dir ./keymgr_data audit \
+  --tenant-id tenant-a [--key-id <uuid4>] [--action create|read|rotate|revoke|tenant_conflict] \
+  [--limit 100] [--cursor <cursor>]
+```
+
 未知 key/版本或跨租户访问以退出码 `4` 报错；非法 algorithm / version
-（非正整数）以退出码 `2` 报错，错误信息指明字段。
+（非正整数）/ 非法审计筛选或游标以退出码 `2` 报错，错误信息指明字段；
+审计写账失败以退出码 `1` 报错（变更已回滚，不会单边落盘）。
 
 ## 基础测试
 
@@ -123,3 +145,20 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   无状态字段的旧记录按 `active` 处理。
 - `key_id` 为 UUID4，读取时校验格式以杜绝路径穿越；未知 key、未知版本与
   跨租户访问一律 `404`，不泄露密钥是否存在。
+
+## 持久化审计
+
+- 生成 / 读取（含指定版本与 current）/ 轮换 / 吊销都会向
+  `<data_dir>/audit.jsonl`（权限 `0600`，追加写 + fsync）写入一条事件：
+  `event_id`（UUID4）、`tenant_id`、`action`、`key_id`、`outcome`
+  （`success` / `rejected`）与 UTC `timestamp`。重启后事件仍可查。
+- 成功时记录 `create` / `read` / `rotate` / `revoke`；租户缺失、为空、
+  非法或 header/query/body 租户不一致时记录 `action=tenant_conflict`，
+  且 `tenant_id` 与 `key_id` 均为 `null`，对任何租户的审计查询不可见。
+- 未知或跨租户的 key 只记录请求方租户（`key_id=null`），不泄露其他
+  租户的 key_id；审计事件与所有响应一样不含私钥材料。
+- 变更与事件同事务：轮换 / 吊销 / 生成在 per-key 锁内先落密钥再写事件，
+  写账失败即回滚密钥文件，HTTP 返回 `500`、CLI 退出码 `1`，不会单边落盘。
+- 审计游标绑定租户、筛选与快照，用持久化密钥（`audit.secret`）做
+  HMAC 签名：篡改、失效或筛选改变返回 `400`（指明 `cursor`），分页期间
+  新写入的事件不会插入已有快照，保证不重不漏。
