@@ -75,6 +75,10 @@ class KeyRecord:
     label: str
     versions: list = field(default_factory=list)  # list[VersionRecord]
     current_version: int = 0
+    status: str = "active"  # "active" | "revoked"
+    reason: Optional[str] = None
+    operator: Optional[str] = None
+    revoked_at: Optional[str] = None
 
     @property
     def created_at(self) -> str:
@@ -102,6 +106,10 @@ class KeyRecord:
             "tenant_id": self.tenant_id,
             "label": self.label,
             "current_version": self.current_version,
+            "status": self.status,
+            "reason": self.reason,
+            "operator": self.operator,
+            "revoked_at": self.revoked_at,
             "versions": [ver.to_json() for ver in self.versions],
         }
 
@@ -128,6 +136,12 @@ class KeyRecord:
             label=data["label"],
             versions=versions,
             current_version=current_version,
+            # Records written before revocation existed have no status
+            # fields; they are active with null revocation metadata.
+            status=data.get("status", "active"),
+            reason=data.get("reason"),
+            operator=data.get("operator"),
+            revoked_at=data.get("revoked_at"),
         )
 
     def to_create_response(self) -> dict:
@@ -154,6 +168,26 @@ class KeyRecord:
             "label": self.label,
             "created_at": self.created_at,
             "public_key": self.current.public_key,
+        }
+
+    def to_revoke_response(self) -> dict:
+        """Body of POST .../revoke (200). Never contains private material."""
+        return {
+            "key_id": self.key_id,
+            "status": self.status,
+            "reason": self.reason,
+            "operator": self.operator,
+            "revoked_at": self.revoked_at,
+        }
+
+    def to_status_response(self) -> dict:
+        """Body of GET .../status (200). Null revocation fields when active."""
+        return {
+            "key_id": self.key_id,
+            "status": self.status,
+            "reason": self.reason,
+            "operator": self.operator,
+            "revoked_at": self.revoked_at,
         }
 
 
@@ -304,4 +338,30 @@ class KeyStore:
         if ver is None:
             return None
         return record, ver
+
+    def revoke(
+        self, key_id: str, tenant_id: str, reason: str, operator: str
+    ) -> Optional[KeyRecord]:
+        """Mark a key as revoked, keeping the first reason/operator/time.
+
+        Returns None for an unknown or foreign key. The transition is
+        idempotent: a repeated or concurrent revoke returns the already
+        revoked record unchanged, so the first reason, operator and
+        revoked_at always win. The read-modify-write runs under the same
+        per-key locks as rotation and is persisted atomically.
+        """
+        if not _KEY_ID_RE.fullmatch(key_id):
+            return None
+        path = self._path_for(key_id)
+        with self._key_lock(key_id), self._file_lock(key_id):
+            record = self._read_record(path)
+            if record is None or record.tenant_id != tenant_id:
+                return None
+            if record.status != "revoked":
+                record.status = "revoked"
+                record.reason = reason
+                record.operator = operator
+                record.revoked_at = datetime.now(timezone.utc).isoformat()
+                self._write_atomic(path, record.to_json())
+        return record
 

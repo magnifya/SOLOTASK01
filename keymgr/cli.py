@@ -64,6 +64,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_current.add_argument("--tenant-id", required=True)
     p_current.add_argument("--key-id", required=True)
 
+    p_revoke = sub.add_parser("revoke", help="revoke a key")
+    p_revoke.add_argument("--tenant-id", required=True)
+    p_revoke.add_argument("--key-id", required=True)
+    p_revoke.add_argument("--reason", required=True)
+    p_revoke.add_argument("--operator", required=True)
+
+    p_status = sub.add_parser("status", help="show a key's revocation status")
+    p_status.add_argument("--tenant-id", required=True)
+    p_status.add_argument("--key-id", required=True)
+
     p_serve = sub.add_parser("serve", help="run the HTTP server")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8080)
@@ -138,6 +148,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         if record is None:
             return _fail("key not found", 4)
         _print(record.current.to_version_response(args.key_id))
+        return 0
+
+    if args.command == "revoke":
+        if not args.reason:
+            return _fail("field reason must be a non-empty string", 2)
+        if not args.operator:
+            return _fail("field operator must be a non-empty string", 2)
+        record = store.revoke(
+            args.key_id, args.tenant_id, args.reason, args.operator
+        )
+        if record is None:
+            return _fail("key not found", 4)
+        _print(record.to_revoke_response())
+        return 0
+
+    if args.command == "status":
+        record = store.get(args.key_id, args.tenant_id)
+        if record is None:
+            return _fail("key not found", 4)
+        _print(record.to_status_response())
         return 0
 
     return 2  # pragma: no cover - argparse enforces choices

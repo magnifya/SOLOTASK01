@@ -35,6 +35,16 @@ python -m keymgr --data-dir ./keymgr_data serve --host 127.0.0.1 --port 8080
   必须是正整数。成功返回 `200`：
   `{"key_id", "version", "created_at", "algorithm", "public_key"}`。
 - `GET /v1/keys/{key_id}/current`：读取当前版本，字段同上。
+- `POST /v1/keys/{key_id}/revoke`：吊销密钥。请求体 JSON 含非空字符串
+  `tenant_id`、`reason`、`operator`；`X-Tenant-Id` / `?tenant_id=` 可选，
+  但与 body 冲突时返回 400 并指明 `tenant_id`。吊销把 `active` 置为
+  `revoked`，保存首次的 `reason`、`operator` 与 UTC `revoked_at`；重复或
+  并发吊销幂等，保留首值。成功返回 `200`：
+  `{"key_id", "status": "revoked", "reason", "operator", "revoked_at"}`。
+- `GET /v1/keys/{key_id}/status`：查询吊销状态，租户来自 `X-Tenant-Id`
+  或 `?tenant_id=`（两者同时给出须一致）。返回 `200`：
+  `{"key_id", "status", "reason", "operator", "revoked_at"}`；
+  `active`（含无状态字段的旧记录）时后三项为 `null`。
 - 缺少必填字段、algorithm 不支持、version 非正整数、或
   header/query/body 提供了互相冲突的租户参数，返回 `400`，错误信息指明
   具体字段；未知 key、未知版本及跨租户访问统一返回 `404`。任何响应均不含
@@ -73,8 +83,20 @@ python -m keymgr --data-dir ./keymgr_data current \
   --tenant-id tenant-a --key-id <key_id>
 ```
 
+吊销与状态查询同样打印单行 JSON，字段与对应 HTTP 响应一致：
+
+```bash
+# 吊销：输出 {"key_id","status","reason","operator","revoked_at"}
+python -m keymgr --data-dir ./keymgr_data revoke \
+  --tenant-id tenant-a --key-id <key_id> --reason compromised --operator alice
+# 状态：字段同上；active 时 reason/operator/revoked_at 为 null
+python -m keymgr --data-dir ./keymgr_data status \
+  --tenant-id tenant-a --key-id <key_id>
+```
+
 未知 key/版本或跨租户访问以退出码 `4` 报错；非法 algorithm / version
-（非正整数）以退出码 `2` 报错，错误信息指明字段。
+（非正整数）、空 `reason` / `operator` 等参数错误以退出码 `2` 报错，
+错误信息指明字段。
 
 ## 基础测试
 

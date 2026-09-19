@@ -10,11 +10,14 @@ from .store import KeyStore
 
 _KEY_PATH_RE = re.compile(r"^/v1/keys/([^/]+)$")
 _ROTATE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/rotate$")
+_REVOKE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/revoke$")
+_STATUS_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/status$")
 _VERSION_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/versions/([^/]+)$")
 _CURRENT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/current$")
 _POSITIVE_INT_RE = re.compile(r"[0-9]+")
 _REQUIRED_FIELDS = ("tenant_id", "algorithm", "label")
 _ROTATE_FIELDS = ("tenant_id", "algorithm")
+_REVOKE_FIELDS = ("tenant_id", "reason", "operator")
 _MISSING = object()
 
 
@@ -66,6 +69,18 @@ def make_handler(store: KeyStore) -> type:
                     return False
                 if not isinstance(payload[field], str):
                     self._bad_request("field %s must be a string" % field)
+                    return False
+            return True
+
+        def _require_non_empty_fields(self, payload, fields):
+            """Validate required non-empty string fields; False means 400 sent."""
+            if not self._require_fields(payload, fields):
+                return False
+            for field in fields:
+                if not payload[field]:
+                    self._bad_request(
+                        "field %s must be a non-empty string" % field
+                    )
                     return False
             return True
 
@@ -129,6 +144,11 @@ def make_handler(store: KeyStore) -> type:
                 self._rotate_key(rotate_match.group(1), parts)
                 return
 
+            revoke_match = _REVOKE_PATH_RE.match(path)
+            if revoke_match is not None:
+                self._revoke_key(revoke_match.group(1), parts)
+                return
+
             self._send_json(404, {"error": "not found"})
 
         def _create_key(self) -> None:
@@ -175,6 +195,27 @@ def make_handler(store: KeyStore) -> type:
                 return
             self._send_json(201, record.to_rotate_response())
 
+        def _revoke_key(self, key_id: str, parts) -> None:
+            payload = self._read_json_object()
+            if payload is None:
+                return
+            # The JSON body must carry non-empty tenant_id, reason, operator.
+            if not self._require_non_empty_fields(payload, _REVOKE_FIELDS):
+                return
+            # X-Tenant-Id / ?tenant_id= are optional but must agree with
+            # the body's tenant_id; a conflict is a 400 naming tenant_id.
+            tenant_id = self._tenant(parts, payload)
+            if tenant_id is None:
+                return
+            record = store.revoke(
+                key_id, tenant_id, payload["reason"], payload["operator"]
+            )
+            if record is None:
+                # Unknown key or another tenant's key look identical.
+                self._send_json(404, {"error": "key not found"})
+                return
+            self._send_json(200, record.to_revoke_response())
+
         # -- GET ----------------------------------------------------------
         def do_GET(self) -> None:
             parts = urlsplit(self.path)
@@ -190,6 +231,11 @@ def make_handler(store: KeyStore) -> type:
             current_match = _CURRENT_PATH_RE.match(path)
             if current_match is not None:
                 self._get_current(current_match.group(1), parts)
+                return
+
+            status_match = _STATUS_PATH_RE.match(path)
+            if status_match is not None:
+                self._get_status(status_match.group(1), parts)
                 return
 
             key_match = _KEY_PATH_RE.match(path)
@@ -236,6 +282,18 @@ def make_handler(store: KeyStore) -> type:
                 self._send_json(404, {"error": "key not found"})
                 return
             self._send_json(200, record.current.to_version_response(key_id))
+
+        def _get_status(self, key_id: str, parts) -> None:
+            # Tenant comes from X-Tenant-Id and/or ?tenant_id=; both must
+            # agree when present.
+            tenant_id = self._tenant(parts)
+            if tenant_id is None:
+                return
+            record = store.get(key_id, tenant_id)
+            if record is None:
+                self._send_json(404, {"error": "key not found"})
+                return
+            self._send_json(200, record.to_status_response())
 
     return KeyHandler
 
