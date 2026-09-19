@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 from typing import List, Optional
 
@@ -11,6 +12,20 @@ from .server import serve
 from .store import KeyStore
 
 DEFAULT_DATA_DIR = os.environ.get("KEYMGR_DATA_DIR", "keymgr_data")
+
+
+def _positive_int(value: str) -> int:
+    """argparse type: a positive integer version (ASCII digits only)."""
+    if not re.fullmatch(r"[0-9]+", value):
+        raise argparse.ArgumentTypeError(
+            "field version must be a positive integer"
+        )
+    ivalue = int(value)
+    if ivalue < 1:
+        raise argparse.ArgumentTypeError(
+            "field version must be a positive integer"
+        )
+    return ivalue
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,6 +48,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_show = sub.add_parser("show", help="show an existing key")
     p_show.add_argument("--tenant-id", required=True)
     p_show.add_argument("--key-id", required=True)
+
+    p_rotate = sub.add_parser("rotate", help="rotate a key to a new version")
+    p_rotate.add_argument("--tenant-id", required=True)
+    p_rotate.add_argument("--key-id", required=True)
+    p_rotate.add_argument("--algorithm", required=True,
+                          help="one of: %s" % ", ".join(SUPPORTED_ALGORITHMS))
+
+    p_version = sub.add_parser("version", help="show a specific key version")
+    p_version.add_argument("--tenant-id", required=True)
+    p_version.add_argument("--key-id", required=True)
+    p_version.add_argument("--version", required=True, type=_positive_int)
+
+    p_current = sub.add_parser("current", help="show the current key version")
+    p_current.add_argument("--tenant-id", required=True)
+    p_current.add_argument("--key-id", required=True)
 
     p_serve = sub.add_parser("serve", help="run the HTTP server")
     p_serve.add_argument("--host", default="127.0.0.1")
@@ -78,6 +108,36 @@ def main(argv: Optional[List[str]] = None) -> int:
         if record is None:
             return _fail("key not found", 4)
         _print(record.to_get_response())
+        return 0
+
+    if args.command == "rotate":
+        if args.algorithm not in SUPPORTED_ALGORITHMS:
+            return _fail(
+                "unsupported value for field algorithm: %r (supported: %s)"
+                % (args.algorithm, ", ".join(SUPPORTED_ALGORITHMS)),
+                2,
+            )
+        record = store.rotate(args.key_id, args.tenant_id, args.algorithm)
+        if record is None:
+            return _fail("key not found", 4)
+        _print(record.to_rotate_response())
+        return 0
+
+    if args.command == "version":
+        result = store.get_version(
+            args.key_id, args.tenant_id, args.version
+        )
+        if result is None:
+            return _fail("version not found", 4)
+        _record, ver = result
+        _print(ver.to_version_response(args.key_id))
+        return 0
+
+    if args.command == "current":
+        record = store.get(args.key_id, args.tenant_id)
+        if record is None:
+            return _fail("key not found", 4)
+        _print(record.current.to_version_response(args.key_id))
         return 0
 
     return 2  # pragma: no cover - argparse enforces choices
