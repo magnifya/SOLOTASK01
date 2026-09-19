@@ -274,6 +274,10 @@ class KeyStore:
                 audit_mod.ACTION_REVOKE,
                 audit_mod.ACTION_IMPORT,
                 audit_mod.ACTION_EXPORT,
+                audit_mod.ACTION_AUDIT,
+                audit_mod.ACTION_POLICY_READ,
+                audit_mod.ACTION_POLICY_UPDATE,
+                audit_mod.ACTION_POLICY_DELETE,
             )
         ):
             event = self.audit.new_event(tenant_id, action, key_id, outcome)
@@ -448,6 +452,13 @@ class KeyStore:
             # tenant: never confirm the existence of another tenant's key.
             return None
         return record
+
+    def owner(self, key_id: str) -> Optional[str]:
+        """Return the owning tenant of a key, or None if it does not exist."""
+        if not _KEY_ID_RE.fullmatch(key_id):
+            return None
+        record = self._read_record(self._path_for(key_id))
+        return record.tenant_id if record is not None else None
 
     def rotate(self, key_id: str, tenant_id: str, algorithm: str) -> Optional[KeyRecord]:
         """Append a new version with fresh material.

@@ -64,18 +64,58 @@ python -m keymgr --data-dir ./keymgr_data serve --host 127.0.0.1 --port 8080
   记录不变；`key_id` 已被其他租户占用时返回 `404`，跨租户不泄露存在性。
 - `GET /v1/audit`：查询本租户的审计事件。租户由**单一** `X-Tenant-Id`
   头或**单一** `?tenant_id=` 参数提供；缺失、重复、为空或两者冲突均返回
-  `400` 且错误信息指出 `tenant_id`。可选筛选：`key_id`（非 UUID4 返回
+  `400` 且错误信息指出 `tenant_id`（此类参数错误仍记一条不可见的
+  `tenant_conflict`；查询本身不记账）。可选筛选：`key_id`（非 UUID4 返回
   `400`）、`action`（`create` / `read` / `rotate` / `revoke` / `import` /
-  `export` / `tenant_conflict` 七值之一）、`limit`（默认 `100`，范围
-  `1–1000`）、`cursor`（上一页返回的不透明游标）。返回
-  `{"events", "next_cursor"}`，事件按 `timestamp`、`event_id` 升序；
-  `next_cursor` 为 `null` 表示到末页。未知但合法的 `key_id` 返回空列表。
-  游标绑定租户、筛选条件与快照：失效、被篡改或改变筛选/租户均返回 `400`
-  且错误指出 `cursor`；分页保证不重不漏。审计查询本身不记账。
+  `export` / `audit` / `policy_read` / `policy_update` / `policy_delete` /
+  `tenant_conflict` 之一）、`limit`（默认 `100`，范围 `1–1000`）、`cursor`
+  （上一页返回的不透明游标）。返回 `{"events", "next_cursor"}`，事件按
+  `timestamp`、`event_id` 升序；`next_cursor` 为 `null` 表示到末页。未知但
+  合法的 `key_id` 返回空列表。游标绑定租户、筛选条件与快照：失效、被篡改
+  或改变筛选/租户均返回 `400` 且错误指出 `cursor`；分页保证不重不漏。审计
+  查询受策略的 `audit` 动作管控（见下），被拒绝时记 `action=audit`、
+  `outcome=rejected`、`key_id=null` 并返回 `403`；允许的查询不产生事件。
+- `GET /v1/policy`：读取本租户策略。租户由**单一** `X-Tenant-Id` 头或**单一**
+  `?tenant_id=` 参数提供；请求头必须带非空 `X-Operator-Id`（CLI 用
+  `--operator`）。同时给出头与参数、重复、缺失或为空均返回 `400` 且错误
+  指出 `tenant_id`；缺失/空 `X-Operator-Id` 返回 `400`。成功返回 `200`：
+  `{"tenant_id", "rules"}`；该租户尚无策略返回 `404`。策略管理端点不受策略
+  自身约束（管理免检）。
+- `PUT /v1/policy`：创建或整体替换本租户策略。请求体 JSON 必须含非空字符串
+  `tenant_id` 与 `rules` 数组；`tenant_id` 与唯一的头/参数来源必须一致
+  （不一致返回 `400` 且指出 `tenant_id`），同样要求非空 `X-Operator-Id`。
+  成功返回 `200`：`{"tenant_id", "rules"}`。
+- `DELETE /v1/policy`：删除本租户策略，租户与 `X-Operator-Id` 要求同 GET。
+  成功返回 `200`：`{"tenant_id", "deleted": true}`；策略不存在返回 `404`。
+  `rules` 中每一项为 `{"subject", "actions", "effect"}`：
+  - `subject`：非空字符串，匹配调用方的 `X-Operator-Id`，**区分大小写**。
+  - `actions`：非空数组，元素取自 `create` / `read` / `rotate` / `revoke` /
+    `import` / `export` / `audit`；元素须为非空字符串，重复元素去重。
+  - `effect`：仅 `allow` 或 `deny`。
+  - 未知字段值、类型错误，或两条 `subject` + `effect` 相同且 `actions`
+    集合相同（顺序无关）的规则，均返回 `400` 并指出具体字段。
+  - 策略文件按租户 id 的 SHA-256 命名（`policy-<hash>.json`），与密钥一样
+    原子落盘（`0600`）并通过 outbox 与审计事件同事务提交，崩溃可幂等恢复。
 - 缺少必填字段、algorithm 不支持、version 非正整数、导入包口令/格式错误、或
   header/query/body 提供了互相冲突的租户参数，返回 `400`，错误信息指明
   具体字段；未知 key、未知版本及跨租户访问统一返回 `404`；同租户重复导入
   返回 `409`。任何响应均不含私钥材料。
+
+### 策略强制语义
+
+策略按被治理的动作（上述七个，不含策略管理本身）对 `X-Operator-Id` 生效：
+
+- **无策略即允许**：租户从未设置策略时，所有动作照旧放行。
+- **有策略时白名单收敛**：仅当存在 `subject` 等于操作者（区分大小写）且
+  `actions` 含该动作的规则时才可能放行；`rules=[]` 或没有任何匹配规则时
+  一律拒绝（未匹配拒绝）。
+- **deny 优先**：同时匹配到 `allow` 与 `deny` 时以 `deny` 为准。
+- 拒绝返回 `403`，并按**原动作**记一条 `outcome=rejected` 的审计事件
+  （`key_id` 为该操作的 key，create/import/audit 为 `null`）。
+- **未知 key / 跨租户仍返回 `404`**，且该判定先于策略：绝不因 `403` 泄露
+  其他租户密钥的存在性。
+- 策略管理（`GET/PUT/DELETE /v1/policy`）免检，即便策略是 `rules=[]`
+  也能继续管理。
 
 ### 版本与轮换
 
@@ -89,9 +129,10 @@ per-key 锁（进程内锁 + `fcntl` 跨进程锁）保护下做读-改-写并�
 
 密钥的生成、读取（含当前版本、历史版本、状态查询）、轮换、吊销、导入与导出
 都会写入持久化审计账。每条事件字段为 `event_id`、`tenant_id`、`action`、
-`key_id`、`outcome`、`timestamp`（UTC）；`action` 为 `create` / `read` /
-`rotate` / `revoke` / `import` / `export`，`outcome` 为 `success` /
-`rejected`。
+`key_id`、`outcome`、`timestamp`（UTC）；密钥动作的 `action` 为 `create` /
+`read` / `rotate` / `revoke` / `import` / `export`，策略与查询相关的为
+`audit` / `policy_read` / `policy_update` / `policy_delete`，`outcome` 为
+`success` / `rejected`。
 
 - 租户已确定且 `key_id` 合法时，事件同时记录两个标识，且仅该请求租户可见。
   未知或跨租户的访问（含导出、跨租户导入冲突）记为 `outcome=rejected`，
@@ -180,6 +221,32 @@ bundle 格式、版本、字段错误同样以退出码 `2` 报错。
 `--cursor` 以退出码 `2` 报错，错误信息指明字段；同租户重复导入已存在的
 `key_id` 以退出码 `3` 报错（对应 HTTP `409`，原记录不变）；审计账写失败
 以退出码 `1` 失败（对应 HTTP `500`）。
+
+策略管理命令 `policy show` / `set` / `delete` 与上述接口一一对应，均需
+`--tenant-id` 与 `--operator`，`set` 另需 `--rules`（JSON 数组），输出为
+单行 JSON 且字段与 HTTP 响应同形（`show`/`set` 为 `{"tenant_id","rules"}`，
+`delete` 为 `{"tenant_id","deleted":true}`）：
+
+```bash
+# 设置/替换策略（deny 优先；rules 为空数组表示拒绝所有动作）
+python -m keymgr --data-dir ./keymgr_data policy set --tenant-id tenant-a \
+  --operator admin --rules '[{"subject":"alice","actions":["read","create"],"effect":"allow"}]'
+# 读取策略
+python -m keymgr --data-dir ./keymgr_data policy show \
+  --tenant-id tenant-a --operator admin
+# 删除策略（删除后该租户回到“无策略即允许”）
+python -m keymgr --data-dir ./keymgr_data policy delete \
+  --tenant-id tenant-a --operator admin
+```
+
+参数错误（缺 `--tenant-id`/`--operator`、`--rules` 非 JSON 或规则非法）以
+退出码 `2` 报错；策略不存在（`show`/`delete`）以退出码 `4` 报错；审计账
+写失败以退出码 `1` 失败。策略管理为管理操作、免检，不会产生授权拒绝。
+
+退出码总表：审计账失败 `1`、参数错误 `2`、HTTP 被策略拒绝（`403`，授权）
+`3`、未知/跨租户（`404`）`4`；同租户重复导入（`409`）沿用既有约定亦以 `3`
+报错。策略强制（`403`/`X-Operator-Id` 匹配）作用于 HTTP 接口；CLI 的密钥
+子命令直接读写本地账本、不携带操作者主体，因此不经策略管控。
 
 ## 基础测试
 

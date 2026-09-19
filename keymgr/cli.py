@@ -9,8 +9,9 @@ from typing import List, Optional
 
 from . import audit as audit_mod
 from . import keybundle
-from .audit import InvalidCursor, LedgerError
+from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
+from .policy import InvalidPolicy, PolicyStore, validate_rules
 from .server import serve
 from .store import IMPORT_CONFLICT, KeyStore, is_valid_key_id
 
@@ -98,6 +99,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_audit.add_argument("--cursor", default=None,
                          help="pagination cursor from a previous response")
 
+    p_policy = sub.add_parser("policy", help="manage a tenant's action policy")
+    pol_sub = p_policy.add_subparsers(dest="policy_command", required=True)
+
+    p_pol_show = pol_sub.add_parser("show", help="show a tenant's policy")
+    p_pol_show.add_argument("--tenant-id", required=True)
+    p_pol_show.add_argument("--operator", required=True)
+
+    p_pol_set = pol_sub.add_parser("set", help="create or replace a policy")
+    p_pol_set.add_argument("--tenant-id", required=True)
+    p_pol_set.add_argument("--operator", required=True)
+    p_pol_set.add_argument("--rules", required=True,
+                           help="JSON array of rules, e.g. "
+                                '\'[{"subject":"alice","actions":["read"],'
+                                '"effect":"allow"}]\'')
+
+    p_pol_del = pol_sub.add_parser("delete", help="delete a tenant's policy")
+    p_pol_del.add_argument("--tenant-id", required=True)
+    p_pol_del.add_argument("--operator", required=True)
+
     p_serve = sub.add_parser("serve", help="run the HTTP server")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8080)
@@ -145,6 +165,76 @@ def _identifiers_ok(tenant_id, key_id) -> bool:
     return bool(tenant_id) and (key_id is None or is_valid_key_id(key_id))
 
 
+def _run_policy(args, store, policies) -> int:
+    """Handle `policy show|set|delete`; returns a process exit code.
+
+    Exit codes mirror the HTTP layer: 2 for bad parameters/rules, 4 when no
+    policy exists (show/delete), and 1 for a ledger failure. Output is a
+    single-line JSON object identical in shape to the HTTP responses.
+    """
+    tenant_id = args.tenant_id
+    operator = args.operator
+    sub = args.policy_command
+
+    if sub == "show":
+        record = policies.get(tenant_id)
+        if record is None:
+            if not _attempt(
+                store, tenant_id, None,
+                audit_mod.ACTION_POLICY_READ, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            return _fail("policy not found", 4)
+        if not _attempt(
+            store, tenant_id, None,
+            audit_mod.ACTION_POLICY_READ, audit_mod.OUTCOME_SUCCESS,
+        ):
+            return 1
+        _print(record.to_response())
+        return 0
+
+    if sub == "set":
+        try:
+            raw_rules = json.loads(args.rules)
+        except ValueError:
+            if not _attempt(
+                store, tenant_id, None,
+                audit_mod.ACTION_POLICY_UPDATE, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            return _fail("field rules must be valid JSON", 2)
+        try:
+            rules = validate_rules(raw_rules)
+        except InvalidPolicy as exc:
+            if not _attempt(
+                store, tenant_id, None,
+                audit_mod.ACTION_POLICY_UPDATE, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            return _fail(str(exc), 2)
+        try:
+            record = policies.set(tenant_id, rules, operator)
+        except LedgerError as exc:
+            return _ledger_fail(exc)
+        _print(record.to_response())
+        return 0
+
+    # delete
+    try:
+        deleted = policies.delete(tenant_id, operator)
+    except LedgerError as exc:
+        return _ledger_fail(exc)
+    if not deleted:
+        if not _attempt(
+            store, tenant_id, None,
+            audit_mod.ACTION_POLICY_DELETE, audit_mod.OUTCOME_REJECTED,
+        ):
+            return 1
+        return _fail("policy not found", 4)
+    _print({"tenant_id": tenant_id, "deleted": True})
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """CLI entry point; returns a process exit code."""
     args = build_parser().parse_args(argv)
@@ -154,6 +244,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     store = KeyStore(args.data_dir)
+
+    if args.command == "policy":
+        policies = PolicyStore(args.data_dir, store.audit)
+        return _run_policy(args, store, policies)
 
     if args.command == "gen":
         if not args.tenant_id or args.algorithm not in SUPPORTED_ALGORITHMS:
