@@ -9,6 +9,8 @@ from typing import List, Optional
 
 from . import audit as audit_mod
 from . import keybundle
+from . import restore as restore_mod
+from . import tenantbundle
 from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
 from .policy import PolicyError, PolicyStore, validate_rules
@@ -86,6 +88,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_import = tenant_parser("import", help="import a key from an encrypted bundle")
     p_import.add_argument("--passphrase", required=True)
     p_import.add_argument("--bundle", required=True)
+
+    p_backup = tenant_parser(
+        "backup", help="back up all of a tenant's keys and policy"
+    )
+    p_backup.add_argument("--passphrase", required=True)
+
+    p_restore = tenant_parser(
+        "restore", help="restore a tenant from an encrypted backup bundle"
+    )
+    p_restore.add_argument("--passphrase", required=True)
+    p_restore.add_argument("--bundle", required=True)
 
     p_audit = tenant_parser("audit", help="list a tenant's audit events")
     p_audit.add_argument("--key-id", default=None,
@@ -191,6 +204,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     audit_log = AuditLog(args.data_dir)
     store = KeyStore(args.data_dir, audit_log)
     policies = PolicyStore(args.data_dir, audit_log)
+    coordinator = restore_mod.RestoreCoordinator(store, policies)
 
     if not getattr(args, "operator", None):
         return _fail(
@@ -477,6 +491,97 @@ def main(argv: Optional[List[str]] = None) -> int:
         # The success event committed together with the imported key file.
         _print(record.to_create_response())
         return 0
+
+    if args.command == "backup":
+        if not args.tenant_id or not args.passphrase:
+            if not _identifiers_ok(args.tenant_id, None):
+                if not _conflict(store):
+                    return 1
+            elif not _attempt(
+                store, args.tenant_id, None,
+                audit_mod.ACTION_EXPORT, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            if not args.tenant_id:
+                return _fail("field tenant_id must be a non-empty string", 2)
+            return _fail(
+                "field passphrase must be a non-empty string", 2
+            )
+        if not allowed(audit_mod.ACTION_EXPORT):
+            return _deny(store, args.tenant_id, None,
+                         audit_mod.ACTION_EXPORT)
+        try:
+            bundle = coordinator.backup_bundle(
+                args.tenant_id, args.passphrase
+            )
+        except LedgerError as exc:
+            return _ledger_fail(exc)
+        if not _attempt(
+            store, args.tenant_id, None,
+            audit_mod.ACTION_EXPORT, audit_mod.OUTCOME_SUCCESS,
+        ):
+            return 1
+        _print({"format": tenantbundle.FORMAT, "bundle": bundle})
+        return 0
+
+    if args.command == "restore":
+        if not args.tenant_id or not args.passphrase or not args.bundle:
+            if not _identifiers_ok(args.tenant_id, None):
+                if not _conflict(store):
+                    return 1
+            elif not _attempt(
+                store, args.tenant_id, None,
+                audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            if not args.tenant_id:
+                return _fail("field tenant_id must be a non-empty string", 2)
+            field = "passphrase" if not args.passphrase else "bundle"
+            return _fail(
+                "field %s must be a non-empty string" % field, 2
+            )
+        try:
+            payload = tenantbundle.decode_bundle(
+                args.bundle, args.passphrase
+            )
+        except tenantbundle.TenantBundleError as exc:
+            if not _attempt(
+                store, args.tenant_id, None,
+                audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            return _fail(str(exc), 2)
+        if not allowed(audit_mod.ACTION_IMPORT):
+            return _deny(store, args.tenant_id, None,
+                         audit_mod.ACTION_IMPORT)
+        if payload["tenant_id"] != args.tenant_id:
+            if not _attempt(
+                store, args.tenant_id, None,
+                audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            return _fail("tenant backup not found", 4)
+        try:
+            result = coordinator.restore(args.tenant_id, payload)
+        except LedgerError as exc:
+            return _ledger_fail(exc)
+        if result.status == restore_mod.RESTORE_CREATED:
+            _print(
+                {
+                    "tenant_id": result.tenant_id,
+                    "key_ids": result.key_ids,
+                    "policy_restored": result.policy_restored,
+                }
+            )
+            return 0
+        if not _attempt(
+            store, args.tenant_id, None,
+            audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
+        ):
+            return 1
+        if result.status == restore_mod.RESTORE_SAME_TENANT_CONFLICT:
+            return _fail("backup target already contains this data", 3)
+        return _fail("tenant backup not found", 4)
 
     if args.command == "audit":
         if not args.tenant_id:

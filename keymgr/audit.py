@@ -279,6 +279,17 @@ class AuditLog:
                 self._unlock_file(fd)
         return event
 
+    def get_event(self, event_id: str) -> Optional[AuditEvent]:
+        """Look up one event by event_id, or None if it has not been logged.
+
+        Used by multi-file restore recovery to decide whether the shared
+        event reached the ledger after a crash.
+        """
+        for event in self._read_all():
+            if event.event_id == event_id:
+                return event
+        return None
+
     # -- cursors -----------------------------------------------------------
     def _encode_cursor(self, payload: dict) -> str:
         raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")

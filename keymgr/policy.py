@@ -154,6 +154,10 @@ class PolicyStore:
         self._recover_pending_events()
 
     # -- on-disk shape -----------------------------------------------------
+    def path_for(self, tenant_id: str) -> str:
+        """Public accessor for a tenant's policy document path."""
+        return self._path_for(tenant_id)
+
     def _path_for(self, tenant_id: str) -> str:
         # Tenant ids are free-form strings, so never use them as a filename:
         # key the file by a digest of the tenant instead.
@@ -212,9 +216,12 @@ class PolicyStore:
                     except OSError:
                         pass
                 continue
+            # A multi-file tenant restore transaction is resolved by the
+            # RestoreCoordinator (its manifest drives the shared event).
+            if isinstance(pending_event, dict) and pending_event.get("_restore"):
+                continue
             event = AuditEvent.from_json(pending_event)
-            if name.endswith(".json.del"):
-                # A delete tombstone. If the original file is still on disk the
+            if name.endswith(".json.del"):                # A delete tombstone. If the original file is still on disk the
                 # crash happened before the unlink, so the delete never
                 # happened: discard the tombstone without appending. Otherwise
                 # finish the transaction (append is idempotent on event_id).
@@ -351,3 +358,46 @@ class PolicyStore:
                 return False
             allowed = True
         return allowed
+
+    # -- tenant restore hooks ---------------------------------------------
+    def owner_of_path(self, path: str) -> Optional[str]:
+        """Return the owning tenant_id recorded inside a policy file."""
+        doc = self._read_doc(path)
+        if doc is None:
+            return None
+        return doc[0]
+
+    def write_restore_pending(
+        self, tenant_id: str, rules: List[Rule], marker: dict
+    ) -> None:
+        """Atomically write a restored policy document carrying the marker.
+
+        Used by the RestoreCoordinator; the caller guarantees no document
+        exists for the tenant and holds the write lock.
+        """
+        self._write_atomic(
+            self._path_for(tenant_id),
+            {
+                "tenant_id": tenant_id,
+                "rules": [r.to_json() for r in rules],
+                "pending_event": marker,
+            },
+        )
+
+    def clear_restore_pending(self, tenant_id: str, rules: List[Rule]) -> None:
+        """Rewrite a restored policy document without its pending marker."""
+        self._write_atomic(
+            self._path_for(tenant_id),
+            {
+                "tenant_id": tenant_id,
+                "rules": [r.to_json() for r in rules],
+                "pending_event": None,
+            },
+        )
+
+    def remove_restore_file(self, tenant_id: str) -> None:
+        """Delete a policy document written by a restore being rolled back."""
+        try:
+            os.unlink(self._path_for(tenant_id))
+        except FileNotFoundError:
+            pass

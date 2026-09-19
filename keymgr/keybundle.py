@@ -66,8 +66,13 @@ def _derive_key(passphrase: str, salt: bytes) -> bytes:
     return kdf.derive(passphrase.encode("utf-8"))
 
 
-def encode_bundle(payload: dict, passphrase: str) -> str:
-    """Authenticated-encrypt an export payload into an opaque base64 token."""
+def seal_envelope(payload: dict, passphrase: str, format_tag: str) -> str:
+    """Authenticated-encrypt a payload into an opaque base64 token.
+
+    Shared by the single-key export and the tenant backup; the ``format_tag``
+    both names the envelope and authenticates the ciphertext as AAD, so a
+    bundle of one format can never be replayed as the other.
+    """
     salt = os.urandom(16)
     nonce = os.urandom(_NONCE_LEN)
     key = _derive_key(passphrase, salt)
@@ -75,7 +80,7 @@ def encode_bundle(payload: dict, passphrase: str) -> str:
         payload, separators=(",", ":"), sort_keys=True
     ).encode("utf-8")
     envelope = {
-        "format": FORMAT,
+        "format": format_tag,
         "version": _ENVELOPE_VERSION,
         "kdf": "scrypt",
         "salt": _b64e(salt),
@@ -83,13 +88,50 @@ def encode_bundle(payload: dict, passphrase: str) -> str:
         "r": _SCRYPT_R,
         "p": _SCRYPT_P,
         "nonce": _b64e(nonce),
-        "data": _b64e(AESGCM(key).encrypt(nonce, plaintext, FORMAT.encode("ascii"))),
+        "data": _b64e(
+            AESGCM(key).encrypt(nonce, plaintext, format_tag.encode("ascii"))
+        ),
     }
     raw = json.dumps(envelope, separators=(",", ":"), sort_keys=True).encode("utf-8")
     return _b64e(raw)
 
 
-def _load_envelope(bundle: str) -> dict:
+def open_envelope(bundle: str, passphrase: str, format_tag: str) -> bytes:
+    """Authenticate and decrypt an envelope, returning raw plaintext bytes.
+
+    Raises WrongPassphrase for authentication failures and InvalidBundle for
+    structural problems; shared by the single-key and the tenant formats.
+    """
+    params = _load_envelope(bundle, format_tag)
+    if not isinstance(passphrase, str) or not passphrase:
+        raise InvalidBundle("field passphrase must be a non-empty string")
+    try:
+        kdf = Scrypt(
+            salt=params["salt"],
+            length=_KEY_LEN,
+            n=params["n"],
+            r=params["r"],
+            p=params["p"],
+        )
+        key = kdf.derive(passphrase.encode("utf-8"))
+    except (TypeError, ValueError) as exc:
+        raise InvalidBundle("invalid kdf parameters in field bundle") from exc
+    try:
+        return AESGCM(key).decrypt(
+            params["nonce"], params["data"], format_tag.encode("ascii")
+        )
+    except InvalidTag as exc:
+        raise WrongPassphrase(
+            "field passphrase is incorrect or bundle is tampered"
+        ) from exc
+
+
+def encode_bundle(payload: dict, passphrase: str) -> str:
+    """Authenticated-encrypt an export payload into an opaque base64 token."""
+    return seal_envelope(payload, passphrase, FORMAT)
+
+
+def _load_envelope(bundle: str, expected_format: str = FORMAT) -> dict:
     raw = _b64d(bundle)
     try:
         envelope = json.loads(raw.decode("utf-8"))
@@ -97,9 +139,9 @@ def _load_envelope(bundle: str) -> dict:
         raise InvalidBundle("field bundle does not contain valid JSON") from exc
     if not isinstance(envelope, dict):
         raise InvalidBundle("field bundle must be a JSON object")
-    if envelope.get("format") != FORMAT:
+    if envelope.get("format") != expected_format:
         raise InvalidBundle(
-            "field format must be %r" % FORMAT
+            "field format must be %r" % expected_format
         )
     if envelope.get("version") != _ENVELOPE_VERSION:
         raise InvalidBundle(
@@ -142,6 +184,77 @@ def _require(data: dict, field: str, types) -> object:
     return data[field]
 
 
+def validate_version(ver, where: str) -> dict:
+    """Validate one versions[i] block; ``where`` names it in error messages."""
+    if not isinstance(ver, dict):
+        raise InvalidBundle("field %s must be an object" % where)
+    number = ver.get("version")
+    created_at = ver.get("created_at")
+    algorithm = ver.get("algorithm")
+    public_key = ver.get("public_key")
+    private_material = ver.get("private_material")
+    if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+        raise InvalidBundle(
+            "field %s.version must be a positive integer" % where
+        )
+    if not isinstance(created_at, str) or not created_at:
+        raise InvalidBundle("field %s.created_at must be a string" % where)
+    if algorithm not in SUPPORTED_ALGORITHMS:
+        raise InvalidBundle(
+            "field %s.algorithm must be one of: %s"
+            % (where, ", ".join(SUPPORTED_ALGORITHMS))
+        )
+    if public_key is not None and not isinstance(public_key, str):
+        raise InvalidBundle(
+            "field %s.public_key must be a string or null" % where
+        )
+    if not isinstance(private_material, str) or not private_material:
+        raise InvalidBundle(
+            "field %s.private_material must be a non-empty string" % where
+        )
+    return {
+        "version": number,
+        "created_at": created_at,
+        "algorithm": algorithm,
+        "public_key": public_key,
+        "private_material": private_material,
+    }
+
+
+def validate_revocation_fields(data: dict, where: str = "") -> dict:
+    """Validate status/reason/operator/revoked_at and return them cleaned."""
+    prefix = where + "." if where else ""
+    status = _require(data, "status", str)
+    if status not in ("active", "revoked"):
+        raise InvalidBundle(
+            "field %sstatus must be 'active' or 'revoked'" % prefix
+        )
+    reason = data.get("reason")
+    operator = data.get("operator")
+    revoked_at = data.get("revoked_at")
+    if status == "revoked":
+        for name, value in (
+            ("reason", reason),
+            ("operator", operator),
+            ("revoked_at", revoked_at),
+        ):
+            if not isinstance(value, str) or not value:
+                raise InvalidBundle(
+                    "field %s%s must be a non-empty string for a revoked key"
+                    % (prefix, name)
+                )
+    elif any(v is not None for v in (reason, operator, revoked_at)):
+        raise InvalidBundle(
+            "revocation fields must be null for an active key"
+        )
+    return {
+        "status": status,
+        "reason": reason,
+        "operator": operator,
+        "revoked_at": revoked_at,
+    }
+
+
 def validate_payload(data: dict) -> dict:
     """Validate the decrypted export payload and return a cleaned copy.
 
@@ -168,46 +281,13 @@ def validate_payload(data: dict) -> dict:
     clean_versions = []
     for index, ver in enumerate(versions):
         where = "versions[%d]" % index
-        if not isinstance(ver, dict):
-            raise InvalidBundle("field %s must be an object" % where)
-        number = ver.get("version")
-        created_at = ver.get("created_at")
-        algorithm = ver.get("algorithm")
-        public_key = ver.get("public_key")
-        private_material = ver.get("private_material")
-        if not isinstance(number, int) or isinstance(number, bool) or number < 1:
-            raise InvalidBundle(
-                "field %s.version must be a positive integer" % where
-            )
-        if number in seen_versions:
+        clean = validate_version(ver, where)
+        if clean["version"] in seen_versions:
             raise InvalidBundle(
                 "field %s.version duplicates another version" % where
             )
-        seen_versions.add(number)
-        if not isinstance(created_at, str) or not created_at:
-            raise InvalidBundle("field %s.created_at must be a string" % where)
-        if algorithm not in SUPPORTED_ALGORITHMS:
-            raise InvalidBundle(
-                "field %s.algorithm must be one of: %s"
-                % (where, ", ".join(SUPPORTED_ALGORITHMS))
-            )
-        if public_key is not None and not isinstance(public_key, str):
-            raise InvalidBundle(
-                "field %s.public_key must be a string or null" % where
-            )
-        if not isinstance(private_material, str) or not private_material:
-            raise InvalidBundle(
-                "field %s.private_material must be a non-empty string" % where
-            )
-        clean_versions.append(
-            {
-                "version": number,
-                "created_at": created_at,
-                "algorithm": algorithm,
-                "public_key": public_key,
-                "private_material": private_material,
-            }
-        )
+        seen_versions.add(clean["version"])
+        clean_versions.append(clean)
 
     current_version = data.get("current_version")
     expected_numbers = set(range(1, len(seen_versions) + 1))
@@ -225,37 +305,17 @@ def validate_payload(data: dict) -> dict:
         )
     clean_versions.sort(key=lambda v: v["version"])
 
-    status = _require(data, "status", str)
-    if status not in ("active", "revoked"):
-        raise InvalidBundle("field status must be 'active' or 'revoked'")
-    reason = data.get("reason")
-    operator = data.get("operator")
-    revoked_at = data.get("revoked_at")
-    if status == "revoked":
-        for name, value in (
-            ("reason", reason),
-            ("operator", operator),
-            ("revoked_at", revoked_at),
-        ):
-            if not isinstance(value, str) or not value:
-                raise InvalidBundle(
-                    "field %s must be a non-empty string for a revoked key"
-                    % name
-                )
-    elif any(v is not None for v in (reason, operator, revoked_at)):
-        raise InvalidBundle(
-            "revocation fields must be null for an active key"
-        )
+    revocation = validate_revocation_fields(data)
 
     return {
         "format": FORMAT,
         "key_id": key_id,
         "label": label,
         "current_version": current_version,
-        "status": status,
-        "reason": reason,
-        "operator": operator,
-        "revoked_at": revoked_at,
+        "reason": revocation["reason"],
+        "operator": revocation["operator"],
+        "revoked_at": revocation["revoked_at"],
+        "status": revocation["status"],
         "versions": clean_versions,
     }
 
@@ -267,28 +327,7 @@ def decode_bundle(bundle: str, passphrase: str) -> dict:
     tampered ciphertext) and InvalidBundle for structural, format/version and
     missing-field problems.
     """
-    params = _load_envelope(bundle)
-    if not isinstance(passphrase, str) or not passphrase:
-        raise InvalidBundle("field passphrase must be a non-empty string")
-    try:
-        kdf = Scrypt(
-            salt=params["salt"],
-            length=_KEY_LEN,
-            n=params["n"],
-            r=params["r"],
-            p=params["p"],
-        )
-        key = kdf.derive(passphrase.encode("utf-8"))
-    except (TypeError, ValueError) as exc:
-        raise InvalidBundle("invalid kdf parameters in field bundle") from exc
-    try:
-        plaintext = AESGCM(key).decrypt(
-            params["nonce"], params["data"], FORMAT.encode("ascii")
-        )
-    except InvalidTag as exc:
-        raise WrongPassphrase(
-            "field passphrase is incorrect or bundle is tampered"
-        ) from exc
+    plaintext = open_envelope(bundle, passphrase, FORMAT)
     try:
         data = json.loads(plaintext.decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as exc:

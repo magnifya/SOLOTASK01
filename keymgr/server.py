@@ -7,6 +7,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import audit as audit_mod
 from . import keybundle
+from . import restore as restore_mod
+from . import tenantbundle
 from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
 from .policy import PolicyError, PolicyStore, validate_rules
@@ -15,6 +17,8 @@ from .store import IMPORT_CONFLICT, KeyStore, is_valid_key_id
 _AUDIT_PATH = "/v1/audit"
 _POLICY_PATH = "/v1/policy"
 _IMPORT_PATH = "/v1/keys/import"
+_BACKUP_PATH = "/v1/backup"
+_RESTORE_PATH = "/v1/restore"
 _KEY_PATH_RE = re.compile(r"^/v1/keys/([^/]+)$")
 _ROTATE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/rotate$")
 _REVOKE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/revoke$")
@@ -26,7 +30,11 @@ _POSITIVE_INT_RE = re.compile(r"[0-9]+")
 _MISSING = object()
 
 
-def make_handler(store: KeyStore, policy_store: PolicyStore) -> type:
+def make_handler(
+    store: KeyStore,
+    policy_store: PolicyStore,
+    coordinator: "restore_mod.RestoreCoordinator",
+) -> type:
     """Build a BaseHTTPRequestHandler subclass bound to the stores."""
 
     class KeyHandler(BaseHTTPRequestHandler):
@@ -266,6 +274,14 @@ def make_handler(store: KeyStore, policy_store: PolicyStore) -> type:
 
                 if path == _IMPORT_PATH:
                     self._import_key(parts, operator)
+                    return
+
+                if path == _BACKUP_PATH:
+                    self._backup_tenant(parts, operator)
+                    return
+
+                if path == _RESTORE_PATH:
+                    self._restore_tenant(parts, operator)
                     return
             except LedgerError as exc:
                 self._server_error(exc)
@@ -571,6 +587,158 @@ def make_handler(store: KeyStore, policy_store: PolicyStore) -> type:
                 return
             # The success event committed in the same transaction as the file.
             self._send_json(201, record.to_create_response())
+
+        # -- tenant backup / restore --------------------------------------
+        def _backup_tenant(self, parts, operator: str) -> None:
+            """POST /v1/backup.
+
+            The whole tenant (every key with all versions and private
+            material, plus its policy) is returned only sealed inside the
+            opaque tenant bundle. A tenant with no data backs up as an empty
+            bundle (keys [], policy null).
+            """
+            payload = self._read_json_object()
+            if payload is None:
+                return
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                if not self._record_conflict():
+                    return
+                self._bad_request("field tenant_id must be a non-empty string")
+                return
+            tenant_id = self._tenant(parts, payload)
+            if tenant_id is None:
+                return
+            passphrase = payload.get("passphrase")
+            if not isinstance(passphrase, str) or not passphrase:
+                if not self._record_attempt(
+                    tenant_id, None, audit_mod.ACTION_EXPORT,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._bad_request(
+                    "field passphrase must be a non-empty string"
+                )
+                return
+            if not self._enforce(
+                tenant_id, None, audit_mod.ACTION_EXPORT, operator
+            ):
+                return
+            try:
+                bundle = coordinator.backup_bundle(tenant_id, passphrase)
+            except LedgerError as exc:
+                self._server_error(exc)
+                return
+            # A backup reads but never mutates; its event rides with the
+            # successful response like a single-key export.
+            if not self._record_attempt(
+                tenant_id, None, audit_mod.ACTION_EXPORT,
+                audit_mod.OUTCOME_SUCCESS,
+            ):
+                return
+            self._send_json(
+                200, {"format": tenantbundle.FORMAT, "bundle": bundle}
+            )
+
+        def _restore_tenant(self, parts, operator: str) -> None:
+            """POST /v1/restore.
+
+            Decryption/tamper/format errors are 400s naming passphrase or
+            bundle and never touch disk. Authorization (import) follows
+            validation and precedes the in-bundle tenant check: a bundle
+            naming another tenant answers 404. A key_id or policy already
+            present for this tenant is a 409 that changes nothing; an id
+            occupied by another tenant answers 404. Every audit event for a
+            restore carries key_id null.
+            """
+            payload = self._read_json_object()
+            if payload is None:
+                return
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                if not self._record_conflict():
+                    return
+                self._bad_request("field tenant_id must be a non-empty string")
+                return
+            tenant_id = self._tenant(parts, payload)
+            if tenant_id is None:
+                return
+            passphrase = payload.get("passphrase")
+            if not isinstance(passphrase, str) or not passphrase:
+                if not self._record_attempt(
+                    tenant_id, None, audit_mod.ACTION_IMPORT,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._bad_request(
+                    "field passphrase must be a non-empty string"
+                )
+                return
+            bundle = payload.get("bundle")
+            if not isinstance(bundle, str) or not bundle:
+                if not self._record_attempt(
+                    tenant_id, None, audit_mod.ACTION_IMPORT,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._bad_request("field bundle must be a non-empty string")
+                return
+            try:
+                decoded = tenantbundle.decode_bundle(bundle, passphrase)
+            except tenantbundle.TenantBundleError as exc:
+                if not self._record_attempt(
+                    tenant_id, None, audit_mod.ACTION_IMPORT,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._bad_request(str(exc))
+                return
+            # Validation (400) precedes authorization; the policy decision
+            # uses the requesting tenant and a null key_id.
+            if not self._enforce(
+                tenant_id, None, audit_mod.ACTION_IMPORT, operator
+            ):
+                return
+            if decoded["tenant_id"] != tenant_id:
+                # The sealed bundle belongs to another tenant: answer exactly
+                # like a missing object so existence never leaks.
+                if not self._record_attempt(
+                    tenant_id, None, audit_mod.ACTION_IMPORT,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._send_json(404, {"error": "tenant backup not found"})
+                return
+            try:
+                result = coordinator.restore(tenant_id, decoded)
+            except LedgerError as exc:
+                # The coordinator has already removed every written file.
+                self._server_error(exc)
+                return
+            if result.status == restore_mod.RESTORE_CREATED:
+                # The success event committed in the same transaction as the
+                # restored files.
+                self._send_json(
+                    201,
+                    {
+                        "tenant_id": result.tenant_id,
+                        "key_ids": result.key_ids,
+                        "policy_restored": result.policy_restored,
+                    },
+                )
+                return
+            if not self._record_attempt(
+                tenant_id, None, audit_mod.ACTION_IMPORT,
+                audit_mod.OUTCOME_REJECTED,
+            ):
+                return
+            if result.status == restore_mod.RESTORE_SAME_TENANT_CONFLICT:
+                self._send_json(
+                    409,
+                    {"error": "backup target already contains this data"},
+                )
+            else:
+                self._send_json(404, {"error": "tenant backup not found"})
 
         # -- GET ----------------------------------------------------------
         def do_GET(self) -> None:
@@ -951,8 +1119,10 @@ def serve(host: str, port: int, data_dir: str) -> None:
     audit_log = AuditLog(data_dir)
     store = KeyStore(data_dir, audit_log)
     policy_store = PolicyStore(data_dir, audit_log)
+    coordinator = restore_mod.RestoreCoordinator(store, policy_store)
     httpd = ThreadingHTTPServer(
-        (host, port), make_handler(store, policy_store)
+        (host, port),
+        make_handler(store, policy_store, coordinator),
     )
     httpd.daemon_threads = True
     try:

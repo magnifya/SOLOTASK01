@@ -302,6 +302,11 @@ class KeyStore:
                 record = self._read_record(path)
                 if record is None or not record.pending_event:
                     continue
+                # A multi-file tenant restore transaction is resolved by the
+                # RestoreCoordinator (its manifest drives the shared event),
+                # not by this per-key recovery.
+                if record.pending_event.get("_restore"):
+                    continue
                 # append() is idempotent on event_id, so this is safe whether
                 # the crash happened before or after the ledger write.
                 event = AuditEvent.from_json(record.pending_event)
@@ -592,4 +597,99 @@ class KeyStore:
             )
             self._commit_mutation(path, record, event, None)
         return IMPORT_CREATED, record
+
+    # -- tenant backup / restore ------------------------------------------
+    def list_for_tenant(self, tenant_id: str) -> list:
+        """Return all KeyRecords owned by the tenant (sorted by key_id)."""
+        records = []
+        try:
+            names = os.listdir(self.data_dir)
+        except OSError:
+            return records
+        for name in names:
+            if not (name.endswith(".json") and is_valid_key_id(name[:-5])):
+                continue
+            record = self._read_record(os.path.join(self.data_dir, name))
+            if record is not None and record.tenant_id == tenant_id:
+                records.append(record)
+        records.sort(key=lambda r: r.key_id)
+        return records
+
+    @staticmethod
+    def backup_entry(record: KeyRecord) -> dict:
+        """Project a record for a tenant backup payload.
+
+        The projection includes private material; it is only ever sealed
+        inside the authenticated tenant bundle and never appears in a
+        response or an audit projection.
+        """
+        return {
+            "key_id": record.key_id,
+            "label": record.label,
+            "current_version": record.current_version,
+            "status": record.status,
+            "reason": record.reason,
+            "operator": record.operator,
+            "revoked_at": record.revoked_at,
+            "versions": [ver.to_json() for ver in record.versions],
+        }
+
+    def read_raw(self, key_id: str) -> Optional[KeyRecord]:
+        """Read a record by key_id without a tenant check (restore checks)."""
+        if not _KEY_ID_RE.fullmatch(key_id):
+            return None
+        return self._read_record(self._path_for(key_id))
+
+    def record_from_backup(self, tenant_id: str, entry: dict) -> KeyRecord:
+        """Build an unsaved KeyRecord from a validated backup keys[i] entry."""
+        versions = [
+            VersionRecord(
+                version=ver["version"],
+                created_at=ver["created_at"],
+                algorithm=ver["algorithm"],
+                public_key=ver["public_key"],
+                private_material=ver["private_material"],
+            )
+            for ver in entry["versions"]
+        ]
+        return KeyRecord(
+            key_id=entry["key_id"],
+            tenant_id=tenant_id,
+            label=entry["label"],
+            versions=versions,
+            current_version=entry["current_version"],
+            status=entry["status"],
+            reason=entry["reason"],
+            operator=entry["operator"],
+            revoked_at=entry["revoked_at"],
+        )
+
+    def write_restore_pending(
+        self, record: KeyRecord, marker: dict
+    ) -> None:
+        """Atomically write a restored key file carrying the shared marker.
+
+        Used by the RestoreCoordinator's multi-file outbox transaction; the
+        caller guarantees the key_id is free and holds the per-key locks.
+        """
+        record.pending_event = marker
+        self._write_atomic(self._path_for(record.key_id), record.to_json())
+
+    def clear_restore_pending(self, record: KeyRecord) -> None:
+        """Rewrite a restored key file without its pending marker."""
+        record.pending_event = None
+        self._write_atomic(self._path_for(record.key_id), record.to_json())
+
+    def remove_file(self, key_id: str) -> None:
+        """Delete a key file written by a restore being rolled back."""
+        try:
+            os.unlink(self._path_for(key_id))
+        except FileNotFoundError:
+            pass
+
+    @contextmanager
+    def key_locks(self, key_id: str) -> Iterator[None]:
+        """Acquire the in-process and cross-process locks for one key_id."""
+        with self._key_lock(key_id), self._file_lock(key_id):
+            yield
 
