@@ -4,4 +4,40 @@
 
 ## 当前状态
 
-上述接口尚未实现。实现完成后，请在此补充安装依赖、启动方式与基础测试命令。
+接口已实现。代码结构：`kms/store.py`（磁盘持久化，按租户分目录）、`kms/service.py`（生成与查询逻辑）、`kms/server.py`（HTTP 服务，仅标准库）、`kms/cli.py`（命令行入口）。
+
+### 安装依赖
+
+```bash
+pip install cryptography
+```
+
+### 启动 HTTP 服务
+
+```bash
+python3 -m kms --data-dir ./kms_data serve --host 127.0.0.1 --port 8080
+```
+
+示例：
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/keys \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant_id": "acme", "algorithm": "RSA2048", "label": "signing"}'
+curl 'http://127.0.0.1:8080/v1/keys/<key_id>?tenant_id=acme'
+```
+
+### 命令行
+
+```bash
+python3 -m kms gen --tenant-id acme --algorithm AES256 --label enc
+python3 -m kms show --tenant-id acme --key-id <key_id>
+```
+
+输出为单行 JSON，字段名与 HTTP 响应一致。`--data-dir` 可指定数据目录（默认 `./kms_data`）。
+
+### 运行测试
+
+```bash
+python3 -m unittest discover -s tests -v
+```
