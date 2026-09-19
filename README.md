@@ -46,20 +46,36 @@ python -m keymgr --data-dir ./keymgr_data serve --host 127.0.0.1 --port 8080
   或 `?tenant_id=`（两者同时给出必须一致）。返回 `200`：
   `{"key_id", "status", "reason", "operator", "revoked_at"}`；
   `active`（含无状态字段的旧记录）时后三项为 `null`。
+- `POST /v1/keys/{key_id}/export`：加密导出整把密钥。请求体 JSON 含非空
+  字符串 `tenant_id`、`passphrase`；可附与 body 一致的 `X-Tenant-Id` /
+  `?tenant_id=`（冲突返回 `400` 且指明 `tenant_id`）。成功返回 `200`：
+  `{"format":"keymgr-export-v1","bundle": <不透明 base64>}`。bundle 以
+  passphrase 经 scrypt 派生密钥后用 AES-256-GCM 认证加密，内含 `label`、
+  全部版本（算法、时间、公钥、私有材料）、`current_version` 与吊销字段；
+  私钥与口令只存在于加密包内，响应与审计投影均不泄露。未知 key / 跨租户
+  统一 `404`。
+- `POST /v1/keys/import`：从加密包导入。请求体 JSON 含非空字符串
+  `tenant_id`、`passphrase`、`bundle`；同样接受与 body 一致的
+  `X-Tenant-Id` / `?tenant_id=`。解密失败、密文被篡改、`format`/版本错误
+  或缺字段返回 `400` 且错误指出具体字段（`passphrase` / `bundle` /
+  `versions[i].xxx` 等），全程不落盘、不留半成品。成功返回 `201`：
+  `{"key_id", "algorithm", "public_key"}`，并保留原 `key_id`、全部版本号、
+  `current`、`label` 与吊销状态。该租户已有同一 `key_id` 返回 `409` 且原
+  记录不变；`key_id` 已被其他租户占用时返回 `404`，跨租户不泄露存在性。
 - `GET /v1/audit`：查询本租户的审计事件。租户由**单一** `X-Tenant-Id`
   头或**单一** `?tenant_id=` 参数提供；缺失、重复、为空或两者冲突均返回
   `400` 且错误信息指出 `tenant_id`。可选筛选：`key_id`（非 UUID4 返回
-  `400`）、`action`（`create` / `read` / `rotate` / `revoke` /
-  `tenant_conflict` 五值之一）、`limit`（默认 `100`，范围 `1–1000`）、
-  `cursor`（上一页返回的不透明游标）。返回
+  `400`）、`action`（`create` / `read` / `rotate` / `revoke` / `import` /
+  `export` / `tenant_conflict` 七值之一）、`limit`（默认 `100`，范围
+  `1–1000`）、`cursor`（上一页返回的不透明游标）。返回
   `{"events", "next_cursor"}`，事件按 `timestamp`、`event_id` 升序；
   `next_cursor` 为 `null` 表示到末页。未知但合法的 `key_id` 返回空列表。
   游标绑定租户、筛选条件与快照：失效、被篡改或改变筛选/租户均返回 `400`
   且错误指出 `cursor`；分页保证不重不漏。审计查询本身不记账。
-- 缺少必填字段、algorithm 不支持、version 非正整数、或
+- 缺少必填字段、algorithm 不支持、version 非正整数、导入包口令/格式错误、或
   header/query/body 提供了互相冲突的租户参数，返回 `400`，错误信息指明
-  具体字段；未知 key、未知版本及跨租户访问统一返回 `404`。任何响应均不含
-  私钥材料。
+  具体字段；未知 key、未知版本及跨租户访问统一返回 `404`；同租户重复导入
+  返回 `409`。任何响应均不含私钥材料。
 
 ### 版本与轮换
 
@@ -71,22 +87,26 @@ per-key 锁（进程内锁 + `fcntl` 跨进程锁）保护下做读-改-写并�
 
 ## 审计
 
-密钥的生成、读取（含当前版本、历史版本、状态查询）、轮换、吊销都会写入
-持久化审计账。每条事件字段为 `event_id`、`tenant_id`、`action`、`key_id`、
-`outcome`、`timestamp`（UTC）；`action` 为 `create` / `read` / `rotate` /
-`revoke`，`outcome` 为 `success` / `rejected`。
+密钥的生成、读取（含当前版本、历史版本、状态查询）、轮换、吊销、导入与导出
+都会写入持久化审计账。每条事件字段为 `event_id`、`tenant_id`、`action`、
+`key_id`、`outcome`、`timestamp`（UTC）；`action` 为 `create` / `read` /
+`rotate` / `revoke` / `import` / `export`，`outcome` 为 `success` /
+`rejected`。
 
 - 租户已确定且 `key_id` 合法时，事件同时记录两个标识，且仅该请求租户可见。
-  未知或跨租户的访问记为 `outcome=rejected`，只对请求租户可见，不泄露密钥
-  归属。未知但合法的 `key_id` 在审计查询中返回空。
+  未知或跨租户的访问（含导出、跨租户导入冲突）记为 `outcome=rejected`，
+  只对请求租户可见，不泄露密钥归属。导入在解密成功前尚不知 `key_id`，
+  这类拒绝事件的 `key_id` 为 `null`；未知但合法的 `key_id` 在审计查询中
+  返回空。
 - 租户缺失、为空、标识非法（`key_id` 非 UUID4）或头/查询/体提供的租户互相
   不一致时，记一条 `action=tenant_conflict`、`outcome=rejected` 的事件，
   其 `tenant_id` 与 `key_id` 均为 `null`，任何租户都查不到它。
 - 审计账只追加，存于数据目录的 `audit.log`（每行一个 JSON）。变更（生成 /
-  轮换 / 吊销）与其事件在同一逻辑事务提交：先把事件作为待提交标记随密钥文件
-  原子落盘，再 durable 追加账本，最后清除标记；账本写失败则回滚密钥文件并对
-  HTTP 返回 `500`、CLI 以退出码 `1` 失败，绝不允许单边落盘。进程在两步之间
-  崩溃时，下次启动依据待提交标记幂等补记账本（按 `event_id` 去重）。
+  轮换 / 吊销 / 导入）与其事件在同一逻辑事务提交：先把事件作为待提交标记
+  随密钥文件原子落盘，再 durable 追加账本，最后清除标记；账本写失败则回滚
+  密钥文件并对 HTTP 返回 `500`、CLI 以退出码 `1` 失败，绝不允许单边落盘。
+  导出只读，其审计事件随成功响应直接追加账本。进程在两步之间崩溃时，下次
+  启动依据待提交标记幂等补记账本（按 `event_id` 去重）。
 - 事件与查询投影均不含任何私钥材料。`GET /v1/audit` 自身不产生审计事件。
 
 
@@ -126,6 +146,19 @@ python -m keymgr --data-dir ./keymgr_data status \
   --tenant-id tenant-a --key-id <key_id>
 ```
 
+加密导入 / 导出同样打印单行 JSON，字段与对应 HTTP 响应一致：
+
+```bash
+# 导出：输出 {"format","bundle"}，bundle 为不透明 base64
+python -m keymgr --data-dir ./keymgr_data export \
+  --tenant-id tenant-a --key-id <key_id> --passphrase 'hunter2'
+# 导入：输出 {"key_id","algorithm","public_key"}（201 的创建响应字段）
+python -m keymgr --data-dir ./keymgr_data import \
+  --tenant-id tenant-b --passphrase 'hunter2' --bundle '<bundle>'
+```
+
+导出、导入分别写 `action=export` / `action=import` 的审计事件。
+
 审计查询同样打印单行 JSON，字段与 `GET /v1/audit` 响应一致
 （`{"events","next_cursor"}`）：
 
@@ -139,12 +172,14 @@ python -m keymgr --data-dir ./keymgr_data audit \
 ```
 
 非法的 `--key-id` / `--action` / `--limit` 或失效篡改的 `--cursor` 以
-退出码 `2` 报错，错误信息指出具体字段。
+退出码 `2` 报错，错误信息指出具体字段。导出/导入的口令缺失、口令错误或
+bundle 格式、版本、字段错误同样以退出码 `2` 报错。
 
 未知 key/版本或跨租户访问以退出码 `4` 报错；非法 algorithm / version
 （非正整数）、非法 `--key-id` / `--action` / `--limit` 或失效篡改的
-`--cursor` 以退出码 `2` 报错，错误信息指明字段；审计账写失败以退出码
-`1` 失败（对应 HTTP `500`）。
+`--cursor` 以退出码 `2` 报错，错误信息指明字段；同租户重复导入已存在的
+`key_id` 以退出码 `3` 报错（对应 HTTP `409`，原记录不变）；审计账写失败
+以退出码 `1` 失败（对应 HTTP `500`）。
 
 ## 基础测试
 
@@ -171,6 +206,14 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   无状态字段的旧记录按 `active` 处理。
 - `key_id` 为 UUID4，读取时校验格式以杜绝路径穿越；未知 key、未知版本与
   跨租户访问一律 `404`，不泄露密钥是否存在。
+- 导出包 `keymgr-export-v1` 为不透明的单层 base64 令牌：内部 JSON 信封记录
+  `scrypt`（随机盐、固定成本参数）派生的 AES-256-GCM 密钥与随机 nonce，
+  密文以 `format` 作为附加认证数据。口令错误或任何篡改都在 GCM 认证处失败，
+  不会解出半截明文；KDF 参数只接受本服务发出的固定集合，拒绝伪造信封请求
+  任意内存。解密后的载荷逐字段校验（`label`、连续 `1..N` 的版本、算法、
+  公钥/私有材料、`current_version`、吊销字段），缺字段或版本错误以 `400`
+  指出具体字段。导入沿用每 key 锁 + 原子落盘 + outbox 事务，账本失败回滚、
+  崩溃幂等补记，重启后导入的全部版本与状态均可读。
 - 审计账为数据目录下的 `audit.log`（每行一个 JSON，只追加），追加由进程内锁
   + `audit.log.lock` 上的 `fcntl` 排他锁串行化并 fsync，`seq` 单调不乱序。
   生成 / 轮换 / 吊销采用“密钥文件携带待提交事件 → 追加账本 → 清除标记”的

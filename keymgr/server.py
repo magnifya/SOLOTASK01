@@ -6,14 +6,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from . import audit as audit_mod
+from . import keybundle
 from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
-from .store import KeyStore, is_valid_key_id
+from .store import IMPORT_CONFLICT, KeyStore, is_valid_key_id
 
 _AUDIT_PATH = "/v1/audit"
+_IMPORT_PATH = "/v1/keys/import"
 _KEY_PATH_RE = re.compile(r"^/v1/keys/([^/]+)$")
 _ROTATE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/rotate$")
 _REVOKE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/revoke$")
+_EXPORT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/export$")
 _STATUS_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/status$")
 _VERSION_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/versions/([^/]+)$")
 _CURRENT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/current$")
@@ -211,6 +214,15 @@ def make_handler(store: KeyStore) -> type:
                 if revoke_match is not None:
                     self._revoke_key(revoke_match.group(1), parts)
                     return
+
+                export_match = _EXPORT_PATH_RE.match(path)
+                if export_match is not None:
+                    self._export_key(export_match.group(1), parts)
+                    return
+
+                if path == _IMPORT_PATH:
+                    self._import_key(parts)
+                    return
             except LedgerError as exc:
                 self._server_error(exc)
                 return
@@ -355,6 +367,141 @@ def make_handler(store: KeyStore) -> type:
                 self._send_json(404, {"error": "key not found"})
                 return
             self._send_json(200, record.to_status_response())
+
+        def _export_key(self, key_id: str, parts) -> None:
+            """POST /v1/keys/{key_id}/export.
+
+            The body must carry a non-empty tenant_id and passphrase; an
+            X-Tenant-Id header or ?tenant_id= may supplement the body but
+            must agree with it. The full record (including private material)
+            is only ever returned sealed inside the opaque bundle.
+            """
+            payload = self._read_json_object()
+            if payload is None:
+                return
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                if not self._record_conflict():
+                    return
+                self._bad_request("field tenant_id must be a non-empty string")
+                return
+            tenant_id = self._tenant(parts, payload)
+            if tenant_id is None:
+                return
+            if self._bad_key_id(key_id):
+                return
+            passphrase = payload.get("passphrase")
+            if not isinstance(passphrase, str) or not passphrase:
+                if not self._record_attempt(
+                    tenant_id, key_id, audit_mod.ACTION_EXPORT,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._bad_request(
+                    "field passphrase must be a non-empty string"
+                )
+                return
+            # The record is read before the success event, but nothing is
+            # persisted by an export, so a ledger failure after this point
+            # simply fails the request with 500.
+            bundle = store.export_bundle(key_id, tenant_id, passphrase)
+            if bundle is None:
+                # Unknown key and another tenant's key look identical.
+                if not self._record_attempt(
+                    tenant_id, key_id, audit_mod.ACTION_EXPORT,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._send_json(404, {"error": "key not found"})
+                return
+            if not self._record_attempt(
+                tenant_id, key_id, audit_mod.ACTION_EXPORT,
+                audit_mod.OUTCOME_SUCCESS,
+            ):
+                return
+            self._send_json(
+                200, {"format": keybundle.FORMAT, "bundle": bundle}
+            )
+
+        def _import_key(self, parts) -> None:
+            """POST /v1/keys/import.
+
+            Decryption/tamper/format errors are 400s naming passphrase or
+            bundle and never touch disk. A key_id the tenant already owns is
+            a 409 that leaves the original record untouched; the same key_id
+            owned by another tenant answers 404 so existence never leaks
+            across tenants.
+            """
+            payload = self._read_json_object()
+            if payload is None:
+                return
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                if not self._record_conflict():
+                    return
+                self._bad_request("field tenant_id must be a non-empty string")
+                return
+            tenant_id = self._tenant(parts, payload)
+            if tenant_id is None:
+                return
+            passphrase = payload.get("passphrase")
+            if not isinstance(passphrase, str) or not passphrase:
+                if not self._record_attempt(
+                    tenant_id, None, audit_mod.ACTION_IMPORT,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._bad_request(
+                    "field passphrase must be a non-empty string"
+                )
+                return
+            bundle = payload.get("bundle")
+            if not isinstance(bundle, str) or not bundle:
+                if not self._record_attempt(
+                    tenant_id, None, audit_mod.ACTION_IMPORT,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._bad_request("field bundle must be a non-empty string")
+                return
+            try:
+                decoded = keybundle.decode_bundle(bundle, passphrase)
+            except keybundle.WrongPassphrase as exc:
+                if not self._record_attempt(
+                    tenant_id, None, audit_mod.ACTION_IMPORT,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._bad_request(str(exc))
+                return
+            except keybundle.InvalidBundle as exc:
+                if not self._record_attempt(
+                    tenant_id, None, audit_mod.ACTION_IMPORT,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._bad_request(str(exc))
+                return
+            # The bundle authenticated; its key_id is a validated UUID4. The
+            # existence check and the create happen atomically in the store.
+            status, record = store.import_bundle(tenant_id, decoded)
+            if status == IMPORT_CONFLICT:
+                if not self._record_attempt(
+                    tenant_id, record.key_id, audit_mod.ACTION_IMPORT,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                if record.tenant_id == tenant_id:
+                    self._send_json(
+                        409, {"error": "key_id already exists for this tenant"}
+                    )
+                else:
+                    # Same answer as a missing key: never confirm another
+                    # tenant owns this key_id.
+                    self._send_json(404, {"error": "key not found"})
+                return
+            # The success event committed in the same transaction as the file.
+            self._send_json(201, record.to_create_response())
 
         # -- GET ----------------------------------------------------------
         def do_GET(self) -> None:

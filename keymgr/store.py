@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Iterator, Optional
 
 from . import audit as audit_mod
+from . import keybundle
 from .audit import AuditEvent, AuditLog
 from .crypto import generate_key
 
@@ -30,6 +31,12 @@ _KEY_ID_RE = re.compile(
 def is_valid_key_id(key_id) -> bool:
     """True only for a canonical lowercase UUID4 string."""
     return isinstance(key_id, str) and bool(_KEY_ID_RE.fullmatch(key_id))
+
+
+# Outcomes of an import: a brand-new record, or a key_id that already exists
+# (whose on-disk record must remain byte-for-byte untouched).
+IMPORT_CREATED = "created"
+IMPORT_CONFLICT = "conflict"
 
 
 @dataclass
@@ -197,6 +204,24 @@ class KeyRecord:
             "public_key": self.current.public_key,
         }
 
+    def to_export_payload(self) -> dict:
+        """Full record for an export bundle, including private material.
+
+        This projection is only ever sealed inside the authenticated bundle;
+        it must never appear in an HTTP response or audit projection.
+        """
+        return {
+            "format": keybundle.FORMAT,
+            "key_id": self.key_id,
+            "label": self.label,
+            "current_version": self.current_version,
+            "status": self.status,
+            "reason": self.reason,
+            "operator": self.operator,
+            "revoked_at": self.revoked_at,
+            "versions": [ver.to_json() for ver in self.versions],
+        }
+
 
 class KeyStore:
     """File-backed key store with one JSON file per key."""
@@ -247,6 +272,8 @@ class KeyStore:
                 audit_mod.ACTION_READ,
                 audit_mod.ACTION_ROTATE,
                 audit_mod.ACTION_REVOKE,
+                audit_mod.ACTION_IMPORT,
+                audit_mod.ACTION_EXPORT,
             )
         ):
             event = self.audit.new_event(tenant_id, action, key_id, outcome)
@@ -502,4 +529,66 @@ class KeyStore:
         if ver is None:
             return None
         return record, ver
+
+    # -- export / import ---------------------------------------------------
+    def export_bundle(
+        self, key_id: str, tenant_id: str, passphrase: str
+    ) -> Optional[str]:
+        """Seal a tenant's full key record into an opaque bundle.
+
+        Returns None for an unknown or foreign key, so the caller cannot tell
+        the two cases apart. Export does not modify the record; its audit event
+        is appended by the caller alongside the response, like a read.
+        """
+        record = self.get(key_id, tenant_id)
+        if record is None:
+            return None
+        return keybundle.encode_bundle(
+            record.to_export_payload(), passphrase
+        )
+
+    def import_bundle(
+        self, tenant_id: str, payload: dict
+    ) -> tuple:
+        """Persist a validated export payload under the importing tenant.
+
+        Returns (IMPORT_CREATED, record) for a brand-new key_id, or
+        (IMPORT_CONFLICT, existing) when the key_id already exists; the
+        existing record on disk is never touched, and the caller decides 409
+        versus 404 from its owner. A successful import and its audit event
+        commit through the same outbox transaction as create/rotate.
+        """
+        key_id = payload["key_id"]
+        path = self._path_for(key_id)
+        with self._key_lock(key_id), self._file_lock(key_id):
+            existing = self._read_record(path)
+            if existing is not None:
+                return IMPORT_CONFLICT, existing
+            versions = [
+                VersionRecord(
+                    version=ver["version"],
+                    created_at=ver["created_at"],
+                    algorithm=ver["algorithm"],
+                    public_key=ver["public_key"],
+                    private_material=ver["private_material"],
+                )
+                for ver in payload["versions"]
+            ]
+            record = KeyRecord(
+                key_id=key_id,
+                tenant_id=tenant_id,
+                label=payload["label"],
+                versions=versions,
+                current_version=payload["current_version"],
+                status=payload["status"],
+                reason=payload["reason"],
+                operator=payload["operator"],
+                revoked_at=payload["revoked_at"],
+            )
+            event = self.audit.new_event(
+                tenant_id, audit_mod.ACTION_IMPORT, key_id,
+                audit_mod.OUTCOME_SUCCESS,
+            )
+            self._commit_mutation(path, record, event, None)
+        return IMPORT_CREATED, record
 
