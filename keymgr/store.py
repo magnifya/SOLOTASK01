@@ -247,6 +247,8 @@ class KeyStore:
                 audit_mod.ACTION_READ,
                 audit_mod.ACTION_ROTATE,
                 audit_mod.ACTION_REVOKE,
+                audit_mod.ACTION_EXPORT,
+                audit_mod.ACTION_IMPORT,
             )
         ):
             event = self.audit.new_event(tenant_id, action, key_id, outcome)
@@ -410,6 +412,47 @@ class KeyStore:
         with self._key_lock(key_id), self._file_lock(key_id):
             self._commit_mutation(self._path_for(key_id), record, event, None)
         return record
+
+    def import_key(self, tenant_id: str, data: dict) -> tuple:
+        """Persist a previously exported key under its original key_id.
+
+        ``data`` must already be a validated import payload (see
+        bundle.validate_import_payload); nothing is written before the
+        conflict checks pass, so a failed import leaves no partial state.
+        Returns ("created", record) on success, ("conflict", None) when this
+        tenant already owns key_id (the existing record is left untouched),
+        and ("foreign", None) when the key_id is taken by another tenant —
+        the caller maps that to the same 404 as an unknown key so existence
+        is never leaked across tenants. The import event is committed in the
+        same transaction as the key file, exactly like create.
+        """
+        key_id = data["key_id"]
+        path = self._path_for(key_id)
+        with self._key_lock(key_id), self._file_lock(key_id):
+            existing = self._read_record(path)
+            if existing is not None:
+                if existing.tenant_id == tenant_id:
+                    return "conflict", None
+                return "foreign", None
+            record = KeyRecord(
+                key_id=key_id,
+                tenant_id=tenant_id,
+                label=data["label"],
+                versions=[
+                    VersionRecord.from_json(v) for v in data["versions"]
+                ],
+                current_version=data["current_version"],
+                status=data["status"],
+                reason=data["reason"],
+                operator=data["operator"],
+                revoked_at=data["revoked_at"],
+            )
+            event = self.audit.new_event(
+                tenant_id, audit_mod.ACTION_IMPORT, key_id,
+                audit_mod.OUTCOME_SUCCESS,
+            )
+            self._commit_mutation(path, record, event, None)
+        return "created", record
 
     def get(self, key_id: str, tenant_id: str) -> Optional[KeyRecord]:
         """Return the record only when it belongs to the tenant, else None."""

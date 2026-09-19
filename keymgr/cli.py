@@ -9,6 +9,14 @@ from typing import List, Optional
 
 from . import audit as audit_mod
 from .audit import InvalidCursor, LedgerError
+from .bundle import (
+    EXPORT_FORMAT,
+    BundleError,
+    build_export_payload,
+    decrypt_bundle,
+    encrypt_bundle,
+    validate_import_payload,
+)
 from .crypto import SUPPORTED_ALGORITHMS
 from .server import serve
 from .store import KeyStore, is_valid_key_id
@@ -75,6 +83,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", help="show a key's revocation status")
     p_status.add_argument("--tenant-id", required=True)
     p_status.add_argument("--key-id", required=True)
+
+    p_export = sub.add_parser(
+        "export", help="export a key as a passphrase-encrypted bundle"
+    )
+    p_export.add_argument("--tenant-id", required=True)
+    p_export.add_argument("--key-id", required=True)
+    p_export.add_argument("--passphrase", required=True)
+
+    p_import = sub.add_parser(
+        "import", help="import a passphrase-encrypted key bundle"
+    )
+    p_import.add_argument("--tenant-id", required=True)
+    p_import.add_argument("--passphrase", required=True)
+    p_import.add_argument("--bundle", required=True)
 
     p_audit = sub.add_parser("audit", help="list a tenant's audit events")
     p_audit.add_argument("--tenant-id", required=True)
@@ -297,6 +319,86 @@ def main(argv: Optional[List[str]] = None) -> int:
         ):
             return 1
         _print(record.to_status_response())
+        return 0
+
+    if args.command == "export":
+        if not args.tenant_id or not args.passphrase:
+            if not _identifiers_ok(args.tenant_id, args.key_id):
+                if not _conflict(store):
+                    return 1
+            elif not _attempt(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_EXPORT, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            if not args.tenant_id:
+                return _fail("field tenant_id must be a non-empty string", 2)
+            return _fail("field passphrase must be a non-empty string", 2)
+        record = store.get(args.key_id, args.tenant_id)
+        if record is None:
+            if not _identifiers_ok(args.tenant_id, args.key_id):
+                if not _conflict(store):
+                    return 1
+            elif not _attempt(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_EXPORT, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            return _fail("key not found", 4)
+        blob = encrypt_bundle(args.passphrase, build_export_payload(record))
+        if not _attempt(
+            store, args.tenant_id, args.key_id,
+            audit_mod.ACTION_EXPORT, audit_mod.OUTCOME_SUCCESS,
+        ):
+            return 1
+        _print({"format": EXPORT_FORMAT, "bundle": blob})
+        return 0
+
+    if args.command == "import":
+        if not args.tenant_id or not args.passphrase or not args.bundle:
+            if not _identifiers_ok(args.tenant_id, None):
+                if not _conflict(store):
+                    return 1
+            elif not _attempt(
+                store, args.tenant_id, None,
+                audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            if not args.tenant_id:
+                return _fail("field tenant_id must be a non-empty string", 2)
+            field = "passphrase" if not args.passphrase else "bundle"
+            return _fail("field %s must be a non-empty string" % field, 2)
+        try:
+            data = validate_import_payload(
+                decrypt_bundle(args.passphrase, args.bundle)
+            )
+        except BundleError as exc:
+            if not _attempt(
+                store, args.tenant_id, None,
+                audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            return _fail(str(exc), 2)
+        key_id = data["key_id"]
+        try:
+            status, record = store.import_key(args.tenant_id, data)
+        except LedgerError as exc:
+            return _ledger_fail(exc)
+        if status == "conflict":
+            if not _attempt(
+                store, args.tenant_id, key_id,
+                audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            return _fail("key already exists", 2)
+        if status == "foreign":
+            if not _attempt(
+                store, args.tenant_id, key_id,
+                audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            return _fail("key not found", 4)
+        _print(record.to_create_response())
         return 0
 
     if args.command == "audit":

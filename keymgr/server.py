@@ -7,13 +7,23 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import audit as audit_mod
 from .audit import AuditLog, InvalidCursor, LedgerError
+from .bundle import (
+    EXPORT_FORMAT,
+    BundleError,
+    build_export_payload,
+    decrypt_bundle,
+    encrypt_bundle,
+    validate_import_payload,
+)
 from .crypto import SUPPORTED_ALGORITHMS
 from .store import KeyStore, is_valid_key_id
 
 _AUDIT_PATH = "/v1/audit"
+_IMPORT_PATH = "/v1/keys/import"
 _KEY_PATH_RE = re.compile(r"^/v1/keys/([^/]+)$")
 _ROTATE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/rotate$")
 _REVOKE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/revoke$")
+_EXPORT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/export$")
 _STATUS_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/status$")
 _VERSION_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/versions/([^/]+)$")
 _CURRENT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/current$")
@@ -202,6 +212,10 @@ def make_handler(store: KeyStore) -> type:
                     self._create_key()
                     return
 
+                if path == _IMPORT_PATH:
+                    self._import_key()
+                    return
+
                 rotate_match = _ROTATE_PATH_RE.match(path)
                 if rotate_match is not None:
                     self._rotate_key(rotate_match.group(1), parts)
@@ -210,6 +224,11 @@ def make_handler(store: KeyStore) -> type:
                 revoke_match = _REVOKE_PATH_RE.match(path)
                 if revoke_match is not None:
                     self._revoke_key(revoke_match.group(1), parts)
+                    return
+
+                export_match = _EXPORT_PATH_RE.match(path)
+                if export_match is not None:
+                    self._export_key(export_match.group(1), parts)
                     return
             except LedgerError as exc:
                 self._server_error(exc)
@@ -355,6 +374,114 @@ def make_handler(store: KeyStore) -> type:
                 self._send_json(404, {"error": "key not found"})
                 return
             self._send_json(200, record.to_status_response())
+
+        def _export_key(self, key_id: str, parts) -> None:
+            payload = self._read_json_object()
+            if payload is None:
+                return
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                # The body must itself carry a non-empty tenant_id.
+                if not self._record_conflict():
+                    return
+                self._bad_request("field tenant_id must be a non-empty string")
+                return
+            tenant_id = self._tenant(parts, payload)
+            if tenant_id is None:
+                return
+            if self._bad_key_id(key_id):
+                return
+            passphrase = payload.get("passphrase")
+            if not isinstance(passphrase, str) or not passphrase:
+                if not self._record_attempt(
+                    tenant_id, key_id, audit_mod.ACTION_EXPORT,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._bad_request(
+                    "field passphrase must be a non-empty string"
+                )
+                return
+            record = store.get(key_id, tenant_id)
+            if record is None:
+                # Unknown key and another tenant's key look identical.
+                if not self._record_attempt(
+                    tenant_id, key_id, audit_mod.ACTION_EXPORT,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._send_json(404, {"error": "key not found"})
+                return
+            bundle = encrypt_bundle(passphrase, build_export_payload(record))
+            if not self._record_attempt(
+                tenant_id, key_id, audit_mod.ACTION_EXPORT,
+                audit_mod.OUTCOME_SUCCESS,
+            ):
+                return
+            self._send_json(200, {"format": EXPORT_FORMAT, "bundle": bundle})
+
+        def _import_key(self) -> None:
+            payload = self._read_json_object()
+            if payload is None:
+                return
+            # tenant_id comes from the body for import; validate it first so
+            # later field errors are tenant-visible rejections.
+            tenant_id = payload.get("tenant_id")
+            if not isinstance(tenant_id, str) or not tenant_id:
+                if not self._record_conflict():
+                    return
+                self._bad_request("field tenant_id must be a non-empty string")
+                return
+            for field in ("passphrase", "bundle"):
+                value = payload.get(field)
+                if not isinstance(value, str) or not value:
+                    if not self._record_attempt(
+                        tenant_id, None, audit_mod.ACTION_IMPORT,
+                        audit_mod.OUTCOME_REJECTED,
+                    ):
+                        return
+                    self._bad_request(
+                        "field %s must be a non-empty string" % field
+                        if value is not None
+                        else "missing required field: %s" % field
+                    )
+                    return
+            try:
+                decrypted = decrypt_bundle(payload["passphrase"], payload["bundle"])
+                data = validate_import_payload(decrypted)
+            except BundleError as exc:
+                # Decryption failure, tampering, format/version errors and
+                # missing fields all 400 here, naming the field; nothing has
+                # been written, so no partial import can remain.
+                if not self._record_attempt(
+                    tenant_id, None, audit_mod.ACTION_IMPORT,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._bad_request(str(exc))
+                return
+            key_id = data["key_id"]
+            status, record = store.import_key(tenant_id, data)
+            if status == "conflict":
+                # This tenant already has the key_id; it stays untouched.
+                if not self._record_attempt(
+                    tenant_id, key_id, audit_mod.ACTION_IMPORT,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._send_json(409, {"error": "key already exists"})
+                return
+            if status == "foreign":
+                # The key_id is taken by another tenant: answer exactly like
+                # an unknown key so existence is never leaked across tenants.
+                if not self._record_attempt(
+                    tenant_id, key_id, audit_mod.ACTION_IMPORT,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._send_json(404, {"error": "key not found"})
+                return
+            self._send_json(201, record.to_create_response())
 
         # -- GET ----------------------------------------------------------
         def do_GET(self) -> None:

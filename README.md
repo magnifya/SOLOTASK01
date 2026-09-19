@@ -46,11 +46,27 @@ python -m keymgr --data-dir ./keymgr_data serve --host 127.0.0.1 --port 8080
   或 `?tenant_id=`（两者同时给出必须一致）。返回 `200`：
   `{"key_id", "status", "reason", "operator", "revoked_at"}`；
   `active`（含无状态字段的旧记录）时后三项为 `null`。
+- `POST /v1/keys/{key_id}/export`：导出密钥为加密包。请求体 JSON 含非空
+  字符串 `tenant_id`、`passphrase`；`X-Tenant-Id` / `?tenant_id=` 可选，
+  但必须与 body 一致，冲突返回 `400` 且错误指明 `tenant_id`。成功返回
+  `200`：`{"format": "keymgr-export-v1", "bundle"}`；`bundle` 为不透明
+  base64，内部用口令派生密钥（PBKDF2-HMAC-SHA256）做 AES-GCM 认证加密，
+  包含 `label`、全部版本的算法/时间/公钥/私有材料、`current` 指针与吊销
+  字段。包内不含口令，响应与账本均不含私有材料。未知或跨租户 key 返回
+  `404`。
+- `POST /v1/keys/import`：导入加密包。请求体 JSON 含非空字符串
+  `tenant_id`、`passphrase`、`bundle`。口令错误、包被篡改、格式/版本不受
+  支持或包内缺字段均返回 `400` 且错误指明字段，不留下任何半成品。成功
+  返回 `201`：`{"key_id", "algorithm", "public_key"}`，并完整保留原
+  `key_id`、全部版本、`current` 指针、`label` 与吊销状态。该租户已拥有
+  同一 `key_id` 时返回 `409`，原记录不变；`key_id` 属于其他租户时与未知
+  key 一样返回 `404`，不泄露其存在。
 - `GET /v1/audit`：查询本租户的审计事件。租户由**单一** `X-Tenant-Id`
   头或**单一** `?tenant_id=` 参数提供；缺失、重复、为空或两者冲突均返回
   `400` 且错误信息指出 `tenant_id`。可选筛选：`key_id`（非 UUID4 返回
   `400`）、`action`（`create` / `read` / `rotate` / `revoke` /
-  `tenant_conflict` 五值之一）、`limit`（默认 `100`，范围 `1–1000`）、
+  `export` / `import` / `tenant_conflict` 七值之一）、`limit`（默认
+  `100`，范围 `1–1000`）、
   `cursor`（上一页返回的不透明游标）。返回
   `{"events", "next_cursor"}`，事件按 `timestamp`、`event_id` 升序；
   `next_cursor` 为 `null` 表示到末页。未知但合法的 `key_id` 返回空列表。
@@ -71,10 +87,11 @@ per-key 锁（进程内锁 + `fcntl` 跨进程锁）保护下做读-改-写并�
 
 ## 审计
 
-密钥的生成、读取（含当前版本、历史版本、状态查询）、轮换、吊销都会写入
-持久化审计账。每条事件字段为 `event_id`、`tenant_id`、`action`、`key_id`、
-`outcome`、`timestamp`（UTC）；`action` 为 `create` / `read` / `rotate` /
-`revoke`，`outcome` 为 `success` / `rejected`。
+密钥的生成、读取（含当前版本、历史版本、状态查询）、轮换、吊销、导出与
+导入都会写入持久化审计账。每条事件字段为 `event_id`、`tenant_id`、`action`、
+`key_id`、`outcome`、`timestamp`（UTC）；`action` 为 `create` / `read` /
+`rotate` / `revoke` / `export` / `import`，`outcome` 为 `success` /
+`rejected`。
 
 - 租户已确定且 `key_id` 合法时，事件同时记录两个标识，且仅该请求租户可见。
   未知或跨租户的访问记为 `outcome=rejected`，只对请求租户可见，不泄露密钥
@@ -124,6 +141,17 @@ python -m keymgr --data-dir ./keymgr_data revoke \
 # 状态：字段同 revoke；active 时 reason/operator/revoked_at 为 null
 python -m keymgr --data-dir ./keymgr_data status \
   --tenant-id tenant-a --key-id <key_id>
+```
+
+导出与导入同样打印单行 JSON，字段与对应 HTTP 响应一致：
+
+```bash
+# 导出：输出 {"format":"keymgr-export-v1","bundle":...}
+python -m keymgr --data-dir ./keymgr_data export \
+  --tenant-id tenant-a --key-id <key_id> --passphrase '<口令>'
+# 导入：输出 {"key_id","algorithm","public_key"}，保留原 key_id 与全部版本
+python -m keymgr --data-dir ./keymgr_data import \
+  --tenant-id tenant-a --passphrase '<口令>' --bundle '<bundle>'
 ```
 
 审计查询同样打印单行 JSON，字段与 `GET /v1/audit` 响应一致
