@@ -248,7 +248,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             if not _identifiers_ok(args.tenant_id, args.key_id):
                 if not _conflict(store):
                     return 1
-            return _fail("key not found", 4)
+            return _fail("field key_id must be a UUID4", 2)
         if not allowed(audit_mod.ACTION_READ):
             return _deny(store, args.tenant_id, args.key_id,
                          audit_mod.ACTION_READ)
@@ -291,7 +291,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not is_valid_key_id(args.key_id):
             if not _conflict(store):
                 return 1
-            return _fail("key not found", 4)
+            return _fail("field key_id must be a UUID4", 2)
         if not allowed(audit_mod.ACTION_ROTATE):
             return _deny(store, args.tenant_id, args.key_id,
                          audit_mod.ACTION_ROTATE)
@@ -316,7 +316,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             if not _identifiers_ok(args.tenant_id, args.key_id):
                 if not _conflict(store):
                     return 1
-            return _fail("version not found", 4)
+            return _fail("field key_id must be a UUID4", 2)
         if not allowed(audit_mod.ACTION_READ):
             return _deny(store, args.tenant_id, args.key_id,
                          audit_mod.ACTION_READ)
@@ -355,7 +355,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not is_valid_key_id(args.key_id):
             if not _conflict(store):
                 return 1
-            return _fail("key not found", 4)
+            return _fail("field key_id must be a UUID4", 2)
         if not allowed(audit_mod.ACTION_REVOKE):
             return _deny(store, args.tenant_id, args.key_id,
                          audit_mod.ACTION_REVOKE)
@@ -380,7 +380,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             if not _identifiers_ok(args.tenant_id, args.key_id):
                 if not _conflict(store):
                     return 1
-            return _fail("key not found", 4)
+            return _fail("field key_id must be a UUID4", 2)
         if not allowed(audit_mod.ACTION_READ):
             return _deny(store, args.tenant_id, args.key_id,
                          audit_mod.ACTION_READ)
@@ -416,7 +416,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not is_valid_key_id(args.key_id):
             if not _conflict(store):
                 return 1
-            return _fail("key not found", 4)
+            return _fail("field key_id must be a UUID4", 2)
         if not allowed(audit_mod.ACTION_EXPORT):
             return _deny(store, args.tenant_id, args.key_id,
                          audit_mod.ACTION_EXPORT)

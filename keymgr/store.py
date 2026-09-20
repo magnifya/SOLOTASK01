@@ -21,15 +21,17 @@ try:  # fcntl is POSIX-only; rotation still works without cross-process locks.
 except ImportError:  # pragma: no cover - non-POSIX platforms
     fcntl = None
 
-# A key_id is a canonical UUID4 hex string; validating it prevents path
-# traversal via key_id in lookups.
+# A key_id is a canonical RFC 4122 UUID4 hex string: the version nibble must
+# be 4 and the variant nibble must be one of 8/9/a/b. Validating it prevents
+# path traversal via key_id in lookups and rejects malformed identifiers as
+# parameter errors rather than missing keys.
 _KEY_ID_RE = re.compile(
-    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
 )
 
 
 def is_valid_key_id(key_id) -> bool:
-    """True only for a canonical lowercase UUID4 string."""
+    """True only for a canonical lowercase RFC 4122 UUID4 string."""
     return isinstance(key_id, str) and bool(_KEY_ID_RE.fullmatch(key_id))
 
 
@@ -692,4 +694,22 @@ class KeyStore:
         """Acquire the in-process and cross-process locks for one key_id."""
         with self._key_lock(key_id), self._file_lock(key_id):
             yield
+
+    @contextmanager
+    def multi_key_locks(self, key_ids) -> Iterator[None]:
+        """Acquire the per-key locks for many key_ids, in sorted order.
+
+        A fixed acquisition order keeps this deadlock-free against the
+        restore transaction, which also takes its key locks sorted.
+        """
+        acquired = []
+        try:
+            for key_id in sorted(set(key_ids)):
+                lock_cm = self.key_locks(key_id)
+                lock_cm.__enter__()
+                acquired.append(lock_cm)
+            yield
+        finally:
+            for lock_cm in reversed(acquired):
+                lock_cm.__exit__(None, None, None)
 

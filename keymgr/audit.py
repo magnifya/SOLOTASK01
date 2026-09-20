@@ -160,7 +160,12 @@ class AuditLog:
             os.close(fd)
 
     def _signing_secret(self) -> bytes:
-        """Load (creating once, 0600) the HMAC secret used for cursors."""
+        """Load (creating once, 0600) the HMAC secret used for cursors.
+
+        The read-or-create runs under the same cross-process file lock as
+        appends, so two processes initializing concurrently cannot raise
+        FileExistsError or read a half-written secret.
+        """
         if self._secret is not None:
             return self._secret
         try:
@@ -171,20 +176,31 @@ class AuditLog:
                 return secret
         except FileNotFoundError:
             pass
-        secret = os.urandom(32)
-        fd = os.open(self._secret_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd = self._locked_file()
         try:
-            os.write(fd, secret.hex().encode("ascii"))
-            os.fsync(fd)
-        except FileExistsError:
-            os.close(fd)
-            with open(self._secret_path, "rb") as fh:
-                self._secret = fh.read()
-            return self._secret
-        else:
-            os.close(fd)
-        self._secret = secret.hex().encode("ascii")
-        return self._secret
+            # Re-check under the lock: another process may have completed
+            # the initialization while this one waited.
+            try:
+                with open(self._secret_path, "rb") as fh:
+                    secret = fh.read()
+                if secret:
+                    self._secret = secret
+                    return secret
+            except FileNotFoundError:
+                pass
+            secret = os.urandom(32).hex().encode("ascii")
+            out = os.open(
+                self._secret_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+            )
+            try:
+                os.write(out, secret)
+                os.fsync(out)
+            finally:
+                os.close(out)
+            self._secret = secret
+            return secret
+        finally:
+            self._unlock_file(fd)
 
     # -- reads -------------------------------------------------------------
     def _read_all_locked(self) -> List[AuditEvent]:
@@ -210,9 +226,18 @@ class AuditLog:
         return events
 
     def _read_all(self) -> List[AuditEvent]:
-        """Read under the append lock for a consistent snapshot."""
+        """Read under both locks for a consistent cross-process snapshot.
+
+        Appends commit (write + fsync) while holding the exclusive file
+        lock, so a reader holding the same lock never observes a torn or
+        partially-committed tail.
+        """
         with self._append_lock:
-            return self._read_all_locked()
+            fd = self._locked_file()
+            try:
+                return self._read_all_locked()
+            finally:
+                self._unlock_file(fd)
 
     @staticmethod
     def _fingerprint(events: List[AuditEvent]) -> str:

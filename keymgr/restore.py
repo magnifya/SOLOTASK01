@@ -23,19 +23,33 @@ An empty bundle (``keys == []`` and ``policy is null``) creates no files but
 still commits the single ``import`` event and reports success.
 """
 
+import hashlib
+import json
 import os
 import threading
-from typing import Dict, List, NamedTuple, Optional
+from contextlib import contextmanager
+from typing import Dict, Iterator, List, NamedTuple, Optional
 
 from . import audit as audit_mod
 from . import tenantbundle
 from .audit import AuditEvent, LedgerError
 from .policy import Rule
 
+try:  # fcntl is POSIX-only; restores still work without cross-process locks.
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    fcntl = None
+
 # Restore outcomes.
 RESTORE_CREATED = "created"
 RESTORE_SAME_TENANT_CONFLICT = "same_tenant_conflict"
 RESTORE_FOREIGN_CONFLICT = "foreign_conflict"
+
+# An empty restore writes no key/policy file, so it persists its idempotency
+# marker as ``restore-empty-<sha256(tenant_id)>.json`` in the data directory:
+# the batch commits at most once and a repeated empty restore of the same
+# tenant conflicts instead of logging a second import event.
+_EMPTY_MARKER_PREFIX = "restore-empty-"
 
 
 class Conflict(NamedTuple):
@@ -81,17 +95,34 @@ class RestoreCoordinator:
 
     # -- backup ------------------------------------------------------------
     def backup_payload(self, tenant_id: str) -> dict:
-        """Build the decrypted tenant payload {format, tenant_id, keys, policy}."""
-        records = self.store.list_for_tenant(tenant_id)
-        rules = self.policy_store.get(tenant_id)
-        return {
-            "format": tenantbundle.FORMAT,
-            "tenant_id": tenant_id,
-            "keys": [self.store.backup_entry(r) for r in records],
-            "policy": None
-            if rules is None
-            else {"rules": [r.to_json() for r in rules]},
-        }
+        """Build the decrypted tenant payload {format, tenant_id, keys, policy}.
+
+        The read runs under the tenant's policy lock and every key lock of
+        the tenant (all acquired in the same sorted order the restore
+        transaction uses), so the bundle is one committed view: a concurrent
+        rotate/revoke/policy update in any process is either fully before or
+        fully after the snapshot, never mixed into it.
+        """
+        key_ids = [r.key_id for r in self.store.list_for_tenant(tenant_id)]
+        with self.policy_store.tenant_lock(tenant_id), self.store.multi_key_locks(
+            key_ids
+        ):
+            # Re-read under the locks: a record listed above may have been
+            # rotated or revoked since the unlocked directory scan.
+            records = []
+            for key_id in key_ids:
+                record = self.store.read_raw(key_id)
+                if record is not None and record.tenant_id == tenant_id:
+                    records.append(record)
+            rules = self.policy_store.get(tenant_id)
+            return {
+                "format": tenantbundle.FORMAT,
+                "tenant_id": tenant_id,
+                "keys": [self.store.backup_entry(r) for r in records],
+                "policy": None
+                if rules is None
+                else {"rules": [r.to_json() for r in rules]},
+            }
 
     def backup_bundle(self, tenant_id: str, passphrase: str) -> str:
         """Seal the tenant's full state into an opaque backup bundle."""
@@ -100,6 +131,35 @@ class RestoreCoordinator:
         )
 
     # -- restore -----------------------------------------------------------
+    @contextmanager
+    def _cross_process_restore_lock(self) -> Iterator[None]:
+        """Serialize whole restore transactions across processes.
+
+        The in-process ``_restore_lock`` cannot stop a second server or CLI
+        process from interleaving its conflict scan with this one's writes;
+        an exclusive ``fcntl`` lock on ``restore.lock`` can.
+        """
+        if fcntl is None:  # pragma: no cover - non-POSIX platforms
+            yield
+            return
+        fd = os.open(
+            os.path.join(self.store.data_dir, "restore.lock"),
+            os.O_RDWR | os.O_CREAT,
+            0o600,
+        )
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def _empty_marker_path(self, tenant_id: str) -> str:
+        digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()
+        return os.path.join(
+            self.store.data_dir, _EMPTY_MARKER_PREFIX + digest + ".json"
+        )
+
     def restore(self, tenant_id: str, payload: dict) -> RestoreResult:
         """Atomically restore a validated tenant payload.
 
@@ -107,7 +167,7 @@ class RestoreCoordinator:
         existing file byte-for-byte untouched. Raises LedgerError when the
         transaction cannot be committed; all written files are rolled back.
         """
-        with self._restore_lock:
+        with self._restore_lock, self._cross_process_restore_lock():
             key_ids = sorted(k["key_id"] for k in payload["keys"])
             policy_rules = None
             if payload["policy"] is not None:
@@ -131,6 +191,30 @@ class RestoreCoordinator:
                 audit_mod.OUTCOME_SUCCESS,
             )
             writes_policy = policy_rules is not None
+
+            if not key_ids and not writes_policy:
+                # Empty bundle: no key/policy files, but the batch still
+                # commits a persistent idempotency marker plus its single
+                # import event, so a repeated empty restore of this tenant
+                # conflicts (409) instead of succeeding twice. The policy
+                # conflict is re-checked under the tenant's policy lock so a
+                # concurrent policy write in another process linearizes
+                # either before or after this restore.
+                with self.policy_store.tenant_lock(tenant_id):
+                    policy_path = self.policy_store.path_for(tenant_id)
+                    if os.path.exists(policy_path):
+                        owner = self.policy_store.owner_of_path(policy_path)
+                        if owner is not None and owner != tenant_id:
+                            return RestoreResult(
+                                status=RESTORE_FOREIGN_CONFLICT,
+                                conflict=Conflict(kind="policy", owner=owner),
+                            )
+                        return RestoreResult(
+                            status=RESTORE_SAME_TENANT_CONFLICT,
+                            conflict=Conflict(kind="policy", owner=tenant_id),
+                        )
+                    return self._commit_empty(tenant_id, event)
+
             marker = {
                 "_restore": True,
                 "event": event.to_json(),
@@ -147,20 +231,51 @@ class RestoreCoordinator:
                 for key_id in key_ids
             ]
 
-            if not records and not writes_policy:
-                # Empty bundle: no files, but the successful import is still
-                # part of the ledger.
-                self.store.audit.append(event)
-                return RestoreResult(
-                    status=RESTORE_CREATED,
-                    tenant_id=tenant_id,
-                    key_ids=[],
-                    policy_restored=False,
-                )
-
             return self._commit(
                 tenant_id, key_ids, records, policy_rules, event, marker
             )
+
+    def _commit_empty(self, tenant_id: str, event: AuditEvent) -> RestoreResult:
+        """Commit an empty restore: idempotency marker + one import event.
+
+        The marker file first lands carrying the pending event, the event is
+        appended, then the marker is finalized with the event cleared. A
+        ledger failure removes the marker (nothing commits); a crash is
+        repaired by recovery exactly like a multi-file restore group.
+        """
+        path = self._empty_marker_path(tenant_id)
+        if os.path.exists(path):
+            # This tenant already committed an empty restore batch.
+            return RestoreResult(
+                status=RESTORE_SAME_TENANT_CONFLICT,
+                conflict=Conflict(kind="batch", owner=tenant_id),
+            )
+        marker = {
+            "_restore": True,
+            "_empty": True,
+            "event": event.to_json(),
+            "tenant_id": tenant_id,
+            "key_ids": [],
+            "policy": False,
+        }
+        self.store._write_atomic(path, marker)
+        try:
+            self.store.audit.append(event)
+        except BaseException:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
+        finalized = dict(marker)
+        finalized["event"] = None
+        self.store._write_atomic(path, finalized)
+        return RestoreResult(
+            status=RESTORE_CREATED,
+            tenant_id=tenant_id,
+            key_ids=[],
+            policy_restored=False,
+        )
 
     def _scan_conflicts(
         self, tenant_id: str, key_ids: List[str]
@@ -208,9 +323,10 @@ class RestoreCoordinator:
     ) -> RestoreResult:
         """Run the multi-file outbox transaction under all required locks."""
         locked = []
+        policy_cm = self.policy_store.tenant_lock(tenant_id)
         policy_taken = False
         try:
-            self.policy_store._write_lock.acquire()
+            policy_cm.__enter__()
             policy_taken = True
             for key_id in key_ids:
                 lock_cm = self.store.key_locks(key_id)
@@ -267,7 +383,7 @@ class RestoreCoordinator:
             for lock_cm in reversed(locked):
                 lock_cm.__exit__(None, None, None)
             if policy_taken:
-                self.policy_store._write_lock.release()
+                policy_cm.__exit__(None, None, None)
 
     def _rollback(
         self, written_keys: List[str], wrote_policy: bool, tenant_id: str
@@ -303,6 +419,9 @@ class RestoreCoordinator:
         except OSError:
             names = []
         for name in names:
+            if name.startswith(_EMPTY_MARKER_PREFIX) and name.endswith(".json"):
+                self._recover_empty_marker(os.path.join(data_dir, name))
+                continue
             if not (name.endswith(".json") and _is_uuid(name[:-5])):
                 continue
             path = os.path.join(data_dir, name)
@@ -334,6 +453,38 @@ class RestoreCoordinator:
 
         for eid, group in groups.items():
             self._recover_group(eid, group)
+
+    def _recover_empty_marker(self, path: str) -> None:
+        """Resolve an empty-restore idempotency marker after a crash.
+
+        A finalized marker (``event`` is null) is the persistent record that
+        the batch committed; it stays. A marker still carrying its pending
+        event is finished when the event reached the ledger, and removed
+        otherwise — both idempotently, mirroring multi-file recovery.
+        """
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                marker = json.load(fh)
+        except (OSError, ValueError):
+            return
+        if not isinstance(marker, dict) or not marker.get("_restore"):
+            return
+        event = marker.get("event")
+        if not event:
+            return  # finalized marker: the committed batch's idempotency record
+        try:
+            committed = self.store.audit.get_event(event["event_id"]) is not None
+        except (LedgerError, KeyError, TypeError):
+            return  # leave it for a later open to retry
+        if committed:
+            finalized = dict(marker)
+            finalized["event"] = None
+            self.store._write_atomic(path, finalized)
+        else:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
     def _recover_group(self, eid: str, group: _PendingGroup) -> None:
         marker = group.marker
