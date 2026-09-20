@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import tempfile
 import threading
 import uuid
 from dataclasses import dataclass
@@ -160,31 +161,47 @@ class AuditLog:
             os.close(fd)
 
     def _signing_secret(self) -> bytes:
-        """Load (creating once, 0600) the HMAC secret used for cursors."""
+        """Load (creating once, 0600) the HMAC secret used for cursors.
+
+        Creation is serialized on the same sidecar lock as appends and the
+        file is installed by atomic replace, so a first concurrent
+        initialization never raises FileExistsError and no reader can observe
+        an empty or half-written secret.
+        """
         if self._secret is not None:
             return self._secret
-        try:
-            with open(self._secret_path, "rb") as fh:
-                secret = fh.read()
-            if secret:
+        with self._append_lock:
+            if self._secret is not None:
+                return self._secret
+            fd = self._locked_file()
+            try:
+                try:
+                    with open(self._secret_path, "rb") as fh:
+                        secret = fh.read()
+                except FileNotFoundError:
+                    secret = b""
+                if not secret:
+                    secret = os.urandom(32).hex().encode("ascii")
+                    fd_tmp, tmp_path = tempfile.mkstemp(
+                        dir=self.data_dir, suffix=".tmp"
+                    )
+                    try:
+                        with os.fdopen(fd_tmp, "wb") as fh:
+                            fh.write(secret)
+                            fh.flush()
+                            os.fsync(fh.fileno())
+                        os.chmod(tmp_path, 0o600)
+                        os.replace(tmp_path, self._secret_path)
+                    except BaseException:
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+                        raise
                 self._secret = secret
                 return secret
-        except FileNotFoundError:
-            pass
-        secret = os.urandom(32)
-        fd = os.open(self._secret_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            os.write(fd, secret.hex().encode("ascii"))
-            os.fsync(fd)
-        except FileExistsError:
-            os.close(fd)
-            with open(self._secret_path, "rb") as fh:
-                self._secret = fh.read()
-            return self._secret
-        else:
-            os.close(fd)
-        self._secret = secret.hex().encode("ascii")
-        return self._secret
+            finally:
+                self._unlock_file(fd)
 
     # -- reads -------------------------------------------------------------
     def _read_all_locked(self) -> List[AuditEvent]:
@@ -210,9 +227,15 @@ class AuditLog:
         return events
 
     def _read_all(self) -> List[AuditEvent]:
-        """Read under the append lock for a consistent snapshot."""
+        """Read under the append and cross-process locks for a consistent
+        snapshot: a concurrent append in another process cannot leave a
+        torn tail line in the result."""
         with self._append_lock:
-            return self._read_all_locked()
+            fd = self._locked_file()
+            try:
+                return self._read_all_locked()
+            finally:
+                self._unlock_file(fd)
 
     @staticmethod
     def _fingerprint(events: List[AuditEvent]) -> str:

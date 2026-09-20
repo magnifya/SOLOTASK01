@@ -21,15 +21,17 @@ try:  # fcntl is POSIX-only; rotation still works without cross-process locks.
 except ImportError:  # pragma: no cover - non-POSIX platforms
     fcntl = None
 
-# A key_id is a canonical UUID4 hex string; validating it prevents path
-# traversal via key_id in lookups.
+# A key_id is a canonical RFC 4122 UUID4 string: the version nibble must be
+# 4 and the variant bits must be 10xx (8/9/a/b). Validating it strictly
+# prevents path traversal via key_id in lookups and rejects identifiers the
+# service itself would never have issued.
 _KEY_ID_RE = re.compile(
-    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
 )
 
 
 def is_valid_key_id(key_id) -> bool:
-    """True only for a canonical lowercase UUID4 string."""
+    """True only for a canonical lowercase RFC 4122 UUID4 string."""
     return isinstance(key_id, str) and bool(_KEY_ID_RE.fullmatch(key_id))
 
 
@@ -692,4 +694,37 @@ class KeyStore:
         """Acquire the in-process and cross-process locks for one key_id."""
         with self._key_lock(key_id), self._file_lock(key_id):
             yield
+
+    def list_key_ids(self) -> list:
+        """Return every key_id with a record file on disk (sorted)."""
+        try:
+            names = os.listdir(self.data_dir)
+        except OSError:
+            return []
+        return sorted(
+            name[:-5]
+            for name in names
+            if name.endswith(".json") and is_valid_key_id(name[:-5])
+        )
+
+    @contextmanager
+    def all_key_locks(self, key_ids) -> Iterator[None]:
+        """Acquire every listed key's locks, in sorted order.
+
+        Used by tenant backup to read a consistent committed view: while the
+        locks are held no rotation, revocation, import or restore can change
+        any of these records, so versions, current pointers and revocation
+        fields never mix across keys. Sorted acquisition matches the restore
+        coordinator's order, so the two cannot deadlock.
+        """
+        cms = []
+        try:
+            for key_id in sorted(key_ids):
+                cm = self.key_locks(key_id)
+                cm.__enter__()
+                cms.append(cm)
+            yield
+        finally:
+            for cm in reversed(cms):
+                cm.__exit__(None, None, None)
 

@@ -147,16 +147,34 @@ def make_handler(
         def _tenant(self, parts, body=_MISSING):
             """Resolve tenant from X-Tenant-Id / query / JSON body.
 
-            Returns the tenant id, or None after sending 400. Two different
-            supplied tenant identifiers are a conflicting-parameter 400. Any
-            missing/empty/conflicting tenant is written to the ledger as an
-            invisible tenant_conflict event.
+            Returns the tenant id, or None after sending 400. A duplicated
+            X-Tenant-Id header or a duplicated ?tenant_id= query parameter is
+            a 400 naming tenant_id; two different supplied tenant identifiers
+            are a conflicting-parameter 400. Any missing/empty/duplicate/
+            conflicting tenant is written to the ledger as an invisible
+            tenant_conflict event.
             """
             candidates = []
-            header = self.headers.get("X-Tenant-Id")
-            if header is not None:
-                candidates.append(header)
-            query = parse_qs(parts.query).get("tenant_id")
+            headers = self.headers.get_all("X-Tenant-Id") or []
+            if len(headers) > 1:
+                if not self._record_conflict():
+                    return None
+                self._bad_request(
+                    "duplicate tenant_id (provide a single X-Tenant-Id header)"
+                )
+                return None
+            if headers:
+                candidates.append(headers[0])
+            query = parse_qs(parts.query, keep_blank_values=True).get(
+                "tenant_id", []
+            )
+            if len(query) > 1:
+                if not self._record_conflict():
+                    return None
+                self._bad_request(
+                    "duplicate tenant_id (provide a single tenant_id parameter)"
+                )
+                return None
             if query:
                 candidates.append(query[0])
             if body is not _MISSING:
@@ -196,25 +214,27 @@ def make_handler(
 
             Exactly one of a single X-Tenant-Id header or a single
             ?tenant_id= parameter must supply it. Any missing/duplicate/
-            empty/conflicting value is a 400 naming tenant_id; the audit
-            endpoint itself is never written to the ledger.
+            empty/conflicting value is a 400 naming tenant_id and is written
+            to the ledger as an invisible tenant_conflict event; a successful
+            audit query itself is never recorded.
             """
             headers = self.headers.get_all("X-Tenant-Id") or []
-            if len(headers) > 1:
-                self._bad_request(
-                    "duplicate tenant_id (provide a single X-Tenant-Id header)"
-                )
-                return None
             query_values = parse_qs(parts.query, keep_blank_values=True).get(
                 "tenant_id", []
             )
+
+            def fail(message: str) -> None:
+                if self._record_conflict():
+                    self._bad_request(message)
+
+            if len(headers) > 1:
+                fail("duplicate tenant_id (provide a single X-Tenant-Id header)")
+                return None
             if len(query_values) > 1:
-                self._bad_request(
-                    "duplicate tenant_id (provide a single tenant_id parameter)"
-                )
+                fail("duplicate tenant_id (provide a single tenant_id parameter)")
                 return None
             if headers and query_values:
-                self._bad_request(
+                fail(
                     "conflicting tenant_id parameters (use header or query, not both)"
                 )
                 return None
@@ -222,10 +242,10 @@ def make_handler(
                 query_values[0] if query_values else None
             )
             if tenant is None:
-                self._bad_request("missing required field: tenant_id")
+                fail("missing required field: tenant_id")
                 return None
             if not tenant:
-                self._bad_request("field tenant_id must be a non-empty string")
+                fail("field tenant_id must be a non-empty string")
                 return None
             return tenant
 
@@ -237,12 +257,12 @@ def make_handler(
             return int(raw)
 
         def _bad_key_id(self, key_id) -> bool:
-            """Record an invisible conflict for an illegal key_id."""
+            """Reject a non-UUID4 key_id with 400; record an invisible conflict."""
             if is_valid_key_id(key_id):
                 return False
             if not self._record_conflict():
                 return True
-            self._send_json(404, {"error": "key not found"})
+            self._bad_request("field key_id must be a UUID4")
             return True
 
         # -- POST ---------------------------------------------------------
@@ -926,7 +946,8 @@ def make_handler(
                 return
             key_id = values[0] if values else None
             if key_id is not None and not is_valid_key_id(key_id):
-                self._bad_request("field key_id must be a UUID4")
+                if self._record_conflict():
+                    self._bad_request("field key_id must be a UUID4")
                 return
 
             values, errored = self._single_param(qs, "action")

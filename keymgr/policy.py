@@ -20,11 +20,17 @@ import json
 import os
 import tempfile
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Iterator, List, Optional
 
 from . import audit as audit_mod
 from .audit import AuditEvent, AuditLog, LedgerError
+
+try:  # fcntl is POSIX-only.
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    fcntl = None
 
 # Actions a policy rule can govern. These are the same action names the audit
 # ledger uses (the management actions policy_* are deliberately not governable).
@@ -164,11 +170,54 @@ class PolicyStore:
         digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()
         return os.path.join(self.dir_path, digest + ".json")
 
+    def _lock_path_for(self, tenant_id: str) -> str:
+        digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()
+        return os.path.join(self.dir_path, digest + ".lock")
+
+    @contextmanager
+    def tenant_lock(self, tenant_id: str) -> Iterator[None]:
+        """Serialize one tenant's policy writes across threads and processes.
+
+        Combines the in-process write lock with an exclusive ``fcntl`` lock
+        on a per-tenant sidecar file, so a policy update and a tenant backup
+        (or a restore) in another process never interleave.
+        """
+        with self._write_lock:
+            if fcntl is None:  # pragma: no cover - non-POSIX platforms
+                yield
+                return
+            fd = os.open(
+                self._lock_path_for(tenant_id), os.O_RDWR | os.O_CREAT, 0o600
+            )
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+
     def _write_atomic(self, path: str, payload: dict) -> None:
         fd, tmp_path = tempfile.mkstemp(dir=self.dir_path, suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    def _write_atomic_text(self, path: str, text: str) -> None:
+        """Atomically restore a previously read raw document."""
+        fd, tmp_path = tempfile.mkstemp(dir=self.dir_path, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(text)
                 fh.flush()
                 os.fsync(fh.fileno())
             os.chmod(tmp_path, 0o600)
@@ -206,46 +255,58 @@ class PolicyStore:
             doc = self._read_doc(path)
             if doc is None:
                 continue
-            tenant_id, rules, pending_event = doc
-            if not pending_event:
-                # A tombstone left behind after a successful ledger append:
-                # finish the delete.
-                if name.endswith(".del"):
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
-                continue
-            # A multi-file tenant restore transaction is resolved by the
-            # RestoreCoordinator (its manifest drives the shared event).
-            if isinstance(pending_event, dict) and pending_event.get("_restore"):
-                continue
-            event = AuditEvent.from_json(pending_event)
-            if name.endswith(".json.del"):                # A delete tombstone. If the original file is still on disk the
-                # crash happened before the unlink, so the delete never
-                # happened: discard the tombstone without appending. Otherwise
-                # finish the transaction (append is idempotent on event_id).
-                original = path[: -len(".del")]
-                if os.path.exists(original):
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
-                    continue
-                self.audit.append(event)
+            # Serialize with any live put/delete in another process, then
+            # re-read: the state may have moved on while we waited.
+            with self.tenant_lock(doc[0]):
+                self._recover_one(path)
+
+    def _recover_one(self, path: str) -> None:
+        """Recover a single policy file; caller holds the tenant lock."""
+        name = os.path.basename(path)
+        doc = self._read_doc(path)
+        if doc is None:
+            return
+        tenant_id, rules, pending_event = doc
+        if not pending_event:
+            # A tombstone left behind after a successful ledger append:
+            # finish the delete.
+            if name.endswith(".del"):
                 try:
                     os.unlink(path)
                 except OSError:
                     pass
-            else:
-                # append() is idempotent on event_id.
-                self.audit.append(event)
-                self._write_atomic(
-                    path,
-                    {"tenant_id": tenant_id,
-                     "rules": [r.to_json() for r in rules],
-                     "pending_event": None},
-                )
+            return
+        # A multi-file tenant restore transaction is resolved by the
+        # RestoreCoordinator (its manifest drives the shared event).
+        if isinstance(pending_event, dict) and pending_event.get("_restore"):
+            return
+        event = AuditEvent.from_json(pending_event)
+        if name.endswith(".del"):
+            # A delete tombstone. If the original file is still on disk the
+            # crash happened before the unlink, so the delete never
+            # happened: discard the tombstone without appending. Otherwise
+            # finish the transaction (append is idempotent on event_id).
+            original = path[: -len(".del")]
+            if os.path.exists(original):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                return
+            self.audit.append(event)
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        else:
+            # append() is idempotent on event_id.
+            self.audit.append(event)
+            self._write_atomic(
+                path,
+                {"tenant_id": tenant_id,
+                 "rules": [r.to_json() for r in rules],
+                 "pending_event": None},
+            )
 
     def _commit_put(self, tenant_id: str, rules: List[Rule],
                     event: AuditEvent, existed: bool, previous: Optional[dict]):
@@ -281,7 +342,7 @@ class PolicyStore:
 
     def put(self, tenant_id: str, rules: List[Rule]) -> List[Rule]:
         """Replace (or create) the tenant's document and audit policy_update."""
-        with self._write_lock:
+        with self.tenant_lock(tenant_id):
             path = self._path_for(tenant_id)
             existed = os.path.exists(path)
             previous = None
@@ -305,10 +366,12 @@ class PolicyStore:
 
         Tombstone sequence: write a ``.json.del`` marker carrying the event,
         unlink the document, append the event, then remove the marker. A crash
-        between any two steps is repaired on the next open. Deleting a tenant
-        that has no document still records the management event.
+        between any two steps is repaired on the next open. If the ledger
+        append fails, the original document is restored and the tombstone
+        dropped, so a failed delete never leaves a half-finished state.
+        Deleting a tenant that has no document still records the event.
         """
-        with self._write_lock:
+        with self.tenant_lock(tenant_id):
             path = self._path_for(tenant_id)
             existed = os.path.exists(path)
             event = self.audit.new_event(
@@ -318,6 +381,13 @@ class PolicyStore:
             if not existed:
                 self.audit.append(event)
                 return
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    previous = fh.read()
+            except OSError as exc:
+                raise LedgerError(
+                    "cannot read policy document: %s" % exc
+                ) from exc
             tombstone = path + ".del"
             self._write_atomic(
                 tombstone,
@@ -325,9 +395,19 @@ class PolicyStore:
                  "pending_event": event.to_json()},
             )
             os.unlink(path)
-            # From here on a crash is repaired from the tombstone; the append
-            # is idempotent on event_id.
-            self.audit.append(event)
+            try:
+                # From here on a crash is repaired from the tombstone; the
+                # append is idempotent on event_id.
+                self.audit.append(event)
+            except BaseException:
+                # The ledger write failed: put the original document back and
+                # drop the tombstone so the delete never happened.
+                self._write_atomic_text(path, previous)
+                try:
+                    os.unlink(tombstone)
+                except OSError:
+                    pass
+                raise
             try:
                 os.unlink(tombstone)
             except OSError:
