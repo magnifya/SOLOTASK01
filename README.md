@@ -358,3 +358,39 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   篡改、改租户/筛选或可见事件集变化都会令游标失效（`400` / 退出 `2`），
   其他租户的活动不影响本租户游标。事件按 `timestamp`、`event_id` 升序，
   分页不重不漏。审计事件与响应投影均不含私钥材料。
+
+## KMS/HSM 提供者层
+
+密钥材料的生成、轮换、导入与删除都委托给一个 **provider**，由环境变量
+`KEYMGR_PROVIDER` 选择：
+
+- 缺省、为空或 `local`：内置本地 provider（`provider_id` 为 `local`），
+  材料以不透明包装形式随密钥文件保存；
+- `module:factory`：导入指定模块并无参调用工厂函数得到 provider。
+
+provider 在**首次使用时**懒加载并缓存；加载失败（模块不存在、工厂异常、
+契约不符）或操作失败时，HTTP 返回 `503`、CLI 以退出码 `1` 报错，**绝不
+回退**到本地 provider。读取类接口（show/version/current/status/audit/
+policy）不经过 provider，provider 不可用时仍可读。
+
+provider 契约：必须有非空 `provider_id` 与 `capabilities`
+（`{"algorithms": ["AES256","RSA2048"], "operations": ["generate",
+"rotate","import_material","export_material","delete"]}`）；方法
+`generate(algorithm)` / `rotate(algorithm)` /
+`import_material(algorithm, public_key, material)` 返回
+`{"handle","public_key","encrypted_material"}`（handle 与
+encrypted_material 非空），`export_material(handle)` 返回
+`{"public_key","encrypted_material"}`，`delete(handle)` 幂等。
+
+- 每个版本持久化 `provider_id`、`handle`、`encrypted_material`，只有
+  成功（含审计账本提交）才落盘；账本写失败回滚密钥文件并删除已铸句柄，
+  HTTP 返回 `500`、CLI 退出 `1`。
+- 轮换 / 导出 / 导入 / 恢复要求记录（或包）中的 `provider_id` 与当前
+  配置的 provider 一致，不符返回 `503`（CLI 退出 `1`）。
+- 导出与租户备份的每个版本附带
+  `provider: {"provider_id","handle","encrypted_material"}`；
+  `keymgr-export-v1` 旧包没有该字段时按 `local` 处理。
+- 导入 / 恢复逐版本校验元数据、算法、句柄与材料，格式错误返回 `400`
+  （CLI 退出 `2`）并指明字段；跨租户 / 未知仍为 `404`；材料一律经
+  provider 的 `import_material` 重新托管，**不落盘明文私钥**。
+- 句柄与材料从不出现在任何响应、审计事件或错误信息中。

@@ -12,6 +12,7 @@ from . import tenantbundle
 from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
 from .policy import PolicyError, PolicyStore, validate_rules
+from .providers import ProviderError
 from .store import IMPORT_CONFLICT, KeyStore, is_valid_key_id
 
 _AUDIT_PATH = "/v1/audit"
@@ -56,6 +57,12 @@ def make_handler(
             # A ledger write failure aborts the request with 500; mutations
             # have already rolled back their key-file change by this point.
             self._send_json(500, {"error": "audit ledger failure: %s" % exc})
+
+        def _provider_error(self, exc: Exception) -> None:
+            # The configured KMS/HSM provider is unavailable or rejected the
+            # operation (503). The message is static text — never a handle
+            # or key material.
+            self._send_json(503, {"error": str(exc)})
 
         def log_message(self, fmt, *args):  # silence default stderr logging
             return
@@ -300,6 +307,9 @@ def make_handler(
                     return
             except LedgerError as exc:
                 self._server_error(exc)
+                return
+            except ProviderError as exc:
+                self._provider_error(exc)
                 return
 
             self._send_json(404, {"error": "not found"})

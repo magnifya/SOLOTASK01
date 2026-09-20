@@ -13,8 +13,9 @@ from typing import Iterator, Optional
 
 from . import audit as audit_mod
 from . import keybundle
-from .audit import AuditEvent, AuditLog
-from .crypto import generate_key
+from . import providers
+from .audit import AuditEvent, AuditLog, LedgerError
+from .providers import ProviderError
 
 try:  # fcntl is POSIX-only; rotation still works without cross-process locks.
     import fcntl
@@ -41,35 +42,95 @@ IMPORT_CREATED = "created"
 IMPORT_CONFLICT = "conflict"
 
 
+def ensure_record_provider(record, provider) -> None:
+    """Require every version of a record to belong to the given provider.
+
+    Rotate/export/backup only proceed when the key is managed by the
+    currently configured provider; a mismatch is a 503 (ProviderError),
+    never a silent cross-provider operation.
+    """
+    for ver in record.versions:
+        if ver.provider_id != provider.provider_id:
+            raise ProviderError(
+                "key is managed by a different provider than the configured one"
+            )
+
+
 @dataclass
 class VersionRecord:
-    """One immutable key version. Old versions are never overwritten."""
+    """One immutable key version. Old versions are never overwritten.
+
+    KMS-era versions persist ``provider_id``/``handle``/``encrypted_material``
+    (never plaintext). Pre-KMS files carry ``private_material`` instead and
+    are treated as belonging to the local provider.
+    """
 
     version: int
     created_at: str
     algorithm: str
     public_key: Optional[str]
-    private_material: str
+    provider_id: str = providers.LOCAL_PROVIDER_ID
+    handle: Optional[str] = None
+    encrypted_material: Optional[str] = None
+    # Legacy on-disk field (pre-KMS records); never written for new versions.
+    private_material: Optional[str] = None
 
     def to_json(self) -> dict:
         """Serialize to a plain dict suitable for JSON storage."""
-        return {
+        data = {
             "version": self.version,
             "created_at": self.created_at,
             "algorithm": self.algorithm,
             "public_key": self.public_key,
-            "private_material": self.private_material,
         }
+        if self.handle is not None:
+            data["provider_id"] = self.provider_id
+            data["handle"] = self.handle
+            data["encrypted_material"] = self.encrypted_material
+        else:
+            data["private_material"] = self.private_material
+        return data
+
+    def to_bundle_json(self) -> dict:
+        """Serialize for an export/backup bundle.
+
+        KMS versions carry a nested ``provider`` object
+        (``provider_id``/``handle``/``encrypted_material``); legacy versions
+        keep the historical ``private_material`` field so old bundles stay
+        shape-compatible.
+        """
+        data = {
+            "version": self.version,
+            "created_at": self.created_at,
+            "algorithm": self.algorithm,
+            "public_key": self.public_key,
+        }
+        if self.handle is not None:
+            data["provider"] = {
+                "provider_id": self.provider_id,
+                "handle": self.handle,
+                "encrypted_material": self.encrypted_material,
+            }
+        else:
+            data["private_material"] = self.private_material
+        return data
 
     @classmethod
     def from_json(cls, data: dict) -> "VersionRecord":
-        return cls(
+        common = dict(
             version=int(data["version"]),
             created_at=data["created_at"],
             algorithm=data["algorithm"],
             public_key=data.get("public_key"),
-            private_material=data["private_material"],
         )
+        if "handle" in data or "encrypted_material" in data:
+            return cls(
+                provider_id=data["provider_id"],
+                handle=data["handle"],
+                encrypted_material=data["encrypted_material"],
+                **common
+            )
+        return cls(private_material=data["private_material"], **common)
 
     def to_version_response(self, key_id: str) -> dict:
         """Body of GET .../versions/{v} and .../current. No private material."""
@@ -207,7 +268,7 @@ class KeyRecord:
         }
 
     def to_export_payload(self) -> dict:
-        """Full record for an export bundle, including private material.
+        """Full record for an export bundle, including provider material.
 
         This projection is only ever sealed inside the authenticated bundle;
         it must never appear in an HTTP response or audit projection.
@@ -221,7 +282,7 @@ class KeyRecord:
             "reason": self.reason,
             "operator": self.operator,
             "revoked_at": self.revoked_at,
-            "versions": [ver.to_json() for ver in self.versions],
+            "versions": [ver.to_bundle_json() for ver in self.versions],
         }
 
 
@@ -414,11 +475,16 @@ class KeyStore:
     def create(self, tenant_id: str, algorithm: str, label: str) -> KeyRecord:
         """Generate, persist and return a new key record (version 1).
 
-        The create event is committed in the same transaction as the key
-        file; a ledger failure removes the just-written key file and raises
-        LedgerError, so the change and its event never land separately.
+        Material is minted by the configured key provider; only the
+        provider's handle and encrypted material are persisted. The create
+        event is committed in the same transaction as the key file; a ledger
+        failure removes the just-written key file, discards the provider
+        handle and raises LedgerError, so the change and its event never
+        land separately.
         """
-        generated = generate_key(algorithm)
+        provider = providers.get_provider()
+        providers.check_algorithm(provider, algorithm)
+        material = providers.run(provider, "generate", algorithm)
         key_id = str(uuid.uuid4())
         created_at = datetime.now(timezone.utc).isoformat()
         record = KeyRecord(
@@ -430,8 +496,10 @@ class KeyStore:
                     version=1,
                     created_at=created_at,
                     algorithm=algorithm,
-                    public_key=generated.public_material,
-                    private_material=generated.private_material,
+                    public_key=material["public_key"],
+                    provider_id=provider.provider_id,
+                    handle=material["handle"],
+                    encrypted_material=material["encrypted_material"],
                 )
             ],
             current_version=1,
@@ -440,10 +508,15 @@ class KeyStore:
             tenant_id, audit_mod.ACTION_CREATE, key_id,
             audit_mod.OUTCOME_SUCCESS, timestamp=created_at,
         )
-        # The key_id is fresh, but take the same locks as rotation so a
-        # concurrent rotate cannot observe a half-written create.
-        with self._key_lock(key_id), self._file_lock(key_id):
-            self._commit_mutation(self._path_for(key_id), record, event, None)
+        try:
+            # The key_id is fresh, but take the same locks as rotation so a
+            # concurrent rotate cannot observe a half-written create.
+            with self._key_lock(key_id), self._file_lock(key_id):
+                self._commit_mutation(self._path_for(key_id), record, event, None)
+        except LedgerError:
+            # The change did not commit: drop the minted handle too.
+            providers.discard(provider, material["handle"])
+            raise
         return record
 
     def get(self, key_id: str, tenant_id: str) -> Optional[KeyRecord]:
@@ -472,24 +545,35 @@ class KeyStore:
             record = self._read_record(path)
             if record is None or record.tenant_id != tenant_id:
                 return None
+            provider = providers.get_provider()
+            # The key must be managed by the configured provider (503
+            # otherwise); rotation never crosses provider boundaries.
+            ensure_record_provider(record, provider)
+            providers.check_algorithm(provider, algorithm)
             previous = record.to_json()
             next_number = record.current_version + 1
             created_at = datetime.now(timezone.utc).isoformat()
-            generated = generate_key(algorithm)
+            material = providers.run(provider, "rotate", algorithm)
             record.append_version(
                 VersionRecord(
                     version=next_number,
                     created_at=created_at,
                     algorithm=algorithm,
-                    public_key=generated.public_material,
-                    private_material=generated.private_material,
+                    public_key=material["public_key"],
+                    provider_id=provider.provider_id,
+                    handle=material["handle"],
+                    encrypted_material=material["encrypted_material"],
                 )
             )
             event = self.audit.new_event(
                 tenant_id, audit_mod.ACTION_ROTATE, key_id,
                 audit_mod.OUTCOME_SUCCESS, timestamp=created_at,
             )
-            self._commit_mutation(path, record, event, previous)
+            try:
+                self._commit_mutation(path, record, event, previous)
+            except LedgerError:
+                providers.discard(provider, material["handle"])
+                raise
         return record
 
     def revoke(
@@ -551,6 +635,9 @@ class KeyStore:
         record = self.get(key_id, tenant_id)
         if record is None:
             return None
+        # Export only from the provider that manages the key (503 on
+        # mismatch); the bundle carries each version's provider triple.
+        ensure_record_provider(record, providers.get_provider())
         return keybundle.encode_bundle(
             record.to_export_payload(), passphrase
         )
@@ -572,16 +659,8 @@ class KeyStore:
             existing = self._read_record(path)
             if existing is not None:
                 return IMPORT_CONFLICT, existing
-            versions = [
-                VersionRecord(
-                    version=ver["version"],
-                    created_at=ver["created_at"],
-                    algorithm=ver["algorithm"],
-                    public_key=ver["public_key"],
-                    private_material=ver["private_material"],
-                )
-                for ver in payload["versions"]
-            ]
+            provider = providers.get_provider()
+            versions = self._versions_from_bundle(provider, payload["versions"])
             record = KeyRecord(
                 key_id=key_id,
                 tenant_id=tenant_id,
@@ -597,8 +676,59 @@ class KeyStore:
                 tenant_id, audit_mod.ACTION_IMPORT, key_id,
                 audit_mod.OUTCOME_SUCCESS,
             )
-            self._commit_mutation(path, record, event, None)
+            try:
+                self._commit_mutation(path, record, event, None)
+            except LedgerError:
+                for ver in versions:
+                    providers.discard(provider, ver.handle)
+                raise
         return IMPORT_CREATED, record
+
+    @staticmethod
+    def _versions_from_bundle(provider, versions: list) -> list:
+        """Mint provider handles for validated bundle versions.
+
+        Each version's recorded provider must match the configured one
+        (versions without a provider block are pre-KMS ``local`` bundles);
+        the material is imported through the provider and only the returned
+        handle/encrypted material is kept — plaintext never reaches disk.
+        On any failure the handles minted so far are discarded.
+        """
+        built = []
+        try:
+            for ver in versions:
+                info = ver.get("provider")
+                if info is not None:
+                    bundle_provider = info["provider_id"]
+                    material = info["encrypted_material"]
+                else:
+                    bundle_provider = providers.LOCAL_PROVIDER_ID
+                    material = ver["private_material"]
+                if bundle_provider != provider.provider_id:
+                    raise ProviderError(
+                        "bundle is managed by a different provider than the"
+                        " configured one"
+                    )
+                minted = providers.run(
+                    provider, "import_material",
+                    ver["algorithm"], ver["public_key"], material,
+                )
+                built.append(
+                    VersionRecord(
+                        version=ver["version"],
+                        created_at=ver["created_at"],
+                        algorithm=ver["algorithm"],
+                        public_key=minted["public_key"],
+                        provider_id=provider.provider_id,
+                        handle=minted["handle"],
+                        encrypted_material=minted["encrypted_material"],
+                    )
+                )
+        except BaseException:
+            for ver in built:
+                providers.discard(provider, ver.handle)
+            raise
+        return built
 
     # -- tenant backup / restore ------------------------------------------
     def list_for_tenant(self, tenant_id: str) -> list:
@@ -621,7 +751,7 @@ class KeyStore:
     def backup_entry(record: KeyRecord) -> dict:
         """Project a record for a tenant backup payload.
 
-        The projection includes private material; it is only ever sealed
+        The projection includes provider material; it is only ever sealed
         inside the authenticated tenant bundle and never appears in a
         response or an audit projection.
         """
@@ -633,7 +763,7 @@ class KeyStore:
             "reason": record.reason,
             "operator": record.operator,
             "revoked_at": record.revoked_at,
-            "versions": [ver.to_json() for ver in record.versions],
+            "versions": [ver.to_bundle_json() for ver in record.versions],
         }
 
     def read_raw(self, key_id: str) -> Optional[KeyRecord]:
@@ -643,17 +773,14 @@ class KeyStore:
         return self._read_record(self._path_for(key_id))
 
     def record_from_backup(self, tenant_id: str, entry: dict) -> KeyRecord:
-        """Build an unsaved KeyRecord from a validated backup keys[i] entry."""
-        versions = [
-            VersionRecord(
-                version=ver["version"],
-                created_at=ver["created_at"],
-                algorithm=ver["algorithm"],
-                public_key=ver["public_key"],
-                private_material=ver["private_material"],
-            )
-            for ver in entry["versions"]
-        ]
+        """Build an unsaved KeyRecord from a validated backup keys[i] entry.
+
+        Versions are re-minted through the configured provider (which must
+        match the bundle's recorded provider); only handles and encrypted
+        material are kept, never plaintext.
+        """
+        provider = providers.get_provider()
+        versions = self._versions_from_bundle(provider, entry["versions"])
         return KeyRecord(
             key_id=entry["key_id"],
             tenant_id=tenant_id,

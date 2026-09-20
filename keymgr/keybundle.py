@@ -185,14 +185,19 @@ def _require(data: dict, field: str, types) -> object:
 
 
 def validate_version(ver, where: str) -> dict:
-    """Validate one versions[i] block; ``where`` names it in error messages."""
+    """Validate one versions[i] block; ``where`` names it in error messages.
+
+    A KMS-era version carries ``provider`` with a non-empty
+    ``provider_id``/``handle``/``encrypted_material`` triple. A version
+    without a ``provider`` field is a pre-KMS (local) export and must carry
+    ``private_material`` instead.
+    """
     if not isinstance(ver, dict):
         raise InvalidBundle("field %s must be an object" % where)
     number = ver.get("version")
     created_at = ver.get("created_at")
     algorithm = ver.get("algorithm")
     public_key = ver.get("public_key")
-    private_material = ver.get("private_material")
     if not isinstance(number, int) or isinstance(number, bool) or number < 1:
         raise InvalidBundle(
             "field %s.version must be a positive integer" % where
@@ -208,15 +213,38 @@ def validate_version(ver, where: str) -> dict:
         raise InvalidBundle(
             "field %s.public_key must be a string or null" % where
         )
-    if not isinstance(private_material, str) or not private_material:
-        raise InvalidBundle(
-            "field %s.private_material must be a non-empty string" % where
-        )
+    provider = ver.get("provider")
+    private_material = ver.get("private_material")
+    if provider is not None:
+        if not isinstance(provider, dict):
+            raise InvalidBundle(
+                "field %s.provider must be an object" % where
+            )
+        for name in ("provider_id", "handle", "encrypted_material"):
+            if not isinstance(provider.get(name), str) or not provider.get(name):
+                raise InvalidBundle(
+                    "field %s.provider.%s must be a non-empty string"
+                    % (where, name)
+                )
+        clean_provider = {
+            "provider_id": provider["provider_id"],
+            "handle": provider["handle"],
+            "encrypted_material": provider["encrypted_material"],
+        }
+        private_material = None
+    else:
+        # No provider block: a legacy local bundle.
+        if not isinstance(private_material, str) or not private_material:
+            raise InvalidBundle(
+                "field %s.private_material must be a non-empty string" % where
+            )
+        clean_provider = None
     return {
         "version": number,
         "created_at": created_at,
         "algorithm": algorithm,
         "public_key": public_key,
+        "provider": clean_provider,
         "private_material": private_material,
     }
 

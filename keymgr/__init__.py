@@ -1,3 +1,3 @@
 """Multi-tenant key management backend."""
 
-__all__ = ["crypto", "store", "server", "cli"]
+__all__ = ["crypto", "providers", "store", "server", "cli"]

@@ -31,9 +31,11 @@ from contextlib import contextmanager
 from typing import Dict, Iterator, List, NamedTuple, Optional
 
 from . import audit as audit_mod
+from . import providers
 from . import tenantbundle
 from .audit import AuditEvent, LedgerError
 from .policy import Rule
+from .store import ensure_record_provider
 
 try:  # fcntl is POSIX-only; restores still work without cross-process locks.
     import fcntl
@@ -114,6 +116,12 @@ class RestoreCoordinator:
                 record = self.store.read_raw(key_id)
                 if record is not None and record.tenant_id == tenant_id:
                     records.append(record)
+            # A backup is a tenant-level export: every key must be managed
+            # by the configured provider (503 on mismatch), and each
+            # version's provider triple rides inside the sealed bundle.
+            provider = providers.get_provider()
+            for record in records:
+                ensure_record_provider(record, provider)
             rules = self.policy_store.get(tenant_id)
             return {
                 "format": tenantbundle.FORMAT,
@@ -223,17 +231,46 @@ class RestoreCoordinator:
                 "policy": writes_policy,
             }
 
-            records = [
-                self.store.record_from_backup(
-                    tenant_id,
-                    next(k for k in payload["keys"] if k["key_id"] == key_id),
-                )
-                for key_id in key_ids
-            ]
+            # Re-mint every version through the configured provider (the
+            # bundle's recorded provider must match; a mismatch is a 503
+            # and nothing is written). Handles minted for a restore that
+            # does not commit are discarded again.
+            provider = providers.get_provider()
+            records = []
+            try:
+                for key_id in key_ids:
+                    records.append(
+                        self.store.record_from_backup(
+                            tenant_id,
+                            next(
+                                k for k in payload["keys"]
+                                if k["key_id"] == key_id
+                            ),
+                        )
+                    )
+            except BaseException:
+                self._discard_records(provider, records)
+                raise
 
-            return self._commit(
-                tenant_id, key_ids, records, policy_rules, event, marker
-            )
+            try:
+                result = self._commit(
+                    tenant_id, key_ids, records, policy_rules, event, marker
+                )
+            except LedgerError:
+                self._discard_records(provider, records)
+                raise
+            if result.status != RESTORE_CREATED:
+                # A conflict found by the locked re-scan: the minted handles
+                # are not persisted anywhere, so drop them.
+                self._discard_records(provider, records)
+            return result
+
+    @staticmethod
+    def _discard_records(provider, records) -> None:
+        """Best-effort delete of every handle minted for aborted records."""
+        for record in records:
+            for ver in record.versions:
+                providers.discard(provider, ver.handle)
 
     def _commit_empty(self, tenant_id: str, event: AuditEvent) -> RestoreResult:
         """Commit an empty restore: idempotency marker + one import event.

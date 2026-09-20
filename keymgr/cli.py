@@ -14,6 +14,7 @@ from . import tenantbundle
 from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
 from .policy import PolicyError, PolicyStore, validate_rules
+from .providers import ProviderError
 from .server import serve
 from .store import IMPORT_CONFLICT, KeyStore, is_valid_key_id
 
@@ -210,6 +211,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _fail(
             "field operator must be a non-empty string", 2
         )
+
+    try:
+        return _dispatch(args, store, policies, coordinator)
+    except ProviderError as exc:
+        # KMS/HSM provider failures exit 1 (the HTTP 503 counterpart).
+        return _fail(str(exc), 1)
+
+
+def _dispatch(args, store, policies, coordinator) -> int:
+    """Run one subcommand against the stores; returns the exit code."""
 
     def allowed(action, key_id=None) -> bool:
         """Policy gate; on denial the response/audit was already handled."""
