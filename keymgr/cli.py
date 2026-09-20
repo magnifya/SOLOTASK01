@@ -218,9 +218,15 @@ def _run(argv: Optional[List[str]] = None) -> int:
         return 0
 
     audit_log = AuditLog(args.data_dir)
-    store = KeyStore(args.data_dir, audit_log)
-    policies = PolicyStore(args.data_dir, audit_log)
-    coordinator = restore_mod.RestoreCoordinator(store, policies)
+    try:
+        # Construction replays interrupted outbox/restore transactions and may
+        # hit the provider (fixed message, exit 1) or an unreadable ledger
+        # (exit 1); neither must escape as a traceback.
+        store = KeyStore(args.data_dir, audit_log)
+        policies = PolicyStore(args.data_dir, audit_log)
+        coordinator = restore_mod.RestoreCoordinator(store, policies)
+    except LedgerError as exc:
+        return _ledger_fail(exc)
 
     if not getattr(args, "operator", None):
         return _fail(

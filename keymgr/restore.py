@@ -113,6 +113,9 @@ class RestoreCoordinator:
             for key_id in key_ids:
                 record = self.store.read_raw(key_id)
                 if record is not None and record.tenant_id == tenant_id:
+                    # Lazily adopt any raw pre-provider versions (local active
+                    # only) while this key's locks are held.
+                    self.store.adopt_legacy_under_locks(key_id, record)
                     records.append(record)
             rules = self.policy_store.get(tenant_id)
             return {
@@ -175,10 +178,37 @@ class RestoreCoordinator:
                     Rule.from_json(r) for r in payload["policy"]["rules"]
                 ]
 
+            # Adopt every version through its matching provider and finish
+            # ALL version validation BEFORE any conflict decision, file write
+            # or ledger append. A provider mismatch is ProviderUnavailable
+            # (503), malformed material is ProviderInvalidMaterial (400);
+            # either surfaces even when a key_id would also conflict, and the
+            # handles already minted for earlier keys/versions are released so
+            # the backend leaks nothing and no existing file or audit entry
+            # changes.
+            records = []
+            try:
+                for key_id in key_ids:
+                    entry = next(
+                        k for k in payload["keys"] if k["key_id"] == key_id
+                    )
+                    records.append(
+                        self.store.record_from_backup(tenant_id, entry)
+                    )
+            except BaseException:
+                for record in records:
+                    self.store.release_record_handles(record)
+                raise
+
+            def release_all() -> None:
+                for record in records:
+                    self.store.release_record_handles(record)
+
             # Conflict scan. Any foreign owner anywhere wins (404); otherwise
             # a same-tenant owner is a 409. Repeated under every lock below.
             conflict = self._scan_conflicts(tenant_id, key_ids)
             if conflict is not None:
+                release_all()
                 status = (
                     RESTORE_FOREIGN_CONFLICT
                     if conflict.owner != tenant_id
@@ -223,25 +253,6 @@ class RestoreCoordinator:
                 "policy": writes_policy,
             }
 
-            # Adopt every version through its matching provider *before* any
-            # file is written. A provider mismatch is ProviderUnavailable
-            # (503), malformed material is ProviderInvalidMaterial (400); if a
-            # later key/version fails, handles already minted for earlier ones
-            # are released so the backend leaks nothing.
-            records = []
-            try:
-                for key_id in key_ids:
-                    entry = next(
-                        k for k in payload["keys"] if k["key_id"] == key_id
-                    )
-                    records.append(
-                        self.store.record_from_backup(tenant_id, entry)
-                    )
-            except BaseException:
-                for record in records:
-                    self.store.release_record_handles(record)
-                raise
-
             return self._commit(
                 tenant_id, key_ids, records, policy_rules, event, marker
             )
@@ -280,7 +291,13 @@ class RestoreCoordinator:
             raise
         finalized = dict(marker)
         finalized["event"] = None
-        self.store._write_atomic(path, finalized)
+        try:
+            self.store._write_atomic(path, finalized)
+        except BaseException as exc:
+            # Committed; recovery finalizes the marker on the next open.
+            raise LedgerError(
+                "committed empty restore awaiting marker cleanup: %s" % exc
+            ) from exc
         return RestoreResult(
             status=RESTORE_CREATED,
             tenant_id=tenant_id,
@@ -383,14 +400,23 @@ class RestoreCoordinator:
                     "tenant restore failed before commit: %s" % exc
                 ) from exc
 
-            # Phase 3: clear the markers. A crash here is repaired on the next
-            # open (the event is already durably in the ledger).
-            for record in records:
-                self.store.clear_restore_pending(record)
-            if policy_rules is not None:
-                self.policy_store.clear_restore_pending(
-                    tenant_id, policy_rules
-                )
+            # Phase 3: clear the markers. The durable ledger append above is
+            # the commit point, so a failure here (or a crash) must never roll
+            # the files back or delete the minted handles. The surviving
+            # markers are resolved idempotently on the next open (append is
+            # deduped by event_id); meanwhile the request fails as a ledger
+            # failure rather than reporting success with pending markers.
+            try:
+                for record in records:
+                    self.store.clear_restore_pending(record)
+                if policy_rules is not None:
+                    self.policy_store.clear_restore_pending(
+                        tenant_id, policy_rules
+                    )
+            except BaseException as exc:
+                raise LedgerError(
+                    "committed restore awaiting marker cleanup: %s" % exc
+                ) from exc
             return RestoreResult(
                 status=RESTORE_CREATED,
                 tenant_id=tenant_id,
@@ -419,9 +445,11 @@ class RestoreCoordinator:
         by_id = {r.key_id: r for r in (records or [])}
         for key_id in written_keys:
             self.store.remove_file(key_id)
-            record = by_id.get(key_id)
-            if record is not None:
-                self.store.release_record_handles(record)
+        # Release handles for EVERY would-be record, including any whose file
+        # write never landed (the phase-1 write loop may have failed midway),
+        # so a pre-commit abort leaves no orphaned KMS/HSM objects.
+        for record in by_id.values():
+            self.store.release_record_handles(record)
         if wrote_policy:
             self.policy_store.remove_restore_file(tenant_id)
 
@@ -510,7 +538,13 @@ class RestoreCoordinator:
         if committed:
             finalized = dict(marker)
             finalized["event"] = None
-            self.store._write_atomic(path, finalized)
+            try:
+                self.store._write_atomic(path, finalized)
+            except OSError as exc:
+                # Committed; leave the marker for a later open to finalize.
+                raise LedgerError(
+                    "cannot finalize committed empty-restore marker: %s" % exc
+                ) from exc
         else:
             try:
                 os.unlink(path)
@@ -538,15 +572,23 @@ class RestoreCoordinator:
                 self.policy_store.remove_restore_file(tenant_id)
             return
         # Committed: finish the transaction by clearing the markers.
-        for key_id, path in group.key_files.items():
-            record = self.store._read_record(path)
-            if record is None or not record.pending_event:
-                continue
-            self.store.clear_restore_pending(record)
-        if group.policy_file is not None:
-            self.policy_store.clear_restore_pending(
-                group.policy_tenant or tenant_id, group.policy_rules
-            )
+        try:
+            for key_id, path in group.key_files.items():
+                record = self.store._read_record(path)
+                if record is None or not record.pending_event:
+                    continue
+                self.store.clear_restore_pending(record)
+            if group.policy_file is not None:
+                self.policy_store.clear_restore_pending(
+                    group.policy_tenant or tenant_id, group.policy_rules
+                )
+        except OSError as exc:
+            # Every file is committed and the event is durable; leave the
+            # surviving markers for a later open to clear and surface a
+            # ledger-class failure so the caller does not assume completion.
+            raise LedgerError(
+                "cannot clear committed restore markers: %s" % exc
+            ) from exc
 
 
 def _is_uuid(value: str) -> bool:

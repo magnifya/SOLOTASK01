@@ -14,7 +14,7 @@ from typing import Iterator, Optional
 from . import audit as audit_mod
 from . import keybundle
 from . import provider as provider_mod
-from .audit import AuditEvent, AuditLog
+from .audit import AuditEvent, AuditLog, LedgerError
 from .provider import (
     LOCAL_PROVIDER_ID,
     ProviderUnavailable,
@@ -245,15 +245,17 @@ class KeyStore:
         self._locks_lock = threading.Lock()
         self._locks: dict = {}
         self.audit = audit_log if audit_log is not None else AuditLog(data_dir)
-        # Bind the built-in local provider so pre-provider records can be
-        # adopted; an external KEYMGR_PROVIDER is still imported lazily.
+        # Bind the built-in local provider's state (DEK + handle registry) so
+        # a legacy local record can be adopted lazily; an external
+        # KEYMGR_PROVIDER factory is never imported here.
         provider_mod.configure_local(self.data_dir)
-        # Adopt pre-provider records (raw local material) into the local
-        # provider before any pending-event recovery, so every version on
-        # disk ends up carrying a handle.
-        self._migrate_legacy_material()
-        # Commit any change whose key file landed but whose ledger append was
-        # interrupted by a crash, so a mutation and its event never diverge.
+        # Legacy raw-material records are NOT rewritten at startup: ordinary
+        # reads never load a provider or touch the file. A legacy version is
+        # adopted into the local provider lazily and atomically, and only when
+        # local is the active provider and an export/backup first needs the
+        # material. Commit any change whose key file landed but whose ledger
+        # append was interrupted by a crash, so a mutation and its event never
+        # diverge.
         self._recover_pending_events()
 
     # -- provider helpers --------------------------------------------------
@@ -262,43 +264,67 @@ class KeyStore:
         """The active KMS/HSM provider (imported lazily on first use)."""
         return provider_mod.get_provider()
 
-    def _migrate_legacy_material(self) -> None:
-        """Wrap raw pre-provider material into the local provider.
+    def _adopt_legacy_versions_locked(
+        self, path: str, record: KeyRecord
+    ) -> None:
+        """Lazily adopt raw pre-provider material into the local provider.
 
-        Legacy versions carry raw ``private_material`` and an empty handle;
-        adopt them into the built-in local provider (validate + wrap +
-        registry), rewriting the file with the new triple. The migration is
-        per-file idempotent and runs under the same locks as a mutation.
+        Legacy versions carry raw ``private_material`` with an empty handle;
+        they are owned by the built-in local provider. Adoption happens only
+        when local is the ACTIVE provider and the material is first needed
+        (single-key export / tenant backup), under the key's in-process and
+        cross-process locks. Every legacy version of the file is validated,
+        wrapped and registered, and the file rewritten atomically as one
+        change. The registry write lands before the key-file rewrite, and the
+        wrapped blobs are self-describing, so a crash leaves the original
+        record fully usable (a later adoption simply re-registers); if the
+        material fails validation or either write fails, the original file is
+        left byte-for-byte in place and the provider error propagates.
         """
-        try:
-            names = os.listdir(self.data_dir)
-        except OSError:
+        if not self._local_is_active():
             return
         local = provider_mod.get_local_provider()
-        for name in names:
-            if not (name.endswith(".json") and is_valid_key_id(name[:-5])):
-                continue
-            path = os.path.join(self.data_dir, name)
-            key_id = name[:-5]
-            with self._key_lock(key_id), self._file_lock(key_id):
-                record = self._read_record(path)
-                if record is None:
-                    continue
-                changed = False
-                for ver in record.versions:
-                    if ver.provider_id == LOCAL_PROVIDER_ID and not ver.handle:
-                        triple = local.import_material(
-                            ver.algorithm,
-                            ver.public_key,
-                            ver.encrypted_material,
-                        )
-                        ver.handle = triple.handle
-                        ver.encrypted_material = triple.encrypted_material
-                        if ver.public_key is None:
-                            ver.public_key = triple.public_key
-                        changed = True
-                if changed:
-                    self._write_atomic(path, record.to_json())
+        legacy = [
+            v
+            for v in record.versions
+            if v.provider_id == LOCAL_PROVIDER_ID and not v.handle
+        ]
+        if not legacy:
+            return
+        previous = record.to_json()
+        adopted = []
+        rewrite_attempted = False
+        try:
+            for ver in legacy:
+                triple = local.import_material(
+                    ver.algorithm, ver.public_key, ver.encrypted_material
+                )
+                adopted.append(triple.handle)
+                ver.handle = triple.handle
+                ver.encrypted_material = triple.encrypted_material
+                if ver.public_key is None:
+                    ver.public_key = triple.public_key
+            # All versions validated and registered: the registry writes are
+            # already durable. Now the single atomic key-file rewrite.
+            rewrite_attempted = True
+            self._write_atomic(path, record.to_json())
+        except BaseException:
+            # If the failure was a validation/provider error the file was
+            # never touched: keep the original exactly as it was. Only after
+            # the rewrite was attempted (and may have landed) do we restore
+            # the prior bytes. Either way drop the handles this attempt
+            # registered so the local backend leaks nothing.
+            if rewrite_attempted:
+                try:
+                    self._write_atomic(path, previous)
+                except Exception:
+                    pass
+            for handle in adopted:
+                try:
+                    local.delete(handle)
+                except Exception:
+                    pass
+            raise
 
     # -- audit bookkeeping -------------------------------------------------
     def audit_conflict(self) -> None:
@@ -375,7 +401,14 @@ class KeyStore:
                 event = AuditEvent.from_json(record.pending_event)
                 self.audit.append(event)
                 record.pending_event = None
-                self._write_atomic(path, record.to_json())
+                try:
+                    self._write_atomic(path, record.to_json())
+                except OSError as exc:
+                    # The event is already durable; leave the marker for a
+                    # later open to clear and surface a ledger-class failure.
+                    raise LedgerError(
+                        "cannot clear committed pending marker: %s" % exc
+                    ) from exc
 
     def _commit_mutation(
         self,
@@ -390,13 +423,19 @@ class KeyStore:
 
         The record is first written carrying the pending event (an outbox
         marker), the event is then appended durably to the ledger, and the
-        marker is cleared in a second atomic write. If the ledger append
-        fails the key file is rolled back (deleted for a brand-new key whose
-        ``previous`` is None, restored to its prior bytes otherwise), and any
-        provider handles the change minted are deleted, so a failed ledger
-        write leaves neither a single-sided file nor an orphaned HSM object.
-        A crash at any point is repaired idempotently by
-        _recover_pending_events on the next open.
+        marker is cleared in a second atomic write. The durable ledger append
+        is the commit point:
+
+        * before it, any failure rolls the key file back (deleted for a
+          brand-new key whose ``previous`` is None, restored to its prior
+          bytes otherwise) and deletes every provider handle the change
+          minted, so neither a single-sided file nor an orphaned backend
+          object remains;
+        * after it, the change is committed and nothing is rolled back. A
+          failure to clear the marker (or a crash) leaves it on disk and the
+          handles owned by the key; the next open finishes the cleanup
+          idempotently by event_id (the append dedupes), so the event is
+          never duplicated and committed data is never undone.
         """
         record.pending_event = event.to_json()
 
@@ -414,8 +453,9 @@ class KeyStore:
             self._write_atomic(path, record.to_json())
             self.audit.append(event)
         except BaseException:
-            # Only roll the file back when it may have landed: a failure of
-            # the ledger append, or of the initial write after a partial file.
+            # Commit point not reached: only roll the file back when it may
+            # have landed (a failed ledger append, or a partial initial
+            # write), then release every handle minted for this change.
             if os.path.exists(path):
                 if previous is None:
                     try:
@@ -429,13 +469,18 @@ class KeyStore:
                         pass
             release_handles()
             raise
+        # The ledger append returned: the transaction is committed. Clearing
+        # the marker is pure post-commit cleanup; it must never roll the file
+        # back or delete the handles the committed key now owns. A failure
+        # here is surfaced as a ledger failure (HTTP 500 / CLI exit 1) and the
+        # surviving marker is resolved idempotently on the next open.
         record.pending_event = None
         try:
             self._write_atomic(path, record.to_json())
-        except BaseException:
-            # The ledger already committed, so do not unlink; just release no
-            # handle (the key legitimately owns it). Surface the write error.
-            raise
+        except BaseException as exc:
+            raise LedgerError(
+                "committed transaction awaiting marker cleanup: %s" % exc
+            ) from exc
 
     def _key_lock(self, key_id: str) -> threading.Lock:
         with self._locks_lock:
@@ -499,16 +544,25 @@ class KeyStore:
             return None
 
     @staticmethod
+    def _local_is_active() -> bool:
+        """True only when the configured active provider is the built-in one.
+
+        ``KEYMGR_PROVIDER`` unset/empty or explicitly ``local`` activates the
+        local provider; a ``module:factory`` specification activates that
+        external instance and local is never used on its behalf.
+        """
+        return provider_mod.get_provider().provider_id == LOCAL_PROVIDER_ID
+
+    @staticmethod
     def _provider_for(provider_id: str):
         """Return the provider instance that owns ``provider_id``.
 
-        The built-in local provider is always available; any other id must
-        match the currently configured external provider. A record naming a
-        provider that is not active cannot be rotated/exported/imported and
-        fails as unavailable (503) rather than silently switching providers.
+        A stored triple or a bundle provenance block is only serviceable by
+        the currently active provider instance, whose ``provider_id`` must
+        match exactly. That includes the built-in local provider: its
+        records/blocks are refused (503) while an external KMS/HSM is active,
+        and vice versa — there is never a silent provider switch or fallback.
         """
-        if provider_id == LOCAL_PROVIDER_ID:
-            return provider_mod.get_local_provider()
         active = provider_mod.get_provider()
         if active.provider_id != provider_id:
             raise ProviderUnavailable(
@@ -588,7 +642,10 @@ class KeyStore:
                 return None
             # A version is rotated on the provider that owns the record;
             # switching providers mid-key is refused (503), never silently
-            # migrated.
+            # migrated. A raw pre-provider current version is local-owned; if
+            # local is active, adopt the legacy versions atomically as part of
+            # the same locked read-modify-write before minting the new one.
+            self._adopt_legacy_versions_locked(path, record)
             provider = self._provider_for(record.current.provider_id)
             previous = record.to_json()
             next_number = record.current_version + 1
@@ -707,15 +764,24 @@ class KeyStore:
         """Seal a tenant's full key record into an opaque bundle.
 
         Returns None for an unknown or foreign key, so the caller cannot tell
-        the two cases apart. Export does not modify the record; its audit event
-        is appended by the caller alongside the response, like a read.
+        the two cases apart. Export does not mutate ordinary state, but a key
+        still carrying raw pre-provider versions is adopted into the local
+        provider here — lazily and atomically, and only when local is active.
+        The adoption and the provider reads run under the key's locks so a
+        concurrent rotation cannot interleave with the snapshot. Its audit
+        event is appended by the caller alongside the response, like a read.
         """
-        record = self.get(key_id, tenant_id)
-        if record is None:
+        if not _KEY_ID_RE.fullmatch(key_id):
             return None
-        return keybundle.encode_bundle(
-            self.export_payload(record), passphrase
-        )
+        path = self._path_for(key_id)
+        with self._key_lock(key_id), self._file_lock(key_id):
+            record = self._read_record(path)
+            if record is None or record.tenant_id != tenant_id:
+                return None
+            self._adopt_legacy_versions_locked(path, record)
+            return keybundle.encode_bundle(
+                self.export_payload(record), passphrase
+            )
 
     def _adopt_imported_version(self, ver: dict) -> tuple:
         """Adopt one validated bundle version through its target provider.
@@ -728,7 +794,12 @@ class KeyStore:
         """
         block = ver.get("provider")
         if block is None:
-            target = provider_mod.get_local_provider()
+            # A legacy keymgr-export-v1 version carries no provenance block:
+            # it originated on the built-in local provider. Importing it is
+            # therefore only possible while local is the active provider;
+            # under an external KMS/HSM this is a 503 mismatch, never a
+            # silent adoption into the wrong backend.
+            target = self._provider_for(LOCAL_PROVIDER_ID)
         else:
             target = self._provider_for(block["provider_id"])
         triple = target.import_material(
@@ -785,48 +856,67 @@ class KeyStore:
         Returns (IMPORT_CREATED, record) for a brand-new key_id, or
         (IMPORT_CONFLICT, existing) when the key_id already exists; the
         existing record on disk is never touched, and the caller decides 409
-        versus 404 from its owner. Each version is adopted through the
-        matching provider (a mismatch raises ProviderUnavailable -> 503 and
-        malformed material ProviderInvalidMaterial -> 400). A successful
-        import and its audit event commit through the same outbox transaction
-        as create/rotate, and a failure deletes every minted handle.
+        versus 404 from its owner. Every version is validated and adopted
+        through its matching provider BEFORE the conflict re-check (a
+        mismatch raises ProviderUnavailable -> 503 and malformed material
+        ProviderInvalidMaterial -> 400); if that adoption, the conflict
+        decision, the file write or the durable ledger append fails before
+        the commit point, every handle minted by this attempt is deleted and
+        existing files and the ledger stay unchanged. A successful import and
+        its audit event commit through the same outbox transaction as
+        create/rotate.
         """
         key_id = payload["key_id"]
         path = self._path_for(key_id)
+        # Phase A: validate and adopt EVERY version through its provider
+        # first, before any conflict decision or file write. Two concurrent
+        # imports of the same key_id may both mint here; the loser of the
+        # locked conflict re-check below releases its handles.
+        adopted = []  # (provider, handle)
+        try:
+            versions = []
+            for ver in payload["versions"]:
+                version_record, target = self._adopt_imported_version(ver)
+                versions.append(version_record)
+                adopted.append((target, version_record.handle))
+        except BaseException:
+            self._release_handles(adopted)
+            raise
+        record = KeyRecord(
+            key_id=key_id,
+            tenant_id=tenant_id,
+            label=payload["label"],
+            versions=versions,
+            current_version=payload["current_version"],
+            status=payload["status"],
+            reason=payload["reason"],
+            operator=payload["operator"],
+            revoked_at=payload["revoked_at"],
+        )
+        event = self.audit.new_event(
+            tenant_id, audit_mod.ACTION_IMPORT, key_id,
+            audit_mod.OUTCOME_SUCCESS,
+        )
         with self._key_lock(key_id), self._file_lock(key_id):
+            # Phase B: conflict re-check under the locks; delete everything
+            # this attempt minted and leave the existing record byte-for-byte
+            # untouched.
             existing = self._read_record(path)
             if existing is not None:
+                self._release_handles(adopted)
                 return IMPORT_CONFLICT, existing
-            adopted = []  # (provider, handle)
-            try:
-                versions = []
-                for ver in payload["versions"]:
-                    version_record, target = self._adopt_imported_version(ver)
-                    versions.append(version_record)
-                    adopted.append((target, version_record.handle))
-            except BaseException:
-                self._release_handles(adopted)
-                raise
-            record = KeyRecord(
-                key_id=key_id,
-                tenant_id=tenant_id,
-                label=payload["label"],
-                versions=versions,
-                current_version=payload["current_version"],
-                status=payload["status"],
-                reason=payload["reason"],
-                operator=payload["operator"],
-                revoked_at=payload["revoked_at"],
+            # Phase C: file write plus durable audit append. The committer
+            # deletes the minted handles only on a pre-commit-point failure;
+            # after the append returns the imported key owns them and a
+            # later marker-cleanup failure must not delete them.
+            self._commit_mutation(
+                path,
+                record,
+                event,
+                None,
+                provider=self._provider(),
+                new_handles=[handle for _target, handle in adopted],
             )
-            event = self.audit.new_event(
-                tenant_id, audit_mod.ACTION_IMPORT, key_id,
-                audit_mod.OUTCOME_SUCCESS,
-            )
-            try:
-                self._commit_mutation(path, record, event, None)
-            except BaseException:
-                self._release_handles(adopted)
-                raise
         return IMPORT_CREATED, record
 
     # -- tenant backup / restore ------------------------------------------
@@ -845,6 +935,18 @@ class KeyStore:
                 records.append(record)
         records.sort(key=lambda r: r.key_id)
         return records
+
+    def adopt_legacy_under_locks(self, key_id: str, record: KeyRecord) -> None:
+        """Adopt a record's raw legacy versions while its locks are held.
+
+        Used by the tenant backup snapshot, which acquires every key lock
+        before reading; the adoption (local active only) rewrites that one
+        file atomically under the same locks. A failure propagates and leaves
+        the original file intact (see _adopt_legacy_versions_locked).
+        """
+        self._adopt_legacy_versions_locked(
+            self._path_for(key_id), record
+        )
 
     def backup_entry(self, record: KeyRecord) -> dict:
         """Project a record for a tenant backup payload.

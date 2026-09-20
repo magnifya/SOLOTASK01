@@ -272,12 +272,19 @@ class PolicyStore:
             else:
                 # append() is idempotent on event_id.
                 self.audit.append(event)
-                self._write_atomic(
-                    path,
-                    {"tenant_id": tenant_id,
-                     "rules": [r.to_json() for r in rules],
-                     "pending_event": None},
-                )
+                try:
+                    self._write_atomic(
+                        path,
+                        {"tenant_id": tenant_id,
+                         "rules": [r.to_json() for r in rules],
+                         "pending_event": None},
+                    )
+                except OSError as exc:
+                    # The event is durable; leave the marker for a later open
+                    # to clear and surface a ledger-class failure.
+                    raise LedgerError(
+                        "cannot clear committed policy marker: %s" % exc
+                    ) from exc
 
     def _commit_put(self, tenant_id: str, rules: List[Rule],
                     event: AuditEvent, existed: bool, previous: Optional[dict]):
@@ -301,7 +308,14 @@ class PolicyStore:
                 self._write_atomic(path, previous)
             raise
         doc["pending_event"] = None
-        self._write_atomic(path, doc)
+        try:
+            self._write_atomic(path, doc)
+        except OSError as exc:
+            # The ledger append already committed; leave the marker for the
+            # next open to clear and surface a ledger-class failure.
+            raise LedgerError(
+                "committed policy update awaiting marker cleanup: %s" % exc
+            ) from exc
 
     # -- public API --------------------------------------------------------
     def get(self, tenant_id: str) -> Optional[List[Rule]]:

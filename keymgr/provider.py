@@ -183,6 +183,14 @@ def _validate_external(obj) -> None:
         raise ProviderUnavailable(
             "provider factory returned an object without a non-empty provider_id"
         )
+    if provider_id == LOCAL_PROVIDER_ID:
+        # "local" names the built-in software provider; an external factory
+        # may never claim it, otherwise record ownership checks would mistake
+        # a pluggable backend for the local instance.
+        raise ProviderUnavailable(
+            "an external provider may not use the reserved provider_id %r"
+            % LOCAL_PROVIDER_ID
+        )
     caps = getattr(obj, "capabilities", None)
     if not isinstance(caps, dict):
         raise ProviderUnavailable(
