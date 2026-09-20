@@ -300,8 +300,15 @@ class PolicyStore:
             elif previous is not None:
                 self._write_atomic(path, previous)
             raise
+        # The durable ledger append is the commit point; clearing the marker
+        # is post-commit housekeeping. A failure here leaves the marker for
+        # startup recovery and must never roll the document back or fail the
+        # request.
         doc["pending_event"] = None
-        self._write_atomic(path, doc)
+        try:
+            self._write_atomic(path, doc)
+        except OSError:
+            pass
 
     # -- public API --------------------------------------------------------
     def get(self, tenant_id: str) -> Optional[List[Rule]]:

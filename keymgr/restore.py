@@ -79,6 +79,7 @@ class _PendingGroup:
         self.policy_file: Optional[str] = None
         self.policy_tenant: Optional[str] = None
         self.policy_rules: List[Rule] = []
+        self.journal: Optional[str] = marker.get("journal")
 
 
 class RestoreCoordinator:
@@ -114,6 +115,13 @@ class RestoreCoordinator:
                 record = self.store.read_raw(key_id)
                 if record is not None and record.tenant_id == tenant_id:
                     records.append(record)
+            # Lazily take over any raw pre-provider versions here, under the
+            # same key locks, so the backup is one committed view. This only
+            # imports/wraps while the local provider is active; with an
+            # external provider active a legacy version fails 503 and the
+            # backup is refused without a fallback.
+            for record in records:
+                self.store.prepare_backup_record(record)
             rules = self.policy_store.get(tenant_id)
             return {
                 "format": tenantbundle.FORMAT,
@@ -165,7 +173,15 @@ class RestoreCoordinator:
 
         Returns a created result, or a conflict result after leaving every
         existing file byte-for-byte untouched. Raises LedgerError when the
-        transaction cannot be committed; all written files are rolled back.
+        transaction cannot be committed; all written files and all handles
+        minted by the attempt are rolled back.
+
+        Ordering: every version is validated and adopted through its provider
+        first (the durable provision journal records each handle as it is
+        minted); only then are conflicts rechecked, files written and the
+        single audit event appended. A failure, refused conflict or crash at
+        any point before that commit point deletes every handle the attempt
+        created; the durable event is the point of no return.
         """
         with self._restore_lock, self._cross_process_restore_lock():
             key_ids = sorted(k["key_id"] for k in payload["keys"])
@@ -175,76 +191,93 @@ class RestoreCoordinator:
                     Rule.from_json(r) for r in payload["policy"]["rules"]
                 ]
 
-            # Conflict scan. Any foreign owner anywhere wins (404); otherwise
-            # a same-tenant owner is a 409. Repeated under every lock below.
-            conflict = self._scan_conflicts(tenant_id, key_ids)
-            if conflict is not None:
-                status = (
-                    RESTORE_FOREIGN_CONFLICT
-                    if conflict.owner != tenant_id
-                    else RESTORE_SAME_TENANT_CONFLICT
-                )
-                return RestoreResult(status=status, conflict=conflict)
-
+            # Mint the committing event up front so the provision journal is
+            # named after its event_id, letting startup recovery decide
+            # committed-vs-not purely from the ledger.
             event = self.store.audit.new_event(
                 tenant_id, audit_mod.ACTION_IMPORT, None,
                 audit_mod.OUTCOME_SUCCESS,
             )
-            writes_policy = policy_rules is not None
-
-            if not key_ids and not writes_policy:
-                # Empty bundle: no key/policy files, but the batch still
-                # commits a persistent idempotency marker plus its single
-                # import event, so a repeated empty restore of this tenant
-                # conflicts (409) instead of succeeding twice. The policy
-                # conflict is re-checked under the tenant's policy lock so a
-                # concurrent policy write in another process linearizes
-                # either before or after this restore.
-                with self.policy_store.tenant_lock(tenant_id):
-                    policy_path = self.policy_store.path_for(tenant_id)
-                    if os.path.exists(policy_path):
-                        owner = self.policy_store.owner_of_path(policy_path)
-                        if owner is not None and owner != tenant_id:
-                            return RestoreResult(
-                                status=RESTORE_FOREIGN_CONFLICT,
-                                conflict=Conflict(kind="policy", owner=owner),
-                            )
-                        return RestoreResult(
-                            status=RESTORE_SAME_TENANT_CONFLICT,
-                            conflict=Conflict(kind="policy", owner=tenant_id),
-                        )
-                    return self._commit_empty(tenant_id, event)
-
-            marker = {
-                "_restore": True,
-                "event": event.to_json(),
-                "tenant_id": tenant_id,
-                "key_ids": key_ids,
-                "policy": writes_policy,
-            }
-
-            # Adopt every version through its matching provider *before* any
-            # file is written. A provider mismatch is ProviderUnavailable
-            # (503), malformed material is ProviderInvalidMaterial (400); if a
-            # later key/version fails, handles already minted for earlier ones
-            # are released so the backend leaks nothing.
-            records = []
-            try:
-                for key_id in key_ids:
-                    entry = next(
-                        k for k in payload["keys"] if k["key_id"] == key_id
-                    )
-                    records.append(
-                        self.store.record_from_backup(tenant_id, entry)
-                    )
-            except BaseException:
-                for record in records:
-                    self.store.release_record_handles(record)
-                raise
-
-            return self._commit(
-                tenant_id, key_ids, records, policy_rules, event, marker
+            journal_id, journal_path = self.store._new_provision_journal(
+                event.event_id
             )
+            try:
+                # Phase 0: complete ALL version validation and provider
+                # calls before the conflict recheck or any file write.
+                records = []
+                try:
+                    for key_id in key_ids:
+                        entry = next(
+                            k for k in payload["keys"] if k["key_id"] == key_id
+                        )
+                        records.append(
+                            self.store.record_from_backup(
+                                tenant_id, entry, journal_path
+                            )
+                        )
+                except BaseException:
+                    # A later key/version failed: release the handles the
+                    # earlier records already minted (record_from_backup
+                    # released its own record's handles; do the rest here).
+                    for record in records:
+                        self.store.release_record_handles(record)
+                    raise
+
+                # Conflict scan only after every provider call succeeded.
+                # Any foreign owner anywhere wins (404); otherwise a
+                # same-tenant owner is a 409. Repeated under every lock.
+                conflict = self._scan_conflicts(tenant_id, key_ids)
+                if conflict is not None:
+                    # Nothing was written; release every minted handle.
+                    for record in records:
+                        self.store.release_record_handles(record)
+                    status = (
+                        RESTORE_FOREIGN_CONFLICT
+                        if conflict.owner != tenant_id
+                        else RESTORE_SAME_TENANT_CONFLICT
+                    )
+                    return RestoreResult(status=status, conflict=conflict)
+
+                writes_policy = policy_rules is not None
+
+                if not key_ids and not writes_policy:
+                    # Empty bundle: no key/policy files or handles, but the
+                    # batch still commits a persistent idempotency marker plus
+                    # its single import event.
+                    with self.policy_store.tenant_lock(tenant_id):
+                        policy_path = self.policy_store.path_for(tenant_id)
+                        if os.path.exists(policy_path):
+                            owner = self.policy_store.owner_of_path(policy_path)
+                            if owner is not None and owner != tenant_id:
+                                return RestoreResult(
+                                    status=RESTORE_FOREIGN_CONFLICT,
+                                    conflict=Conflict(kind="policy", owner=owner),
+                                )
+                            return RestoreResult(
+                                status=RESTORE_SAME_TENANT_CONFLICT,
+                                conflict=Conflict(kind="policy", owner=tenant_id),
+                            )
+                        return self._commit_empty(tenant_id, event)
+
+                marker = {
+                    "_restore": True,
+                    "event": event.to_json(),
+                    "tenant_id": tenant_id,
+                    "key_ids": key_ids,
+                    "policy": writes_policy,
+                    # Ties the marker group to the attempt's handle journal.
+                    "journal": journal_id,
+                }
+
+                return self._commit(
+                    tenant_id, key_ids, records, policy_rules, event, marker
+                )
+            finally:
+                # On a normal return (success, refused conflict or a handled
+                # rollback) the handles were either committed to the records
+                # or released; the journal is spent. A hard crash leaves it on
+                # disk for startup recovery, which is the actual safety net.
+                self.store.drop_provision_journal(journal_id)
 
     def _commit_empty(self, tenant_id: str, event: AuditEvent) -> RestoreResult:
         """Commit an empty restore: idempotency marker + one import event.
@@ -372,8 +405,13 @@ class RestoreCoordinator:
                     )
                     wrote_policy = True
                 # Phase 2: the single ledger append. The files are the outbox.
+                # The durable append is the commit point.
                 self.store.audit.append(event)
             except BaseException as exc:
+                # Roll back every file the transaction created AND every
+                # handle the attempt minted — including records whose file
+                # never landed after a phase-1 failure partway through the
+                # write set.
                 self._rollback(
                     written_keys, wrote_policy, tenant_id, records
                 )
@@ -383,14 +421,22 @@ class RestoreCoordinator:
                     "tenant restore failed before commit: %s" % exc
                 ) from exc
 
-            # Phase 3: clear the markers. A crash here is repaired on the next
-            # open (the event is already durably in the ledger).
+            # Phase 3: clear the markers. The commit point already passed, so
+            # this is best-effort housekeeping: a failure here or a crash is
+            # repaired idempotently on the next open (event is durably in the
+            # ledger, the restored data and its handles stay authoritative).
             for record in records:
-                self.store.clear_restore_pending(record)
+                try:
+                    self.store.clear_restore_pending(record)
+                except OSError:
+                    pass
             if policy_rules is not None:
-                self.policy_store.clear_restore_pending(
-                    tenant_id, policy_rules
-                )
+                try:
+                    self.policy_store.clear_restore_pending(
+                        tenant_id, policy_rules
+                    )
+                except OSError:
+                    pass
             return RestoreResult(
                 status=RESTORE_CREATED,
                 tenant_id=tenant_id,
@@ -412,16 +458,19 @@ class RestoreCoordinator:
     ) -> None:
         """Remove every file created by a restore that did not commit.
 
-        The provider handles the would-be records minted are deleted too, so
-        a ledger failure that aborts the batch leaves no orphaned HSM/KMS
-        objects behind.
+        The provider handles the would-be records minted are deleted too —
+        for *every* record the attempt adopted, including ones whose file
+        never landed when phase 1 failed partway through the write set — so a
+        failure that aborts the batch leaves no orphaned KMS/HSM objects
+        behind.
         """
         by_id = {r.key_id: r for r in (records or [])}
+        landed = set(written_keys)
         for key_id in written_keys:
             self.store.remove_file(key_id)
-            record = by_id.get(key_id)
-            if record is not None:
-                self.store.release_record_handles(record)
+        for key_id, record in by_id.items():
+            # Covers both landed (file now removed) and never-landed records.
+            self.store.release_record_handles(record)
         if wrote_policy:
             self.policy_store.remove_restore_file(tenant_id)
 
@@ -483,7 +532,44 @@ class RestoreCoordinator:
             group.policy_rules = rules
 
         for eid, group in groups.items():
-            self._recover_group(eid, group)
+            if not self._recover_group(eid, group):
+                # The ledger could not be read; leave files and journal for a
+                # later open to retry rather than risking committed material.
+                continue
+            # The group is resolved (committed or rolled back); its handle
+            # journal, deferred from the store's own startup sweep, is now
+            # spent. On the uncommitted path _recover_group already deleted
+            # every handle the journal recorded.
+            self.store.drop_provision_journal(group.journal)
+
+        # Journals with no marker group (crash before the first file landed)
+        # are swept last; their event never committed.
+        self._resolve_orphan_journals()
+
+    def _resolve_orphan_journals(self) -> None:
+        """Reap provision journals left by restore attempts with no marker.
+
+        A crash after provider adoption but before the first file landed
+        leaves a journal but no marker group; the event never committed, so
+        every recorded handle is deleted. Marker-referenced journals are
+        handled with their group in :meth:`recover`.
+        """
+        directory = os.path.join(self.store.data_dir, "provisions")
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            journal_id = name[:-5]
+            try:
+                committed = self.store.audit.get_event(journal_id) is not None
+            except LedgerError:
+                continue
+            if not committed:
+                self.store.release_journal_handles(journal_id)
+            self.store.drop_provision_journal(journal_id)
 
     def _recover_empty_marker(self, path: str) -> None:
         """Resolve an empty-restore idempotency marker after a crash.
@@ -517,36 +603,51 @@ class RestoreCoordinator:
             except OSError:
                 pass
 
-    def _recover_group(self, eid: str, group: _PendingGroup) -> None:
+    def _recover_group(self, eid: str, group: _PendingGroup) -> bool:
+        """Resolve one marker group. True if resolved, False to retry later."""
         marker = group.marker
         tenant_id = marker["tenant_id"]
         try:
             committed = self.store.audit.get_event(eid) is not None
         except LedgerError:
             # Leave the group untouched; a later open retries recovery.
-            return
+            return False
         if not committed:
             # The ledger append never happened: remove every partial file and
-            # release the provider handles the batch minted, so a crash
-            # before commit leaves no orphaned KMS/HSM objects.
+            # release every provider handle the batch minted (the journal
+            # also covers records whose file never landed), so a crash before
+            # commit leaves no orphaned KMS/HSM objects.
+            if group.journal:
+                self.store.release_journal_handles(group.journal)
             for key_id, path in list(group.key_files.items()):
                 record = self.store._read_record(path)
-                if record is not None:
+                if record is not None and not group.journal:
+                    # No journal available: fall back to the handles carried
+                    # by the landed files themselves.
                     self.store.release_record_handles(record)
                 self.store.remove_file(key_id)
             if group.policy_file is not None:
                 self.policy_store.remove_restore_file(tenant_id)
-            return
-        # Committed: finish the transaction by clearing the markers.
+            return True
+        # Committed: finish the transaction by clearing the markers. This is
+        # post-commit housekeeping and best-effort; a rewrite failure leaves
+        # the marker for the next open and never rolls the data back.
         for key_id, path in group.key_files.items():
             record = self.store._read_record(path)
             if record is None or not record.pending_event:
                 continue
-            self.store.clear_restore_pending(record)
+            try:
+                self.store.clear_restore_pending(record)
+            except OSError:
+                pass
         if group.policy_file is not None:
-            self.policy_store.clear_restore_pending(
-                group.policy_tenant or tenant_id, group.policy_rules
-            )
+            try:
+                self.policy_store.clear_restore_pending(
+                    group.policy_tenant or tenant_id, group.policy_rules
+                )
+            except OSError:
+                pass
+        return True
 
 
 def _is_uuid(value: str) -> bool:

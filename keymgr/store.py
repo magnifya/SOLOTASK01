@@ -14,7 +14,7 @@ from typing import Iterator, Optional
 from . import audit as audit_mod
 from . import keybundle
 from . import provider as provider_mod
-from .audit import AuditEvent, AuditLog
+from .audit import AuditEvent, AuditLog, LedgerError
 from .provider import (
     LOCAL_PROVIDER_ID,
     ProviderUnavailable,
@@ -245,16 +245,22 @@ class KeyStore:
         self._locks_lock = threading.Lock()
         self._locks: dict = {}
         self.audit = audit_log if audit_log is not None else AuditLog(data_dir)
-        # Bind the built-in local provider so pre-provider records can be
-        # adopted; an external KEYMGR_PROVIDER is still imported lazily.
-        provider_mod.configure_local(self.data_dir)
-        # Adopt pre-provider records (raw local material) into the local
-        # provider before any pending-event recovery, so every version on
-        # disk ends up carrying a handle.
-        self._migrate_legacy_material()
-        # Commit any change whose key file landed but whose ledger append was
-        # interrupted by a crash, so a mutation and its event never diverge.
+        # Remember the data directory without importing a module:factory
+        # provider or creating local provider state. A module:factory
+        # provider loads lazily on its first operation, and a pre-provider
+        # record is taken over by the local provider lazily on the first
+        # export/backup that needs its material (and never while a non-local
+        # provider is active).
+        provider_mod.bind_data_dir(self.data_dir)
+        # First finish/roll back interrupted single-key outbox transactions
+        # (their resolution keeps the key's handles and drops the journal) ...
         self._recover_pending_events()
+        # ... then delete handles provisioned by attempts that died before
+        # their commit point (their audit event never reached the ledger and
+        # no pending marker references it). Multi-file restore groups are
+        # resolved later by the RestoreCoordinator, which reaps their
+        # journals itself.
+        self._recover_provisions()
 
     # -- provider helpers --------------------------------------------------
     @staticmethod
@@ -262,43 +268,280 @@ class KeyStore:
         """The active KMS/HSM provider (imported lazily on first use)."""
         return provider_mod.get_provider()
 
-    def _migrate_legacy_material(self) -> None:
-        """Wrap raw pre-provider material into the local provider.
+    # -- provision journal -------------------------------------------------
+    # An import/restore attempt mints provider objects (handles) *before* its
+    # conflict recheck, file writes and the durable audit append. The journal
+    # records every minted handle as it appears and is removed only after the
+    # attempt finishes (commit or clean rollback). A process killed in between
+    # is cleaned up at the next open: handles whose committing audit event is
+    # in the ledger stay; every other handle is deleted, idempotently.
+    _PROVISION_DIR = "provisions"
 
-        Legacy versions carry raw ``private_material`` and an empty handle;
-        adopt them into the built-in local provider (validate + wrap +
-        registry), rewriting the file with the new triple. The migration is
-        per-file idempotent and runs under the same locks as a mutation.
+    def _provision_path(self, journal_id: str) -> str:
+        return os.path.join(
+            self.data_dir, self._PROVISION_DIR, journal_id + ".json"
+        )
+
+    def _new_provision_journal(self, journal_id: str):
+        """Create one journal file for an import/restore attempt.
+
+        The journal is named after the attempt's audit ``event_id``: a
+        leftover journal can then be resolved at any startup by asking the
+        ledger whether that event committed — committed means keep every
+        handle, otherwise delete them. Returns (journal_id, path). A crash
+        before the journal exists simply means no handles were recorded yet.
         """
+        directory = os.path.join(self.data_dir, self._PROVISION_DIR)
+        os.makedirs(directory, exist_ok=True)
+        path = self._provision_path(journal_id)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
+        return journal_id, path
+
+    def _append_provision(self, path: str, provider_id: str, handle: str) -> None:
+        """Durably record one minted handle in an attempt's journal."""
+        entry = {"provider_id": provider_id, "handle": handle}
+        line = json.dumps(entry, separators=(",", ":")) + "\n"
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.flush()
+            os.fsync(fh.fileno())
+
+    def _discard_provision_journal(self, path: str) -> None:
+        """Drop an attempt's journal after it committed or rolled back."""
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # Best effort: a stale journal is harmless (recovery re-deletes
+            # handles of a committed event by id and re-deletes others), so a
+            # cleanup failure must not mask the request's outcome.
+            pass
+
+    def _delete_provisioned_handle(self, provider_id: str, handle: str) -> None:
+        if provider_id == LOCAL_PROVIDER_ID:
+            # Crash cleanup may need the local backend before any request
+            # configured it; bind it here (this never imports an external
+            # module:factory provider).
+            try:
+                provider_mod.configure_local(self.data_dir)
+            except ProviderUnavailable:
+                return
+        try:
+            provider = self._provider_for(provider_id)
+        except ProviderUnavailable:
+            return
+        try:
+            provider.delete(handle)
+        except Exception:
+            pass
+
+    def _restore_marker_journals(self) -> set:
+        """Journal ids referenced by still-present restore markers.
+
+        A multi-file restore transaction is resolved by the
+        RestoreCoordinator; its journals must not be reaped here even if its
+        single shared event is not in the ledger yet (the coordinator either
+        commits and keeps the handles, or rolls the whole group back and
+        deletes them). Markers can live on a key file or, for a policy-only
+        restore, in the policies directory.
+        """
+        referenced = set()
+
+        def consider(marker) -> None:
+            if isinstance(marker, dict) and marker.get("_restore"):
+                journal_id = marker.get("journal")
+                if isinstance(journal_id, str) and journal_id:
+                    referenced.add(journal_id)
+
         try:
             names = os.listdir(self.data_dir)
         except OSError:
-            return
-        local = provider_mod.get_local_provider()
+            names = []
         for name in names:
-            if not (name.endswith(".json") and is_valid_key_id(name[:-5])):
+            if name.endswith(".json") and is_valid_key_id(name[:-5]):
+                record = self._read_record(os.path.join(self.data_dir, name))
+                if record is not None:
+                    consider(record.pending_event)
+        policy_dir = os.path.join(self.data_dir, "policies")
+        try:
+            policy_names = os.listdir(policy_dir)
+        except OSError:
+            policy_names = []
+        for name in policy_names:
+            if not name.endswith(".json"):
                 continue
-            path = os.path.join(self.data_dir, name)
-            key_id = name[:-5]
-            with self._key_lock(key_id), self._file_lock(key_id):
-                record = self._read_record(path)
-                if record is None:
+            try:
+                with open(
+                    os.path.join(policy_dir, name), "r", encoding="utf-8"
+                ) as fh:
+                    doc = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if isinstance(doc, dict):
+                consider(doc.get("pending_event"))
+        return referenced
+
+    def _recover_provisions(self) -> None:
+        """Delete handles from attempts that died before committing.
+
+        A journal line is kept (handle retained) only when its transaction's
+        audit event reached the ledger. Journals of uncommitted attempts are
+        applied (every recorded handle deleted, idempotently) and removed;
+        committed journals are removed as well. Journals still referenced by a
+        restore marker are deferred to the RestoreCoordinator. Nothing here
+        imports a provider when there are no handles to reap, so opening a
+        store for plain reads stays provider-free.
+        """
+        deferred = self._restore_marker_journals()
+        directory = os.path.join(self.data_dir, self._PROVISION_DIR)
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            journal_id = name[:-5]
+            if journal_id in deferred:
+                continue
+            path = os.path.join(directory, name)
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    lines = fh.readlines()
+            except OSError:
+                continue
+            entries = []
+            for line in lines:
+                line = line.strip()
+                if not line:
                     continue
-                changed = False
-                for ver in record.versions:
-                    if ver.provider_id == LOCAL_PROVIDER_ID and not ver.handle:
-                        triple = local.import_material(
-                            ver.algorithm,
-                            ver.public_key,
-                            ver.encrypted_material,
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                provider_id = entry.get("provider_id")
+                handle = entry.get("handle")
+                if isinstance(provider_id, str) and provider_id and isinstance(
+                    handle, str
+                ) and handle:
+                    entries.append((provider_id, handle))
+            committed = False
+            try:
+                if uuid.UUID(journal_id).version == 4:
+                    committed = self.audit.get_event(journal_id) is not None
+            except (ValueError, AttributeError):
+                committed = False
+            except LedgerError:
+                # Cannot decide right now; leave the whole journal for a
+                # later open rather than deleting committed material.
+                continue
+            if not committed:
+                for provider_id, handle in entries:
+                    self._delete_provisioned_handle(provider_id, handle)
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def drop_provision_journal(self, journal_id: str) -> None:
+        """Remove an attempt journal after it committed or rolled back."""
+        if not journal_id:
+            return
+        self._discard_provision_journal(self._provision_path(journal_id))
+
+    def read_provision_journal(self, journal_id: str) -> list:
+        """Return the (provider_id, handle) pairs an attempt journal holds."""
+        if not journal_id:
+            return []
+        path = self._provision_path(journal_id)
+        entries = []
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                lines = fh.readlines()
+        except OSError:
+            return []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            provider_id = entry.get("provider_id")
+            handle = entry.get("handle")
+            if isinstance(provider_id, str) and provider_id and isinstance(
+                handle, str
+            ) and handle:
+                entries.append((provider_id, handle))
+        return entries
+
+    def release_journal_handles(self, journal_id: str) -> None:
+        """Idempotently delete every handle recorded in an attempt journal."""
+        for provider_id, handle in self.read_provision_journal(journal_id):
+            self._delete_provisioned_handle(provider_id, handle)
+
+    def _take_over_legacy(self, record: KeyRecord) -> None:
+        """Lazily adopt raw pre-provider versions into the local provider.
+
+        Only runs while the local provider is the active provider; a legacy
+        version touched while a module:factory provider is active is refused
+        by :meth:`_provider_for` instead (503) and nothing is rewritten. Every
+        version is validated and wrapped *before* the file is rewritten once,
+        atomically: if validation or the write fails the original file stays
+        byte-for-byte intact and the handles just minted are released.
+        """
+        if not provider_mod.active_is_local():
+            return
+        local = provider_mod.configure_local(self.data_dir)
+        adopted = []
+        new_versions = []
+        changed = False
+        try:
+            for ver in record.versions:
+                if (
+                    ver.provider_id == LOCAL_PROVIDER_ID
+                    and not ver.handle
+                ):
+                    triple = local.import_material(
+                        ver.algorithm,
+                        ver.public_key,
+                        ver.encrypted_material,
+                    )
+                    adopted.append(triple.handle)
+                    new_versions.append(
+                        (
+                            ver,
+                            triple.handle,
+                            triple.encrypted_material,
+                            triple.public_key,
                         )
-                        ver.handle = triple.handle
-                        ver.encrypted_material = triple.encrypted_material
-                        if ver.public_key is None:
-                            ver.public_key = triple.public_key
-                        changed = True
-                if changed:
-                    self._write_atomic(path, record.to_json())
+                    )
+                    changed = True
+            if not changed:
+                return
+            for ver, handle, material, public_key in new_versions:
+                ver.handle = handle
+                ver.encrypted_material = material
+                if ver.public_key is None:
+                    ver.public_key = public_key
+            self._write_atomic(
+                self._path_for(record.key_id), record.to_json()
+            )
+        except BaseException:
+            # Validation failed or the atomic rewrite did not land: the
+            # original file is untouched. Release the registry entries this
+            # takeover just minted so the local backend leaks nothing.
+            for handle in adopted:
+                try:
+                    local.delete(handle)
+                except Exception:
+                    pass
+            raise
 
     # -- audit bookkeeping -------------------------------------------------
     def audit_conflict(self) -> None:
@@ -373,9 +616,21 @@ class KeyStore:
                 # append() is idempotent on event_id, so this is safe whether
                 # the crash happened before or after the ledger write.
                 event = AuditEvent.from_json(record.pending_event)
-                self.audit.append(event)
-                record.pending_event = None
-                self._write_atomic(path, record.to_json())
+                journal_id = record.pending_event.get("journal")
+                try:
+                    self.audit.append(event)
+                    record.pending_event = None
+                    self._write_atomic(path, record.to_json())
+                except (LedgerError, OSError):
+                    # The ledger or directory is temporarily unwritable.
+                    # Leave the marker in place; it is retried on the next
+                    # open (the append is idempotent on event_id).
+                    continue
+                if isinstance(journal_id, str) and journal_id:
+                    # The import committed (event is in the ledger); its
+                    # minted handles are now owned by the key, so the
+                    # attempt's provision journal is finished.
+                    self.drop_provision_journal(journal_id)
 
     def _commit_mutation(
         self,
@@ -385,6 +640,7 @@ class KeyStore:
         previous: Optional[dict],
         provider=None,
         new_handles=(),
+        journal_id: Optional[str] = None,
     ) -> None:
         """Commit a key-file change and its event as one logical transaction.
 
@@ -395,10 +651,16 @@ class KeyStore:
         ``previous`` is None, restored to its prior bytes otherwise), and any
         provider handles the change minted are deleted, so a failed ledger
         write leaves neither a single-sided file nor an orphaned HSM object.
+        ``journal_id`` (import only) is folded into the marker so crash
+        recovery can drop the attempt's provision journal after resolving it.
         A crash at any point is repaired idempotently by
         _recover_pending_events on the next open.
         """
-        record.pending_event = event.to_json()
+        marker = event.to_json()
+        if journal_id:
+            marker = dict(marker)
+            marker["journal"] = journal_id
+        record.pending_event = marker
 
         def release_handles() -> None:
             # Best effort; never mask the original failure.
@@ -429,13 +691,16 @@ class KeyStore:
                         pass
             release_handles()
             raise
+        # The durable ledger append is the commit point: the change and its
+        # event are now authoritative and must never be rolled back. Clearing
+        # the marker is best-effort housekeeping; a failure here (or a crash)
+        # is repaired on the next open and must not surface as a failed
+        # request or trigger handle deletion.
         record.pending_event = None
         try:
             self._write_atomic(path, record.to_json())
-        except BaseException:
-            # The ledger already committed, so do not unlink; just release no
-            # handle (the key legitimately owns it). Surface the write error.
-            raise
+        except OSError:
+            pass
 
     def _key_lock(self, key_id: str) -> threading.Lock:
         with self._locks_lock:
@@ -502,13 +767,21 @@ class KeyStore:
     def _provider_for(provider_id: str):
         """Return the provider instance that owns ``provider_id``.
 
-        The built-in local provider is always available; any other id must
-        match the currently configured external provider. A record naming a
-        provider that is not active cannot be rotated/exported/imported and
-        fails as unavailable (503) rather than silently switching providers.
+        The built-in local provider is usable only while ``KEYMGR_PROVIDER``
+        is unset or explicitly ``local``: a record (or bundle provenance
+        block) owned by ``local`` while a module:factory provider is active is
+        refused as unavailable (503), never silently handled locally. Any
+        other id must match the currently active external provider, which is
+        imported lazily here. A record naming an inactive provider cannot be
+        rotated/exported/imported and fails 503 rather than switching
+        providers.
         """
         if provider_id == LOCAL_PROVIDER_ID:
-            return provider_mod.get_local_provider()
+            if provider_mod.active_is_local():
+                return provider_mod.get_local_provider()
+            raise ProviderUnavailable(
+                "record is owned by the local provider, which is not active"
+            )
         active = provider_mod.get_provider()
         if active.provider_id != provider_id:
             raise ProviderUnavailable(
@@ -707,33 +980,66 @@ class KeyStore:
         """Seal a tenant's full key record into an opaque bundle.
 
         Returns None for an unknown or foreign key, so the caller cannot tell
-        the two cases apart. Export does not modify the record; its audit event
-        is appended by the caller alongside the response, like a read.
+        the two cases apart. Export does not mutate committed state beyond the
+        lazy one-time adoption of a pre-provider record, and never imports a
+        non-local provider; its audit event is appended by the caller
+        alongside the response, like a read.
         """
-        record = self.get(key_id, tenant_id)
-        if record is None:
+        if not is_valid_key_id(key_id):
             return None
-        return keybundle.encode_bundle(
-            self.export_payload(record), passphrase
-        )
+        path = self._path_for(key_id)
+        with self._key_lock(key_id), self._file_lock(key_id):
+            record = self._read_record(path)
+            if record is None or record.tenant_id != tenant_id:
+                return None
+            # Adopt a raw legacy record now, under the key locks and only
+            # while the local provider is active. When a module:factory
+            # provider is active this is a no-op and _export_version fails
+            # the local-owned version as 503, without rewriting anything.
+            self._take_over_legacy(record)
+            return keybundle.encode_bundle(
+                self.export_payload(record), passphrase
+            )
 
-    def _adopt_imported_version(self, ver: dict) -> tuple:
+    def prepare_backup_record(self, record: KeyRecord) -> KeyRecord:
+        """Lazily adopt a record's legacy versions for a tenant backup.
+
+        Called by the RestoreCoordinator while it already holds the key
+        locks, so the takeover rewrite is part of the backup's consistent
+        snapshot.
+        """
+        self._take_over_legacy(record)
+        return record
+
+    def _adopt_imported_version(self, ver: dict, journal: Optional[str] = None) -> tuple:
         """Adopt one validated bundle version through its target provider.
 
-        Returns (VersionRecord, provider). A ``provider`` block naming the
-        active provider imports through it; a block naming another provider is
-        a 503 mismatch; a legacy bundle without a block adopts into the
-        built-in local provider. Only the provider's freshly-minted triple is
-        ever persisted — raw private material is never written to a key file.
+        Returns (VersionRecord, provider). A ``provider`` provenance block
+        naming the active provider imports through it; a block naming another
+        provider is a 503 mismatch. A legacy bundle without a block
+        (``keymgr-export-v1`` emitted before the provider layer) is interpreted
+        as local material, and is accepted only while the local provider is
+        the active one — with an external provider configured it is refused
+        503 and never falls back. Only the provider's freshly-minted triple is
+        ever persisted; raw private material is never written to a key file.
+        Every minted handle is durably recorded in ``journal`` (when given)
+        before the call returns, so a crash before the commit point reaps it.
         """
         block = ver.get("provider")
         if block is None:
-            target = provider_mod.get_local_provider()
+            if not provider_mod.active_is_local():
+                raise ProviderUnavailable(
+                    "legacy bundle without a provider block is local-only; "
+                    "the local provider is not active"
+                )
+            target = provider_mod.configure_local(self.data_dir)
         else:
             target = self._provider_for(block["provider_id"])
         triple = target.import_material(
             ver["algorithm"], ver["public_key"], ver["private_material"]
         )
+        if journal is not None:
+            self._append_provision(journal, target.provider_id, triple.handle)
         public_key = (
             triple.public_key
             if triple.public_key is not None
@@ -785,23 +1091,31 @@ class KeyStore:
         Returns (IMPORT_CREATED, record) for a brand-new key_id, or
         (IMPORT_CONFLICT, existing) when the key_id already exists; the
         existing record on disk is never touched, and the caller decides 409
-        versus 404 from its owner. Each version is adopted through the
+        versus 404 from its owner. Every version is adopted through the
         matching provider (a mismatch raises ProviderUnavailable -> 503 and
-        malformed material ProviderInvalidMaterial -> 400). A successful
-        import and its audit event commit through the same outbox transaction
-        as create/rotate, and a failure deletes every minted handle.
+        malformed material ProviderInvalidMaterial -> 400) **before** the
+        conflict recheck or any file is written; handles minted by a refused
+        or failed attempt are all deleted and no file or audit line changes.
+        A successful import and its audit event commit through the same
+        outbox transaction as create/rotate.
         """
         key_id = payload["key_id"]
-        path = self._path_for(key_id)
-        with self._key_lock(key_id), self._file_lock(key_id):
-            existing = self._read_record(path)
-            if existing is not None:
-                return IMPORT_CONFLICT, existing
+        # Mint the committing event up front so the provision journal is
+        # named after its event_id: a leftover journal resolves at any startup
+        # by asking the ledger whether the event committed.
+        event = self.audit.new_event(
+            tenant_id, audit_mod.ACTION_IMPORT, key_id,
+            audit_mod.OUTCOME_SUCCESS,
+        )
+        journal_id, journal_path = self._new_provision_journal(event.event_id)
+        try:
             adopted = []  # (provider, handle)
+            versions = []
             try:
-                versions = []
                 for ver in payload["versions"]:
-                    version_record, target = self._adopt_imported_version(ver)
+                    version_record, target = self._adopt_imported_version(
+                        ver, journal_path
+                    )
                     versions.append(version_record)
                     adopted.append((target, version_record.handle))
             except BaseException:
@@ -818,16 +1132,36 @@ class KeyStore:
                 operator=payload["operator"],
                 revoked_at=payload["revoked_at"],
             )
-            event = self.audit.new_event(
-                tenant_id, audit_mod.ACTION_IMPORT, key_id,
-                audit_mod.OUTCOME_SUCCESS,
-            )
-            try:
-                self._commit_mutation(path, record, event, None)
-            except BaseException:
-                self._release_handles(adopted)
-                raise
-        return IMPORT_CREATED, record
+            path = self._path_for(key_id)
+            with self._key_lock(key_id), self._file_lock(key_id):
+                # Conflict recheck only after every version validated and
+                # every provider call succeeded; nothing has been written.
+                existing = self._read_record(path)
+                if existing is not None:
+                    self._release_handles(adopted)
+                    return IMPORT_CONFLICT, existing
+                try:
+                    # Rollback of the just-created file plus explicit handle
+                    # release below; the provision journal also reaps on
+                    # crash.
+                    self._commit_mutation(
+                        path, record, event, None,
+                        journal_id=journal_id,
+                    )
+                except BaseException:
+                    self._release_handles(adopted)
+                    raise
+                # Committed: the handles are owned by the new record and the
+                # durable event makes the journal obsolete.
+                self.drop_provision_journal(journal_id)
+                journal_id = None
+            return IMPORT_CREATED, record
+        finally:
+            if journal_id is not None:
+                # Any non-commit exit (provider failure, validation, conflict,
+                # aborted transaction): every minted handle was released
+                # above; the journal itself is no longer needed.
+                self.drop_provision_journal(journal_id)
 
     # -- tenant backup / restore ------------------------------------------
     def list_for_tenant(self, tenant_id: str) -> list:
@@ -871,21 +1205,26 @@ class KeyStore:
             return None
         return self._read_record(self._path_for(key_id))
 
-    def record_from_backup(self, tenant_id: str, entry: dict) -> KeyRecord:
+    def record_from_backup(
+        self, tenant_id: str, entry: dict, journal: Optional[str] = None
+    ) -> KeyRecord:
         """Build an unsaved KeyRecord from a validated backup keys[i] entry.
 
         Every version is adopted through its matching provider (the bundle's
         ``provider`` provenance block, or the built-in local provider for a
-        legacy bundle without one), so the restored record carries fresh
-        handles and never raw private material. A provider mismatch raises
-        ProviderUnavailable (503); malformed material raises
-        ProviderInvalidMaterial (400).
+        legacy bundle without one and only while local is active), so the
+        restored record carries fresh handles and never raw private material.
+        A provider mismatch raises ProviderUnavailable (503); malformed
+        material raises ProviderInvalidMaterial (400). Minted handles are
+        durably recorded in ``journal`` and released on any later failure.
         """
         versions = []
         adopted = []
         try:
             for ver in entry["versions"]:
-                version_record, target = self._adopt_imported_version(ver)
+                version_record, target = self._adopt_imported_version(
+                    ver, journal
+                )
                 versions.append(version_record)
                 adopted.append((target, version_record.handle))
         except BaseException:
@@ -893,7 +1232,7 @@ class KeyStore:
             # every handle this record minted for its earlier versions.
             self._release_handles(adopted)
             raise
-        return KeyRecord(
+        record = KeyRecord(
             key_id=entry["key_id"],
             tenant_id=tenant_id,
             label=entry["label"],
@@ -904,6 +1243,7 @@ class KeyStore:
             operator=entry["operator"],
             revoked_at=entry["revoked_at"],
         )
+        return record
 
     def write_restore_pending(
         self, record: KeyRecord, marker: dict

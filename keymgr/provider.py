@@ -604,6 +604,18 @@ def _spec() -> str:
     return os.environ.get("KEYMGR_PROVIDER", "") or LOCAL_PROVIDER_ID
 
 
+def active_is_local() -> bool:
+    """Whether the configured active provider is the built-in local one.
+
+    Reads the ``KEYMGR_PROVIDER`` spec without importing anything: the local
+    provider is active only for an empty value or an explicit ``local``. This
+    is used for the provider-selection gates (legacy-record adoption, legacy
+    bundle import) that must never trigger an import of a module:factory
+    provider from a plain read.
+    """
+    return _spec() == LOCAL_PROVIDER_ID
+
+
 def _load_external(spec: str):
     module_name, sep, factory_name = spec.partition(":")
     if not sep or not module_name or not factory_name:
@@ -681,10 +693,11 @@ def configure(data_dir: str) -> KeyProvider:
 def configure_local(data_dir: str) -> "LocalProvider":
     """Bind state without importing an external provider.
 
-    Used at store startup to adopt pre-provider records (raw local material)
-    even when the active provider is an external KMS/HSM: legacy records are
-    owned by the local provider, never by whatever is configured now. The
-    external factory stays unloaded until its first operation (lazy load).
+    Used when the local provider is actually needed (local generation, lazy
+    legacy adoption, local bundle import, startup cleanup of local handles):
+    legacy records are owned by the local provider, never by whatever is
+    configured now. The external factory stays unloaded until its first
+    operation (lazy load).
     """
     global _configured_dir
     _configured_dir = data_dir
@@ -692,8 +705,24 @@ def configure_local(data_dir: str) -> "LocalProvider":
     return _LOCAL_SINGLETON
 
 
+def bind_data_dir(data_dir: str) -> None:
+    """Remember the data directory without loading any provider.
+
+    Called at store open so the provider chosen lazily by
+    :func:`get_provider` gets configured on first use, while startup itself
+    neither imports a module:factory provider nor creates local provider
+    state. Plain reads therefore load no provider.
+    """
+    global _configured_dir
+    _configured_dir = data_dir
+
+
 def get_local_provider() -> "LocalProvider":
-    """Return the built-in local provider singleton (configured separately)."""
+    """Return the built-in local provider singleton, configured if a data
+    directory has been bound (configure_local/bind_data_dir). Never imports a
+    configured external provider."""
+    if _configured_dir is not None and not _LOCAL_SINGLETON._configured:
+        _LOCAL_SINGLETON.configure(_configured_dir)
     return _LOCAL_SINGLETON
 
 
