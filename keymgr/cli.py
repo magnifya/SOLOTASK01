@@ -9,14 +9,16 @@ from typing import List, Optional
 
 from . import audit as audit_mod
 from . import keybundle
+from . import operations as operations_mod
 from . import restore as restore_mod
 from . import tenantbundle
 from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
+from .operations import OperationStore
 from .policy import PolicyError, PolicyStore, validate_rules
 from .provider import ProviderInvalidMaterial, ProviderUnavailable
-from .server import serve
-from .store import IMPORT_CONFLICT, KeyStore, is_valid_key_id
+from .server import _resolve_committed_operation, serve
+from .store import IMPORT_CONFLICT, KeyStore, LockTimeout, is_valid_key_id
 
 DEFAULT_DATA_DIR = os.environ.get("KEYMGR_DATA_DIR", "keymgr_data")
 
@@ -67,6 +69,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_rotate.add_argument("--key-id", required=True)
     p_rotate.add_argument("--algorithm", required=True,
                           help="one of: %s" % ", ".join(SUPPORTED_ALGORITHMS))
+    p_rotate.add_argument(
+        "--idempotency-key", required=True,
+        help="1-128 chars A-Za-z0-9._~- ; retries reuse the result",
+    )
 
     p_version = tenant_parser("version", help="show a specific key version")
     p_version.add_argument("--key-id", required=True)
@@ -89,6 +95,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_import = tenant_parser("import", help="import a key from an encrypted bundle")
     p_import.add_argument("--passphrase", required=True)
     p_import.add_argument("--bundle", required=True)
+    p_import.add_argument(
+        "--idempotency-key", required=True,
+        help="1-128 chars A-Za-z0-9._~- ; retries reuse the result",
+    )
 
     p_backup = tenant_parser(
         "backup", help="back up all of a tenant's keys and policy"
@@ -100,6 +110,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_restore.add_argument("--passphrase", required=True)
     p_restore.add_argument("--bundle", required=True)
+    p_restore.add_argument(
+        "--idempotency-key", required=True,
+        help="1-128 chars A-Za-z0-9._~- ; retries reuse the result",
+    )
+
+    p_operation = tenant_parser(
+        "operation", help="show one idempotent operation's status"
+    )
+    p_operation.add_argument(
+        "--operation-id", required=True,
+        help="UUID4 operation_id returned by rotate/import/restore",
+    )
 
     p_audit = tenant_parser("audit", help="list a tenant's audit events")
     p_audit.add_argument("--key-id", default=None,
@@ -194,6 +216,149 @@ def _deny(store, tenant_id, key_id, action) -> int:
     return _fail("action not permitted by policy", 3)
 
 
+# Map a stored/terminal HTTP status to its CLI exit code.
+def _http_to_cli(http_status: int) -> int:
+    return {201: 0, 200: 0, 400: 2, 403: 3, 409: 3, 404: 4}.get(
+        http_status, 1
+    )
+
+
+def _idem_key_error(key) -> bool:
+    """Validate an --idempotency-key; report exit 2 when malformed."""
+    if not operations_mod.is_valid_idempotency_key(key):
+        _fail(
+            "field idempotency_key must be 1-128 characters from "
+            "A-Za-z0-9._~-", 2
+        )
+        return True
+    return False
+
+
+def _emit_operation_result(http_status: int, body: dict) -> int:
+    """Print a terminal operation's body and return the CLI exit code."""
+    if 200 <= http_status < 300:
+        _print(body)
+    else:
+        # Errors contain only error and operation_id.
+        print(
+            json.dumps(
+                {
+                    "error": body.get("error", "request failed"),
+                    "operation_id": body.get("operation_id"),
+                },
+                separators=(",", ":"),
+            ),
+            file=sys.stderr,
+        )
+    return _http_to_cli(http_status)
+
+
+def _idem_serve_existing(op_store, kind, record) -> "Optional[int]":
+    """Replay/conflict/wait for a bound key; None means the key is unbound."""
+    if kind == "new":
+        return None
+    if kind == "conflict":
+        return _emit_operation_result(
+            409,
+            {
+                "error": "Idempotency-Key is already bound to a different "
+                "request",
+                "operation_id": record.operation_id,
+            },
+        )
+    if not record.is_terminal():
+        record = op_store.await_terminal(record)
+    if record.is_terminal():
+        return _emit_operation_result(record.http_status, record.response)
+    # Waiter outlived the 5 s budget: timed_out without mutating the owner.
+    return _emit_operation_result(
+        503,
+        {
+            "error": "operation timed out waiting for a lock",
+            "operation_id": record.operation_id,
+        },
+    )
+
+
+def idempotent_run(op_store, path, tenant_id, operator, body, key,
+                   validator, executor):
+    """CLI counterpart of the HTTP idempotency guard.
+
+    Returns a process exit code. ``validator()`` runs side-effect-free checks
+    (e.g. bundle decryption) *before* the key is bound and returns None on
+    success or an ``(exit_code, message)`` refusal; a refusal never consumes
+    the key. ``executor(operation) -> (http_status, body)`` runs once for a
+    new binding and may raise ProviderInvalidMaterial / ProviderUnavailable /
+    LedgerError / LockTimeout.
+    """
+    if _idem_key_error(key):
+        return 2
+    normalized = operations_mod.normalize_body(body)
+
+    # An already-bound key replays/conflicts before the side-effect-free
+    # validation (e.g. bundle decryption), so a bad passphrase on a retry
+    # never masks a replay or consumes the key.
+    peek = op_store.peek(tenant_id, operator, path, normalized, key)
+    existing = _idem_serve_existing(op_store, peek.kind, peek.record)
+    if existing is not None:
+        return existing
+
+    refusal = validator()
+    if refusal is not None:
+        code, message = refusal
+        return _fail(message, code)
+
+    # begin() is authoritative for the bind (another process may have won
+    # between the peek and here).
+    begin = op_store.begin(tenant_id, operator, path, normalized, key)
+    existing = _idem_serve_existing(op_store, begin.kind, begin.record)
+    if existing is not None:
+        return existing
+
+    operation = begin.record
+    op_id = operation.operation_id
+    try:
+        http_status, resp = executor(operation)
+    except LockTimeout:
+        body_err = {
+            "error": "operation timed out waiting for a lock",
+            "operation_id": op_id,
+        }
+        op_store.finish(
+            operation, operations_mod.STATUS_TIMED_OUT, 503, body_err
+        )
+        return _emit_operation_result(503, body_err)
+    except ProviderInvalidMaterial as exc:
+        body_err = {"error": str(exc), "operation_id": op_id}
+        op_store.finish(operation, operations_mod.STATUS_FAILED, 400, body_err)
+        return _emit_operation_result(400, body_err)
+    except ProviderUnavailable:
+        body_err = {
+            "error": "key management provider is unavailable",
+            "operation_id": op_id,
+        }
+        op_store.finish(operation, operations_mod.STATUS_FAILED, 503, body_err)
+        return _emit_operation_result(503, body_err)
+    except LedgerError as exc:
+        body_err = {
+            "error": "audit ledger failure: %s" % exc,
+            "operation_id": op_id,
+        }
+        op_store.finish(operation, operations_mod.STATUS_FAILED, 500, body_err)
+        return _emit_operation_result(500, body_err)
+    resp = dict(resp)
+    resp["operation_id"] = op_id
+    state = (
+        operations_mod.STATUS_SUCCEEDED
+        if http_status == 201
+        else operations_mod.STATUS_CONFLICT
+        if http_status == 409
+        else operations_mod.STATUS_FAILED
+    )
+    op_store.finish(operation, state, http_status, resp)
+    return _emit_operation_result(http_status, resp)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """CLI entry point; returns a process exit code.
 
@@ -221,6 +386,14 @@ def _run(argv: Optional[List[str]] = None) -> int:
     store = KeyStore(args.data_dir, audit_log)
     policies = PolicyStore(args.data_dir, audit_log)
     coordinator = restore_mod.RestoreCoordinator(store, policies)
+    # Resolve any operations left pending by a crashed CLI/server run, after
+    # the key/restore outbox recovery above has settled the mutation.
+    op_store = OperationStore(args.data_dir, audit_log)
+    op_store.recover_pending(
+        lambda record, event: _resolve_committed_operation(
+            store, record, event
+        )
+    )
 
     if not getattr(args, "operator", None):
         return _fail(
@@ -308,24 +481,44 @@ def _run(argv: Optional[List[str]] = None) -> int:
             if not _conflict(store):
                 return 1
             return _fail("field key_id must be a UUID4", 2)
-        if not allowed(audit_mod.ACTION_ROTATE):
-            return _deny(store, args.tenant_id, args.key_id,
-                         audit_mod.ACTION_ROTATE)
-        try:
-            record = store.rotate(
-                args.key_id, args.tenant_id, args.algorithm
-            )
-        except LedgerError as exc:
-            return _ledger_fail(exc)
-        if record is None:
-            if not _attempt(
-                store, args.tenant_id, args.key_id,
-                audit_mod.ACTION_ROTATE, audit_mod.OUTCOME_REJECTED,
+
+        body = {
+            "tenant_id": args.tenant_id,
+            "algorithm": args.algorithm,
+        }
+        path = "/v1/keys/%s/rotate" % args.key_id
+
+        def execute(operation):
+            if not policies.is_allowed(
+                args.tenant_id, audit_mod.ACTION_ROTATE, args.operator
             ):
-                return 1
-            return _fail("key not found", 4)
-        _print(record.to_rotate_response())
-        return 0
+                store.audit_attempt(
+                    args.tenant_id, args.key_id,
+                    audit_mod.ACTION_ROTATE, audit_mod.OUTCOME_REJECTED,
+                )
+                return 403, {"error": "action not permitted by policy"}
+            op_store.update_details(
+                operation,
+                {"kind": "rotate", "key_id": args.key_id,
+                 "algorithm": args.algorithm},
+            )
+            record = store.rotate(
+                args.key_id, args.tenant_id, args.algorithm,
+                event_id=operation.operation_id,
+                lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
+            )
+            if record is None:
+                store.audit_attempt(
+                    args.tenant_id, args.key_id,
+                    audit_mod.ACTION_ROTATE, audit_mod.OUTCOME_REJECTED,
+                )
+                return 404, {"error": "key not found"}
+            return 201, record.to_rotate_response()
+
+        return idempotent_run(
+            op_store, path, args.tenant_id, args.operator, body,
+            args.idempotency_key, lambda: None, execute,
+        )
 
     if args.command == "version":
         if not is_valid_key_id(args.key_id):
@@ -458,63 +651,83 @@ def _run(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.command == "import":
-        if not args.tenant_id or not args.passphrase or not args.bundle:
-            # Until the bundle decrypts the key_id is unknown, so a rejected
-            # import carries a null key_id and is visible to this tenant.
-            if not _identifiers_ok(args.tenant_id, None):
-                if not _conflict(store):
-                    return 1
-            elif not _attempt(
-                store, args.tenant_id, None,
-                audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
-            ):
-                return 1
-            if not args.tenant_id:
-                return _fail("field tenant_id must be a non-empty string", 2)
-            field = "passphrase" if not args.passphrase else "bundle"
-            return _fail(
-                "field %s must be a non-empty string" % field, 2
-            )
-        try:
-            payload = keybundle.decode_bundle(
-                args.bundle, args.passphrase
-            )
-        except keybundle.BundleError as exc:
-            if not _attempt(
-                store, args.tenant_id, None,
-                audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
-            ):
-                return 1
-            return _fail(str(exc), 2)
-        if not allowed(audit_mod.ACTION_IMPORT):
-            return _deny(store, args.tenant_id, payload["key_id"],
-                         audit_mod.ACTION_IMPORT)
-        try:
-            status, record = store.import_bundle(args.tenant_id, payload)
-        except ProviderInvalidMaterial as exc:
-            # Authentic bundle, malformed material: a rejected import.
-            if not _attempt(
-                store, args.tenant_id, payload["key_id"],
-                audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
-            ):
-                return 1
-            return _fail(str(exc), 2)
-        except LedgerError as exc:
-            return _ledger_fail(exc)
-        if status == IMPORT_CONFLICT:
-            if not _attempt(
-                store, args.tenant_id, record.key_id,
-                audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
-            ):
-                return 1
-            if record.tenant_id == args.tenant_id:
-                return _fail(
-                    "key_id already exists for this tenant", 3
+        body = {
+            "tenant_id": args.tenant_id,
+            "passphrase": args.passphrase,
+            "bundle": args.bundle,
+        }
+        path = "/v1/keys/import"
+        decoded = {}
+
+        def validator():
+            # Field validation (audited) and side-effect-free decryption run
+            # after the replay precheck and before the key is bound, so a
+            # refusal never consumes the Idempotency-Key.
+            if not args.tenant_id or not args.passphrase or not args.bundle:
+                if not _identifiers_ok(args.tenant_id, None):
+                    if not _conflict(store):
+                        return (1, "audit ledger failure")
+                elif not _attempt(
+                    store, args.tenant_id, None,
+                    audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
+                ):
+                    return (1, "audit ledger failure")
+                if not args.tenant_id:
+                    return (2, "field tenant_id must be a non-empty string")
+                field = "passphrase" if not args.passphrase else "bundle"
+                return (
+                    2,
+                    "field %s must be a non-empty string" % field,
                 )
-            return _fail("key not found", 4)
-        # The success event committed together with the imported key file.
-        _print(record.to_create_response())
-        return 0
+            try:
+                payload = keybundle.decode_bundle(
+                    args.bundle, args.passphrase
+                )
+            except keybundle.BundleError as exc:
+                if not _attempt(
+                    store, args.tenant_id, None,
+                    audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
+                ):
+                    return (1, "audit ledger failure")
+                return (2, str(exc))
+            decoded.update(payload)
+            return None
+
+        def execute(operation):
+            if not policies.is_allowed(
+                args.tenant_id, audit_mod.ACTION_IMPORT, args.operator
+            ):
+                store.audit_attempt(
+                    args.tenant_id, decoded["key_id"],
+                    audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
+                )
+                return 403, {"error": "action not permitted by policy"}
+            op_store.update_details(
+                operation,
+                {"kind": "import", "key_id": decoded["key_id"]},
+            )
+            status, record = store.import_bundle(
+                args.tenant_id, decoded,
+                event_id=operation.operation_id,
+                lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
+            )
+            if status == IMPORT_CONFLICT:
+                store.audit_attempt(
+                    args.tenant_id, record.key_id,
+                    audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
+                )
+                if record.tenant_id == args.tenant_id:
+                    return (
+                        409,
+                        {"error": "key_id already exists for this tenant"},
+                    )
+                return 404, {"error": "key not found"}
+            return 201, record.to_create_response()
+
+        return idempotent_run(
+            op_store, path, args.tenant_id, args.operator, body,
+            args.idempotency_key, validator, execute,
+        )
 
     if args.command == "backup":
         if not args.tenant_id or not args.passphrase:
@@ -549,72 +762,111 @@ def _run(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.command == "restore":
-        if not args.tenant_id or not args.passphrase or not args.bundle:
-            if not _identifiers_ok(args.tenant_id, None):
-                if not _conflict(store):
-                    return 1
-            elif not _attempt(
-                store, args.tenant_id, None,
-                audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
+        body = {
+            "tenant_id": args.tenant_id,
+            "passphrase": args.passphrase,
+            "bundle": args.bundle,
+        }
+        path = "/v1/restore"
+        decoded = {}
+
+        def validator():
+            if not args.tenant_id or not args.passphrase or not args.bundle:
+                if not _identifiers_ok(args.tenant_id, None):
+                    if not _conflict(store):
+                        return (1, "audit ledger failure")
+                elif not _attempt(
+                    store, args.tenant_id, None,
+                    audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
+                ):
+                    return (1, "audit ledger failure")
+                if not args.tenant_id:
+                    return (2, "field tenant_id must be a non-empty string")
+                field = "passphrase" if not args.passphrase else "bundle"
+                return (
+                    2,
+                    "field %s must be a non-empty string" % field,
+                )
+            try:
+                payload = tenantbundle.decode_bundle(
+                    args.bundle, args.passphrase
+                )
+            except tenantbundle.TenantBundleError as exc:
+                if not _attempt(
+                    store, args.tenant_id, None,
+                    audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
+                ):
+                    return (1, "audit ledger failure")
+                return (2, str(exc))
+            decoded.update(payload)
+            return None
+
+        def execute(operation):
+            if not policies.is_allowed(
+                args.tenant_id, audit_mod.ACTION_IMPORT, args.operator
             ):
-                return 1
-            if not args.tenant_id:
-                return _fail("field tenant_id must be a non-empty string", 2)
-            field = "passphrase" if not args.passphrase else "bundle"
-            return _fail(
-                "field %s must be a non-empty string" % field, 2
-            )
-        try:
-            payload = tenantbundle.decode_bundle(
-                args.bundle, args.passphrase
-            )
-        except tenantbundle.TenantBundleError as exc:
-            if not _attempt(
-                store, args.tenant_id, None,
-                audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
-            ):
-                return 1
-            return _fail(str(exc), 2)
-        if not allowed(audit_mod.ACTION_IMPORT):
-            return _deny(store, args.tenant_id, None,
-                         audit_mod.ACTION_IMPORT)
-        if payload["tenant_id"] != args.tenant_id:
-            if not _attempt(
-                store, args.tenant_id, None,
-                audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
-            ):
-                return 1
-            return _fail("tenant backup not found", 4)
-        try:
-            result = coordinator.restore(args.tenant_id, payload)
-        except ProviderInvalidMaterial as exc:
-            # Authentic bundle, malformed material: a rejected import
-            # (key_id null, like every restore event).
-            if not _attempt(
-                store, args.tenant_id, None,
-                audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
-            ):
-                return 1
-            return _fail(str(exc), 2)
-        except LedgerError as exc:
-            return _ledger_fail(exc)
-        if result.status == restore_mod.RESTORE_CREATED:
-            _print(
+                store.audit_attempt(
+                    args.tenant_id, None,
+                    audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
+                )
+                return 403, {"error": "action not permitted by policy"}
+            if decoded["tenant_id"] != args.tenant_id:
+                store.audit_attempt(
+                    args.tenant_id, None,
+                    audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
+                )
+                return 404, {"error": "tenant backup not found"}
+            key_ids = sorted(k["key_id"] for k in decoded["keys"])
+            op_store.update_details(
+                operation,
                 {
-                    "tenant_id": result.tenant_id,
-                    "key_ids": result.key_ids,
-                    "policy_restored": result.policy_restored,
-                }
+                    "kind": "restore",
+                    "key_ids": key_ids,
+                    "policy_restored": decoded["policy"] is not None,
+                },
             )
-            return 0
-        if not _attempt(
-            store, args.tenant_id, None,
-            audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
-        ):
-            return 1
-        if result.status == restore_mod.RESTORE_SAME_TENANT_CONFLICT:
-            return _fail("backup target already contains this data", 3)
-        return _fail("tenant backup not found", 4)
+            result = coordinator.restore(
+                args.tenant_id, decoded,
+                event_id=operation.operation_id,
+                lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
+            )
+            if result.status == restore_mod.RESTORE_CREATED:
+                return (
+                    201,
+                    {
+                        "tenant_id": result.tenant_id,
+                        "key_ids": result.key_ids,
+                        "policy_restored": result.policy_restored,
+                    },
+                )
+            store.audit_attempt(
+                args.tenant_id, None,
+                audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
+            )
+            if result.status == restore_mod.RESTORE_SAME_TENANT_CONFLICT:
+                return (
+                    409,
+                    {"error": "backup target already contains this data"},
+                )
+            return 404, {"error": "tenant backup not found"}
+
+        return idempotent_run(
+            op_store, path, args.tenant_id, args.operator, body,
+            args.idempotency_key, validator, execute,
+        )
+
+    if args.command == "operation":
+        if not args.tenant_id:
+            return _fail("field tenant_id must be a non-empty string", 2)
+        record = op_store.get(
+            args.operation_id, args.tenant_id, args.operator
+        )
+        if record is None:
+            # Unknown, malformed, another tenant's or another operator's
+            # operation all look identical: never leak existence.
+            return _fail("operation not found", 4)
+        _print(record.to_status_response())
+        return 0
 
     if args.command == "audit":
         if not args.tenant_id:

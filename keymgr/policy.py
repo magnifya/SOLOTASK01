@@ -175,26 +175,57 @@ class PolicyStore:
         return os.path.join(self.dir_path, digest + ".lock")
 
     @contextmanager
-    def tenant_lock(self, tenant_id: str) -> Iterator[None]:
+    def tenant_lock(
+        self, tenant_id: str, timeout: Optional[float] = None
+    ) -> Iterator[None]:
         """Serialize all writes to one tenant's policy across processes.
 
         Pairs the in-process write lock with an exclusive ``fcntl`` lock on a
         per-tenant sidecar file, so a put/delete/restore/backup in another
-        process cannot interleave with this one's read-modify-write.
+        process cannot interleave with this one's read-modify-write. With a
+        finite ``timeout`` (idempotent restore) the wait is bounded and raises
+        :class:`~keymgr.store.LockTimeout` when it elapses.
         """
-        with self._write_lock:
-            if fcntl is None:  # pragma: no cover - non-POSIX platforms
-                yield
-                return
-            fd = os.open(
-                self._lock_path_for(tenant_id), os.O_RDWR | os.O_CREAT, 0o600
-            )
+        import time as _time
+
+        from .store import LockTimeout
+
+        deadline = None if timeout is None else _time.monotonic() + timeout
+        if timeout is None:
+            self._write_lock.acquire()
+        else:
+            if not self._write_lock.acquire(timeout=max(timeout, 0.0)):
+                raise LockTimeout("policy:" + tenant_id)
+        if fcntl is None:  # pragma: no cover - non-POSIX platforms
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX)
                 yield
             finally:
+                self._write_lock.release()
+            return
+        fd = os.open(
+            self._lock_path_for(tenant_id), os.O_RDWR | os.O_CREAT, 0o600
+        )
+        acquired = False
+        try:
+            if deadline is None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            else:
+                while True:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        remaining = deadline - _time.monotonic()
+                        if remaining <= 0:
+                            raise LockTimeout("policy:" + tenant_id)
+                        _time.sleep(min(0.02, remaining))
+            acquired = True
+            yield
+        finally:
+            if acquired:
                 fcntl.flock(fd, fcntl.LOCK_UN)
-                os.close(fd)
+            os.close(fd)
+            self._write_lock.release()
 
     def _write_atomic(self, path: str, payload: dict) -> None:
         fd, tmp_path = tempfile.mkstemp(dir=self.dir_path, suffix=".tmp")

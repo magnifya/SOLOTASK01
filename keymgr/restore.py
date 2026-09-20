@@ -140,27 +140,59 @@ class RestoreCoordinator:
 
     # -- restore -----------------------------------------------------------
     @contextmanager
-    def _cross_process_restore_lock(self) -> Iterator[None]:
+    def _cross_process_restore_lock(
+        self, timeout: Optional[float] = None
+    ) -> Iterator[None]:
         """Serialize whole restore transactions across processes.
 
         The in-process ``_restore_lock`` cannot stop a second server or CLI
         process from interleaving its conflict scan with this one's writes;
-        an exclusive ``fcntl`` lock on ``restore.lock`` can.
+        an exclusive ``fcntl`` lock on ``restore.lock`` can. A finite
+        ``timeout`` bounds the wait (idempotent restore) and raises
+        :class:`~keymgr.store.LockTimeout` when it elapses.
         """
+        import time as _time
+
+        from .store import LockTimeout
+
+        if timeout is None:
+            self._restore_lock.acquire()
+        else:
+            if not self._restore_lock.acquire(timeout=max(timeout, 0.0)):
+                raise LockTimeout("restore")
         if fcntl is None:  # pragma: no cover - non-POSIX platforms
-            yield
+            try:
+                yield
+            finally:
+                self._restore_lock.release()
             return
-        fd = os.open(
+        lock_fd = os.open(
             os.path.join(self.store.data_dir, "restore.lock"),
             os.O_RDWR | os.O_CREAT,
             0o600,
         )
+        acquired = False
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            deadline = None if timeout is None else _time.monotonic() + timeout
+            if deadline is None:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            else:
+                while True:
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        remaining = deadline - _time.monotonic()
+                        if remaining <= 0:
+                            raise LockTimeout("restore")
+                        _time.sleep(min(0.02, remaining))
+            acquired = True
             yield
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
+            if acquired:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+            self._restore_lock.release()
 
     def _empty_marker_path(self, tenant_id: str) -> str:
         digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()
@@ -168,7 +200,60 @@ class RestoreCoordinator:
             self.store.data_dir, _EMPTY_MARKER_PREFIX + digest + ".json"
         )
 
-    def restore(self, tenant_id: str, payload: dict) -> RestoreResult:
+    @contextmanager
+    def _restore_locks(
+        self,
+        tenant_id: str,
+        key_ids: List[str],
+        timeout: Optional[float],
+    ) -> Iterator[None]:
+        """Acquire every lock a restore needs, before any handle is minted.
+
+        Order: the in-process + cross-process restore locks, the tenant policy
+        lock, then the per-key locks in sorted order. With a finite
+        ``timeout`` all acquisitions share one deadline (5 s for an idempotent
+        operation); exhausting it raises LockTimeout before the provision
+        journal, audit event or any provider handle exists.
+        """
+        import time as _time
+
+        entered = []
+        deadline = None if timeout is None else _time.monotonic() + timeout
+
+        def remaining() -> Optional[float]:
+            if deadline is None:
+                return None
+            return max(deadline - _time.monotonic(), 0.0)
+
+        try:
+            global_cm = self._cross_process_restore_lock(
+                timeout=None if deadline is None else remaining()
+            )
+            global_cm.__enter__()
+            entered.append(global_cm)
+            policy_cm = self.policy_store.tenant_lock(
+                tenant_id, timeout=None if deadline is None else remaining()
+            )
+            policy_cm.__enter__()
+            entered.append(policy_cm)
+            if key_ids:
+                keys_cm = self.store.multi_key_locks(
+                    key_ids, timeout=None if deadline is None else remaining()
+                )
+                keys_cm.__enter__()
+                entered.append(keys_cm)
+            yield
+        finally:
+            for cm in reversed(entered):
+                cm.__exit__(None, None, None)
+
+    def restore(
+        self,
+        tenant_id: str,
+        payload: dict,
+        event_id: Optional[str] = None,
+        lock_timeout: Optional[float] = None,
+    ) -> RestoreResult:
         """Atomically restore a validated tenant payload.
 
         Returns a created result, or a conflict result after leaving every
@@ -176,27 +261,32 @@ class RestoreCoordinator:
         transaction cannot be committed; all written files and all handles
         minted by the attempt are rolled back.
 
-        Ordering: every version is validated and adopted through its provider
-        first (the durable provision journal records each handle as it is
-        minted); only then are conflicts rechecked, files written and the
-        single audit event appended. A failure, refused conflict or crash at
-        any point before that commit point deletes every handle the attempt
-        created; the durable event is the point of no return.
+        Ordering: every lock is acquired first (bounded by ``lock_timeout``
+        for an idempotent operation, so a slow lock writes nothing); every
+        version is then validated and adopted through its provider (the
+        durable provision journal records each handle as it is minted); only
+        then are conflicts rechecked, files written and the single audit
+        event appended. A failure, refused conflict or crash at any point
+        before that commit point deletes every handle the attempt created;
+        the durable event is the point of no return. ``event_id`` names that
+        event after the idempotent operation_id.
         """
-        with self._restore_lock, self._cross_process_restore_lock():
-            key_ids = sorted(k["key_id"] for k in payload["keys"])
-            policy_rules = None
-            if payload["policy"] is not None:
-                policy_rules = [
-                    Rule.from_json(r) for r in payload["policy"]["rules"]
-                ]
+        key_ids = sorted(k["key_id"] for k in payload["keys"])
+        policy_rules = None
+        if payload["policy"] is not None:
+            policy_rules = [
+                Rule.from_json(r) for r in payload["policy"]["rules"]
+            ]
 
+        # Take every lock BEFORE minting the event/journal/handles, so a
+        # lock-wait timeout leaves no key, audit event or handle behind.
+        with self._restore_locks(tenant_id, key_ids, lock_timeout):
             # Mint the committing event up front so the provision journal is
             # named after its event_id, letting startup recovery decide
             # committed-vs-not purely from the ledger.
             event = self.store.audit.new_event(
                 tenant_id, audit_mod.ACTION_IMPORT, None,
-                audit_mod.OUTCOME_SUCCESS,
+                audit_mod.OUTCOME_SUCCESS, event_id=event_id,
             )
             journal_id, journal_path = self.store._new_provision_journal(
                 event.event_id
@@ -206,9 +296,10 @@ class RestoreCoordinator:
                 # calls before the conflict recheck or any file write.
                 records = []
                 try:
-                    for key_id in key_ids:
+                    for one_key_id in key_ids:
                         entry = next(
-                            k for k in payload["keys"] if k["key_id"] == key_id
+                            k for k in payload["keys"]
+                            if k["key_id"] == one_key_id
                         )
                         records.append(
                             self.store.record_from_backup(
@@ -243,21 +334,21 @@ class RestoreCoordinator:
                 if not key_ids and not writes_policy:
                     # Empty bundle: no key/policy files or handles, but the
                     # batch still commits a persistent idempotency marker plus
-                    # its single import event.
-                    with self.policy_store.tenant_lock(tenant_id):
-                        policy_path = self.policy_store.path_for(tenant_id)
-                        if os.path.exists(policy_path):
-                            owner = self.policy_store.owner_of_path(policy_path)
-                            if owner is not None and owner != tenant_id:
-                                return RestoreResult(
-                                    status=RESTORE_FOREIGN_CONFLICT,
-                                    conflict=Conflict(kind="policy", owner=owner),
-                                )
+                    # its single import event. The policy lock is already held
+                    # by _restore_locks, so just inspect the path directly.
+                    policy_path = self.policy_store.path_for(tenant_id)
+                    if os.path.exists(policy_path):
+                        owner = self.policy_store.owner_of_path(policy_path)
+                        if owner is not None and owner != tenant_id:
                             return RestoreResult(
-                                status=RESTORE_SAME_TENANT_CONFLICT,
-                                conflict=Conflict(kind="policy", owner=tenant_id),
+                                status=RESTORE_FOREIGN_CONFLICT,
+                                conflict=Conflict(kind="policy", owner=owner),
                             )
-                        return self._commit_empty(tenant_id, event)
+                        return RestoreResult(
+                            status=RESTORE_SAME_TENANT_CONFLICT,
+                            conflict=Conflict(kind="policy", owner=tenant_id),
+                        )
+                    return self._commit_empty(tenant_id, event)
 
                 marker = {
                     "_restore": True,
@@ -269,7 +360,9 @@ class RestoreCoordinator:
                     "journal": journal_id,
                 }
 
-                return self._commit(
+                # All locks are already held; _commit runs the file/ledger
+                # transaction without re-acquiring them.
+                return self._commit_locked(
                     tenant_id, key_ids, records, policy_rules, event, marker
                 )
             finally:
@@ -356,7 +449,7 @@ class RestoreCoordinator:
                 same_tenant = Conflict(kind="policy", owner=tenant_id)
         return same_tenant
 
-    def _commit(
+    def _commit_locked(
         self,
         tenant_id: str,
         key_ids: List[str],
@@ -365,18 +458,8 @@ class RestoreCoordinator:
         event: AuditEvent,
         marker: dict,
     ) -> RestoreResult:
-        """Run the multi-file outbox transaction under all required locks."""
-        locked = []
-        policy_cm = self.policy_store.tenant_lock(tenant_id)
-        policy_taken = False
+        """Run the multi-file outbox transaction; caller already holds locks."""
         try:
-            policy_cm.__enter__()
-            policy_taken = True
-            for key_id in key_ids:
-                lock_cm = self.store.key_locks(key_id)
-                lock_cm.__enter__()
-                locked.append(lock_cm)
-
             # Re-scan now that every file lock is held.
             conflict = self._scan_conflicts(tenant_id, key_ids)
             if conflict is not None:
@@ -385,9 +468,9 @@ class RestoreCoordinator:
                     if conflict.owner != tenant_id
                     else RESTORE_SAME_TENANT_CONFLICT
                 )
-                # The provider objects were minted before the locks, but no
-                # file now commits: release the handles so the backend leaks
-                # nothing on the lost conflict race.
+                # The provider objects were minted before the file writes, but
+                # no file now commits: release the handles so the backend
+                # leaks nothing on the lost conflict race.
                 for record in records:
                     self.store.release_record_handles(record)
                 return RestoreResult(status=status, conflict=conflict)
@@ -443,11 +526,8 @@ class RestoreCoordinator:
                 key_ids=key_ids,
                 policy_restored=policy_rules is not None,
             )
-        finally:
-            for lock_cm in reversed(locked):
-                lock_cm.__exit__(None, None, None)
-            if policy_taken:
-                policy_cm.__exit__(None, None, None)
+        except Exception:
+            raise
 
     def _rollback(
         self,

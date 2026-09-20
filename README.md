@@ -182,6 +182,69 @@ python -m keymgr --data-dir ./keymgr_data serve --host 127.0.0.1 --port 8080
   具体字段；未知 key、未知版本及跨租户访问统一返回 `404`；同租户重复导入
   返回 `409`。任何响应均不含私钥材料。
 
+### 幂等操作
+
+轮换、导入与租户恢复三个变更端点支持幂等：
+
+- `POST /v1/keys/{key_id}/rotate`、`POST /v1/keys/import`、
+  `POST /v1/restore`（CLI 对应 `rotate` / `import` / `restore` 子命令）
+  必须携带**单一** `Idempotency-Key` 请求头（CLI 为必填
+  `--idempotency-key`），值为 1–128 个 ASCII 字符，且只能取自
+  `[A-Za-z0-9._~-]`。缺失、为空、重复或含非法字符一律 `400`
+  （CLI 退出码 `2`），且**不产生任何副作用**（不写密钥、不记审计、
+  不铸造提供者句柄）。
+- 每个键值**全局唯一**地绑定一次操作。服务记录操作的 UUID4
+  `operation_id`、`tenant_id`、操作者、路径、规范化请求体（键排序的
+  紧凑 JSON）、状态、HTTP 状态码与响应体。记录持久化在
+  `operations/<operation_id>.json`（`0600`），绑定索引在
+  `operations/index.json`，二者的读-改-写由一个进程内锁加
+  `operations.lock` 上的 `fcntl` 排他锁串行化。
+- **相同绑定重试**：再次提交完全相同的键 + 租户 + 操作者 + 路径 +
+  规范化体时，直接重放首次的 HTTP 状态码、响应体与审计事件
+  （`operation_id` 相同），业务逻辑绝不执行第二次。成功响应
+  （`201`）与错误响应都附加 `operation_id`；错误体只含 `error` 与
+  `operation_id` 两个字段。
+- **同键不同绑定**：同一个 `Idempotency-Key` 被用于不同的租户/操作者/
+  路径/请求体时返回 `409`（CLI 退出码 `3`），错误体给出**已有**
+  `operation_id`，不执行新请求。
+- 导入/恢复的解密是无副作用的：已绑定键在解密之前即判定重放/冲突；
+  未绑定键若口令错误或包被篡改返回 `400` 且**不占用**该幂等键，改用
+  正确口令后同一键仍可成功。
+- 操作状态为 `pending` / `succeeded` / `failed` / `conflict` /
+  `timed_out`：业务成功为 `201`（`succeeded`）；提供者故障为 `503`
+  （`failed`）；账本/持久化失败为 `500`（`failed`）；同租户冲突为
+  `409`（`conflict`，CLI `3`）；策略拒绝 `403`、未知/跨租户 `404`
+  等均记为 `failed` 并保留各自状态码。
+- **锁等待超时**：并发同键仅一个请求执行，其余等待首个请求到达终态；
+  等待超过 5 秒仍未完成则返回 `503` timed_out（CLI 退出码 `1`），
+  等待方**不**写密钥、不记审计、不铸造句柄，也不改动首个操作的记录。
+- **并发同键仅一次提交**：全局绑定锁保证同一键的并发请求中只有一个
+  进入执行，其余全部重放同一结果、共享同一个 `operation_id`。
+
+#### `GET /v1/operations/{operation_id}`
+
+要求单一 `X-Operator-Id` 与单一租户来源（单一 `X-Tenant-Id` 头或单一
+`?tenant_id=` 参数，规则同审计查询）。操作必须同时属于该租户与该操作者：
+
+- 成功 `200` 返回
+  `{"operation_id","tenant_id","status","http_status","response"}`；
+  `pending` 时 `http_status` 与 `response` 均为 `null`。
+- 未知 id、非法 UUID、跨租户或跨操作者访问一律 `404`，不泄露存在性。
+- CLI 对应 `operation --tenant-id <t> --operator <o>
+  --operation-id <id>` 子命令，打印同形单行 JSON。
+
+#### 崩溃与跨接口一致性
+
+- 幂等操作的 `operation_id` 即该变更审计事件的 `event_id`，因此
+  HTTP 与 CLI 共用同一套操作记录：一边发起的操作，另一边用相同
+  `Idempotency-Key` 重试会重放同一结果，也能通过 `operation_id` 查到。
+- 进程在操作 `pending` 时崩溃，下次启动（服务启动或任意 CLI 调用）在
+  key/restore 的 outbox 恢复**之后**按 `operation_id`（即事件 id）收尾：
+  事件已入帐则判定已提交，据持久化的变更事实重建 `201` 响应并置为
+  `succeeded`；事件未入帐则判定从未提交，置为 `failed`（`500`），
+  半成品密钥文件与提供者句柄由既有的 outbox / provision 恢复清理。
+  CLI 与 HTTP 行为一致。
+
 ### 版本与轮换
 
 每个 key 的首个版本为 `1`；每个版本独立保存创建时间、算法、公钥与私有材料，
@@ -259,15 +322,21 @@ python -m keymgr --data-dir ./keymgr_data show \
 版本与轮换命令同样打印单行 JSON，字段与对应 HTTP 响应一致：
 
 ```bash
-# 轮换：输出 {"key_id","version","algorithm","public_key"}
+# 轮换：输出 {"key_id","version","algorithm","public_key","operation_id"}
+# rotate 必填 --idempotency-key；重试相同键复用同一结果
 python -m keymgr --data-dir ./keymgr_data rotate \
-  --tenant-id tenant-a --key-id <key_id> --algorithm AES256 --operator alice
+  --tenant-id tenant-a --key-id <key_id> --algorithm AES256 --operator alice \
+  --idempotency-key rotate-0001
 # 指定历史版本：输出 {"key_id","version","created_at","algorithm","public_key"}
 python -m keymgr --data-dir ./keymgr_data version \
   --tenant-id tenant-a --key-id <key_id> --version 1 --operator alice
 # 当前版本：字段同 version
 python -m keymgr --data-dir ./keymgr_data current \
   --tenant-id tenant-a --key-id <key_id> --operator alice
+# 查询幂等操作：输出
+# {"operation_id","tenant_id","status","http_status","response"}
+python -m keymgr --data-dir ./keymgr_data operation \
+  --tenant-id tenant-a --operator alice --operation-id <operation_id>
 ```
 
 吊销与状态查询同样打印单行 JSON，字段与对应 HTTP 响应一致：
@@ -288,9 +357,11 @@ python -m keymgr --data-dir ./keymgr_data status \
 # 导出：输出 {"format","bundle"}，bundle 为不透明 base64
 python -m keymgr --data-dir ./keymgr_data export \
   --tenant-id tenant-a --key-id <key_id> --passphrase 'hunter2' --operator alice
-# 导入：输出 {"key_id","algorithm","public_key"}（201 的创建响应字段）
+# 导入：输出 {"key_id","algorithm","public_key","operation_id"}（201）
+# import 必填 --idempotency-key；重试相同键重放首次结果、不重复落库
 python -m keymgr --data-dir ./keymgr_data import \
-  --tenant-id tenant-b --passphrase 'hunter2' --bundle '<bundle>' --operator alice
+  --tenant-id tenant-b --passphrase 'hunter2' --bundle '<bundle>' \
+  --operator alice --idempotency-key import-0001
 ```
 
 导出、导入分别写 `action=export` / `action=import` 的审计事件。
@@ -301,15 +372,19 @@ python -m keymgr --data-dir ./keymgr_data import \
 # 备份：输出 {"format":"tenant-backup-v1","bundle"}
 python -m keymgr --data-dir ./keymgr_data backup \
   --tenant-id tenant-a --passphrase 'hunter2' --operator alice
-# 恢复：输出 {"tenant_id","key_ids","policy_restored"}
+# 恢复：输出 {"tenant_id","key_ids","policy_restored","operation_id"}
+# restore 必填 --idempotency-key
 python -m keymgr --data-dir ./keymgr_data restore \
-  --tenant-id tenant-a --passphrase 'hunter2' --bundle '<bundle>' --operator alice
+  --tenant-id tenant-a --passphrase 'hunter2' --bundle '<bundle>' \
+  --operator alice --idempotency-key restore-0001
 ```
 
 备份、恢复分别写 `action=export` / `action=import`、`key_id=null` 的审计
 事件；口令缺失/错误、bundle 格式错误以退出码 `2` 报错，策略拒绝以 `3`、
 同租户冲突（已有 key_id 或已有策略）以 `3`、包内租户不一致或跨租户占用以
-`4` 报错，账本写失败以 `1` 失败。
+`4` 报错，账本写失败、提供者不可用或锁等待超时（timed_out）以 `1` 失败。
+`rotate` / `import` / `restore` 的非法 `--idempotency-key` 以退出码 `2`
+报错且无副作用；同键不同绑定以退出码 `3` 报错并给出已有 `operation_id`。
 
 审计查询同样打印单行 JSON，字段与 `GET /v1/audit` 响应一致
 （`{"events","next_cursor"}`）：

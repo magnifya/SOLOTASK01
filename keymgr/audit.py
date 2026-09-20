@@ -259,13 +259,20 @@ class AuditLog:
         key_id: Optional[str],
         outcome: str,
         timestamp: Optional[str] = None,
+        event_id: Optional[str] = None,
     ) -> AuditEvent:
-        """Mint an event with a fresh event_id and UTC timestamp (seq unset)."""
+        """Mint an event with a fresh (or supplied) id and UTC timestamp.
+
+        ``event_id`` may be supplied so an idempotent operation's audit event
+        is named after its ``operation_id``; crash recovery then resolves both
+        by the same identifier. The ledger dedupes on event_id, so reusing an
+        id never appends twice.
+        """
         # Imported lazily to avoid a module import cycle at package import.
         from datetime import datetime, timezone
 
         return AuditEvent(
-            event_id=str(uuid.uuid4()),
+            event_id=event_id or str(uuid.uuid4()),
             tenant_id=tenant_id,
             action=action,
             key_id=key_id,

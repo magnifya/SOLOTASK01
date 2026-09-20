@@ -5,6 +5,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -43,6 +44,19 @@ def is_valid_key_id(key_id) -> bool:
 # (whose on-disk record must remain byte-for-byte untouched).
 IMPORT_CREATED = "created"
 IMPORT_CONFLICT = "conflict"
+
+# Default upper bound (seconds) an idempotent operation waits on a per-key or
+# restore lock before giving up as timed_out: no key material, audit event or
+# provider handle may be written past this point.
+DEFAULT_LOCK_TIMEOUT = 5.0
+
+
+class LockTimeout(Exception):
+    """A guarded key could not be locked within the allowed wait.
+
+    Raised only for idempotent operations after the lock-wait budget is
+    exhausted; the caller answers timed_out and has mutated nothing.
+    """
 
 
 @dataclass
@@ -717,18 +731,50 @@ class KeyStore:
         return os.path.join(self.data_dir, key_id + ".lock")
 
     @contextmanager
-    def _file_lock(self, key_id: str) -> Iterator[None]:
-        """Cross-process advisory lock guarding rotation of a single key."""
+    def _timed_inproc(self, key_id: str, deadline) -> Iterator[None]:
+        """Acquire the per-key in-process lock against a shared deadline."""
+        inproc = self._key_lock(key_id)
+        remaining = max(deadline - time.monotonic(), 0.0)
+        if not inproc.acquire(timeout=remaining):
+            raise LockTimeout(key_id)
+        try:
+            yield
+        finally:
+            inproc.release()
+
+    @contextmanager
+    def _file_lock(self, key_id: str, deadline=None) -> Iterator[None]:
+        """Cross-process advisory lock guarding mutation of a single key.
+
+        The in-process lock is taken separately by callers. With ``deadline``
+        (a monotonic deadline) the fcntl lock is acquired non-blocking with
+        polling and :class:`LockTimeout` is raised when the deadline passes;
+        otherwise this blocks until acquired, the historical behavior.
+        """
         lock_path = self._lock_path_for(key_id)
         if fcntl is None:  # pragma: no cover - non-POSIX platforms
             yield
             return
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        acquired = False
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            if deadline is None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            else:
+                while True:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise LockTimeout(key_id)
+                        time.sleep(min(0.02, remaining))
+            acquired = True
             yield
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            if acquired:
+                fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
 
     def _write_atomic(self, path: str, payload: dict) -> None:
@@ -844,18 +890,30 @@ class KeyStore:
             return None
         return record
 
-    def rotate(self, key_id: str, tenant_id: str, algorithm: str) -> Optional[KeyRecord]:
+    def rotate(
+        self,
+        key_id: str,
+        tenant_id: str,
+        algorithm: str,
+        event_id: Optional[str] = None,
+        lock_timeout: Optional[float] = None,
+    ) -> Optional[KeyRecord]:
         """Append a new version with fresh material.
 
         Returns None for an unknown or foreign key. Versions are strictly
         incrementing; the on-disk state is read, extended and written back
         atomically under per-key locks so concurrent rotations never lose a
         version or leave a dangling current pointer.
+
+        An idempotent operation supplies ``event_id`` (its operation_id, so a
+        retried/crashed rotation dedupes on one id) and ``lock_timeout``: if
+        the per-key lock cannot be taken within it, :class:`LockTimeout` is
+        raised before any provider call or write.
         """
         if not _KEY_ID_RE.fullmatch(key_id):
             return None
         path = self._path_for(key_id)
-        with self._key_lock(key_id), self._file_lock(key_id):
+        with self.key_locks(key_id, timeout=lock_timeout):
             record = self._read_record(path)
             if record is None or record.tenant_id != tenant_id:
                 return None
@@ -881,6 +939,7 @@ class KeyStore:
             event = self.audit.new_event(
                 tenant_id, audit_mod.ACTION_ROTATE, key_id,
                 audit_mod.OUTCOME_SUCCESS, timestamp=created_at,
+                event_id=event_id,
             )
             self._commit_mutation(
                 path, record, event, previous,
@@ -1084,7 +1143,11 @@ class KeyStore:
                 pass
 
     def import_bundle(
-        self, tenant_id: str, payload: dict
+        self,
+        tenant_id: str,
+        payload: dict,
+        event_id: Optional[str] = None,
+        lock_timeout: Optional[float] = None,
     ) -> tuple:
         """Persist a validated export payload under the importing tenant.
 
@@ -1098,42 +1161,50 @@ class KeyStore:
         or failed attempt are all deleted and no file or audit line changes.
         A successful import and its audit event commit through the same
         outbox transaction as create/rotate.
+
+        For an idempotent operation the per-key lock is acquired (with
+        ``lock_timeout``) **before** the provision journal or any provider
+        handle exists, so a timed-out wait writes no key, audit event or
+        handle. ``event_id`` names the committing audit event after the
+        operation_id.
         """
         key_id = payload["key_id"]
-        # Mint the committing event up front so the provision journal is
-        # named after its event_id: a leftover journal resolves at any startup
-        # by asking the ledger whether the event committed.
-        event = self.audit.new_event(
-            tenant_id, audit_mod.ACTION_IMPORT, key_id,
-            audit_mod.OUTCOME_SUCCESS,
-        )
-        journal_id, journal_path = self._new_provision_journal(event.event_id)
-        try:
-            adopted = []  # (provider, handle)
-            versions = []
-            try:
-                for ver in payload["versions"]:
-                    version_record, target = self._adopt_imported_version(
-                        ver, journal_path
-                    )
-                    versions.append(version_record)
-                    adopted.append((target, version_record.handle))
-            except BaseException:
-                self._release_handles(adopted)
-                raise
-            record = KeyRecord(
-                key_id=key_id,
-                tenant_id=tenant_id,
-                label=payload["label"],
-                versions=versions,
-                current_version=payload["current_version"],
-                status=payload["status"],
-                reason=payload["reason"],
-                operator=payload["operator"],
-                revoked_at=payload["revoked_at"],
+        # Acquire the key lock first: a lock-wait timeout must surface before
+        # a journal, handle or event exists.
+        with self.key_locks(key_id, timeout=lock_timeout):
+            # Mint the committing event up front so the provision journal is
+            # named after its event_id: a leftover journal resolves at any
+            # startup by asking the ledger whether the event committed.
+            event = self.audit.new_event(
+                tenant_id, audit_mod.ACTION_IMPORT, key_id,
+                audit_mod.OUTCOME_SUCCESS, event_id=event_id,
             )
-            path = self._path_for(key_id)
-            with self._key_lock(key_id), self._file_lock(key_id):
+            journal_id, journal_path = self._new_provision_journal(event.event_id)
+            try:
+                adopted = []  # (provider, handle)
+                versions = []
+                try:
+                    for ver in payload["versions"]:
+                        version_record, target = self._adopt_imported_version(
+                            ver, journal_path
+                        )
+                        versions.append(version_record)
+                        adopted.append((target, version_record.handle))
+                except BaseException:
+                    self._release_handles(adopted)
+                    raise
+                record = KeyRecord(
+                    key_id=key_id,
+                    tenant_id=tenant_id,
+                    label=payload["label"],
+                    versions=versions,
+                    current_version=payload["current_version"],
+                    status=payload["status"],
+                    reason=payload["reason"],
+                    operator=payload["operator"],
+                    revoked_at=payload["revoked_at"],
+                )
+                path = self._path_for(key_id)
                 # Conflict recheck only after every version validated and
                 # every provider call succeeded; nothing has been written.
                 existing = self._read_record(path)
@@ -1155,13 +1226,13 @@ class KeyStore:
                 # durable event makes the journal obsolete.
                 self.drop_provision_journal(journal_id)
                 journal_id = None
-            return IMPORT_CREATED, record
-        finally:
-            if journal_id is not None:
-                # Any non-commit exit (provider failure, validation, conflict,
-                # aborted transaction): every minted handle was released
-                # above; the journal itself is no longer needed.
-                self.drop_provision_journal(journal_id)
+                return IMPORT_CREATED, record
+            finally:
+                if journal_id is not None:
+                    # Any non-commit exit (provider failure, validation, conflict,
+                    # aborted transaction): every minted handle was released
+                    # above; the journal itself is no longer needed.
+                    self.drop_provision_journal(journal_id)
 
     # -- tenant backup / restore ------------------------------------------
     def list_for_tenant(self, tenant_id: str) -> list:
@@ -1269,22 +1340,47 @@ class KeyStore:
             pass
 
     @contextmanager
-    def key_locks(self, key_id: str) -> Iterator[None]:
-        """Acquire the in-process and cross-process locks for one key_id."""
-        with self._key_lock(key_id), self._file_lock(key_id):
+    def _key_locks_deadline(self, key_id: str, deadline) -> Iterator[None]:
+        """Take the in-process and fcntl locks against one shared deadline."""
+        with self._timed_inproc(key_id, deadline), self._file_lock(
+            key_id, deadline
+        ):
             yield
 
     @contextmanager
-    def multi_key_locks(self, key_ids) -> Iterator[None]:
+    def key_locks(self, key_id: str, timeout: Optional[float] = None) -> Iterator[None]:
+        """Acquire the in-process and cross-process locks for one key_id.
+
+        With a finite ``timeout`` both locks share one deadline and a wait
+        beyond it raises :class:`LockTimeout` with nothing held.
+        """
+        if timeout is None:
+            with self._key_lock(key_id), self._file_lock(key_id):
+                yield
+        else:
+            with self._key_locks_deadline(
+                key_id, time.monotonic() + timeout
+            ):
+                yield
+
+    @contextmanager
+    def multi_key_locks(
+        self, key_ids, timeout: Optional[float] = None
+    ) -> Iterator[None]:
         """Acquire the per-key locks for many key_ids, in sorted order.
 
         A fixed acquisition order keeps this deadlock-free against the
-        restore transaction, which also takes its key locks sorted.
+        restore transaction, which also takes its key locks sorted. With a
+        finite ``timeout`` the whole acquisition shares one deadline.
         """
+        deadline = None if timeout is None else time.monotonic() + timeout
         acquired = []
         try:
             for key_id in sorted(set(key_ids)):
-                lock_cm = self.key_locks(key_id)
+                if deadline is None:
+                    lock_cm = self.key_locks(key_id)
+                else:
+                    lock_cm = self._key_locks_deadline(key_id, deadline)
                 lock_cm.__enter__()
                 acquired.append(lock_cm)
             yield
