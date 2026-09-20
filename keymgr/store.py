@@ -13,8 +13,12 @@ from typing import Iterator, Optional
 
 from . import audit as audit_mod
 from . import keybundle
+from . import provider as provider_mod
 from .audit import AuditEvent, AuditLog
-from .crypto import generate_key
+from .provider import (
+    LOCAL_PROVIDER_ID,
+    ProviderUnavailable,
+)
 
 try:  # fcntl is POSIX-only; rotation still works without cross-process locks.
     import fcntl
@@ -43,13 +47,22 @@ IMPORT_CONFLICT = "conflict"
 
 @dataclass
 class VersionRecord:
-    """One immutable key version. Old versions are never overwritten."""
+    """One immutable key version. Old versions are never overwritten.
+
+    Private material is owned by a KMS/HSM provider: the record persists only
+    the provider's id, an opaque handle and opaque encrypted material. Raw
+    key material is never stored. Records written before the provider layer
+    carried raw ``private_material`` owned by the built-in local provider;
+    KeyStore adopts those into the local provider on open.
+    """
 
     version: int
     created_at: str
     algorithm: str
     public_key: Optional[str]
-    private_material: str
+    provider_id: str = LOCAL_PROVIDER_ID
+    handle: str = ""
+    encrypted_material: str = ""
 
     def to_json(self) -> dict:
         """Serialize to a plain dict suitable for JSON storage."""
@@ -58,17 +71,30 @@ class VersionRecord:
             "created_at": self.created_at,
             "algorithm": self.algorithm,
             "public_key": self.public_key,
-            "private_material": self.private_material,
+            "provider_id": self.provider_id,
+            "handle": self.handle,
+            "encrypted_material": self.encrypted_material,
         }
 
     @classmethod
     def from_json(cls, data: dict) -> "VersionRecord":
+        provider_id = data.get("provider_id")
+        if provider_id is None:
+            # Pre-provider record: raw material was owned by the built-in
+            # local software provider and is adopted on open.
+            provider_id = LOCAL_PROVIDER_ID
         return cls(
             version=int(data["version"]),
             created_at=data["created_at"],
             algorithm=data["algorithm"],
             public_key=data.get("public_key"),
-            private_material=data["private_material"],
+            provider_id=provider_id,
+            handle=data.get("handle") or "",
+            encrypted_material=(
+                data["encrypted_material"]
+                if "encrypted_material" in data
+                else data["private_material"]
+            ),
         )
 
     def to_version_response(self, key_id: str) -> dict:
@@ -150,7 +176,9 @@ class KeyRecord:
                     created_at=data["created_at"],
                     algorithm=data["algorithm"],
                     public_key=data.get("public_key"),
-                    private_material=data["private_material"],
+                    provider_id=LOCAL_PROVIDER_ID,
+                    handle="",
+                    encrypted_material=data["private_material"],
                 )
             ]
             current_version = 1
@@ -206,24 +234,6 @@ class KeyRecord:
             "public_key": self.current.public_key,
         }
 
-    def to_export_payload(self) -> dict:
-        """Full record for an export bundle, including private material.
-
-        This projection is only ever sealed inside the authenticated bundle;
-        it must never appear in an HTTP response or audit projection.
-        """
-        return {
-            "format": keybundle.FORMAT,
-            "key_id": self.key_id,
-            "label": self.label,
-            "current_version": self.current_version,
-            "status": self.status,
-            "reason": self.reason,
-            "operator": self.operator,
-            "revoked_at": self.revoked_at,
-            "versions": [ver.to_json() for ver in self.versions],
-        }
-
 
 class KeyStore:
     """File-backed key store with one JSON file per key."""
@@ -235,9 +245,60 @@ class KeyStore:
         self._locks_lock = threading.Lock()
         self._locks: dict = {}
         self.audit = audit_log if audit_log is not None else AuditLog(data_dir)
+        # Bind the built-in local provider so pre-provider records can be
+        # adopted; an external KEYMGR_PROVIDER is still imported lazily.
+        provider_mod.configure_local(self.data_dir)
+        # Adopt pre-provider records (raw local material) into the local
+        # provider before any pending-event recovery, so every version on
+        # disk ends up carrying a handle.
+        self._migrate_legacy_material()
         # Commit any change whose key file landed but whose ledger append was
         # interrupted by a crash, so a mutation and its event never diverge.
         self._recover_pending_events()
+
+    # -- provider helpers --------------------------------------------------
+    @staticmethod
+    def _provider():
+        """The active KMS/HSM provider (imported lazily on first use)."""
+        return provider_mod.get_provider()
+
+    def _migrate_legacy_material(self) -> None:
+        """Wrap raw pre-provider material into the local provider.
+
+        Legacy versions carry raw ``private_material`` and an empty handle;
+        adopt them into the built-in local provider (validate + wrap +
+        registry), rewriting the file with the new triple. The migration is
+        per-file idempotent and runs under the same locks as a mutation.
+        """
+        try:
+            names = os.listdir(self.data_dir)
+        except OSError:
+            return
+        local = provider_mod.get_local_provider()
+        for name in names:
+            if not (name.endswith(".json") and is_valid_key_id(name[:-5])):
+                continue
+            path = os.path.join(self.data_dir, name)
+            key_id = name[:-5]
+            with self._key_lock(key_id), self._file_lock(key_id):
+                record = self._read_record(path)
+                if record is None:
+                    continue
+                changed = False
+                for ver in record.versions:
+                    if ver.provider_id == LOCAL_PROVIDER_ID and not ver.handle:
+                        triple = local.import_material(
+                            ver.algorithm,
+                            ver.public_key,
+                            ver.encrypted_material,
+                        )
+                        ver.handle = triple.handle
+                        ver.encrypted_material = triple.encrypted_material
+                        if ver.public_key is None:
+                            ver.public_key = triple.public_key
+                        changed = True
+                if changed:
+                    self._write_atomic(path, record.to_json())
 
     # -- audit bookkeeping -------------------------------------------------
     def audit_conflict(self) -> None:
@@ -322,6 +383,8 @@ class KeyStore:
         record: KeyRecord,
         event: AuditEvent,
         previous: Optional[dict],
+        provider=None,
+        new_handles=(),
     ) -> None:
         """Commit a key-file change and its event as one logical transaction.
 
@@ -329,26 +392,50 @@ class KeyStore:
         marker), the event is then appended durably to the ledger, and the
         marker is cleared in a second atomic write. If the ledger append
         fails the key file is rolled back (deleted for a brand-new key whose
-        ``previous`` is None, restored to its prior bytes otherwise), so a
-        failed ledger write never leaves a single-sided change. A crash at
-        any point is repaired idempotently by _recover_pending_events on the
-        next open.
+        ``previous`` is None, restored to its prior bytes otherwise), and any
+        provider handles the change minted are deleted, so a failed ledger
+        write leaves neither a single-sided file nor an orphaned HSM object.
+        A crash at any point is repaired idempotently by
+        _recover_pending_events on the next open.
         """
         record.pending_event = event.to_json()
-        self._write_atomic(path, record.to_json())
+
+        def release_handles() -> None:
+            # Best effort; never mask the original failure.
+            if provider is None:
+                return
+            for handle in new_handles:
+                try:
+                    provider.delete(handle)
+                except Exception:
+                    pass
+
         try:
+            self._write_atomic(path, record.to_json())
             self.audit.append(event)
         except BaseException:
-            if previous is None:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
-            else:
-                self._write_atomic(path, previous)
+            # Only roll the file back when it may have landed: a failure of
+            # the ledger append, or of the initial write after a partial file.
+            if os.path.exists(path):
+                if previous is None:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+                else:
+                    try:
+                        self._write_atomic(path, previous)
+                    except Exception:
+                        pass
+            release_handles()
             raise
         record.pending_event = None
-        self._write_atomic(path, record.to_json())
+        try:
+            self._write_atomic(path, record.to_json())
+        except BaseException:
+            # The ledger already committed, so do not unlink; just release no
+            # handle (the key legitimately owns it). Surface the write error.
+            raise
 
     def _key_lock(self, key_id: str) -> threading.Lock:
         with self._locks_lock:
@@ -411,14 +498,36 @@ class KeyStore:
         except (KeyError, TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _provider_for(provider_id: str):
+        """Return the provider instance that owns ``provider_id``.
+
+        The built-in local provider is always available; any other id must
+        match the currently configured external provider. A record naming a
+        provider that is not active cannot be rotated/exported/imported and
+        fails as unavailable (503) rather than silently switching providers.
+        """
+        if provider_id == LOCAL_PROVIDER_ID:
+            return provider_mod.get_local_provider()
+        active = provider_mod.get_provider()
+        if active.provider_id != provider_id:
+            raise ProviderUnavailable(
+                "record provider %r is not the active provider" % provider_id
+            )
+        return active
+
     def create(self, tenant_id: str, algorithm: str, label: str) -> KeyRecord:
         """Generate, persist and return a new key record (version 1).
 
-        The create event is committed in the same transaction as the key
-        file; a ledger failure removes the just-written key file and raises
-        LedgerError, so the change and its event never land separately.
+        Material is minted by the active KMS/HSM provider; only the provider
+        triple (provider_id, handle, encrypted_material) is persisted. The
+        create event is committed in the same transaction as the key file; a
+        ledger failure deletes both the just-written file and the minted
+        handle and raises LedgerError, so the change and its event never land
+        separately.
         """
-        generated = generate_key(algorithm)
+        provider = self._provider()
+        triple = provider.generate(algorithm)
         key_id = str(uuid.uuid4())
         created_at = datetime.now(timezone.utc).isoformat()
         record = KeyRecord(
@@ -430,8 +539,10 @@ class KeyStore:
                     version=1,
                     created_at=created_at,
                     algorithm=algorithm,
-                    public_key=generated.public_material,
-                    private_material=generated.private_material,
+                    public_key=triple.public_key,
+                    provider_id=provider.provider_id,
+                    handle=triple.handle,
+                    encrypted_material=triple.encrypted_material,
                 )
             ],
             current_version=1,
@@ -443,7 +554,10 @@ class KeyStore:
         # The key_id is fresh, but take the same locks as rotation so a
         # concurrent rotate cannot observe a half-written create.
         with self._key_lock(key_id), self._file_lock(key_id):
-            self._commit_mutation(self._path_for(key_id), record, event, None)
+            self._commit_mutation(
+                self._path_for(key_id), record, event, None,
+                provider=provider, new_handles=(triple.handle,),
+            )
         return record
 
     def get(self, key_id: str, tenant_id: str) -> Optional[KeyRecord]:
@@ -472,24 +586,33 @@ class KeyStore:
             record = self._read_record(path)
             if record is None or record.tenant_id != tenant_id:
                 return None
+            # A version is rotated on the provider that owns the record;
+            # switching providers mid-key is refused (503), never silently
+            # migrated.
+            provider = self._provider_for(record.current.provider_id)
             previous = record.to_json()
             next_number = record.current_version + 1
             created_at = datetime.now(timezone.utc).isoformat()
-            generated = generate_key(algorithm)
+            triple = provider.rotate(algorithm)
             record.append_version(
                 VersionRecord(
                     version=next_number,
                     created_at=created_at,
                     algorithm=algorithm,
-                    public_key=generated.public_material,
-                    private_material=generated.private_material,
+                    public_key=triple.public_key,
+                    provider_id=provider.provider_id,
+                    handle=triple.handle,
+                    encrypted_material=triple.encrypted_material,
                 )
             )
             event = self.audit.new_event(
                 tenant_id, audit_mod.ACTION_ROTATE, key_id,
                 audit_mod.OUTCOME_SUCCESS, timestamp=created_at,
             )
-            self._commit_mutation(path, record, event, previous)
+            self._commit_mutation(
+                path, record, event, previous,
+                provider=provider, new_handles=(triple.handle,),
+            )
         return record
 
     def revoke(
@@ -539,6 +662,45 @@ class KeyStore:
         return record, ver
 
     # -- export / import ---------------------------------------------------
+    def _export_version(self, ver: VersionRecord) -> dict:
+        """Project one version for a sealed bundle.
+
+        The owning provider turns the stored handle back into exportable
+        material; a version whose provider is not active cannot be exported
+        and raises ProviderUnavailable (503) rather than leaking an opaque
+        blob. The bundle carries the raw material (legacy ``private_material``
+        field) plus a ``provider`` provenance block mirroring the persisted
+        triple. Both exist only inside the authenticated bundle.
+        """
+        provider = self._provider_for(ver.provider_id)
+        exported = provider.export_material(ver.handle)
+        return {
+            "version": ver.version,
+            "created_at": ver.created_at,
+            "algorithm": ver.algorithm,
+            "public_key": ver.public_key,
+            "private_material": exported.encrypted_material,
+            "provider": {
+                "provider_id": ver.provider_id,
+                "handle": ver.handle,
+                "encrypted_material": ver.encrypted_material,
+            },
+        }
+
+    def export_payload(self, record: KeyRecord) -> dict:
+        """Build the single-key export payload via the owning provider(s)."""
+        return {
+            "format": keybundle.FORMAT,
+            "key_id": record.key_id,
+            "label": record.label,
+            "current_version": record.current_version,
+            "status": record.status,
+            "reason": record.reason,
+            "operator": record.operator,
+            "revoked_at": record.revoked_at,
+            "versions": [self._export_version(v) for v in record.versions],
+        }
+
     def export_bundle(
         self, key_id: str, tenant_id: str, passphrase: str
     ) -> Optional[str]:
@@ -552,8 +714,68 @@ class KeyStore:
         if record is None:
             return None
         return keybundle.encode_bundle(
-            record.to_export_payload(), passphrase
+            self.export_payload(record), passphrase
         )
+
+    def _adopt_imported_version(self, ver: dict) -> tuple:
+        """Adopt one validated bundle version through its target provider.
+
+        Returns (VersionRecord, provider). A ``provider`` block naming the
+        active provider imports through it; a block naming another provider is
+        a 503 mismatch; a legacy bundle without a block adopts into the
+        built-in local provider. Only the provider's freshly-minted triple is
+        ever persisted — raw private material is never written to a key file.
+        """
+        block = ver.get("provider")
+        if block is None:
+            target = provider_mod.get_local_provider()
+        else:
+            target = self._provider_for(block["provider_id"])
+        triple = target.import_material(
+            ver["algorithm"], ver["public_key"], ver["private_material"]
+        )
+        public_key = (
+            triple.public_key
+            if triple.public_key is not None
+            else ver["public_key"]
+        )
+        record = VersionRecord(
+            version=ver["version"],
+            created_at=ver["created_at"],
+            algorithm=ver["algorithm"],
+            public_key=public_key,
+            provider_id=target.provider_id,
+            handle=triple.handle,
+            encrypted_material=triple.encrypted_material,
+        )
+        return record, target
+
+    @staticmethod
+    def _release_handles(adopted) -> None:
+        """Best-effort delete of (provider, handle) pairs on a failed import."""
+        for target, handle in adopted:
+            try:
+                target.delete(handle)
+            except Exception:
+                pass
+
+    def release_record_handles(self, record: KeyRecord) -> None:
+        """Best-effort delete every provider handle a (to-be-discarded) record holds.
+
+        Used when a restore that minted provider objects never commits; each
+        version is routed to its owning provider. A missing/inactive provider
+        only means that provider's handles cannot be reached from here, so the
+        cleanup is skipped for those versions rather than failing the rollback.
+        """
+        for ver in record.versions:
+            try:
+                target = self._provider_for(ver.provider_id)
+            except ProviderUnavailable:
+                continue
+            try:
+                target.delete(ver.handle)
+            except Exception:
+                pass
 
     def import_bundle(
         self, tenant_id: str, payload: dict
@@ -563,8 +785,11 @@ class KeyStore:
         Returns (IMPORT_CREATED, record) for a brand-new key_id, or
         (IMPORT_CONFLICT, existing) when the key_id already exists; the
         existing record on disk is never touched, and the caller decides 409
-        versus 404 from its owner. A successful import and its audit event
-        commit through the same outbox transaction as create/rotate.
+        versus 404 from its owner. Each version is adopted through the
+        matching provider (a mismatch raises ProviderUnavailable -> 503 and
+        malformed material ProviderInvalidMaterial -> 400). A successful
+        import and its audit event commit through the same outbox transaction
+        as create/rotate, and a failure deletes every minted handle.
         """
         key_id = payload["key_id"]
         path = self._path_for(key_id)
@@ -572,16 +797,16 @@ class KeyStore:
             existing = self._read_record(path)
             if existing is not None:
                 return IMPORT_CONFLICT, existing
-            versions = [
-                VersionRecord(
-                    version=ver["version"],
-                    created_at=ver["created_at"],
-                    algorithm=ver["algorithm"],
-                    public_key=ver["public_key"],
-                    private_material=ver["private_material"],
-                )
-                for ver in payload["versions"]
-            ]
+            adopted = []  # (provider, handle)
+            try:
+                versions = []
+                for ver in payload["versions"]:
+                    version_record, target = self._adopt_imported_version(ver)
+                    versions.append(version_record)
+                    adopted.append((target, version_record.handle))
+            except BaseException:
+                self._release_handles(adopted)
+                raise
             record = KeyRecord(
                 key_id=key_id,
                 tenant_id=tenant_id,
@@ -597,7 +822,11 @@ class KeyStore:
                 tenant_id, audit_mod.ACTION_IMPORT, key_id,
                 audit_mod.OUTCOME_SUCCESS,
             )
-            self._commit_mutation(path, record, event, None)
+            try:
+                self._commit_mutation(path, record, event, None)
+            except BaseException:
+                self._release_handles(adopted)
+                raise
         return IMPORT_CREATED, record
 
     # -- tenant backup / restore ------------------------------------------
@@ -617,13 +846,13 @@ class KeyStore:
         records.sort(key=lambda r: r.key_id)
         return records
 
-    @staticmethod
-    def backup_entry(record: KeyRecord) -> dict:
+    def backup_entry(self, record: KeyRecord) -> dict:
         """Project a record for a tenant backup payload.
 
         The projection includes private material; it is only ever sealed
         inside the authenticated tenant bundle and never appears in a
-        response or an audit projection.
+        response or an audit projection. Each version is resolved through its
+        owning provider exactly like a single-key export.
         """
         return {
             "key_id": record.key_id,
@@ -633,7 +862,7 @@ class KeyStore:
             "reason": record.reason,
             "operator": record.operator,
             "revoked_at": record.revoked_at,
-            "versions": [ver.to_json() for ver in record.versions],
+            "versions": [self._export_version(v) for v in record.versions],
         }
 
     def read_raw(self, key_id: str) -> Optional[KeyRecord]:
@@ -643,17 +872,27 @@ class KeyStore:
         return self._read_record(self._path_for(key_id))
 
     def record_from_backup(self, tenant_id: str, entry: dict) -> KeyRecord:
-        """Build an unsaved KeyRecord from a validated backup keys[i] entry."""
-        versions = [
-            VersionRecord(
-                version=ver["version"],
-                created_at=ver["created_at"],
-                algorithm=ver["algorithm"],
-                public_key=ver["public_key"],
-                private_material=ver["private_material"],
-            )
-            for ver in entry["versions"]
-        ]
+        """Build an unsaved KeyRecord from a validated backup keys[i] entry.
+
+        Every version is adopted through its matching provider (the bundle's
+        ``provider`` provenance block, or the built-in local provider for a
+        legacy bundle without one), so the restored record carries fresh
+        handles and never raw private material. A provider mismatch raises
+        ProviderUnavailable (503); malformed material raises
+        ProviderInvalidMaterial (400).
+        """
+        versions = []
+        adopted = []
+        try:
+            for ver in entry["versions"]:
+                version_record, target = self._adopt_imported_version(ver)
+                versions.append(version_record)
+                adopted.append((target, version_record.handle))
+        except BaseException:
+            # A later version failed a provider match or validation; release
+            # every handle this record minted for its earlier versions.
+            self._release_handles(adopted)
+            raise
         return KeyRecord(
             key_id=entry["key_id"],
             tenant_id=tenant_id,

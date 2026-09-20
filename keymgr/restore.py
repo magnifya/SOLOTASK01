@@ -223,13 +223,24 @@ class RestoreCoordinator:
                 "policy": writes_policy,
             }
 
-            records = [
-                self.store.record_from_backup(
-                    tenant_id,
-                    next(k for k in payload["keys"] if k["key_id"] == key_id),
-                )
-                for key_id in key_ids
-            ]
+            # Adopt every version through its matching provider *before* any
+            # file is written. A provider mismatch is ProviderUnavailable
+            # (503), malformed material is ProviderInvalidMaterial (400); if a
+            # later key/version fails, handles already minted for earlier ones
+            # are released so the backend leaks nothing.
+            records = []
+            try:
+                for key_id in key_ids:
+                    entry = next(
+                        k for k in payload["keys"] if k["key_id"] == key_id
+                    )
+                    records.append(
+                        self.store.record_from_backup(tenant_id, entry)
+                    )
+            except BaseException:
+                for record in records:
+                    self.store.release_record_handles(record)
+                raise
 
             return self._commit(
                 tenant_id, key_ids, records, policy_rules, event, marker
@@ -341,6 +352,11 @@ class RestoreCoordinator:
                     if conflict.owner != tenant_id
                     else RESTORE_SAME_TENANT_CONFLICT
                 )
+                # The provider objects were minted before the locks, but no
+                # file now commits: release the handles so the backend leaks
+                # nothing on the lost conflict race.
+                for record in records:
+                    self.store.release_record_handles(record)
                 return RestoreResult(status=status, conflict=conflict)
 
             written_keys: List[str] = []
@@ -358,7 +374,9 @@ class RestoreCoordinator:
                 # Phase 2: the single ledger append. The files are the outbox.
                 self.store.audit.append(event)
             except BaseException as exc:
-                self._rollback(written_keys, wrote_policy, tenant_id)
+                self._rollback(
+                    written_keys, wrote_policy, tenant_id, records
+                )
                 if isinstance(exc, LedgerError):
                     raise
                 raise LedgerError(
@@ -386,11 +404,24 @@ class RestoreCoordinator:
                 policy_cm.__exit__(None, None, None)
 
     def _rollback(
-        self, written_keys: List[str], wrote_policy: bool, tenant_id: str
+        self,
+        written_keys: List[str],
+        wrote_policy: bool,
+        tenant_id: str,
+        records: Optional[list] = None,
     ) -> None:
-        """Remove every file created by a restore that did not commit."""
+        """Remove every file created by a restore that did not commit.
+
+        The provider handles the would-be records minted are deleted too, so
+        a ledger failure that aborts the batch leaves no orphaned HSM/KMS
+        objects behind.
+        """
+        by_id = {r.key_id: r for r in (records or [])}
         for key_id in written_keys:
             self.store.remove_file(key_id)
+            record = by_id.get(key_id)
+            if record is not None:
+                self.store.release_record_handles(record)
         if wrote_policy:
             self.policy_store.remove_restore_file(tenant_id)
 
@@ -495,8 +526,13 @@ class RestoreCoordinator:
             # Leave the group untouched; a later open retries recovery.
             return
         if not committed:
-            # The ledger append never happened: remove every partial file.
-            for key_id in list(group.key_files):
+            # The ledger append never happened: remove every partial file and
+            # release the provider handles the batch minted, so a crash
+            # before commit leaves no orphaned KMS/HSM objects.
+            for key_id, path in list(group.key_files.items()):
+                record = self.store._read_record(path)
+                if record is not None:
+                    self.store.release_record_handles(record)
                 self.store.remove_file(key_id)
             if group.policy_file is not None:
                 self.policy_store.remove_restore_file(tenant_id)

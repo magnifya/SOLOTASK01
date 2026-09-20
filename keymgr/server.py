@@ -12,6 +12,7 @@ from . import tenantbundle
 from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
 from .policy import PolicyError, PolicyStore, validate_rules
+from .provider import ProviderInvalidMaterial, ProviderUnavailable
 from .store import IMPORT_CONFLICT, KeyStore, is_valid_key_id
 
 _AUDIT_PATH = "/v1/audit"
@@ -56,6 +57,19 @@ def make_handler(
             # A ledger write failure aborts the request with 500; mutations
             # have already rolled back their key-file change by this point.
             self._send_json(500, {"error": "audit ledger failure: %s" % exc})
+
+        def _provider_unavailable(self, exc: Exception) -> None:
+            # A KMS/HSM backend failure is a 503 with a generic message: the
+            # detail (which may mention handles) is kept server-side and never
+            # put in a response.
+            self._send_json(
+                503, {"error": "key management provider is unavailable"}
+            )
+
+        def _provider_invalid_material(self, exc: Exception) -> None:
+            # Malformed imported material is a 400. The provider message names
+            # a field but never embeds the material itself.
+            self._send_json(400, {"error": str(exc)})
 
         def log_message(self, fmt, *args):  # silence default stderr logging
             return
@@ -298,6 +312,12 @@ def make_handler(
                 if path == _RESTORE_PATH:
                     self._restore_tenant(parts, operator)
                     return
+            except ProviderInvalidMaterial as exc:
+                self._provider_invalid_material(exc)
+                return
+            except ProviderUnavailable as exc:
+                self._provider_unavailable(exc)
+                return
             except LedgerError as exc:
                 self._server_error(exc)
                 return
@@ -584,7 +604,18 @@ def make_handler(
                 return
             # The bundle authenticated; its key_id is a validated UUID4. The
             # existence check and the create happen atomically in the store.
-            status, record = store.import_bundle(tenant_id, decoded)
+            try:
+                status, record = store.import_bundle(tenant_id, decoded)
+            except ProviderInvalidMaterial as exc:
+                # The sealed bundle was authentic but its material fails the
+                # provider's algorithm checks: a 400 rejected import.
+                if not self._record_attempt(
+                    tenant_id, decoded["key_id"], audit_mod.ACTION_IMPORT,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._send_json(400, {"error": str(exc)})
+                return
             if status == IMPORT_CONFLICT:
                 if not self._record_attempt(
                     tenant_id, record.key_id, audit_mod.ACTION_IMPORT,
@@ -726,6 +757,16 @@ def make_handler(
                 return
             try:
                 result = coordinator.restore(tenant_id, decoded)
+            except ProviderInvalidMaterial as exc:
+                # Authentic bundle, malformed key material: a rejected import
+                # (key_id null, like every other restore audit event).
+                if not self._record_attempt(
+                    tenant_id, None, audit_mod.ACTION_IMPORT,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._send_json(400, {"error": str(exc)})
+                return
             except LedgerError as exc:
                 # The coordinator has already removed every written file.
                 self._server_error(exc)

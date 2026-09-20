@@ -18,7 +18,51 @@ python -m keymgr --data-dir ./keymgr_data serve --host 127.0.0.1 --port 8080
 
 数据目录也可用环境变量 `KEYMGR_DATA_DIR` 指定。
 
+### KMS/HSM 提供者层
+
+私钥的生成、轮换、导入、导出与删除都经由一个可插拔的**提供者（provider）**完成，
+服务自身不再持有明文私钥。
+
+- 提供者由环境变量 `KEYMGR_PROVIDER` 选择：缺省（或显式设为 `local`）使用内置
+  本地软件提供者；其它值必须形如 `module:factory`，服务在**首次使用时**才
+  `import module` 并无参调用 `factory()` 建厂（惰性加载）。模块不存在、工厂缺失
+  或工厂抛错、返回对象不满足契约，一律返回 `503`（CLI 退出码 `1`），**绝不回退**
+  到本地提供者。
+- 工厂返回的对象必须具有非空字符串 `provider_id` 与字典 `capabilities`：
+  `{"algorithms":["AES256","RSA2048"], "operations":["generate","rotate",
+  "import_material","export_material","delete"]}`，并实现这五个无状态方法。
+  - `generate(algorithm)` 与 `rotate(algorithm)` 返回
+    `{handle, public_key, encrypted_material}`；
+  - `import_material(algorithm, public_key, material)` 导入明文材料并返回同样的
+    三元组；
+  - `export_material(handle)` 返回 `{public_key, encrypted_material}`；
+  - `delete(handle)` 删除后端对象且**幂等**。
+  后端在运行期抛出的任何异常都会被归一化为 `503`，响应只含固定文案
+  “key management provider is unavailable”，**句柄与材料绝不出现在任何响应或
+  审计投影中**。导入的材料不符合算法（如 AES256 材料不是 32 字节、RSA2048 公钥
+  与私钥不匹配）返回 `400`（CLI 退出码 `2`），错误只指名字段、不含材料。
+- **本地提供者**仍把材料保存在数据目录，但只用数据加密密钥（`local.dek`，
+  `0600`）以 AES-256-GCM 包装；句柄与包装材料登记在 `local-registry.json`
+  （`0600`，仅存包装后的材料）。密钥文件里保存的是每个版本的
+  `provider_id`、`handle`、`encrypted_material` 三元组，**不落盘明文私钥**。
+  服务启动时会把提供者层之前写入的旧记录（裸 `private_material`、空句柄）
+  自动校验、包装并登记为本地对象，重写文件后旧明文字段消失。
+- 一次生成 / 轮换 / 导入先向提供者换取三元组，再走既有的 outbox 事务；账本写失败
+  返回 `500`（CLI 退出码 `1`）时，除回滚密钥文件外还会调用该提供者的
+  `delete(handle)` 清理本次新建的后端对象（尽力而为，不掩盖账本错误）。
+- 轮换 / 导出 / 导入 / 恢复必须命中记录所登记的 `provider_id`：记录属于
+  当前未激活的提供者时返回 `503`，不会静默切换提供者；导入 / 恢复携带
+  `provider` 来源块但与当前提供者不符时同样 `503`。
+- 单 key 导出包与租户备份包的每个版本除原有字段外，附带
+  `provider:{provider_id, handle, encrypted_material}` 来源块；旧的
+  `keymgr-export-v1` 包没有该字段时一律按本地提供者处理。导入 / 恢复对来源块的
+  元数据、算法、句柄、材料逐字段校验：格式错误为 `400`（指出
+  `versions[i].provider.*` 等字段，全程不落盘、不留半成品）；跨租户占用与未知
+  key 仍为 `404`。材料永远只存在于口令加密的包内或经提供者包装后的记录中，
+  恢复在账本失败或崩溃回滚时同样删除已创建的提供者句柄。
+
 ### 操作者标识
+
 
 除 `serve` 外，每个 HTTP 请求都必须携带**单一非空**请求头
 `X-Operator-Id: <operator>`（CLI 对应全局的 `--operator`，每个子命令都必填）；
@@ -326,8 +370,11 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 - 轮换在 per-key 锁（进程内锁 + `<key_id>.lock` 上的 `fcntl` 排他锁）保护下
   读-改-写，并经 fsync + `os.replace` 原子提交：并发不丢版本、指针不悬空，
   写入失败只清理临时文件而不破坏旧数据。
-- 私钥仅保存在服务端：RSA 为 PKCS8 PEM、AES 为 base64；所有响应投影
-  （create/get/rotate/version/current/revoke/status）都不包含私钥字段。
+- 私钥不经由密钥文件明文保存：每个版本只持久化提供者三元组
+  `provider_id` / `handle` / `encrypted_material`（本地提供者用 `local.dek`
+  做 AES-256-GCM 包装，见“KMS/HSM 提供者层”）；所有响应投影
+  （create/get/rotate/version/current/revoke/status）都不包含句柄或材料字段。
+  提供者层之前的裸 `private_material` 旧记录在启动时被本地提供者自动包装接管。
 - 吊销状态（`status`、`reason`、`operator`、`revoked_at`）随密钥记录
   原子落盘，重启后保持不变；重复或并发吊销幂等，始终保留首次的值。
   无状态字段的旧记录按 `active` 处理。

@@ -14,6 +14,7 @@ from . import tenantbundle
 from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
 from .policy import PolicyError, PolicyStore, validate_rules
+from .provider import ProviderInvalidMaterial, ProviderUnavailable
 from .server import serve
 from .store import IMPORT_CONFLICT, KeyStore, is_valid_key_id
 
@@ -194,7 +195,22 @@ def _deny(store, tenant_id, key_id, action) -> int:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    """CLI entry point; returns a process exit code."""
+    """CLI entry point; returns a process exit code.
+
+    A KMS/HSM backend failure maps to exit code 1 (HTTP 503) with a generic
+    message; malformed imported material maps to exit code 2 (HTTP 400).
+    """
+    try:
+        return _run(argv)
+    except ProviderInvalidMaterial as exc:
+        return _fail(str(exc), 2)
+    except ProviderUnavailable:
+        # Generic wording: never print a handle or material in the error.
+        return _fail("key management provider is unavailable", 1)
+
+
+def _run(argv: Optional[List[str]] = None) -> int:
+    """Parse and execute one CLI command."""
     args = build_parser().parse_args(argv)
 
     if args.command == "serve":
@@ -475,6 +491,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                          audit_mod.ACTION_IMPORT)
         try:
             status, record = store.import_bundle(args.tenant_id, payload)
+        except ProviderInvalidMaterial as exc:
+            # Authentic bundle, malformed material: a rejected import.
+            if not _attempt(
+                store, args.tenant_id, payload["key_id"],
+                audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            return _fail(str(exc), 2)
         except LedgerError as exc:
             return _ledger_fail(exc)
         if status == IMPORT_CONFLICT:
@@ -563,6 +587,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _fail("tenant backup not found", 4)
         try:
             result = coordinator.restore(args.tenant_id, payload)
+        except ProviderInvalidMaterial as exc:
+            # Authentic bundle, malformed material: a rejected import
+            # (key_id null, like every restore event).
+            if not _attempt(
+                store, args.tenant_id, None,
+                audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            return _fail(str(exc), 2)
         except LedgerError as exc:
             return _ledger_fail(exc)
         if result.status == restore_mod.RESTORE_CREATED:

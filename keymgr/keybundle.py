@@ -184,6 +184,36 @@ def _require(data: dict, field: str, types) -> object:
     return data[field]
 
 
+def validate_provider_block(block, where: str):
+    """Validate an optional KMS/HSM provenance block on one version.
+
+    The block is ``{"provider_id", "handle", "encrypted_material"}``; every
+    field must be a non-empty string. ``None``/absent is valid and means the
+    version originated on the built-in local provider (``keymgr-export-v1``
+    bundles emitted before the provider layer carry no such field). Returns
+    the cleaned block or None for a legacy version.
+    """
+    if block is None:
+        return None
+    prefix = where + ".provider"
+    if not isinstance(block, dict):
+        raise InvalidBundle("field %s must be an object" % prefix)
+    unknown = set(block) - {"provider_id", "handle", "encrypted_material"}
+    if unknown:
+        raise InvalidBundle(
+            "unknown field %s.%s" % (prefix, sorted(unknown)[0])
+        )
+    clean = {}
+    for name in ("provider_id", "handle", "encrypted_material"):
+        value = block.get(name)
+        if not isinstance(value, str) or not value:
+            raise InvalidBundle(
+                "field %s.%s must be a non-empty string" % (prefix, name)
+            )
+        clean[name] = value
+    return clean
+
+
 def validate_version(ver, where: str) -> dict:
     """Validate one versions[i] block; ``where`` names it in error messages."""
     if not isinstance(ver, dict):
@@ -212,12 +242,14 @@ def validate_version(ver, where: str) -> dict:
         raise InvalidBundle(
             "field %s.private_material must be a non-empty string" % where
         )
+    provider = validate_provider_block(ver.get("provider"), where)
     return {
         "version": number,
         "created_at": created_at,
         "algorithm": algorithm,
         "public_key": public_key,
         "private_material": private_material,
+        "provider": provider,
     }
 
 
