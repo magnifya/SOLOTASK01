@@ -635,6 +635,12 @@ class RestoreCoordinator:
         group_journals = {
             g.journal for g in groups.values() if g.journal
         }
+        # A batch rotation group (resolved later by BatchRotateCoordinator)
+        # also leaves journals referenced by _batch_rotate markers. Such a
+        # journal must not be swept as an orphan here: an uncommitted batch
+        # requires strict whole-group handle deletion and retry, which this
+        # lenient sweep must not preempt.
+        group_journals |= self.store._restore_marker_journals()
         for eid, group in groups.items():
             if not self._recover_group(eid, group):
                 # The ledger could not be read or a provider handle could not
@@ -738,23 +744,29 @@ class RestoreCoordinator:
         if not committed:
             # The commit-point success append never happened (event absent or
             # only a rejected terminal): remove every partial file and
-            # release every provider handle the batch minted. The journal
-            # also covers records whose file never landed; a single failed
-            # backend delete aborts this group's resolution -- files and
-            # journal stay put and the next open retries.
+            # release every provider handle the batch minted.
             if group.journal:
                 if not self.store.release_journal_handles(group.journal):
                     return False
-            for key_id, path in list(group.key_files.items()):
-                if not group.journal:
-                    # No journal available: fall back to the handles carried
-                    # by the landed files themselves. A failed delete must
-                    # not be hidden: leave the group for a later open.
+            else:
+                # A legacy restore group with no provision journal: enumerate
+                # the handles from the _restore-marked key files and delete
+                # the *whole* group's handles before removing anything. An
+                # unreachable provider or a single unverified delete keeps
+                # every key file, the policy document and all markers intact
+                # for the next open's retry (nothing is removed piecemeal).
+                # Only once every handle is confirmed deleted do the files
+                # and the policy marker go away.
+                handles = []
+                for key_id, path in list(group.key_files.items()):
                     record = self.store._read_record(path)
-                    if record is not None and not self.store.release_record_handles(
-                        record
-                    ):
+                    if record is None:
                         return False
+                    for ver in record.versions:
+                        handles.append((ver.provider_id, ver.handle))
+                if not self.store.strict_delete_handles(handles):
+                    return False
+            for key_id, path in list(group.key_files.items()):
                 self.store.remove_file(key_id)
             if group.policy_file is not None:
                 self.policy_store.remove_restore_file(tenant_id)

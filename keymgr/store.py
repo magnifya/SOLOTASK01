@@ -430,6 +430,28 @@ class KeyStore:
                 cleaned = False
         return cleaned
 
+    def strict_delete_handles(self, entries) -> bool:
+        """Delete (provider_id, handle) pairs with no tolerance.
+
+        Every provider must be reachable and every delete must be verified.
+        Unlike :meth:`_rollback_provision_entries`, an unreachable provider
+        (including a non-local one or the local provider while inactive) or a
+        single failed delete returns False, so callers that must keep an
+        entire write set until the backend is confirmed empty can retain the
+        whole group and retry on the next open. Deletes themselves are
+        idempotent.
+        """
+        for provider_id, handle in entries:
+            try:
+                provider = self._provider_for(provider_id)
+            except ProviderUnavailable:
+                return False
+            try:
+                provider.delete(handle)
+            except Exception:
+                return False
+        return True
+
     def _recover_provisions(self) -> None:
         """Settle provision journals left by attempts that did not finish.
 
@@ -744,6 +766,7 @@ class KeyStore:
                 audit_mod.ACTION_CREATE,
                 audit_mod.ACTION_READ,
                 audit_mod.ACTION_ROTATE,
+                audit_mod.ACTION_BATCH_ROTATE,
                 audit_mod.ACTION_REVOKE,
                 audit_mod.ACTION_IMPORT,
                 audit_mod.ACTION_EXPORT,
@@ -779,8 +802,11 @@ class KeyStore:
                     continue
                 # A multi-file tenant restore transaction is resolved by the
                 # RestoreCoordinator (its manifest drives the shared event),
-                # not by this per-key recovery.
+                # and a multi-key batch rotation by BatchRotateCoordinator;
+                # neither is resolved by this per-key recovery.
                 if record.pending_event.get("_restore"):
+                    continue
+                if record.pending_event.get("_batch_rotate"):
                     continue
                 # append() is idempotent on event_id, so this is safe whether
                 # the crash happened before or after the ledger write.

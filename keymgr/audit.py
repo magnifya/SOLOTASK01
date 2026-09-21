@@ -24,6 +24,8 @@ ACTION_REVOKE = "revoke"
 ACTION_IMPORT = "import"
 ACTION_EXPORT = "export"
 ACTION_AUDIT = "audit"
+# Atomic batch rotation: one event per whole batch, key_id always null.
+ACTION_BATCH_ROTATE = "batch_rotate"
 ACTION_TENANT_CONFLICT = "tenant_conflict"
 # Policy management actions. These are audited but are never themselves
 # governed by a tenant policy (management is exempt from enforcement).
@@ -38,6 +40,7 @@ ACTIONS = (
     ACTION_IMPORT,
     ACTION_EXPORT,
     ACTION_AUDIT,
+    ACTION_BATCH_ROTATE,
     ACTION_TENANT_CONFLICT,
     ACTION_POLICY_READ,
     ACTION_POLICY_UPDATE,

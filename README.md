@@ -59,6 +59,14 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 - `POST /v1/keys/{key_id}/rotate`，body `{tenant_id, algorithm}`，需
   `Idempotency-Key`。`201` → `{key_id, version, algorithm, public_key,
   operation_id}`，版本严格递增、只追加。
+- `POST /v1/keys/batch-rotate`，body
+  `{tenant_id, items:[{key_id, algorithm}, ...]}`，需 `Idempotency-Key`。
+  `items` 限 1–100 项，`key_id` 必须是互不重复的小写 UUID4，`algorithm`
+  仅 `AES256`/`RSA2048`；任一不合法均为绑定前 `400`，零副作用。按
+  `rotate` 授权（`403` 拒绝）；任一 `key_id` 未知或属其它租户一律 `404`，
+  整批零变更。整批原子，`201` →
+  `{items:[{key_id, version, algorithm, public_key}, ...], operation_id}`，
+  `items` 严格按请求序；每个 key 沿用单键 rotate 语义（版本严格递增）。
 - `GET /v1/keys/{key_id}/versions/{version}` 与
   `GET /v1/keys/{key_id}/current` →
   `{key_id, version, created_at, algorithm, public_key}`；version 须为正整数。
@@ -89,10 +97,11 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 
 ## 幂等操作
 
-- rotate/import/restore（CLI：`rotate`/`import`/`restore`）必须携带**单一**
-  `Idempotency-Key` 头（CLI 必填 `--idempotency-key`），值为 1–128 个
-  `[A-Za-z0-9._~-]` 字符。缺失、为空、重复、非法一律 `400`（CLI `2`），且该
-  校验先于请求体读取与一切业务：不写审计、操作记录、密钥或提供者句柄。
+- rotate/batch-rotate/import/restore（CLI：`rotate`/`batch-rotate`/
+  `import`/`restore`）必须携带**单一** `Idempotency-Key` 头（CLI 必填
+  `--idempotency-key`），值为 1–128 个 `[A-Za-z0-9._~-]` 字符。缺失、为
+  空、重复、非法一律 `400`（CLI `2`），且该校验先于请求体读取与一切
+  业务：不写审计、操作记录、密钥或提供者句柄。
 - 键全局唯一，绑定记录 `operation_id`(UUID4)、租户、操作者、路径、规范化体
   （键排序紧凑 JSON）、状态、HTTP 状态与响应；存于 `operations/<id>.json`
   (0600) 与 `operations/index.json`，进程内锁 + `operations.lock` 的 fcntl
@@ -137,10 +146,13 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 ## 审计
 
 - 事件字段 `{event_id, tenant_id, action, key_id, outcome, timestamp}`；
-  `action` 为 `create/read/rotate/revoke/import/export/audit/tenant_conflict/
-  policy_read/policy_update/policy_delete`，`outcome` 为 `success/rejected`。
-  备份记 `export`、恢复记 `import`，两者 `key_id` 均为 null；恢复的所有事件
-  （含成功）`key_id` 为 null。
+  `action` 为 `create/read/rotate/batch_rotate/revoke/import/export/audit/
+  tenant_conflict/policy_read/policy_update/policy_delete`，`outcome` 为
+  `success/rejected`。批量轮换每个已绑定终态至多一条 `batch_rotate`
+  事件（`event_id` 与 `operation_id` 同值，`key_id` 恒为 null），可按
+  `action=batch_rotate` 筛选；绑定前的 `400` 与等待超时不写任何事件。
+  备份记 `export`、恢复记 `import`，两者 `key_id` 均为 null；恢复的所有
+  事件（含成功）`key_id` 为 null。
 - `GET /v1/audit`：单一租户来源；可选 `key_id`(UUID4)、`action`、
   `limit`(1–1000，默认 100)、`cursor`。→ `{events, next_cursor}`，按
   (timestamp, event_id) 升序；游标为 HMAC 签名令牌，绑定租户/筛选/快照，
@@ -166,6 +178,9 @@ python -m keymgr current  --tenant-id t --key-id <id> --operator alice
 python -m keymgr version  --tenant-id t --key-id <id> --version 1 --operator alice
 python -m keymgr rotate   --tenant-id t --key-id <id> --algorithm AES256 \
                           --operator alice --idempotency-key rotate-0001
+python -m keymgr batch-rotate --tenant-id t --operator alice \
+                          --idempotency-key batch-0001 \
+                          --items '[{"key_id":"<id1>","algorithm":"AES256"},{"key_id":"<id2>","algorithm":"RSA2048"}]'
 python -m keymgr revoke   --tenant-id t --key-id <id> --reason r --operator alice
 python -m keymgr status   --tenant-id t --key-id <id> --operator alice
 # 导出/导入、备份/恢复
@@ -207,6 +222,21 @@ python -m keymgr policy --operator admin set|show|delete --tenant-id t [--rules 
 - 每个密钥为数据目录下 `<key_id>.json`（0600，fsync + 原子 rename），含
   append-only `versions` 与 `current_version`；轮换在 per-key 进程内锁 +
   `<key_id>.lock` fcntl 锁下读改写，并发不丢版本、不悬指针。
+- 批量轮换与单键轮换/导入/恢复按 `key_id` 序共用同一套 per-key 锁（先取全
+  部锁再铸句柄）：批量内多个 key 及与并发的单键操作之间跨进程串行，固定获
+  锁顺序避免死锁；5 秒内拿不到任一把锁即 `503 timed_out`，等待方不写任何
+  密钥、事件或句柄。
+- 批量轮换是多文件 outbox：每个参与文件先携带同一 `_batch_rotate` 标记
+  （共享事件 + 每键新版本清单，可含 provision journal 引用）落盘，再追加唯
+  一一条 `batch_rotate` 事件（提交点），随后清标记；提交前任一步失败/崩溃
+  都把各文件回滚到旧版本并删除全部新铸句柄。启动恢复时事件已入帐则保留版
+  本清标记；未入帐则**先**确认删除整批句柄（无 journal 的旧批次改从标记文
+  件的新版本列句柄）——提供者不可达或任一句柄删除无法确认时整组文件、标记
+  与 journal 全部保留，下次启动重试——全部删除确认后才截断新版本。
+- 旧 restore 无 journal 的未提交组：从携带 `_restore` 标记的密钥文件列出全
+  部句柄并在删除任何文件前严格删除；提供者不可达或任一 delete 失败则保留整
+  组密钥文件、策略文档与标记，启动重试，全部句柄确认删除后才移除密钥与策略
+  标记。
 - 导入/恢复在提供者调用前先建按 event_id 命名的 provision journal，每铸一个
   句柄即耐久登记；提交后句柄归记录所有并删除 journal，未提交（冲突、提供者
   故障、账本失败、崩溃）则幂等删除全部已铸句柄，不留孤儿后端对象。

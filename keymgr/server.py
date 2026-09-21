@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from . import audit as audit_mod
+from . import batch as batch_mod
 from . import keybundle
 from . import operations as operations_mod
 from . import restore as restore_mod
@@ -23,6 +24,7 @@ _AUDIT_PATH = "/v1/audit"
 _POLICY_PATH = "/v1/policy"
 _OPERATIONS_PATH_RE = re.compile(r"^/v1/operations/([^/]+)$")
 _IMPORT_PATH = "/v1/keys/import"
+_BATCH_ROTATE_PATH = "/v1/keys/batch-rotate"
 _BACKUP_PATH = "/v1/backup"
 _RESTORE_PATH = "/v1/restore"
 _KEY_PATH_RE = re.compile(r"^/v1/keys/([^/]+)$")
@@ -41,6 +43,7 @@ def make_handler(
     policy_store: PolicyStore,
     coordinator: "restore_mod.RestoreCoordinator",
     operation_store: "OperationStore",
+    batch_coordinator: "batch_mod.BatchRotateCoordinator" = None,
 ) -> type:
     """Build a BaseHTTPRequestHandler subclass bound to the stores."""
 
@@ -183,11 +186,12 @@ def make_handler(
             """
             op_id = operation.operation_id
             body = {"error": message, "operation_id": op_id}
-            # The accurate key_id rule: a restore's events are always key_id
-            # null; rotate/import carry the (already validated) key_id.
+            # The accurate key_id rule: a restore's or batch rotation's
+            # events are always key_id null; rotate/import carry the
+            # (already validated) key_id.
             kind = (operation.details or {}).get("kind")
             audit_key_id = (
-                None if kind == "restore"
+                None if kind in ("restore", "batch_rotate")
                 else (key_id if is_valid_key_id(key_id) else None)
             )
             audit_desc = {
@@ -226,13 +230,14 @@ def make_handler(
             body = {"error": message, "operation_id": op_id}
             details = operation.details or {}
             kind = details.get("kind")
-            action = (
-                audit_mod.ACTION_ROTATE
-                if kind == "rotate"
-                else audit_mod.ACTION_IMPORT
-            )
+            if kind == "batch_rotate":
+                action = audit_mod.ACTION_BATCH_ROTATE
+            elif kind == "rotate":
+                action = audit_mod.ACTION_ROTATE
+            else:
+                action = audit_mod.ACTION_IMPORT
             audit_key_id = (
-                None if kind == "restore"
+                None if kind in ("restore", "batch_rotate")
                 else (
                     details.get("key_id")
                     if is_valid_key_id(details.get("key_id"))
@@ -614,6 +619,10 @@ def make_handler(
                     self._import_key(parts, operator)
                     return
 
+                if path == _BATCH_ROTATE_PATH:
+                    self._batch_rotate_keys(parts, operator)
+                    return
+
                 if path == _BACKUP_PATH:
                     self._backup_tenant(parts, operator)
                     return
@@ -974,6 +983,136 @@ def make_handler(
                     )
                 # The success event committed in the same transaction as file.
                 return 201, record.to_create_response()
+
+            self._idempotent_guard(
+                parts.path, tenant_id, operator, payload, idem_key, execute
+            )
+
+        def _batch_rotate_keys(self, parts, operator: str) -> None:
+            """POST /v1/keys/batch-rotate.
+
+            Like rotate, the Idempotency-Key is checked before the body is
+            read; every parse/parameter failure (items missing/not an array,
+            out of the 1-100 range, a malformed/duplicate key_id, an
+            unsupported algorithm) is a side-effect-free 400 that never binds
+            the key. Authorization uses the rotate action and precedes any
+            existence check; an unknown or foreign key anywhere in the batch
+            is a terminal 404 that changes nothing. The whole batch commits
+            through one outbox transaction and one ``batch_rotate`` event
+            (key_id null); the response items follow the request order.
+            """
+            idem_key = self._idempotency_key()
+            if idem_key is None:
+                return
+            payload = self._read_json_object(audit=False)
+            if payload is None:
+                return
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                self._bad_request("field tenant_id must be a non-empty string")
+                return
+            tenant_id = self._tenant(parts, payload, audit=False)
+            if tenant_id is None:
+                return
+            raw_items = payload.get("items")
+            if not isinstance(raw_items, list) or not (
+                batch_mod.BATCH_ITEMS_MIN
+                <= len(raw_items)
+                <= batch_mod.BATCH_ITEMS_MAX
+            ):
+                self._bad_request(
+                    "field items must be an array of %d to %d items"
+                    % (
+                        batch_mod.BATCH_ITEMS_MIN,
+                        batch_mod.BATCH_ITEMS_MAX,
+                    )
+                )
+                return
+            items = []
+            seen = set()
+            for index, raw in enumerate(raw_items):
+                if not isinstance(raw, dict):
+                    self._bad_request(
+                        "field items[%d] must be an object" % index
+                    )
+                    return
+                key_id = raw.get("key_id")
+                if not is_valid_key_id(key_id):
+                    self._bad_request(
+                        "field items[%d].key_id must be a UUID4" % index
+                    )
+                    return
+                if key_id in seen:
+                    self._bad_request(
+                        "field items contains duplicate key_id: %s" % key_id
+                    )
+                    return
+                seen.add(key_id)
+                algorithm = raw.get("algorithm")
+                if not isinstance(algorithm, str):
+                    self._bad_request(
+                        "missing required field: items[%d].algorithm" % index
+                    )
+                    return
+                if algorithm not in SUPPORTED_ALGORITHMS:
+                    self._bad_request(
+                        "unsupported value for field items[%d].algorithm: "
+                        "%r (supported: %s)"
+                        % (
+                            index,
+                            algorithm,
+                            ", ".join(SUPPORTED_ALGORITHMS),
+                        )
+                    )
+                    return
+                items.append(batch_mod.BatchRotateItem(key_id, algorithm))
+
+            def execute(operation):
+                # Kind and the exact item set are durable before any business
+                # check, so a 403/404 terminal replays from context alone.
+                operation_store.update_details(
+                    operation,
+                    {
+                        "kind": "batch_rotate",
+                        "items": [
+                            {"key_id": it.key_id, "algorithm": it.algorithm}
+                            for it in items
+                        ],
+                    },
+                )
+                # Batch rotation is authorized exactly like rotate and
+                # authorization precedes existence; a denial is a bound
+                # terminal 403 whose single event is named after the
+                # operation_id and projects key_id null.
+                if not policy_store.is_allowed(
+                    tenant_id, audit_mod.ACTION_ROTATE, operator
+                ):
+                    return self._idempotent_rejection(
+                        operation, tenant_id, None,
+                        audit_mod.ACTION_BATCH_ROTATE, 403,
+                        "action not permitted by policy",
+                    )
+
+                def stage_success(result_items):
+                    body = {"items": result_items}
+                    body["operation_id"] = operation.operation_id
+                    operation_store.stage_terminal(operation, 201, body)
+
+                result = batch_coordinator.rotate(
+                    tenant_id, items,
+                    event_id=operation.operation_id,
+                    lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
+                    pre_commit=stage_success,
+                )
+                if result.status == batch_mod.BATCH_NOT_FOUND:
+                    # Any unknown or cross-tenant key refuses the whole batch
+                    # with one 404 and zero change; the single event projects
+                    # key_id null.
+                    return self._idempotent_rejection(
+                        operation, tenant_id, None,
+                        audit_mod.ACTION_BATCH_ROTATE, 404, "key not found",
+                    )
+                return 201, {"items": result.items}
 
             self._idempotent_guard(
                 parts.path, tenant_id, operator, payload, idem_key, execute
@@ -1584,6 +1723,11 @@ def _resolve_committed_operation(store, policy_store, record, event):
 
     if event.outcome == audit_mod.OUTCOME_REJECTED:
         action = event.action
+        # A batch rotation is authorized as rotate; reconstruct that denial
+        # against the rotate action (the audit action is batch_rotate).
+        policy_action = (
+            audit_mod.ACTION_ROTATE if kind == "batch_rotate" else action
+        )
         terminal = details.get("terminal")
 
         def message_for(status: int) -> str:
@@ -1607,7 +1751,7 @@ def _resolve_committed_operation(store, policy_store, record, event):
         # durable action and the current state.
         # A policy denial outranks existence: it is reconstructed whenever the
         # tenant's policy currently rejects this operator/action.
-        if not policy_store.is_allowed(tenant_id, action, operator_id):
+        if not policy_store.is_allowed(tenant_id, policy_action, operator_id):
             return error(403, message_for(403))
         if kind == "restore":
             # A same-tenant conflict is reconstructed when any key from the
@@ -1641,6 +1785,31 @@ def _resolve_committed_operation(store, policy_store, record, event):
         # unknown or foreign at commit time and no version was appended.
         return error(404, message_for(404))
 
+    if kind == "batch_rotate":
+        # Rebuild the whole batch's items in request order; each committed
+        # version is the one minted at the shared event timestamp.
+        items = []
+        for entry in details.get("items", []):
+            key_id = entry.get("key_id")
+            key = store.get(key_id, tenant_id)
+            if key is None:
+                continue
+            ver = None
+            for candidate in key.versions:
+                if candidate.created_at == event.timestamp:
+                    ver = candidate
+                    break
+            if ver is None:
+                ver = key.current
+            items.append(
+                {
+                    "key_id": key_id,
+                    "version": ver.version,
+                    "algorithm": ver.algorithm,
+                    "public_key": ver.public_key,
+                }
+            )
+        return 201, {"items": items, "operation_id": op_id}
     if kind == "rotate":
         key_id = event.key_id or details.get("key_id")
         key = store.get(key_id, tenant_id)
@@ -1695,6 +1864,9 @@ def serve(host: str, port: int, data_dir: str) -> None:
     store = KeyStore(data_dir, audit_log)
     policy_store = PolicyStore(data_dir, audit_log)
     coordinator = restore_mod.RestoreCoordinator(store, policy_store)
+    # Batch rotation's multi-key outbox recovery also runs before the pending
+    # operations are resolved, like the key/restore outbox recovery.
+    batch_coordinator = batch_mod.BatchRotateCoordinator(store)
     operation_store = OperationStore(data_dir, audit_log)
     operation_store.recover_pending(
         lambda record, event: _resolve_committed_operation(
@@ -1704,7 +1876,8 @@ def serve(host: str, port: int, data_dir: str) -> None:
     httpd = ThreadingHTTPServer(
         (host, port),
         make_handler(
-            store, policy_store, coordinator, operation_store
+            store, policy_store, coordinator, operation_store,
+            batch_coordinator,
         ),
     )
     httpd.daemon_threads = True
