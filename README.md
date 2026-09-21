@@ -106,7 +106,10 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   failed（保留原状态码）。并发同键仅一个执行，其余等待；等待超 5 秒返回
   `503` timed_out（CLI `1`），等待方不写任何东西。
 - `operation_id` 即该变更审计事件的 `event_id`，因此每个终态至多一条事件，
-  HTTP 与 CLI 共用同一套记录，可跨入口用相同键重放或按 id 查询。
+  HTTP 与 CLI 共用同一套记录，可跨入口用相同键重放或按 id 查询。已绑定的
+  提供者失败终态（503）同样只追加一条以 `operation_id` 为 `event_id` 的
+  rejected 事件：rotate 用请求 key_id，import 用包内 key_id，restore 为
+  null；重启后操作、事件与响应保持一致。
 - **崩溃一致性**：进程可在绑定、outbox 落盘、账本追加或清理任一步骤崩溃。
   重启（或任一 CLI 入口）在 key/restore outbox 恢复之后，按同一
   `operation_id` 判定：事件已入帐即已提交，据耐久事实重建原 `201`/`403`/
@@ -209,6 +212,8 @@ python -m keymgr policy --operator admin set|show|delete --tenant-id t [--rules 
   `<key_id>.lock` fcntl 锁下读改写，并发不丢版本、不悬指针。
 - 导入/恢复在提供者调用前先建按 event_id 命名的 provision journal，每铸一个
   句柄即耐久登记；提交后句柄归记录所有并删除 journal，未提交（冲突、提供者
-  故障、账本失败、崩溃）则幂等删除全部已铸句柄，不留孤儿后端对象。
+  故障、账本失败、崩溃）则幂等删除全部已铸句柄，不留孤儿后端对象。清理失败
+  不被静默吞掉：journal 保留至句柄全部删除成功，由后续启动重试；journal 是否
+  已提交按账本中同名 `success` 事件判定（同名 rejected 事件不算提交）。
 - 私钥与口令只存在于口令加密的包内或经提供者包装后的记录中；游标 HMAC 密钥
   存于 `audit.secret`(0600)。材料不会出现在任何响应、审计投影或错误信息中。

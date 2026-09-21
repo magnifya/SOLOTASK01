@@ -211,6 +211,58 @@ def make_handler(
                 "operation_id": operation_id,
             }
 
+        def _provider_failure_rejection(self, operation, tenant_id):
+            """Record a bound operation's provider-failure terminal (503).
+
+            Mirrors a terminal rejection: the fixed 503 body and its audit
+            descriptor are staged durably *before* the single rejected event
+            (named after the operation_id, deduped on event_id) is appended,
+            so crash recovery replays this exact response and never appends a
+            second event. The audit projection follows the operation kind:
+            rotate carries the request key_id, import the bundle key_id,
+            restore null. A staging or ledger failure here must not mask the
+            provider failure: the operation is still finalized failed(503)
+            and the event is simply absent ("at most one"). Returns
+            ``(503, body)`` for the idempotent guard.
+            """
+            op_id = operation.operation_id
+            body = {
+                "error": "key management provider is unavailable",
+                "operation_id": op_id,
+            }
+            details = operation.details or {}
+            kind = details.get("kind")
+            action = (
+                audit_mod.ACTION_ROTATE
+                if kind == "rotate"
+                else audit_mod.ACTION_IMPORT
+            )
+            key_id = details.get("key_id")
+            audit_key_id = (
+                None if kind == "restore"
+                else (key_id if is_valid_key_id(key_id) else None)
+            )
+            try:
+                operation_store.stage_terminal(
+                    operation, 503, body,
+                    audit={
+                        "action": action,
+                        "outcome": audit_mod.OUTCOME_REJECTED,
+                        "tenant_id": tenant_id,
+                        "key_id": audit_key_id,
+                    },
+                )
+                store.audit_attempt(
+                    tenant_id, audit_key_id, action,
+                    audit_mod.OUTCOME_REJECTED, event_id=op_id,
+                )
+            except (LedgerError, OSError):
+                # The terminal is still finalized by the caller; recovery
+                # treats a missing event as an uncommitted failure and never
+                # double-records.
+                pass
+            return 503, body
+
         def _idempotent_guard(self, path, tenant_id, operator, payload, key,
                               executor) -> None:
             """Bind the Idempotency-Key and run an idempotent mutation.
@@ -256,14 +308,17 @@ def make_handler(
                 self._send_json(400, body)
                 return
             except ProviderUnavailable:
-                body = {
-                    "error": "key management provider is unavailable",
-                    "operation_id": op_id,
-                }
-                operation_store.finish(
-                    operation, operations_mod.STATUS_FAILED, 503, body
+                # Bound provider-failure terminal: stage the fixed 503 body
+                # and append its single rejected audit event (event_id ==
+                # operation_id) before finalizing, so a crash and restart
+                # replay the identical response and never double-record.
+                http_status, body = self._provider_failure_rejection(
+                    operation, tenant_id
                 )
-                self._send_json(503, body)
+                operation_store.finish(
+                    operation, operations_mod.STATUS_FAILED, http_status, body
+                )
+                self._send_json(http_status, body)
                 return
             except OSError as exc:
                 # Persisting the staged result (or another pre-commit write)

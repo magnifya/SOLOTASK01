@@ -337,7 +337,14 @@ class KeyStore:
             # cleanup failure must not mask the request's outcome.
             pass
 
-    def _delete_provisioned_handle(self, provider_id: str, handle: str) -> None:
+    def _delete_provisioned_handle(self, provider_id: str, handle: str) -> bool:
+        """Delete one journaled handle; True only when it is gone.
+
+        A False return means the cleanup could not be completed (the owning
+        provider is unavailable or the backend delete failed): the caller
+        must keep the provision journal so a later open retries the delete
+        instead of silently leaking the backend object.
+        """
         if provider_id == LOCAL_PROVIDER_ID:
             # Crash cleanup may need the local backend before any request
             # configured it; bind it here (this never imports an external
@@ -345,15 +352,16 @@ class KeyStore:
             try:
                 provider_mod.configure_local(self.data_dir)
             except ProviderUnavailable:
-                return
+                return False
         try:
             provider = self._provider_for(provider_id)
         except ProviderUnavailable:
-            return
+            return False
         try:
             provider.delete(handle)
         except Exception:
-            pass
+            return False
+        return True
 
     def _restore_marker_journals(self) -> set:
         """Journal ids referenced by still-present restore markers.
@@ -405,12 +413,15 @@ class KeyStore:
         """Delete handles from attempts that died before committing.
 
         A journal line is kept (handle retained) only when its transaction's
-        audit event reached the ledger. Journals of uncommitted attempts are
-        applied (every recorded handle deleted, idempotently) and removed;
-        committed journals are removed as well. Journals still referenced by a
-        restore marker are deferred to the RestoreCoordinator. Nothing here
-        imports a provider when there are no handles to reap, so opening a
-        store for plain reads stays provider-free.
+        audit event reached the ledger as a SUCCESS event — a rejected event
+        with the same id (a refused, conflicted or provider-failed operation)
+        means the handles were never committed. Journals of uncommitted
+        attempts are applied (every recorded handle deleted, idempotently)
+        and removed; committed journals are removed as well. Journals still
+        referenced by a restore marker are deferred to the
+        RestoreCoordinator. Nothing here imports a provider when there are
+        no handles to reap, so opening a store for plain reads stays
+        provider-free.
         """
         deferred = self._restore_marker_journals()
         directory = os.path.join(self.data_dir, self._PROVISION_DIR)
@@ -450,7 +461,15 @@ class KeyStore:
             committed = False
             try:
                 if uuid.UUID(journal_id).version == 4:
-                    committed = self.audit.get_event(journal_id) is not None
+                    # Only a SUCCESS event commits the attempt's handles: a
+                    # rejected event with the same id (a refused/conflicted
+                    # or provider-failed operation) means the handles were
+                    # never committed and must be deleted.
+                    event = self.audit.get_event(journal_id)
+                    committed = (
+                        event is not None
+                        and event.outcome == audit_mod.OUTCOME_SUCCESS
+                    )
             except (ValueError, AttributeError):
                 committed = False
             except LedgerError:
@@ -458,8 +477,16 @@ class KeyStore:
                 # later open rather than deleting committed material.
                 continue
             if not committed:
+                # Delete every recorded handle; the journal is removed only
+                # when the cleanup fully succeeded. A failed delete (provider
+                # down) keeps the journal so a later open retries instead of
+                # leaking the backend object.
+                cleaned = True
                 for provider_id, handle in entries:
-                    self._delete_provisioned_handle(provider_id, handle)
+                    if not self._delete_provisioned_handle(provider_id, handle):
+                        cleaned = False
+                if not cleaned:
+                    continue
             try:
                 os.unlink(path)
             except OSError:
@@ -498,10 +525,17 @@ class KeyStore:
                 entries.append((provider_id, handle))
         return entries
 
-    def release_journal_handles(self, journal_id: str) -> None:
-        """Idempotently delete every handle recorded in an attempt journal."""
+    def release_journal_handles(self, journal_id: str) -> bool:
+        """Idempotently delete every handle recorded in an attempt journal.
+
+        Returns True only when every recorded handle is gone; on False the
+        journal must be kept so a later open retries the remaining deletes.
+        """
+        cleaned = True
         for provider_id, handle in self.read_provision_journal(journal_id):
-            self._delete_provisioned_handle(provider_id, handle)
+            if not self._delete_provisioned_handle(provider_id, handle):
+                cleaned = False
+        return cleaned
 
     def _migrate_legacy_records(self) -> None:
         """Startup sweep adopting raw pre-provider records into local.
@@ -1013,6 +1047,7 @@ class KeyStore:
             journal_id, journal_path = self._new_provision_journal(
                 event.event_id
             )
+            cleanup_failed = False
             try:
                 triple = provider.rotate(algorithm)
                 self._append_provision(
@@ -1039,14 +1074,17 @@ class KeyStore:
                 except BaseException:
                     # Ledger/write failure: the file was already rolled back
                     # inside _commit_mutation; make sure the backend object is
-                    # gone as well (the journal is the crash safety net).
+                    # gone as well. A failed delete is not swallowed: the
+                    # journal (which recorded the handle) stays so startup
+                    # recovery retries the cleanup.
                     try:
                         provider.delete(triple.handle)
                     except Exception:
-                        pass
+                        cleanup_failed = True
                     raise
             except BaseException:
-                self.drop_provision_journal(journal_id)
+                if not cleanup_failed:
+                    self.drop_provision_journal(journal_id)
                 raise
             # Committed: the new handle is owned by the appended version and
             # the durable event makes the journal obsolete.
@@ -1222,31 +1260,42 @@ class KeyStore:
         return record, target
 
     @staticmethod
-    def _release_handles(adopted) -> None:
-        """Best-effort delete of (provider, handle) pairs on a failed import."""
+    def _release_handles(adopted) -> bool:
+        """Best-effort delete of (provider, handle) pairs on a failed import.
+
+        Returns False when any delete failed, so the caller keeps the
+        attempt's provision journal for a startup retry instead of silently
+        leaking the backend object.
+        """
+        cleaned = True
         for target, handle in adopted:
             try:
                 target.delete(handle)
             except Exception:
-                pass
+                cleaned = False
+        return cleaned
 
-    def release_record_handles(self, record: KeyRecord) -> None:
+    def release_record_handles(self, record: KeyRecord) -> bool:
         """Best-effort delete every provider handle a (to-be-discarded) record holds.
 
         Used when a restore that minted provider objects never commits; each
-        version is routed to its owning provider. A missing/inactive provider
-        only means that provider's handles cannot be reached from here, so the
-        cleanup is skipped for those versions rather than failing the rollback.
+        version is routed to its owning provider. Returns False when any
+        handle could not be reached (inactive provider or backend failure) so
+        the caller keeps the attempt's provision journal for a startup retry
+        rather than failing or silently dropping the rollback.
         """
+        cleaned = True
         for ver in record.versions:
             try:
                 target = self._provider_for(ver.provider_id)
             except ProviderUnavailable:
+                cleaned = False
                 continue
             try:
                 target.delete(ver.handle)
             except Exception:
-                pass
+                cleaned = False
+        return cleaned
 
     def import_bundle(
         self,
@@ -1287,6 +1336,7 @@ class KeyStore:
                 audit_mod.OUTCOME_SUCCESS, event_id=event_id,
             )
             journal_id, journal_path = self._new_provision_journal(event.event_id)
+            cleanup_failed = False
             try:
                 adopted = []  # (provider, handle)
                 versions = []
@@ -1298,7 +1348,8 @@ class KeyStore:
                         versions.append(version_record)
                         adopted.append((target, version_record.handle))
                 except BaseException:
-                    self._release_handles(adopted)
+                    if not self._release_handles(adopted):
+                        cleanup_failed = True
                     raise
                 record = KeyRecord(
                     key_id=key_id,
@@ -1316,7 +1367,8 @@ class KeyStore:
                 # every provider call succeeded; nothing has been written.
                 existing = self._read_record(path)
                 if existing is not None:
-                    self._release_handles(adopted)
+                    if not self._release_handles(adopted):
+                        cleanup_failed = True
                     return IMPORT_CONFLICT, existing
                 try:
                     # Rollback of the just-created file plus explicit handle
@@ -1328,7 +1380,8 @@ class KeyStore:
                         pre_commit=pre_commit,
                     )
                 except BaseException:
-                    self._release_handles(adopted)
+                    if not self._release_handles(adopted):
+                        cleanup_failed = True
                     raise
                 # Committed: the handles are owned by the new record and the
                 # durable event makes the journal obsolete.
@@ -1336,10 +1389,12 @@ class KeyStore:
                 journal_id = None
                 return IMPORT_CREATED, record
             finally:
-                if journal_id is not None:
+                if journal_id is not None and not cleanup_failed:
                     # Any non-commit exit (provider failure, validation, conflict,
                     # aborted transaction): every minted handle was released
-                    # above; the journal itself is no longer needed.
+                    # above; the journal itself is no longer needed. When a
+                    # release failed the journal is KEPT so startup recovery
+                    # retries the deletes instead of leaking backend objects.
                     self.drop_provision_journal(journal_id)
 
     # -- tenant backup / restore ------------------------------------------

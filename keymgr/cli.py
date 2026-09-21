@@ -261,6 +261,59 @@ def _terminal_rejection(
     return http_status, body
 
 
+def _provider_failure_rejection(op_store, store, operation, tenant_id):
+    """Record a bound operation's provider-failure terminal (503).
+
+    CLI counterpart of the HTTP handler: the fixed 503 body and its audit
+    descriptor are staged durably *before* the single rejected event (named
+    after the operation_id, deduped on event_id) is appended, so crash
+    recovery replays this exact response and never appends a second event.
+    The audit projection follows the operation kind: rotate carries the
+    request key_id, import the bundle key_id, restore null. A staging or
+    ledger failure must not mask the provider failure: the operation is
+    still finalized failed(503) and the event is simply absent ("at most
+    one"). Returns ``(503, body)`` for idempotent_run.
+    """
+    op_id = operation.operation_id
+    body = {
+        "error": "key management provider is unavailable",
+        "operation_id": op_id,
+    }
+    details = operation.details or {}
+    kind = details.get("kind")
+    action = (
+        audit_mod.ACTION_ROTATE
+        if kind == "rotate"
+        else audit_mod.ACTION_IMPORT
+    )
+    key_id = details.get("key_id")
+    audit_key_id = (
+        None if kind == "restore"
+        else (key_id if is_valid_key_id(key_id) else None)
+    )
+    try:
+        op_store.stage_terminal(
+            operation,
+            503,
+            body,
+            audit={
+                "action": action,
+                "outcome": audit_mod.OUTCOME_REJECTED,
+                "tenant_id": tenant_id,
+                "key_id": audit_key_id,
+            },
+        )
+        store.audit_attempt(
+            tenant_id, audit_key_id, action, audit_mod.OUTCOME_REJECTED,
+            event_id=op_id,
+        )
+    except (LedgerError, OSError):
+        # The terminal is still finalized by the caller; recovery treats a
+        # missing event as an uncommitted failure, never a duplicate.
+        pass
+    return 503, body
+
+
 def _idem_key_error(key) -> bool:
     """Validate an --idempotency-key; report exit 2 when malformed."""
     if not operations_mod.is_valid_idempotency_key(key):
@@ -318,7 +371,7 @@ def _idem_serve_existing(op_store, kind, record) -> "Optional[int]":
     )
 
 
-def idempotent_run(op_store, path, tenant_id, operator, body, key,
+def idempotent_run(op_store, store, path, tenant_id, operator, body, key,
                    validator, executor, decoder=None):
     """CLI counterpart of the HTTP idempotency guard.
 
@@ -381,12 +434,17 @@ def idempotent_run(op_store, path, tenant_id, operator, body, key,
         op_store.finish(operation, operations_mod.STATUS_FAILED, 400, body_err)
         return _emit_operation_result(400, body_err)
     except ProviderUnavailable:
-        body_err = {
-            "error": "key management provider is unavailable",
-            "operation_id": op_id,
-        }
-        op_store.finish(operation, operations_mod.STATUS_FAILED, 503, body_err)
-        return _emit_operation_result(503, body_err)
+        # Bound provider-failure terminal: stage the fixed 503 body and
+        # append its single rejected audit event (event_id == operation_id)
+        # before finalizing, so a crash and restart replay the identical
+        # response and never double-record.
+        http_status, body_err = _provider_failure_rejection(
+            op_store, store, operation, tenant_id
+        )
+        op_store.finish(
+            operation, operations_mod.STATUS_FAILED, http_status, body_err
+        )
+        return _emit_operation_result(http_status, body_err)
     except OSError as exc:
         # A pre-commit staging/write failure happened before the commit-point
         # append: file and handles were rolled back, nothing committed.
@@ -574,7 +632,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
             return 201, record.to_rotate_response()
 
         return idempotent_run(
-            op_store, path, args.tenant_id, args.operator, body,
+            op_store, store, path, args.tenant_id, args.operator, body,
             args.idempotency_key, lambda: None, execute,
         )
 
@@ -790,7 +848,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
             return 201, record.to_create_response()
 
         return idempotent_run(
-            op_store, path, args.tenant_id, args.operator, body,
+            op_store, store, path, args.tenant_id, args.operator, body,
             args.idempotency_key, validator, execute, decoder,
         )
 
@@ -933,7 +991,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
             )
 
         return idempotent_run(
-            op_store, path, args.tenant_id, args.operator, body,
+            op_store, store, path, args.tenant_id, args.operator, body,
             args.idempotency_key, validator, execute, decoder,
         )
 

@@ -292,6 +292,10 @@ class RestoreCoordinator:
             journal_id, journal_path = self.store._new_provision_journal(
                 event.event_id
             )
+            # Tracks whether any handle cleanup failed anywhere below; a
+            # failed cleanup keeps the provision journal so startup recovery
+            # retries the deletes instead of silently leaking backend objects.
+            cleanup = {"failed": False}
             try:
                 # Phase 0: complete ALL version validation and provider
                 # calls before the conflict recheck or any file write.
@@ -312,7 +316,8 @@ class RestoreCoordinator:
                     # earlier records already minted (record_from_backup
                     # released its own record's handles; do the rest here).
                     for record in records:
-                        self.store.release_record_handles(record)
+                        if not self.store.release_record_handles(record):
+                            cleanup["failed"] = True
                     raise
 
                 # Conflict scan only after every provider call succeeded.
@@ -322,7 +327,8 @@ class RestoreCoordinator:
                 if conflict is not None:
                     # Nothing was written; release every minted handle.
                     for record in records:
-                        self.store.release_record_handles(record)
+                        if not self.store.release_record_handles(record):
+                            cleanup["failed"] = True
                     status = (
                         RESTORE_FOREIGN_CONFLICT
                         if conflict.owner != tenant_id
@@ -367,14 +373,17 @@ class RestoreCoordinator:
                 # transaction without re-acquiring them.
                 return self._commit_locked(
                     tenant_id, key_ids, records, policy_rules, event, marker,
-                    pre_commit=pre_commit,
+                    pre_commit=pre_commit, cleanup=cleanup,
                 )
             finally:
                 # On a normal return (success, refused conflict or a handled
                 # rollback) the handles were either committed to the records
-                # or released; the journal is spent. A hard crash leaves it on
-                # disk for startup recovery, which is the actual safety net.
-                self.store.drop_provision_journal(journal_id)
+                # or released; the journal is spent. A failed cleanup keeps
+                # the journal so startup recovery retries the deletes, and a
+                # hard crash leaves it on disk for the same recovery, which
+                # is the actual safety net.
+                if not cleanup["failed"]:
+                    self.store.drop_provision_journal(journal_id)
 
     def _commit_empty(self, tenant_id: str, event: AuditEvent,
                       pre_commit=None) -> RestoreResult:
@@ -471,8 +480,16 @@ class RestoreCoordinator:
         event: AuditEvent,
         marker: dict,
         pre_commit=None,
+        cleanup: Optional[dict] = None,
     ) -> RestoreResult:
-        """Run the multi-file outbox transaction; caller already holds locks."""
+        """Run the multi-file outbox transaction; caller already holds locks.
+
+        ``cleanup`` (when given) is the caller's mutable ``{"failed": bool}``
+        flag: any handle-release failure inside the transaction sets it so
+        the caller keeps the provision journal for a startup retry.
+        """
+        if cleanup is None:
+            cleanup = {"failed": False}
         try:
             # Re-scan now that every file lock is held.
             conflict = self._scan_conflicts(tenant_id, key_ids)
@@ -486,7 +503,8 @@ class RestoreCoordinator:
                 # no file now commits: release the handles so the backend
                 # leaks nothing on the lost conflict race.
                 for record in records:
-                    self.store.release_record_handles(record)
+                    if not self.store.release_record_handles(record):
+                        cleanup["failed"] = True
                 return RestoreResult(status=status, conflict=conflict)
 
             written_keys: List[str] = []
@@ -512,10 +530,12 @@ class RestoreCoordinator:
                 # Roll back every file the transaction created AND every
                 # handle the attempt minted — including records whose file
                 # never landed after a phase-1 failure partway through the
-                # write set.
-                self._rollback(
+                # write set. A cleanup failure is reported through ``cleanup``
+                # so the caller keeps the provision journal for a retry.
+                if not self._rollback(
                     written_keys, wrote_policy, tenant_id, records
-                )
+                ):
+                    cleanup["failed"] = True
                 if isinstance(exc, LedgerError):
                     raise
                 raise LedgerError(
@@ -553,24 +573,27 @@ class RestoreCoordinator:
         wrote_policy: bool,
         tenant_id: str,
         records: Optional[list] = None,
-    ) -> None:
+    ) -> bool:
         """Remove every file created by a restore that did not commit.
 
         The provider handles the would-be records minted are deleted too —
         for *every* record the attempt adopted, including ones whose file
         never landed when phase 1 failed partway through the write set — so a
         failure that aborts the batch leaves no orphaned KMS/HSM objects
-        behind.
+        behind. Returns False when any handle could not be deleted, so the
+        caller keeps the attempt's provision journal for a startup retry.
         """
+        cleaned = True
         by_id = {r.key_id: r for r in (records or [])}
-        landed = set(written_keys)
         for key_id in written_keys:
             self.store.remove_file(key_id)
         for key_id, record in by_id.items():
             # Covers both landed (file now removed) and never-landed records.
-            self.store.release_record_handles(record)
+            if not self.store.release_record_handles(record):
+                cleaned = False
         if wrote_policy:
             self.policy_store.remove_restore_file(tenant_id)
+        return cleaned
 
     # -- crash recovery ----------------------------------------------------
     def recover(self) -> None:
@@ -630,15 +653,11 @@ class RestoreCoordinator:
             group.policy_rules = rules
 
         for eid, group in groups.items():
-            if not self._recover_group(eid, group):
-                # The ledger could not be read; leave files and journal for a
-                # later open to retry rather than risking committed material.
-                continue
-            # The group is resolved (committed or rolled back); its handle
-            # journal, deferred from the store's own startup sweep, is now
-            # spent. On the uncommitted path _recover_group already deleted
-            # every handle the journal recorded.
-            self.store.drop_provision_journal(group.journal)
+            # Resolve the group (commit or roll back); its handle journal,
+            # deferred from the store's own startup sweep, is disposed of
+            # inside _recover_group — dropped once the group's handles are
+            # settled, kept for a later open when a delete could not complete.
+            self._recover_group(eid, group)
 
         # Journals with no marker group (crash before the first file landed)
         # are swept last; their event never committed.
@@ -650,7 +669,9 @@ class RestoreCoordinator:
         A crash after provider adoption but before the first file landed
         leaves a journal but no marker group; the event never committed, so
         every recorded handle is deleted. Marker-referenced journals are
-        handled with their group in :meth:`recover`.
+        handled with their group in :meth:`recover`. A journal whose handles
+        could not all be deleted is kept so a later open retries the cleanup
+        instead of silently leaking the backend objects.
         """
         directory = os.path.join(self.store.data_dir, "provisions")
         try:
@@ -662,11 +683,20 @@ class RestoreCoordinator:
                 continue
             journal_id = name[:-5]
             try:
-                committed = self.store.audit.get_event(journal_id) is not None
+                # Only a SUCCESS event commits the handles; a rejected event
+                # with the same id means the attempt was refused/failed and
+                # its handles must be deleted.
+                event = self.store.audit.get_event(journal_id)
+                committed = (
+                    event is not None
+                    and event.outcome == audit_mod.OUTCOME_SUCCESS
+                )
             except LedgerError:
                 continue
-            if not committed:
-                self.store.release_journal_handles(journal_id)
+            if not committed and not self.store.release_journal_handles(
+                journal_id
+            ):
+                continue
             self.store.drop_provision_journal(journal_id)
 
     def _recover_empty_marker(self, path: str) -> None:
@@ -688,7 +718,13 @@ class RestoreCoordinator:
         if not event:
             return  # finalized marker: the committed batch's idempotency record
         try:
-            committed = self.store.audit.get_event(event["event_id"]) is not None
+            # Only a SUCCESS event finalizes the marker; a rejected event
+            # with the same id means the batch never committed.
+            event_in_ledger = self.store.audit.get_event(event["event_id"])
+            committed = (
+                event_in_ledger is not None
+                and event_in_ledger.outcome == audit_mod.OUTCOME_SUCCESS
+            )
         except (LedgerError, KeyError, TypeError):
             return  # leave it for a later open to retry
         if committed:
@@ -706,7 +742,14 @@ class RestoreCoordinator:
         marker = group.marker
         tenant_id = marker["tenant_id"]
         try:
-            committed = self.store.audit.get_event(eid) is not None
+            # Only a SUCCESS event commits the write set: a rejected event
+            # with the same id (a refused or provider-failed restore) means
+            # the group never committed and must be rolled back.
+            event = self.store.audit.get_event(eid)
+            committed = (
+                event is not None
+                and event.outcome == audit_mod.OUTCOME_SUCCESS
+            )
         except LedgerError:
             # Leave the group untouched; a later open retries recovery.
             return False
@@ -714,22 +757,30 @@ class RestoreCoordinator:
             # The ledger append never happened: remove every partial file and
             # release every provider handle the batch minted (the journal
             # also covers records whose file never landed), so a crash before
-            # commit leaves no orphaned KMS/HSM objects.
+            # commit leaves no orphaned KMS/HSM objects. The journal is
+            # dropped only once every handle is gone; a failed delete keeps
+            # it so a later open retries the cleanup.
+            cleaned = True
             if group.journal:
-                self.store.release_journal_handles(group.journal)
+                cleaned = self.store.release_journal_handles(group.journal)
             for key_id, path in list(group.key_files.items()):
                 record = self.store._read_record(path)
                 if record is not None and not group.journal:
                     # No journal available: fall back to the handles carried
                     # by the landed files themselves.
-                    self.store.release_record_handles(record)
+                    if not self.store.release_record_handles(record):
+                        cleaned = False
                 self.store.remove_file(key_id)
             if group.policy_file is not None:
                 self.policy_store.remove_restore_file(tenant_id)
+            if cleaned and group.journal:
+                self.store.drop_provision_journal(group.journal)
             return True
         # Committed: finish the transaction by clearing the markers. This is
         # post-commit housekeeping and best-effort; a rewrite failure leaves
-        # the marker for the next open and never rolls the data back.
+        # the marker for the next open and never rolls the data back. The
+        # handles are owned by the committed records, so the attempt journal
+        # is spent.
         for key_id, path in group.key_files.items():
             record = self.store._read_record(path)
             if record is None or not record.pending_event:
@@ -745,6 +796,8 @@ class RestoreCoordinator:
                 )
             except OSError:
                 pass
+        if group.journal:
+            self.store.drop_provision_journal(group.journal)
         return True
 
 
