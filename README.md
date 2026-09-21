@@ -69,6 +69,58 @@ python -m keymgr --data-dir ./keymgr_data serve --host 127.0.0.1 --port 8080
 缺失、为空或重复均返回 `400`（CLI 退出 `2`）。该标识既用于审计，也作为租户
 策略中的 `subject` 参与鉴权。
 
+### 幂等操作
+
+以下三个写操作支持幂等：
+
+- `POST /v1/keys/{key_id}/rotate`
+- `POST /v1/keys/import`
+- `POST /v1/restore`
+
+请求必须携带**单一** `Idempotency-Key` 头（CLI 对应必填的
+`--idempotency-key`），取值为 1–128 个 ASCII 字符，字符集
+`[A-Za-z0-9._~-]`。缺失、为空、重复或字符/长度非法一律 `400`
+（CLI 退出码 `2`），且**无任何副作用**（不建操作、不写密钥、不记账、
+不创建提供者句柄）。
+
+**绑定**是 `(tenant_id, X-Operator-Id, Idempotency-Key)` 三元组，HTTP 与
+CLI 共用同一绑定空间（CLI 合成与 HTTP 相同的规范化路径参与指纹）。
+
+- 首次请求生成一个 UUID4 `operation_id`（同时作为该操作提交审计事件的
+  `event_id`），先落一条 `pending` 操作，再由**唯一的提交者**执行。
+- **同绑定 + 同规范化请求体重试**：直接复用已存的状态码、响应体与审计
+  事件。请求体以 `sort_keys`、紧凑分隔的规范化 JSON 参与指纹（路径也
+  计入），因此仅 JSON 空白或键序不同视为同一请求，任何字段不同视为
+  不同请求。
+- **同绑定但路径/请求体不同**：返回 `409`（CLI 退出码 `3`），错误体
+  给出**已有**的 `operation_id`；已有操作不被修改，新操作不被创建。
+- **同键并发**：同一绑定的并发请求串行化，只有一个提交；等待绑定锁
+  **超过 5 秒**的请求返回 `503`（CLI 退出码 `1`），状态 `timed_out`，
+  等待方不写密钥、不写审计、不建句柄。不同幂等键互不阻塞。
+
+**状态机**：`pending` / `succeeded` / `failed` / `conflict` /
+`timed_out`。成功为 `201`（`succeeded`）；提供者后端故障为 `503`
+（`failed`，CLI 退出码 `1`）；账本/持久化失败为 `500`（`failed`，
+CLI 退出码 `1`）；同租户冲突为 `409`（`conflict`，CLI 退出码 `3`）；
+参数错误 `400`、策略拒绝 `403`、未知/跨租户对象 `404` 均为 `failed`
+（CLI 分别退出 `2`/`3`/`4`）。所有由绑定操作产生的响应都带
+`operation_id`；错误响应体**仅含** `error` 与 `operation_id`。
+
+`GET /v1/operations/{operation_id}` 查询操作状态：租户来自**单一**
+`X-Tenant-Id` 头或**单一** `?tenant_id=`（缺失/重复/冲突为 `400`），
+且必须是创建该操作的同一操作者。成功返回 `200`：
+`{"operation_id","tenant_id","status","http_status","response"}`；
+`pending` 时 `http_status` 与 `response` 均为 `null`。未知 id、跨租户或
+跨操作者一律 `404`，不泄露存在性。该查询不记账。
+
+**崩溃恢复**以 `operation_id == event_id`（也等于句柄台账 id）为键：
+启动时先由既有的密钥/策略/恢复 outbox 与句柄台账恢复（提交补记或回滚
+半成品文件与句柄），再由操作存储据账本收尾——已提交的操作据持久化状态
+重建为 `succeeded`；终态拒绝携带的待提交标记幂等补记；未提交且仍被
+绑定指针引用的操作保持 `pending`，由随后的同绑定重试在同一
+`operation_id` 下续跑；落盘但绑定指针未建成的孤儿操作收尾为 `failed`。
+HTTP 与 CLI 行为完全一致。
+
 ### 租户策略
 
 - `GET /v1/policy`：读取一个租户的策略。租户由**单一** `X-Tenant-Id` 头或
@@ -259,9 +311,11 @@ python -m keymgr --data-dir ./keymgr_data show \
 版本与轮换命令同样打印单行 JSON，字段与对应 HTTP 响应一致：
 
 ```bash
-# 轮换：输出 {"key_id","version","algorithm","public_key"}
+# 轮换：输出 {"key_id","version","algorithm","public_key","operation_id"}
+# rotate / import / restore 都必填 --idempotency-key（见“幂等操作”）
 python -m keymgr --data-dir ./keymgr_data rotate \
-  --tenant-id tenant-a --key-id <key_id> --algorithm AES256 --operator alice
+  --tenant-id tenant-a --key-id <key_id> --algorithm AES256 --operator alice \
+  --idempotency-key <key>
 # 指定历史版本：输出 {"key_id","version","created_at","algorithm","public_key"}
 python -m keymgr --data-dir ./keymgr_data version \
   --tenant-id tenant-a --key-id <key_id> --version 1 --operator alice
@@ -288,9 +342,10 @@ python -m keymgr --data-dir ./keymgr_data status \
 # 导出：输出 {"format","bundle"}，bundle 为不透明 base64
 python -m keymgr --data-dir ./keymgr_data export \
   --tenant-id tenant-a --key-id <key_id> --passphrase 'hunter2' --operator alice
-# 导入：输出 {"key_id","algorithm","public_key"}（201 的创建响应字段）
+# 导入：输出 {"key_id","algorithm","public_key","operation_id"}（201 的创建响应字段）
 python -m keymgr --data-dir ./keymgr_data import \
-  --tenant-id tenant-b --passphrase 'hunter2' --bundle '<bundle>' --operator alice
+  --tenant-id tenant-b --passphrase 'hunter2' --bundle '<bundle>' --operator alice \
+  --idempotency-key <key>
 ```
 
 导出、导入分别写 `action=export` / `action=import` 的审计事件。
@@ -301,9 +356,10 @@ python -m keymgr --data-dir ./keymgr_data import \
 # 备份：输出 {"format":"tenant-backup-v1","bundle"}
 python -m keymgr --data-dir ./keymgr_data backup \
   --tenant-id tenant-a --passphrase 'hunter2' --operator alice
-# 恢复：输出 {"tenant_id","key_ids","policy_restored"}
+# 恢复：输出 {"tenant_id","key_ids","policy_restored","operation_id"}
 python -m keymgr --data-dir ./keymgr_data restore \
-  --tenant-id tenant-a --passphrase 'hunter2' --bundle '<bundle>' --operator alice
+  --tenant-id tenant-a --passphrase 'hunter2' --bundle '<bundle>' --operator alice \
+  --idempotency-key <key>
 ```
 
 备份、恢复分别写 `action=export` / `action=import`、`key_id=null` 的审计

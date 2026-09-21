@@ -544,7 +544,7 @@ class KeyStore:
             raise
 
     # -- audit bookkeeping -------------------------------------------------
-    def audit_conflict(self) -> None:
+    def audit_conflict(self, event_id: Optional[str] = None) -> None:
         """Record an invisible tenant_conflict event (both ids null)."""
         self.audit.append(
             self.audit.new_event(
@@ -552,6 +552,7 @@ class KeyStore:
                 audit_mod.ACTION_TENANT_CONFLICT,
                 None,
                 audit_mod.OUTCOME_REJECTED,
+                event_id=event_id,
             )
         )
 
@@ -561,6 +562,7 @@ class KeyStore:
         key_id,
         action: str,
         outcome: str,
+        event_id: Optional[str] = None,
     ) -> None:
         """Record one attempt against a key.
 
@@ -568,6 +570,8 @@ class KeyStore:
         absent (create) or a legal UUID4, both identifiers are recorded and
         the event is visible to that tenant only. A missing/empty/illegal
         identifier collapses to an invisible tenant_conflict with null ids.
+        ``event_id`` pins the event id (idempotent operations pin it to their
+        operation_id so a replayed request reuses the exact same event).
         """
         if (
             isinstance(tenant_id, str)
@@ -583,13 +587,16 @@ class KeyStore:
                 audit_mod.ACTION_AUDIT,
             )
         ):
-            event = self.audit.new_event(tenant_id, action, key_id, outcome)
+            event = self.audit.new_event(
+                tenant_id, action, key_id, outcome, event_id=event_id
+            )
         else:
             event = self.audit.new_event(
                 None,
                 audit_mod.ACTION_TENANT_CONFLICT,
                 None,
                 audit_mod.OUTCOME_REJECTED,
+                event_id=event_id,
             )
         self.audit.append(event)
 
@@ -844,13 +851,21 @@ class KeyStore:
             return None
         return record
 
-    def rotate(self, key_id: str, tenant_id: str, algorithm: str) -> Optional[KeyRecord]:
+    def rotate(
+        self,
+        key_id: str,
+        tenant_id: str,
+        algorithm: str,
+        event_id: Optional[str] = None,
+    ) -> Optional[KeyRecord]:
         """Append a new version with fresh material.
 
         Returns None for an unknown or foreign key. Versions are strictly
         incrementing; the on-disk state is read, extended and written back
         atomically under per-key locks so concurrent rotations never lose a
-        version or leave a dangling current pointer.
+        version or leave a dangling current pointer. ``event_id`` pins the
+        committing audit event (an idempotent operation reuses its
+        operation_id); a fresh id is minted otherwise.
         """
         if not _KEY_ID_RE.fullmatch(key_id):
             return None
@@ -859,6 +874,15 @@ class KeyStore:
             record = self._read_record(path)
             if record is None or record.tenant_id != tenant_id:
                 return None
+            if event_id is not None:
+                # Crash-after-commit replay guard: the pinned event already
+                # reached the ledger, so its version is authoritative. Do not
+                # mint another version; the caller replays the stored result.
+                try:
+                    if self.audit.get_event(event_id) is not None:
+                        return record
+                except LedgerError:
+                    pass
             # A version is rotated on the provider that owns the record;
             # switching providers mid-key is refused (503), never silently
             # migrated.
@@ -881,6 +905,7 @@ class KeyStore:
             event = self.audit.new_event(
                 tenant_id, audit_mod.ACTION_ROTATE, key_id,
                 audit_mod.OUTCOME_SUCCESS, timestamp=created_at,
+                event_id=event_id,
             )
             self._commit_mutation(
                 path, record, event, previous,
@@ -1084,7 +1109,10 @@ class KeyStore:
                 pass
 
     def import_bundle(
-        self, tenant_id: str, payload: dict
+        self,
+        tenant_id: str,
+        payload: dict,
+        event_id: Optional[str] = None,
     ) -> tuple:
         """Persist a validated export payload under the importing tenant.
 
@@ -1105,7 +1133,7 @@ class KeyStore:
         # by asking the ledger whether the event committed.
         event = self.audit.new_event(
             tenant_id, audit_mod.ACTION_IMPORT, key_id,
-            audit_mod.OUTCOME_SUCCESS,
+            audit_mod.OUTCOME_SUCCESS, event_id=event_id,
         )
         journal_id, journal_path = self._new_provision_journal(event.event_id)
         try:
@@ -1138,6 +1166,16 @@ class KeyStore:
                 # every provider call succeeded; nothing has been written.
                 existing = self._read_record(path)
                 if existing is not None:
+                    if event_id is not None:
+                        # A replay pinned to an event already in the ledger is
+                        # the same commit finishing, not a new conflict: the
+                        # existing record is this operation's result.
+                        try:
+                            if self.audit.get_event(event_id) is not None:
+                                self._release_handles(adopted)
+                                return IMPORT_CREATED, existing
+                        except LedgerError:
+                            pass
                     self._release_handles(adopted)
                     return IMPORT_CONFLICT, existing
                 try:

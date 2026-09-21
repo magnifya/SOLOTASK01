@@ -168,13 +168,20 @@ class RestoreCoordinator:
             self.store.data_dir, _EMPTY_MARKER_PREFIX + digest + ".json"
         )
 
-    def restore(self, tenant_id: str, payload: dict) -> RestoreResult:
+    def restore(
+        self,
+        tenant_id: str,
+        payload: dict,
+        event_id: Optional[str] = None,
+    ) -> RestoreResult:
         """Atomically restore a validated tenant payload.
 
         Returns a created result, or a conflict result after leaving every
         existing file byte-for-byte untouched. Raises LedgerError when the
         transaction cannot be committed; all written files and all handles
-        minted by the attempt are rolled back.
+        minted by the attempt are rolled back. ``event_id`` pins the single
+        committing audit event (an idempotent restore reuses its
+        operation_id).
 
         Ordering: every version is validated and adopted through its provider
         first (the durable provision journal records each handle as it is
@@ -196,7 +203,7 @@ class RestoreCoordinator:
             # committed-vs-not purely from the ledger.
             event = self.store.audit.new_event(
                 tenant_id, audit_mod.ACTION_IMPORT, None,
-                audit_mod.OUTCOME_SUCCESS,
+                audit_mod.OUTCOME_SUCCESS, event_id=event_id,
             )
             journal_id, journal_path = self.store._new_provision_journal(
                 event.event_id
