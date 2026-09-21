@@ -205,6 +205,60 @@ def make_handler(
             )
             return http_status, body
 
+        def _idempotent_provider_terminal(
+            self, operation, http_status, message
+        ):
+            """Persist a bound op's provider-failure terminal and append it.
+
+            A KMS/HSM load/contract/call/handle-delete failure (503) or a
+            refusal of imported material (400) that happens *after* the
+            Idempotency-Key is bound is a durable terminal state, exactly like
+            a 403/404/409 refusal: the safe response is staged first, then a
+            single ``rejected`` event named after the operation_id is appended
+            (rotate projects the request key_id, import the in-bundle key_id,
+            restore null), so HTTP/CLI retries and GET operation replay the
+            same status/body byte-for-byte and the event is never duplicated.
+            The body never carries the backend detail, a handle, material or
+            a passphrase. A failure of the stage write or the ledger append
+            propagates (the guard finalizes failed(500)); nothing committed.
+            """
+            op_id = operation.operation_id
+            body = {"error": message, "operation_id": op_id}
+            details = operation.details or {}
+            kind = details.get("kind")
+            action = (
+                audit_mod.ACTION_ROTATE
+                if kind == "rotate"
+                else audit_mod.ACTION_IMPORT
+            )
+            audit_key_id = (
+                None if kind == "restore"
+                else (
+                    details.get("key_id")
+                    if is_valid_key_id(details.get("key_id"))
+                    else None
+                )
+            )
+            operation_store.stage_terminal(
+                operation,
+                http_status,
+                body,
+                audit={
+                    "action": action,
+                    "outcome": audit_mod.OUTCOME_REJECTED,
+                    "tenant_id": operation.tenant_id,
+                    "key_id": audit_key_id,
+                },
+            )
+            store.audit_attempt(
+                operation.tenant_id, audit_key_id, action,
+                audit_mod.OUTCOME_REJECTED, event_id=op_id,
+            )
+            operation_store.finish(
+                operation, operations_mod.STATUS_FAILED, http_status, body
+            )
+            self._send_json(http_status, body)
+
         def _timed_out_body(self, operation_id: str) -> dict:
             return {
                 "error": "operation timed out waiting for a lock",
@@ -249,22 +303,46 @@ def make_handler(
                 self._send_json(503, body)
                 return
             except ProviderInvalidMaterial as exc:
-                body = {"error": str(exc), "operation_id": op_id}
-                operation_store.finish(
-                    operation, operations_mod.STATUS_FAILED, 400, body
-                )
-                self._send_json(400, body)
-                return
+                # A bound refusal of imported material is a terminal 400:
+                # stage the field-naming error, append its single rejected
+                # event and finish. A failure of that persistence itself
+                # becomes failed(500) below; nothing committed.
+                try:
+                    self._idempotent_provider_terminal(
+                        operation, 400, str(exc)
+                    )
+                    return
+                except (OSError, LedgerError) as persist_exc:
+                    body = {
+                        "error": "audit ledger failure: %s" % persist_exc,
+                        "operation_id": op_id,
+                    }
+                    operation_store.finish(
+                        operation, operations_mod.STATUS_FAILED, 500, body
+                    )
+                    self._send_json(500, body)
+                    return
             except ProviderUnavailable:
-                body = {
-                    "error": "key management provider is unavailable",
-                    "operation_id": op_id,
-                }
-                operation_store.finish(
-                    operation, operations_mod.STATUS_FAILED, 503, body
-                )
-                self._send_json(503, body)
-                return
+                # A bound KMS/HSM fault (load/contract/call/handle-delete) is
+                # a durable terminal 503 with the fixed safe message and one
+                # rejected event named after the operation_id; retries replay
+                # it verbatim. Persistence failure becomes failed(500).
+                try:
+                    self._idempotent_provider_terminal(
+                        operation, 503,
+                        "key management provider is unavailable",
+                    )
+                    return
+                except (OSError, LedgerError) as persist_exc:
+                    body = {
+                        "error": "audit ledger failure: %s" % persist_exc,
+                        "operation_id": op_id,
+                    }
+                    operation_store.finish(
+                        operation, operations_mod.STATUS_FAILED, 500, body
+                    )
+                    self._send_json(500, body)
+                    return
             except OSError as exc:
                 # Persisting the staged result (or another pre-commit write)
                 # failed before the commit-point append: the store already

@@ -261,6 +261,56 @@ def _terminal_rejection(
     return http_status, body
 
 
+def _provider_terminal(
+    op_store, store, operation, http_status, message
+):
+    """Persist a bound op's provider-failure terminal and append it.
+
+    CLI counterpart of the HTTP handler: after the Idempotency-Key is bound,
+    a KMS/HSM load/contract/call/handle-delete failure (503) or a refusal of
+    imported material (400) is a durable terminal -- the safe response is
+    staged, one rejected event named after the operation_id is appended
+    (rotate projects the request key_id, import the in-bundle key_id, restore
+    null), and the op is finished, so an HTTP/CLI cross-retry replays exactly
+    this result and the event is never duplicated. Raises OSError/LedgerError
+    if that persistence itself fails (the caller finalizes failed(500)).
+    """
+    op_id = operation.operation_id
+    body = {"error": message, "operation_id": op_id}
+    details = operation.details or {}
+    kind = details.get("kind")
+    action = (
+        audit_mod.ACTION_ROTATE
+        if kind == "rotate"
+        else audit_mod.ACTION_IMPORT
+    )
+    audit_key_id = (
+        None if kind == "restore"
+        else (
+            details.get("key_id")
+            if is_valid_key_id(details.get("key_id"))
+            else None
+        )
+    )
+    op_store.stage_terminal(
+        operation,
+        http_status,
+        body,
+        audit={
+            "action": action,
+            "outcome": audit_mod.OUTCOME_REJECTED,
+            "tenant_id": operation.tenant_id,
+            "key_id": audit_key_id,
+        },
+    )
+    store.audit_attempt(
+        operation.tenant_id, audit_key_id, action,
+        audit_mod.OUTCOME_REJECTED, event_id=op_id,
+    )
+    op_store.finish(operation, operations_mod.STATUS_FAILED, http_status, body)
+    return http_status, body
+
+
 def _idem_key_error(key) -> bool:
     """Validate an --idempotency-key; report exit 2 when malformed."""
     if not operations_mod.is_valid_idempotency_key(key):
@@ -318,7 +368,7 @@ def _idem_serve_existing(op_store, kind, record) -> "Optional[int]":
     )
 
 
-def idempotent_run(op_store, path, tenant_id, operator, body, key,
+def idempotent_run(op_store, store, path, tenant_id, operator, body, key,
                    validator, executor, decoder=None):
     """CLI counterpart of the HTTP idempotency guard.
 
@@ -377,16 +427,36 @@ def idempotent_run(op_store, path, tenant_id, operator, body, key,
         )
         return _emit_operation_result(503, body_err)
     except ProviderInvalidMaterial as exc:
-        body_err = {"error": str(exc), "operation_id": op_id}
-        op_store.finish(operation, operations_mod.STATUS_FAILED, 400, body_err)
-        return _emit_operation_result(400, body_err)
+        try:
+            http_status, body_err = _provider_terminal(
+                op_store, store, operation, 400, str(exc)
+            )
+            return _emit_operation_result(http_status, body_err)
+        except (OSError, LedgerError) as persist_exc:
+            body_err = {
+                "error": "audit ledger failure: %s" % persist_exc,
+                "operation_id": op_id,
+            }
+            op_store.finish(
+                operation, operations_mod.STATUS_FAILED, 500, body_err
+            )
+            return _emit_operation_result(500, body_err)
     except ProviderUnavailable:
-        body_err = {
-            "error": "key management provider is unavailable",
-            "operation_id": op_id,
-        }
-        op_store.finish(operation, operations_mod.STATUS_FAILED, 503, body_err)
-        return _emit_operation_result(503, body_err)
+        try:
+            http_status, body_err = _provider_terminal(
+                op_store, store, operation, 503,
+                "key management provider is unavailable",
+            )
+            return _emit_operation_result(http_status, body_err)
+        except (OSError, LedgerError) as persist_exc:
+            body_err = {
+                "error": "audit ledger failure: %s" % persist_exc,
+                "operation_id": op_id,
+            }
+            op_store.finish(
+                operation, operations_mod.STATUS_FAILED, 500, body_err
+            )
+            return _emit_operation_result(500, body_err)
     except OSError as exc:
         # A pre-commit staging/write failure happened before the commit-point
         # append: file and handles were rolled back, nothing committed.
@@ -574,7 +644,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
             return 201, record.to_rotate_response()
 
         return idempotent_run(
-            op_store, path, args.tenant_id, args.operator, body,
+            op_store, store, path, args.tenant_id, args.operator, body,
             args.idempotency_key, lambda: None, execute,
         )
 
@@ -790,7 +860,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
             return 201, record.to_create_response()
 
         return idempotent_run(
-            op_store, path, args.tenant_id, args.operator, body,
+            op_store, store, path, args.tenant_id, args.operator, body,
             args.idempotency_key, validator, execute, decoder,
         )
 
@@ -933,7 +1003,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
             )
 
         return idempotent_run(
-            op_store, path, args.tenant_id, args.operator, body,
+            op_store, store, path, args.tenant_id, args.operator, body,
             args.idempotency_key, validator, execute, decoder,
         )
 
