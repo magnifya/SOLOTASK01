@@ -719,6 +719,7 @@ class KeyStore:
         provider=None,
         new_handles=(),
         journal_id: Optional[str] = None,
+        pre_commit=None,
     ) -> None:
         """Commit a key-file change and its event as one logical transaction.
 
@@ -731,8 +732,13 @@ class KeyStore:
         write leaves neither a single-sided file nor an orphaned HSM object.
         ``journal_id`` (import only) is folded into the marker so crash
         recovery can drop the attempt's provision journal after resolving it.
-        A crash at any point is repaired idempotently by
-        _recover_pending_events on the next open.
+        ``pre_commit`` (when given) runs strictly between the durable marker
+        write and the ledger append: it lets the caller durably persist the
+        idempotent operation's terminal context so the response can be
+        replayed verbatim once the event lands; an exception rolls the file
+        and handles back exactly like a failed ledger append. A crash at any
+        point is repaired idempotently by _recover_pending_events on the next
+        open.
         """
         marker = event.to_json()
         if journal_id:
@@ -752,6 +758,11 @@ class KeyStore:
 
         try:
             self._write_atomic(path, record.to_json())
+            if pre_commit is not None:
+                # The in-memory record already carries the version being
+                # committed, so the caller can stage the exact 201 response
+                # before the commit-point append.
+                pre_commit(record)
             self.audit.append(event)
         except BaseException:
             # Only roll the file back when it may have landed: a failure of
@@ -961,6 +972,7 @@ class KeyStore:
         algorithm: str,
         event_id: Optional[str] = None,
         lock_timeout: Optional[float] = None,
+        pre_commit=None,
     ) -> Optional[KeyRecord]:
         """Append a new version with fresh material.
 
@@ -1022,6 +1034,7 @@ class KeyStore:
                         path, record, event, previous,
                         provider=provider, new_handles=(triple.handle,),
                         journal_id=journal_id,
+                        pre_commit=pre_commit,
                     )
                 except BaseException:
                     # Ledger/write failure: the file was already rolled back
@@ -1241,6 +1254,7 @@ class KeyStore:
         payload: dict,
         event_id: Optional[str] = None,
         lock_timeout: Optional[float] = None,
+        pre_commit=None,
     ) -> tuple:
         """Persist a validated export payload under the importing tenant.
 
@@ -1311,6 +1325,7 @@ class KeyStore:
                     self._commit_mutation(
                         path, record, event, None,
                         journal_id=journal_id,
+                        pre_commit=pre_commit,
                     )
                 except BaseException:
                     self._release_handles(adopted)

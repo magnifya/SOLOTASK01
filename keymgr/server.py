@@ -166,26 +166,44 @@ def make_handler(
         def _idempotent_rejection(
             self, operation, tenant_id, key_id, action, http_status, message
         ):
-            """Write the single terminal rejection event of a bound op.
+            """Durably persist a bound op's terminal rejection and append it.
 
-            The terminal status is first merged into the persisted operation
-            details and then the rejection event is appended named after the
-            operation_id, so on a crash between the two: if the event is not
-            durable the op is recovered as an uncommitted failure (nothing was
-            written to roll back), and once it is durable startup recovery
-            replays this exact 403/404/409 instead of guessing it from the
-            current policy or store state. The ledger dedupes on event_id, so
-            a retry never writes the event twice. Returns
+            The operation kind, the exact key_id rule, the terminal status,
+            the complete error response and the audit descriptor (action,
+            outcome, tenant_id and the projection key_id) are merged into the
+            durable operation context *before* the single rejection event is
+            appended, so on a crash between the two: if the event is not
+            durable the op recovers as an uncommitted failure (no key, file or
+            handle was written by a refusal), and once it is durable startup
+            recovery replays this exact 403/404/409 response verbatim instead
+            of re-evaluating the policy or re-reading the object. The ledger
+            dedupes on event_id, so a retry never writes the event twice. The
+            error body contains only error and operation_id. Returns
             ``(http_status, body)`` for the idempotent guard.
             """
-            details = dict(operation.details or {})
-            details["terminal"] = http_status
-            operation_store.update_details(operation, details)
-            store.audit_attempt(
-                tenant_id, key_id, action, audit_mod.OUTCOME_REJECTED,
-                event_id=operation.operation_id,
+            op_id = operation.operation_id
+            body = {"error": message, "operation_id": op_id}
+            # The accurate key_id rule: a restore's events are always key_id
+            # null; rotate/import carry the (already validated) key_id.
+            kind = (operation.details or {}).get("kind")
+            audit_key_id = (
+                None if kind == "restore"
+                else (key_id if is_valid_key_id(key_id) else None)
             )
-            return http_status, {"error": message}
+            audit_desc = {
+                "action": action,
+                "outcome": audit_mod.OUTCOME_REJECTED,
+                "tenant_id": tenant_id,
+                "key_id": audit_key_id,
+            }
+            operation_store.stage_terminal(
+                operation, http_status, body, audit=audit_desc
+            )
+            store.audit_attempt(
+                tenant_id, audit_key_id, action, audit_mod.OUTCOME_REJECTED,
+                event_id=op_id,
+            )
+            return http_status, body
 
         def _timed_out_body(self, operation_id: str) -> dict:
             return {
@@ -246,6 +264,20 @@ def make_handler(
                     operation, operations_mod.STATUS_FAILED, 503, body
                 )
                 self._send_json(503, body)
+                return
+            except OSError as exc:
+                # Persisting the staged result (or another pre-commit write)
+                # failed before the commit-point append: the store already
+                # rolled back the file and minted handles, so nothing
+                # committed. Finalize failed(500).
+                body = {
+                    "error": "audit ledger failure: %s" % exc,
+                    "operation_id": op_id,
+                }
+                operation_store.finish(
+                    operation, operations_mod.STATUS_FAILED, 500, body
+                )
+                self._send_json(500, body)
                 return
             except LedgerError as exc:
                 body = {
@@ -608,6 +640,14 @@ def make_handler(
                 return
 
             def execute(operation):
+                # The operation kind and the exact key_id rule are durable
+                # before the authorization check, so even a 403 terminal can
+                # be replayed verbatim after a crash from context alone.
+                operation_store.update_details(
+                    operation,
+                    {"kind": "rotate", "key_id": key_id,
+                     "algorithm": algorithm},
+                )
                 # Authorization follows validation and precedes existence; a
                 # denial is a bound terminal 403 whose single rejection event
                 # is named after the operation_id.
@@ -619,15 +659,20 @@ def make_handler(
                         audit_mod.ACTION_ROTATE, 403,
                         "action not permitted by policy",
                     )
-                operation_store.update_details(
-                    operation,
-                    {"kind": "rotate", "key_id": key_id,
-                     "algorithm": algorithm},
-                )
+
+                def stage_success(committed_record):
+                    # Runs after the key file landed, before the commit-point
+                    # ledger append: the exact 201 body is durable with the
+                    # event, independent of later policy/object state.
+                    body = committed_record.to_rotate_response()
+                    body["operation_id"] = operation.operation_id
+                    operation_store.stage_terminal(operation, 201, body)
+
                 record = store.rotate(
                     key_id, tenant_id, algorithm,
                     event_id=operation.operation_id,
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
+                    pre_commit=stage_success,
                 )
                 if record is None:
                     return self._idempotent_rejection(
@@ -803,6 +848,12 @@ def make_handler(
 
             def execute(operation):
                 key_id = decoded["key_id"]
+                # Kind and exact key_id rule are durable before any business
+                # check, so a 403/404/409 terminal replays from context alone.
+                operation_store.update_details(
+                    operation,
+                    {"kind": "import", "key_id": key_id},
+                )
                 # Authorization precedes the conflict check: a denial is a
                 # bound terminal 403 even when the key_id already exists for
                 # another tenant.
@@ -814,16 +865,21 @@ def make_handler(
                         audit_mod.ACTION_IMPORT, 403,
                         "action not permitted by policy",
                     )
+
+                def stage_success(committed_record):
+                    # After the new key file landed, before the commit-point
+                    # append: stage the exact 201 body verbatim.
+                    body = committed_record.to_create_response()
+                    body["operation_id"] = operation.operation_id
+                    operation_store.stage_terminal(operation, 201, body)
+
                 # ProviderInvalidMaterial propagates to the guard (400). The
                 # existence check and the create are atomic in the store.
-                operation_store.update_details(
-                    operation,
-                    {"kind": "import", "key_id": key_id},
-                )
                 status, record = store.import_bundle(
                     tenant_id, decoded,
                     event_id=operation.operation_id,
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
+                    pre_commit=stage_success,
                 )
                 if status == IMPORT_CONFLICT:
                     if record.tenant_id == tenant_id:
@@ -949,6 +1005,19 @@ def make_handler(
                 return
 
             def execute(operation):
+                key_ids = sorted(k["key_id"] for k in decoded["keys"])
+                writes_policy = decoded["policy"] is not None
+                # Kind and write-set facts are durable before any business
+                # check. Restore events always project key_id null, enforced
+                # by the rejection helper from kind == "restore".
+                operation_store.update_details(
+                    operation,
+                    {
+                        "kind": "restore",
+                        "key_ids": key_ids,
+                        "policy_restored": writes_policy,
+                    },
+                )
                 # Authorization (import) precedes the in-bundle tenant check.
                 if not policy_store.is_allowed(
                     tenant_id, audit_mod.ACTION_IMPORT, operator
@@ -966,23 +1035,26 @@ def make_handler(
                         audit_mod.ACTION_IMPORT, 404,
                         "tenant backup not found",
                     )
+
+                def stage_success():
+                    # After the write set landed, before the single
+                    # commit-point append: stage the exact 201 body verbatim.
+                    body = {
+                        "tenant_id": tenant_id,
+                        "key_ids": key_ids,
+                        "policy_restored": writes_policy,
+                        "operation_id": operation.operation_id,
+                    }
+                    operation_store.stage_terminal(operation, 201, body)
+
                 # ProviderInvalidMaterial (400) and LedgerError (500)
                 # propagate to the guard; the coordinator has already removed
                 # every written file on a ledger failure.
-                key_ids = sorted(k["key_id"] for k in decoded["keys"])
-                writes_policy = decoded["policy"] is not None
-                operation_store.update_details(
-                    operation,
-                    {
-                        "kind": "restore",
-                        "key_ids": key_ids,
-                        "policy_restored": writes_policy,
-                    },
-                )
                 result = coordinator.restore(
                     tenant_id, decoded,
                     event_id=operation.operation_id,
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
+                    pre_commit=stage_success,
                 )
                 if result.status == restore_mod.RESTORE_CREATED:
                     # The single success event committed with the files.

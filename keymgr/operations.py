@@ -447,15 +447,51 @@ class OperationStore:
     def update_details(self, record: OperationRecord, details: dict) -> None:
         """Persist recovery facts on a still-pending owned operation.
 
-        Written before the mutation runs, so a crash after the audit commit
-        but before :meth:`finish` can still rebuild the committed response.
+        ``details`` is merged into the already-persisted context rather than
+        replacing it, so a terminal rejection never erases the operation kind,
+        the exact key_id rule or other facts recorded before the business
+        check ran. Written before the mutation runs, so a crash after the
+        audit commit but before :meth:`finish` can still rebuild the committed
+        response from durable context alone.
         """
-        record.details = details
+        merged = dict(record.details or {})
+        merged.update(details)
+        record.details = merged
         fd = self._locked()
         try:
             self._write_record(record)
         finally:
             self._unlocked(fd)
+
+    def stage_terminal(
+        self,
+        record: OperationRecord,
+        http_status: int,
+        response: dict,
+        audit: Optional[dict] = None,
+    ) -> None:
+        """Durably persist the exact terminal result *before* the event append.
+
+        The staged ``result`` (HTTP status plus the complete error/success
+        response body) and optional ``audit`` descriptor are merged into the
+        operation context and fsynced to the record file. Once the subsequent
+        audit append lands, crash recovery replays this exact status/response
+        verbatim -- never re-evaluating the policy, re-reading the object or
+        re-decrypting the bundle. A crash before the append leaves both the
+        stage and the event uncommitted and the operation is later finalized
+        as failed(500).
+        """
+        details = dict(record.details or {})
+        details["result"] = {
+            "http_status": http_status,
+            "response": response,
+        }
+        # Explicit terminal status mirror; also read by the legacy fallback
+        # resolver for records predating the staged "result".
+        details["terminal"] = http_status
+        if audit is not None:
+            details["audit"] = audit
+        self.update_details(record, details)
 
     def finish(
         self,
@@ -509,16 +545,17 @@ class OperationStore:
         Must run *after* the key-store and restore outbox recovery, so the
         ledger already reflects every half-committed mutation. For each
         pending operation: when its event reached the ledger the operation
-        is durable -- ``resolve_committed(record, event)`` rebuilds
-        ``(http_status, response)`` from the now-durable state and the
-        operation is finished in :func:`state_for_http_status` (a successful
-        201, a 409 conflict, or a 403/404 failure whose rejection event is
-        the durable fact); otherwise it never committed and is recorded as a
-        500 failure (the outbox/provision recovery has already removed its
-        half-written files and minted handles). The response resolver is
-        best effort: if it cannot rebuild the projection the operation is
-        still marked succeeded (the mutation did commit) with an
-        operation_id-only response rather than left pending forever.
+        is durable and the terminal status/response persisted *with the
+        rejection/success context* (``details["result"]``) are replayed
+        verbatim -- the policy, the current object state and the (possibly no
+        longer decryptable) bundle are never consulted again, so a later
+        policy/state change cannot turn a 403 into a 404/409 or rewrite the
+        first response; only when no result was staged (older records) does
+        ``resolve_committed(record, event)`` rebuild a best-effort
+        projection. When the event never reached the ledger the operation
+        never committed and is recorded as a 500 failure (the outbox/
+        provision recovery has already removed its half-written files and
+        minted handles).
         """
         try:
             names = os.listdir(self.dir_path)
@@ -538,18 +575,32 @@ class OperationStore:
                 # Cannot decide right now; leave it for a later open.
                 continue
             if event is not None:
-                http_status, response = 201, {
-                    "operation_id": record.operation_id
-                }
-                if resolve_committed is not None:
-                    try:
-                        http_status, response = resolve_committed(
-                            record, event
-                        )
-                    except Exception:
-                        http_status, response = 201, {
-                            "operation_id": record.operation_id
-                        }
+                details = record.details or {}
+                staged = details.get("result")
+                if (
+                    isinstance(staged, dict)
+                    and isinstance(staged.get("http_status"), int)
+                    and isinstance(staged.get("response"), dict)
+                ):
+                    # The durable fact: replay the first status/response
+                    # byte-for-byte regardless of the current policy/state.
+                    http_status = int(staged["http_status"])
+                    response = staged["response"]
+                else:
+                    # Backwards-compatible recovery for records that
+                    # committed before the result was staged.
+                    http_status, response = 201, {
+                        "operation_id": record.operation_id
+                    }
+                    if resolve_committed is not None:
+                        try:
+                            http_status, response = resolve_committed(
+                                record, event
+                            )
+                        except Exception:
+                            http_status, response = 201, {
+                                "operation_id": record.operation_id
+                            }
                 self.finish(
                     record,
                     state_for_http_status(http_status),

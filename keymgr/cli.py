@@ -226,22 +226,39 @@ def _terminal_rejection(
     op_store, store, operation, tenant_id, key_id, action,
     http_status, message,
 ):
-    """Record a bound operation's single terminal rejection.
+    """Durably persist a bound op's terminal rejection and append it.
 
-    CLI counterpart of the HTTP handler's helper: the terminal status is
-    persisted in the operation details first, then one rejected event named
-    after the operation_id is appended (at most once, deduped on event_id), so
-    a crash and startup recovery replay this exact 403/404/409. Returns
+    CLI counterpart of the HTTP handler: the operation kind, the exact key_id
+    rule, the terminal status, the complete error response and the audit
+    descriptor are merged into the durable context *before* the one rejected
+    event (named after the operation_id, deduped on event_id) is appended, so a
+    crash and startup recovery replay this exact 403/404/409 verbatim instead
+    of re-evaluating the policy or re-reading the object. Returns
     ``(http_status, body)`` for idempotent_run.
     """
-    details = dict(operation.details or {})
-    details["terminal"] = http_status
-    op_store.update_details(operation, details)
-    store.audit_attempt(
-        tenant_id, key_id, action, audit_mod.OUTCOME_REJECTED,
-        event_id=operation.operation_id,
+    op_id = operation.operation_id
+    body = {"error": message, "operation_id": op_id}
+    kind = (operation.details or {}).get("kind")
+    audit_key_id = (
+        None if kind == "restore"
+        else (key_id if is_valid_key_id(key_id) else None)
     )
-    return http_status, {"error": message}
+    op_store.stage_terminal(
+        operation,
+        http_status,
+        body,
+        audit={
+            "action": action,
+            "outcome": audit_mod.OUTCOME_REJECTED,
+            "tenant_id": tenant_id,
+            "key_id": audit_key_id,
+        },
+    )
+    store.audit_attempt(
+        tenant_id, audit_key_id, action, audit_mod.OUTCOME_REJECTED,
+        event_id=op_id,
+    )
+    return http_status, body
 
 
 def _idem_key_error(key) -> bool:
@@ -370,6 +387,16 @@ def idempotent_run(op_store, path, tenant_id, operator, body, key,
         }
         op_store.finish(operation, operations_mod.STATUS_FAILED, 503, body_err)
         return _emit_operation_result(503, body_err)
+    except OSError as exc:
+        # A pre-commit staging/write failure happened before the commit-point
+        # append: file and handles were rolled back, nothing committed.
+        # Finalize failed(500).
+        body_err = {
+            "error": "audit ledger failure: %s" % exc,
+            "operation_id": op_id,
+        }
+        op_store.finish(operation, operations_mod.STATUS_FAILED, 500, body_err)
+        return _emit_operation_result(500, body_err)
     except LedgerError as exc:
         body_err = {
             "error": "audit ledger failure: %s" % exc,
@@ -510,6 +537,13 @@ def _run(argv: Optional[List[str]] = None) -> int:
         path = "/v1/keys/%s/rotate" % args.key_id
 
         def execute(operation):
+            # Kind/exact key_id are durable before the authorization check so
+            # a 403 terminal replays from context alone after a crash.
+            op_store.update_details(
+                operation,
+                {"kind": "rotate", "key_id": args.key_id,
+                 "algorithm": args.algorithm},
+            )
             if not policies.is_allowed(
                 args.tenant_id, audit_mod.ACTION_ROTATE, args.operator
             ):
@@ -519,15 +553,17 @@ def _run(argv: Optional[List[str]] = None) -> int:
                     audit_mod.ACTION_ROTATE, 403,
                     "action not permitted by policy",
                 )
-            op_store.update_details(
-                operation,
-                {"kind": "rotate", "key_id": args.key_id,
-                 "algorithm": args.algorithm},
-            )
+
+            def stage_success(committed_record):
+                body = committed_record.to_rotate_response()
+                body["operation_id"] = operation.operation_id
+                op_store.stage_terminal(operation, 201, body)
+
             record = store.rotate(
                 args.key_id, args.tenant_id, args.algorithm,
                 event_id=operation.operation_id,
                 lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
+                pre_commit=stage_success,
             )
             if record is None:
                 return _terminal_rejection(
@@ -712,6 +748,11 @@ def _run(argv: Optional[List[str]] = None) -> int:
 
         def execute(operation):
             key_id = decoded["key_id"]
+            # Kind/exact key_id durable before any business check.
+            op_store.update_details(
+                operation,
+                {"kind": "import", "key_id": key_id},
+            )
             if not policies.is_allowed(
                 args.tenant_id, audit_mod.ACTION_IMPORT, args.operator
             ):
@@ -721,14 +762,17 @@ def _run(argv: Optional[List[str]] = None) -> int:
                     audit_mod.ACTION_IMPORT, 403,
                     "action not permitted by policy",
                 )
-            op_store.update_details(
-                operation,
-                {"kind": "import", "key_id": key_id},
-            )
+
+            def stage_success(committed_record):
+                body = committed_record.to_create_response()
+                body["operation_id"] = operation.operation_id
+                op_store.stage_terminal(operation, 201, body)
+
             status, record = store.import_bundle(
                 args.tenant_id, decoded,
                 event_id=operation.operation_id,
                 lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
+                pre_commit=stage_success,
             )
             if status == IMPORT_CONFLICT:
                 if record.tenant_id == args.tenant_id:
@@ -821,6 +865,18 @@ def _run(argv: Optional[List[str]] = None) -> int:
             return None
 
         def execute(operation):
+            key_ids = sorted(k["key_id"] for k in decoded["keys"])
+            writes_policy = decoded["policy"] is not None
+            # Kind/write-set durable before any business check; restore
+            # events project key_id null via the rejection helper.
+            op_store.update_details(
+                operation,
+                {
+                    "kind": "restore",
+                    "key_ids": key_ids,
+                    "policy_restored": writes_policy,
+                },
+            )
             if not policies.is_allowed(
                 args.tenant_id, audit_mod.ACTION_IMPORT, args.operator
             ):
@@ -837,19 +893,21 @@ def _run(argv: Optional[List[str]] = None) -> int:
                     audit_mod.ACTION_IMPORT, 404,
                     "tenant backup not found",
                 )
-            key_ids = sorted(k["key_id"] for k in decoded["keys"])
-            op_store.update_details(
-                operation,
-                {
-                    "kind": "restore",
+
+            def stage_success():
+                body = {
+                    "tenant_id": args.tenant_id,
                     "key_ids": key_ids,
-                    "policy_restored": decoded["policy"] is not None,
-                },
-            )
+                    "policy_restored": writes_policy,
+                    "operation_id": operation.operation_id,
+                }
+                op_store.stage_terminal(operation, 201, body)
+
             result = coordinator.restore(
                 args.tenant_id, decoded,
                 event_id=operation.operation_id,
                 lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
+                pre_commit=stage_success,
             )
             if result.status == restore_mod.RESTORE_CREATED:
                 return (

@@ -253,6 +253,7 @@ class RestoreCoordinator:
         payload: dict,
         event_id: Optional[str] = None,
         lock_timeout: Optional[float] = None,
+        pre_commit=None,
     ) -> RestoreResult:
         """Atomically restore a validated tenant payload.
 
@@ -348,7 +349,9 @@ class RestoreCoordinator:
                             status=RESTORE_SAME_TENANT_CONFLICT,
                             conflict=Conflict(kind="policy", owner=tenant_id),
                         )
-                    return self._commit_empty(tenant_id, event)
+                    return self._commit_empty(
+                        tenant_id, event, pre_commit=pre_commit
+                    )
 
                 marker = {
                     "_restore": True,
@@ -363,7 +366,8 @@ class RestoreCoordinator:
                 # All locks are already held; _commit runs the file/ledger
                 # transaction without re-acquiring them.
                 return self._commit_locked(
-                    tenant_id, key_ids, records, policy_rules, event, marker
+                    tenant_id, key_ids, records, policy_rules, event, marker,
+                    pre_commit=pre_commit,
                 )
             finally:
                 # On a normal return (success, refused conflict or a handled
@@ -372,13 +376,16 @@ class RestoreCoordinator:
                 # disk for startup recovery, which is the actual safety net.
                 self.store.drop_provision_journal(journal_id)
 
-    def _commit_empty(self, tenant_id: str, event: AuditEvent) -> RestoreResult:
+    def _commit_empty(self, tenant_id: str, event: AuditEvent,
+                      pre_commit=None) -> RestoreResult:
         """Commit an empty restore: idempotency marker + one import event.
 
         The marker file first lands carrying the pending event, the event is
         appended, then the marker is finalized with the event cleared. A
         ledger failure removes the marker (nothing commits); a crash is
-        repaired by recovery exactly like a multi-file restore group.
+        repaired by recovery exactly like a multi-file restore group. The
+        optional ``pre_commit`` runs between the durable marker write and the
+        append so the idempotent result is staged before the commit point.
         """
         path = self._empty_marker_path(tenant_id)
         if os.path.exists(path):
@@ -397,13 +404,19 @@ class RestoreCoordinator:
         }
         self.store._write_atomic(path, marker)
         try:
+            if pre_commit is not None:
+                pre_commit()
             self.store.audit.append(event)
-        except BaseException:
+        except BaseException as exc:
             try:
                 os.unlink(path)
             except OSError:
                 pass
-            raise
+            if isinstance(exc, LedgerError):
+                raise
+            raise LedgerError(
+                "tenant restore failed before commit: %s" % exc
+            ) from exc
         finalized = dict(marker)
         finalized["event"] = None
         self.store._write_atomic(path, finalized)
@@ -457,6 +470,7 @@ class RestoreCoordinator:
         policy_rules: Optional[List[Rule]],
         event: AuditEvent,
         marker: dict,
+        pre_commit=None,
     ) -> RestoreResult:
         """Run the multi-file outbox transaction; caller already holds locks."""
         try:
@@ -487,6 +501,10 @@ class RestoreCoordinator:
                         tenant_id, policy_rules, marker
                     )
                     wrote_policy = True
+                # The write set is durable: let the caller stage the exact
+                # idempotent result before the single commit-point append.
+                if pre_commit is not None:
+                    pre_commit()
                 # Phase 2: the single ledger append. The files are the outbox.
                 # The durable append is the commit point.
                 self.store.audit.append(event)
