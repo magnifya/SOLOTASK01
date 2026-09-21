@@ -48,6 +48,11 @@ STATUS_FAILED = "failed"
 STATUS_CONFLICT = "conflict"
 STATUS_TIMED_OUT = "timed_out"
 
+# Terminal rejections always carry a rejected audit event. Kept here (rather
+# than importing the audit module) so the operation store stays decoupled; it
+# must equal audit.OUTCOME_REJECTED.
+OUTCOME_REJECTED = "rejected"
+
 _DIR_NAME = "operations"
 _INDEX_NAME = "index.json"
 _LOCK_NAME = "operations.lock"
@@ -226,6 +231,25 @@ class OperationRecord:
             "http_status": None if pending else self.http_status,
             "response": None if pending else self.response,
         }
+
+    def stored_rejection(self):
+        """Return ``(http_status, response)`` of a durable rejection block.
+
+        A terminal rejection (403/404/409) persists its exact status and full
+        error response *before* its single rejection event is appended. Once
+        that event is in the ledger, recovery replays the rejection from this
+        block verbatim -- never by re-evaluating the policy, re-reading object
+        state or re-decrypting a bundle. Returns ``None`` for a successful
+        operation or a record written before this block existed.
+        """
+        block = (self.details or {}).get("rejection")
+        if not isinstance(block, dict):
+            return None
+        status = block.get("http_status")
+        response = block.get("response")
+        if status not in (403, 404, 409) or not isinstance(response, dict):
+            return None
+        return status, response
 
 
 class OperationStore:
@@ -457,6 +481,78 @@ class OperationStore:
         finally:
             self._unlocked(fd)
 
+    def prepare_rejection(
+        self,
+        record: OperationRecord,
+        *,
+        http_status: int,
+        message: str,
+        action: str,
+        audit_key_id: Optional[str],
+        facts: Optional[dict] = None,
+    ):
+        """Durably settle a bound operation as a terminal rejection.
+
+        Used for the post-binding refusals of rotate/import/restore:
+        authorization denial (403), unknown/cross-tenant object or an
+        in-bundle tenant mismatch (404), and a same-tenant key_id/policy/
+        empty-batch conflict (409).
+
+        Everything recovery needs to replay the rejection *verbatim* is
+        persisted before any state is re-read:
+
+        * the operation kind and the executor facts (e.g. a restore's write
+          set);
+        * the request tenant (``record.tenant_id``) and the already-recorded
+          normalized request body;
+        * the exact audit rule -- ``action``, ``outcome=rejected``,
+          ``tenant_id`` (the requesting tenant) and ``key_id`` (``None`` for
+          every restore event, else the validated key id, never a foreign
+          object's id beyond what the request/bundle named);
+        * the terminal ``http_status`` and the *full* final error response
+          (only ``error`` and ``operation_id``).
+
+        The rejection block is fsynced to the record first, then the single
+        rejected event named after the operation_id is appended (the ledger
+        dedupes on event_id). A crash between the two leaves no event, so
+        recovery treats the op as uncommitted (failed 500) after the outbox/
+        provision rollback; once the event is durable the stored block is
+        replayed as-is, independent of later policy or object state. Returns
+        ``(http_status, response_body)`` for the guard.
+        """
+        if http_status not in (403, 404, 409):
+            raise ValueError("prepare_rejection accepts only 403/404/409")
+        op_id = record.operation_id
+        response = {"error": message, "operation_id": op_id}
+        details = dict(record.details or {})
+        if facts:
+            for key, value in facts.items():
+                details[key] = value
+        # Persist the terminal status and complete error response before the
+        # event lands, so a durable rejection event always has a matching
+        # verbatim block to replay.
+        details["terminal"] = http_status
+        details["rejection"] = {
+            "http_status": http_status,
+            "response": response,
+            "audit": {
+                "action": action,
+                "outcome": OUTCOME_REJECTED,
+                "tenant_id": record.tenant_id,
+                "key_id": audit_key_id,
+            },
+        }
+        self.update_details(record, details)
+        event = self.audit.new_event(
+            record.tenant_id,
+            action,
+            audit_key_id,
+            OUTCOME_REJECTED,
+            event_id=op_id,
+        )
+        self.audit.append(event)
+        return http_status, {"error": message}
+
     def finish(
         self,
         record: OperationRecord,
@@ -538,18 +634,27 @@ class OperationStore:
                 # Cannot decide right now; leave it for a later open.
                 continue
             if event is not None:
-                http_status, response = 201, {
-                    "operation_id": record.operation_id
-                }
-                if resolve_committed is not None:
-                    try:
-                        http_status, response = resolve_committed(
-                            record, event
-                        )
-                    except Exception:
-                        http_status, response = 201, {
-                            "operation_id": record.operation_id
-                        }
+                stored = record.stored_rejection()
+                if stored is not None:
+                    # A terminal 403/404/409 whose rejection event reached the
+                    # ledger: the durable block is the original fact. Replay
+                    # its exact status and full error response verbatim --
+                    # never re-check the policy, re-read object state or
+                    # re-decrypt the bundle, any of which could have changed.
+                    http_status, response = stored
+                else:
+                    http_status, response = 201, {
+                        "operation_id": record.operation_id
+                    }
+                    if resolve_committed is not None:
+                        try:
+                            http_status, response = resolve_committed(
+                                record, event
+                            )
+                        except Exception:
+                            http_status, response = 201, {
+                                "operation_id": record.operation_id
+                            }
                 self.finish(
                     record,
                     state_for_http_status(http_status),

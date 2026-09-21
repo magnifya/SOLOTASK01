@@ -166,26 +166,29 @@ def make_handler(
         def _idempotent_rejection(
             self, operation, tenant_id, key_id, action, http_status, message
         ):
-            """Write the single terminal rejection event of a bound op.
+            """Durably settle a bound op as a terminal 403/404/409 rejection.
 
-            The terminal status is first merged into the persisted operation
-            details and then the rejection event is appended named after the
-            operation_id, so on a crash between the two: if the event is not
-            durable the op is recovered as an uncommitted failure (nothing was
-            written to roll back), and once it is durable startup recovery
-            replays this exact 403/404/409 instead of guessing it from the
-            current policy or store state. The ledger dedupes on event_id, so
-            a retry never writes the event twice. Returns
-            ``(http_status, body)`` for the idempotent guard.
+            Delegates to the operation store, which first fsyncs the full
+            rejection context (kind/facts, request tenant, normalized body,
+            the exact audit rule and the complete error response) and only
+            then appends the single rejected event named after the
+            operation_id. A crash before that append leaves the op recoverable
+            as an uncommitted failure (nothing was written to roll back for a
+            403/404/409); once the event is durable, restart recovery replays
+            this exact status and response, independent of later policy
+            changes, object state or re-decryption. ``key_id`` is the exact id
+            the request/bundle named (a validated UUID4 for rotate/import,
+            always ``None`` for restore). Returns ``(http_status, body)`` for
+            the idempotent guard; the ledger dedupes on event_id so the event
+            lands at most once.
             """
-            details = dict(operation.details or {})
-            details["terminal"] = http_status
-            operation_store.update_details(operation, details)
-            store.audit_attempt(
-                tenant_id, key_id, action, audit_mod.OUTCOME_REJECTED,
-                event_id=operation.operation_id,
+            return operation_store.prepare_rejection(
+                operation,
+                http_status=http_status,
+                message=message,
+                action=action,
+                audit_key_id=key_id,
             )
-            return http_status, {"error": message}
 
         def _timed_out_body(self, operation_id: str) -> dict:
             return {
@@ -608,6 +611,13 @@ def make_handler(
                 return
 
             def execute(operation):
+                # Persist the operation kind and its facts before any refusal,
+                # so even a 403 terminal carries the full rejection context.
+                operation_store.update_details(
+                    operation,
+                    {"kind": "rotate", "key_id": key_id,
+                     "algorithm": algorithm},
+                )
                 # Authorization follows validation and precedes existence; a
                 # denial is a bound terminal 403 whose single rejection event
                 # is named after the operation_id.
@@ -619,11 +629,6 @@ def make_handler(
                         audit_mod.ACTION_ROTATE, 403,
                         "action not permitted by policy",
                     )
-                operation_store.update_details(
-                    operation,
-                    {"kind": "rotate", "key_id": key_id,
-                     "algorithm": algorithm},
-                )
                 record = store.rotate(
                     key_id, tenant_id, algorithm,
                     event_id=operation.operation_id,
@@ -803,6 +808,12 @@ def make_handler(
 
             def execute(operation):
                 key_id = decoded["key_id"]
+                # Persist kind and the bundle-named key_id before the denial:
+                # a 403/404/409 terminal must still carry the full context.
+                operation_store.update_details(
+                    operation,
+                    {"kind": "import", "key_id": key_id},
+                )
                 # Authorization precedes the conflict check: a denial is a
                 # bound terminal 403 even when the key_id already exists for
                 # another tenant.
@@ -816,10 +827,6 @@ def make_handler(
                     )
                 # ProviderInvalidMaterial propagates to the guard (400). The
                 # existence check and the create are atomic in the store.
-                operation_store.update_details(
-                    operation,
-                    {"kind": "import", "key_id": key_id},
-                )
                 status, record = store.import_bundle(
                     tenant_id, decoded,
                     event_id=operation.operation_id,
@@ -949,6 +956,19 @@ def make_handler(
                 return
 
             def execute(operation):
+                # Persist kind and the write-set facts before every refusal:
+                # a 403/404/409 terminal must still carry the full context.
+                # Every restore audit event carries key_id null.
+                key_ids = sorted(k["key_id"] for k in decoded["keys"])
+                writes_policy = decoded["policy"] is not None
+                operation_store.update_details(
+                    operation,
+                    {
+                        "kind": "restore",
+                        "key_ids": key_ids,
+                        "policy_restored": writes_policy,
+                    },
+                )
                 # Authorization (import) precedes the in-bundle tenant check.
                 if not policy_store.is_allowed(
                     tenant_id, audit_mod.ACTION_IMPORT, operator
@@ -969,16 +989,6 @@ def make_handler(
                 # ProviderInvalidMaterial (400) and LedgerError (500)
                 # propagate to the guard; the coordinator has already removed
                 # every written file on a ledger failure.
-                key_ids = sorted(k["key_id"] for k in decoded["keys"])
-                writes_policy = decoded["policy"] is not None
-                operation_store.update_details(
-                    operation,
-                    {
-                        "kind": "restore",
-                        "key_ids": key_ids,
-                        "policy_restored": writes_policy,
-                    },
-                )
                 result = coordinator.restore(
                     tenant_id, decoded,
                     event_id=operation.operation_id,

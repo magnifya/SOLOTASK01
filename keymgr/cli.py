@@ -226,22 +226,24 @@ def _terminal_rejection(
     op_store, store, operation, tenant_id, key_id, action,
     http_status, message,
 ):
-    """Record a bound operation's single terminal rejection.
+    """Durably settle a bound operation's single terminal rejection.
 
-    CLI counterpart of the HTTP handler's helper: the terminal status is
-    persisted in the operation details first, then one rejected event named
-    after the operation_id is appended (at most once, deduped on event_id), so
-    a crash and startup recovery replay this exact 403/404/409. Returns
+    CLI counterpart of the HTTP handler's helper: it delegates to the same
+    operation-store path, which fsyncs the full rejection context (kind,
+    facts, request tenant, normalized body, the exact audit rule and the
+    complete error response) and then appends one rejected event named after
+    the operation_id (deduped on event_id, at most once). A crash and restart
+    recovery replays this exact 403/404/409 verbatim. ``key_id`` is the
+    validated request/bundle id, always ``None`` for restore. Returns
     ``(http_status, body)`` for idempotent_run.
     """
-    details = dict(operation.details or {})
-    details["terminal"] = http_status
-    op_store.update_details(operation, details)
-    store.audit_attempt(
-        tenant_id, key_id, action, audit_mod.OUTCOME_REJECTED,
-        event_id=operation.operation_id,
+    return op_store.prepare_rejection(
+        operation,
+        http_status=http_status,
+        message=message,
+        action=action,
+        audit_key_id=key_id,
     )
-    return http_status, {"error": message}
 
 
 def _idem_key_error(key) -> bool:
@@ -510,6 +512,11 @@ def _run(argv: Optional[List[str]] = None) -> int:
         path = "/v1/keys/%s/rotate" % args.key_id
 
         def execute(operation):
+            op_store.update_details(
+                operation,
+                {"kind": "rotate", "key_id": args.key_id,
+                 "algorithm": args.algorithm},
+            )
             if not policies.is_allowed(
                 args.tenant_id, audit_mod.ACTION_ROTATE, args.operator
             ):
@@ -519,11 +526,6 @@ def _run(argv: Optional[List[str]] = None) -> int:
                     audit_mod.ACTION_ROTATE, 403,
                     "action not permitted by policy",
                 )
-            op_store.update_details(
-                operation,
-                {"kind": "rotate", "key_id": args.key_id,
-                 "algorithm": args.algorithm},
-            )
             record = store.rotate(
                 args.key_id, args.tenant_id, args.algorithm,
                 event_id=operation.operation_id,
@@ -712,6 +714,10 @@ def _run(argv: Optional[List[str]] = None) -> int:
 
         def execute(operation):
             key_id = decoded["key_id"]
+            op_store.update_details(
+                operation,
+                {"kind": "import", "key_id": key_id},
+            )
             if not policies.is_allowed(
                 args.tenant_id, audit_mod.ACTION_IMPORT, args.operator
             ):
@@ -721,10 +727,6 @@ def _run(argv: Optional[List[str]] = None) -> int:
                     audit_mod.ACTION_IMPORT, 403,
                     "action not permitted by policy",
                 )
-            op_store.update_details(
-                operation,
-                {"kind": "import", "key_id": key_id},
-            )
             status, record = store.import_bundle(
                 args.tenant_id, decoded,
                 event_id=operation.operation_id,
@@ -821,6 +823,15 @@ def _run(argv: Optional[List[str]] = None) -> int:
             return None
 
         def execute(operation):
+            key_ids = sorted(k["key_id"] for k in decoded["keys"])
+            op_store.update_details(
+                operation,
+                {
+                    "kind": "restore",
+                    "key_ids": key_ids,
+                    "policy_restored": decoded["policy"] is not None,
+                },
+            )
             if not policies.is_allowed(
                 args.tenant_id, audit_mod.ACTION_IMPORT, args.operator
             ):
@@ -837,15 +848,6 @@ def _run(argv: Optional[List[str]] = None) -> int:
                     audit_mod.ACTION_IMPORT, 404,
                     "tenant backup not found",
                 )
-            key_ids = sorted(k["key_id"] for k in decoded["keys"])
-            op_store.update_details(
-                operation,
-                {
-                    "kind": "restore",
-                    "key_ids": key_ids,
-                    "policy_restored": decoded["policy"] is not None,
-                },
-            )
             result = coordinator.restore(
                 args.tenant_id, decoded,
                 event_id=operation.operation_id,
