@@ -649,8 +649,18 @@ class RestoreCoordinator:
             self.store.drop_provision_journal(group.journal)
 
         # Journals with no marker group (crash before the first file landed)
-        # are swept last; their event never committed as a success.
-        self._resolve_orphan_journals(skip=group_journals)
+        # are swept last; their event never committed as a success. Journals
+        # still tied to a surviving marker (a restore group, OR an unresolved
+        # batch-rotation group -- including one whose snapshot file is missing
+        # or corrupt) or to a batch-rotations snapshot are skipped: the batch
+        # recovery owns those exclusively and must retain them so it never
+        # orphans handles or guesses state.
+        skip = (
+            set(group_journals)
+            | self.store._batch_snapshot_ids()
+            | self.store._restore_marker_journals()
+        )
+        self._resolve_orphan_journals(skip=skip)
 
     def _resolve_orphan_journals(self, skip=()) -> None:
         """Reap provision journals left by restore attempts with no marker.

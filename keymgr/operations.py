@@ -422,6 +422,46 @@ class OperationStore:
         finally:
             self._unlocked(fd)
 
+    def _settle_durable_pending(
+        self, record: OperationRecord
+    ) -> Optional[OperationRecord]:
+        """Finalize a pending op whose commit already reached the ledger.
+
+        A retried request (or a waiter polling an in-flight owner) can arrive
+        after the owner crashed between the durable audit append -- the commit
+        point -- and its own terminal write. Startup recovery normally settles
+        such an op, but a live retry must not be forced to wait for a restart:
+        when the op's event is already in the ledger and its exact result
+        (HTTP status + response body) was staged before the append, the first
+        result is replayed verbatim here -- the same operation_id, the same
+        status/body, no second execution and no duplicate event (the ledger
+        dedupes on event_id). Returns the terminal record, or None when the op
+        is genuinely still uncommitted/undecidable.
+        """
+        details = record.details or {}
+        staged = details.get("result")
+        if not (
+            isinstance(staged, dict)
+            and isinstance(staged.get("http_status"), int)
+            and isinstance(staged.get("response"), dict)
+        ):
+            return None
+        try:
+            event = self.audit.get_event(record.event_id)
+        except Exception:
+            return None
+        if event is None:
+            return None
+        http_status = int(staged["http_status"])
+        response = staged["response"]
+        self.finish(
+            record,
+            state_for_http_status(http_status),
+            http_status,
+            response,
+        )
+        return record
+
     def await_terminal(
         self, record: OperationRecord, timeout: float = LOCK_WAIT_SECONDS
     ) -> OperationRecord:
@@ -429,11 +469,18 @@ class OperationStore:
 
         Polls the record file until the owner records a terminal state, or
         until ``timeout`` elapses, in which case the still-pending record is
-        returned (the caller answers timed_out without mutating it).
+        returned (the caller answers timed_out without mutating it). A pending
+        record whose event is already durable and whose result was staged is
+        settled in place (the owner died after the commit point): the wait
+        never burns its full budget against a committed operation and a live
+        HTTP/CLI retry replays the original result without a restart.
         """
         deadline = time.monotonic() + timeout
         current = record
         while not current.is_terminal():
+            settled = self._settle_durable_pending(current)
+            if settled is not None:
+                return settled
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return current
