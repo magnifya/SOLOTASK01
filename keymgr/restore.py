@@ -635,6 +635,13 @@ class RestoreCoordinator:
         group_journals = {
             g.journal for g in groups.values() if g.journal
         }
+        # A provision journal still owned by an unfinished batch-rotation
+        # recovery (a surviving _batch_rotate marker or batch snapshot) is
+        # resolved by KeyStore, which deletes every new handle and restores
+        # every old file before dropping journal and snapshot together. Never
+        # reap such a journal here independently, or the rollback's retry
+        # basis (and its new handles) would be discarded halfway.
+        group_journals |= self.store.batch_recovery_journal_ids()
         for eid, group in groups.items():
             if not self._recover_group(eid, group):
                 # The ledger could not be read or a provider handle could not

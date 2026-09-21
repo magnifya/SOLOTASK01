@@ -1,5 +1,6 @@
 """Persistent, tenant-isolated, versioned key storage."""
 
+import base64
 import json
 import os
 import re
@@ -503,7 +504,10 @@ class KeyStore:
         handles to reap, so opening a store for plain reads stays
         provider-free.
         """
-        deferred = self._restore_marker_journals()
+        deferred = (
+            self._restore_marker_journals()
+            | self.batch_recovery_journal_ids()
+        )
         directory = os.path.join(self.data_dir, self._PROVISION_DIR)
         try:
             names = os.listdir(directory)
@@ -1031,6 +1035,34 @@ class KeyStore:
                 pass
             raise
 
+    def _write_bytes_atomic(self, path: str, raw: bytes) -> None:
+        """Write raw bytes to path atomically (0600, fsynced before rename).
+
+        Used to restore a rotated key file to its EXACT pre-batch bytes: a
+        JSON re-serialization could differ from the original even while
+        decoding to the same object, so an uncommitted batch rollback writes
+        the snapshot's captured bytes verbatim instead.
+        """
+        fd, tmp_path = tempfile.mkstemp(dir=self.data_dir, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(raw)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
+    def _read_file_bytes(path: str) -> bytes:
+        with open(path, "rb") as fh:
+            return fh.read()
+
     def _read_record(self, path: str) -> Optional[KeyRecord]:
         try:
             with open(path, "r", encoding="utf-8") as fh:
@@ -1248,31 +1280,49 @@ class KeyStore:
 
     def _write_batch_snapshot(
         self, snapshot_id: str, tenant_id: str, key_ids: List[str],
-        previous: dict,
+        previous_bytes: dict,
     ) -> None:
-        """Durably record the pre-batch bytes of every group key.
+        """Durably record the pre-batch whole-file bytes of every group key.
 
-        Written before any provider call: crash recovery of an uncommitted
-        group restores these exact bytes, and a group whose snapshot is gone
-        is left untouched rather than guessed at.
+        ``previous_bytes`` maps key_id to the key file's literal bytes read
+        before the batch. They are stored base64-encoded, so crash recovery
+        of an uncommitted group restores each file byte-for-byte rather than
+        re-serializing a parsed object. Written before any provider call; a
+        group whose snapshot is gone is left untouched rather than guessed at.
         """
         directory = os.path.join(self.data_dir, self._BATCH_DIR)
         os.makedirs(directory, exist_ok=True)
         path = self._batch_snapshot_path(snapshot_id)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        os.close(fd)
         payload = {
             "event_id": snapshot_id,
             "tenant_id": tenant_id,
             "keys": [
-                {"key_id": key_id, "previous": previous[key_id]}
+                {
+                    "key_id": key_id,
+                    "previous_b64": base64.b64encode(
+                        previous_bytes[key_id]
+                    ).decode("ascii"),
+                }
                 for key_id in key_ids
             ],
         }
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh)
-            fh.flush()
-            os.fsync(fh.fileno())
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+        except BaseException:
+            # The durable snapshot never landed and no key file references
+            # it yet (it is written before any provider call); remove the
+            # partial file so a corrupt snapshot cannot outlive the attempt.
+            # A failed unlink simply leaves it for the next open, whose
+            # corrupt-snapshot rule preserves the scene rather than guessing.
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
 
     def _read_batch_snapshot(self, snapshot_id: str) -> Optional[dict]:
         try:
@@ -1333,7 +1383,7 @@ class KeyStore:
         ordered_ids = [key_id for key_id, _ in ordered]
         with self.multi_key_locks(ordered_ids, timeout=lock_timeout):
             records: dict = {}
-            previous: dict = {}
+            previous_bytes: dict = {}
             for key_id, _ in ordered:
                 record = self._read_record(self._path_for(key_id))
                 if record is None or record.tenant_id != tenant_id:
@@ -1341,7 +1391,10 @@ class KeyStore:
                     # before a journal, handle or file write exists.
                     return self.BATCH_NOT_FOUND, key_id
                 records[key_id] = record
-                previous[key_id] = record.to_json()
+                path = self._path_for(key_id)
+                # Capture the file's exact pre-batch bytes under the held
+                # locks: an uncommitted rollback restores these byte-for-byte.
+                previous_bytes[key_id] = self._read_file_bytes(path)
                 # The owning provider must be active (503 otherwise); versions
                 # are never silently moved to another provider.
                 self._provider_for(record.current.provider_id)
@@ -1358,7 +1411,7 @@ class KeyStore:
             snapshot_created = False
             try:
                 self._write_batch_snapshot(
-                    event.event_id, tenant_id, ordered_ids, previous
+                    event.event_id, tenant_id, ordered_ids, previous_bytes
                 )
                 snapshot_created = True
                 marker = {
@@ -1406,27 +1459,38 @@ class KeyStore:
                 # Phase 2: the single ledger append is the commit point.
                 self.audit.append(event)
             except BaseException as exc:
-                # Nothing committed: restore every file to its pre-batch
-                # bytes (the snapshot is the durable source of truth).
+                # Nothing committed: the durable success event never landed.
+                # First confirm every minted handle is gone (the in-memory
+                # pairs plus the durable journal, which is the crash-safe
+                # superset) WITHOUT dropping the journal yet, then restore
+                # every key file to its exact pre-batch bytes (that rewrite
+                # also clears the pending marker). The provision journal, the
+                # batch snapshot and any surviving marker are removed only
+                # once the handle deletes AND the file restores have ALL been
+                # verified. A single failed delete or rewrite keeps the whole
+                # group and every retry basis for the next open; nothing is
+                # partially cleaned up.
+                handles_cleaned = self._release_handles(minted)
+                if not self.release_journal_handles(journal_id):
+                    handles_cleaned = False
+                files_restored = True
                 for key_id in ordered_ids:
                     try:
-                        self._write_atomic(
-                            self._path_for(key_id), previous[key_id]
+                        self._write_bytes_atomic(
+                            self._path_for(key_id), previous_bytes[key_id]
                         )
                     except OSError:
-                        # A rewrite failure leaves the marker for startup
-                        # recovery, which restores from the snapshot.
-                        pass
-                cleaned = self._release_handles(minted)
-                if not self.rollback_provision_journal(journal_id):
-                    cleaned = False
-                if not cleaned:
-                    # Keep the snapshot/journal: a backend object may survive
-                    # and startup must retry the whole-group rollback.
+                        # The file may still carry the pending marker; startup
+                        # recovery restores it from the durable snapshot. Never
+                        # discard the rollback basis below.
+                        files_restored = False
+                if not (handles_cleaned and files_restored):
                     raise ProviderUnavailable(
-                        "could not delete a handle provisioned by a failed "
-                        "batch rotation; cleanup will be retried at startup"
+                        "could not fully roll back a failed batch rotation; "
+                        "the whole group and its snapshot/journal are "
+                        "retained for startup recovery"
                     ) from exc
+                self.drop_provision_journal(journal_id)
                 if snapshot_created:
                     self._discard_batch_snapshot(event.event_id)
                 raise
@@ -1449,40 +1513,82 @@ class KeyStore:
                 (key_id, records[key_id]) for key_id, _ in request_order
             ]
 
-    def _recover_batch_rotations(self) -> None:
-        """Finish or roll back batch rotations interrupted by a crash.
+    def _list_batch_snapshot_ids(self) -> List[str]:
+        directory = os.path.join(self.data_dir, self._BATCH_DIR)
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return []
+        return [name[:-5] for name in names if name.endswith(".json")]
 
-        Key files carrying a ``_batch_rotate`` marker are grouped by the
-        embedded event id. When the event reached the ledger the batch
-        committed: its versions stay and the markers are cleared. Otherwise
-        the batch never committed: every minted handle (from the provision
-        journal and from the snapshot-vs-file handle delta) is deleted FIRST,
-        and only once every delete is verified are the files restored to
-        their pre-batch bytes from the snapshot; an unreachable provider or a
-        failed delete keeps the entire group (files, markers, policy
-        untouched, snapshot and journal) for a retry on the next open.
-        Snapshots with no surviving group (crash before the first file
-        landed) are reconciled here as well.
+    def batch_recovery_journal_ids(self) -> set:
+        """Provision journal ids still owned by an unfinished batch recovery.
+
+        A journal named by a surviving ``_batch_rotate`` marker or by a
+        surviving batch snapshot is resolved exclusively by batch-group
+        recovery: every new handle is deleted and every old file restored
+        before the journal and snapshot are removed *together*. The generic
+        provision sweep and the restore orphan sweep must not reap such a
+        journal independently, or they would delete handles while the marked
+        files and snapshot still need an all-or-nothing rollback -- the
+        durable retry basis would be discarded halfway.
         """
-        groups: dict = {}
-
-        def group_for(marker: dict) -> dict:
-            eid = marker["event"]["event_id"]
-            group = groups.get(eid)
-            if group is None:
-                group = {
-                    "marker": marker,
-                    "files": {},
-                    "journal": marker.get("journal"),
-                    "snapshot": marker.get("snapshot") or eid,
-                }
-                groups[eid] = group
-            return group
-
+        owned = set()
         try:
             names = os.listdir(self.data_dir)
         except OSError:
-            return
+            names = []
+        for name in names:
+            if not (name.endswith(".json") and is_valid_key_id(name[:-5])):
+                continue
+            record = self._read_record(os.path.join(self.data_dir, name))
+            marker = getattr(record, "pending_event", None)
+            if isinstance(marker, dict) and marker.get("_batch_rotate"):
+                journal_id = marker.get("journal")
+                if isinstance(journal_id, str) and journal_id:
+                    owned.add(journal_id)
+        # A snapshot is named after the event id, which is also its provision
+        # journal id, so every surviving snapshot defers that journal.
+        owned.update(self._list_batch_snapshot_ids())
+        return owned
+
+    def _recover_batch_rotations(self) -> None:
+        """Finish or roll back batch rotations interrupted by a crash.
+
+        Recovery is driven by the UNION of two durable artifacts, not by the
+        markers alone:
+
+        * key files still carrying a ``_batch_rotate`` marker name the event;
+        * ``batch-rotations/<event_id>.json`` holds the COMPLETE write set as
+          every key's exact pre-batch file bytes.
+
+        Markers may survive only partially (some files were already restored
+        or finalized when the process died) or be entirely absent (a crash
+        after the snapshot landed but before the first file, or after a
+        rollback that died before removing the snapshot). Either way the
+        snapshot supplies the full write set, and the whole set is locked in
+        sorted key_id order (in-process lock plus the per-key fcntl lock) so
+        recovery never interleaves with a single-key rotate on a shared key.
+
+        Under those locks the ledger decides, exactly once per event:
+
+        * the success event is durable  -> the batch committed: keep every
+          new version and clear surviving markers (snapshot not consulted);
+        * otherwise                       -> the batch never committed: every
+          new handle is confirmed deleted FIRST, and only then is every old
+          file restored from the snapshot; provision journal, snapshot and
+          markers are removed only after both fully verify.
+
+        A missing or unreadable snapshot while a file still needs resolution,
+        an unreachable provider, a failed delete or a failed write-back leaves
+        the ENTIRE scene (files, markers, journal, snapshot) for the next
+        open; the state is never guessed at.
+        """
+        marker_groups: dict = {}
+        try:
+            names = os.listdir(self.data_dir)
+        except OSError:
+            names = []
         for name in names:
             if not (name.endswith(".json") and is_valid_key_id(name[:-5])):
                 continue
@@ -1493,92 +1599,216 @@ class KeyStore:
                 "_batch_rotate"
             ):
                 continue
-            group_for(marker)["files"][record.key_id] = path
+            event_desc = marker.get("event")
+            eid = (
+                event_desc.get("event_id")
+                if isinstance(event_desc, dict)
+                else None
+            )
+            if not isinstance(eid, str) or not eid:
+                # A marker whose event cannot be identified cannot be safely
+                # resolved either way; leave it (and its files) untouched.
+                continue
+            group = marker_groups.get(eid)
+            if group is None:
+                group = {
+                    "files": {},
+                    "journal": marker.get("journal"),
+                }
+                marker_groups[eid] = group
+            group["files"][record.key_id] = path
 
-        for eid, group in groups.items():
-            self._recover_batch_group(eid, group)
+        # Presence matters separately from readability: a corrupt snapshot
+        # file still defers its journal and parks its (marker-bearing) group.
+        snapshots: dict = {}
+        for snapshot_id in self._list_batch_snapshot_ids():
+            snapshots[snapshot_id] = self._read_batch_snapshot(snapshot_id)
 
-        # Snapshots whose whole marker group is gone (crash before the first
-        # file landed, or a prior open that resolved the group but died before
-        # removing the snapshot).
-        self._resolve_orphan_batch_snapshots(set(groups))
+        for eid in sorted(set(marker_groups) | set(snapshots)):
+            self._recover_batch_unit(
+                eid, marker_groups.get(eid), snapshots.get(eid),
+                snapshot_present=eid in snapshots,
+            )
 
-    def _recover_batch_group(self, eid: str, group: dict) -> bool:
-        """Resolve one batch-rotation marker group. True when settled."""
-        key_ids = list(group["files"])
-        with self.multi_key_locks(sorted(key_ids)):
+    def _batch_snapshot_entries(self, snapshot, marker_keys) -> Optional[list]:
+        """Validate a batch snapshot's complete write set.
+
+        Returns ``[(key_id, previous_bytes, previous_dict), ...]`` in snapshot
+        order, or None when the snapshot is missing/corrupt/incomplete for the
+        marked group. ``previous_bytes`` are the exact whole-file bytes
+        restored on rollback; ``previous_dict`` is their parsed object used to
+        compute the handle delta. Current snapshots store the bytes base64
+        (``previous_b64``); older snapshots stored the parsed object
+        (``previous``) and are accepted for compatibility. Every file that
+        still carries the batch's marker MUST have a pre-batch image, or
+        restoring it would require guessing -- such a snapshot is unusable.
+        """
+        if not isinstance(snapshot, dict):
+            return None
+        raw_entries = snapshot.get("keys")
+        if not isinstance(raw_entries, list) or not raw_entries:
+            return None
+        entries = []
+        seen = set()
+        for entry in raw_entries:
+            if not isinstance(entry, dict):
+                return None
+            key_id = entry.get("key_id")
+            if not is_valid_key_id(key_id) or key_id in seen:
+                return None
+            if "previous_b64" in entry:
+                encoded = entry.get("previous_b64")
+                if not isinstance(encoded, str):
+                    return None
+                try:
+                    raw_bytes = base64.b64decode(encoded, validate=True)
+                    previous_dict = json.loads(raw_bytes.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    return None
+            else:
+                previous_dict = entry.get("previous")
+                if not isinstance(previous_dict, dict):
+                    return None
+                raw_bytes = json.dumps(previous_dict).encode("utf-8")
+            if not isinstance(previous_dict, dict):
+                return None
+            seen.add(key_id)
+            entries.append((key_id, raw_bytes, previous_dict))
+        if not set(marker_keys) <= seen:
+            # The snapshot does not describe every file still marked: it
+            # cannot restore the whole group, so it is unusable.
+            return None
+        return entries
+
+    def _recover_batch_unit(
+        self, eid: str, group: Optional[dict], snapshot: Optional[dict],
+        snapshot_present: bool = False,
+    ) -> None:
+        """Resolve one batch event: commit-finalize or whole-group rollback."""
+        files = dict(group["files"]) if group else {}
+        journal_id = (
+            group.get("journal") if group and group.get("journal") else eid
+        )
+        entries = self._batch_snapshot_entries(snapshot, files)
+        snapshot_keys = (
+            {key_id for key_id, _, _ in entries} if entries else set()
+        )
+        lock_keys = sorted(set(files) | snapshot_keys)
+        with self.multi_key_locks(lock_keys):
             try:
                 event = self.audit.get_event(eid)
             except LedgerError:
-                return False
-            marker = group["marker"]
-            snapshot_id = group.get("snapshot") or eid
+                # The ledger cannot be read right now; leave everything for a
+                # later open rather than guessing committed-vs-not.
+                return
             if event is not None and event.outcome == audit_mod.OUTCOME_SUCCESS:
-                # Committed: keep every new version and clear the markers.
-                for key_id, path in group["files"].items():
-                    record = self._read_record(path)
-                    if record is None or not record.pending_event:
-                        continue
-                    record.pending_event = None
-                    try:
-                        self._write_atomic(path, record.to_json())
-                    except OSError:
-                        pass
-                self.drop_provision_journal(group.get("journal"))
-                self._discard_batch_snapshot(snapshot_id)
-                return True
-            # Uncommitted: the snapshot is required to restore prior bytes.
-            snapshot = self._read_batch_snapshot(snapshot_id)
-            if snapshot is None:
-                # Never guess: leave files, markers and journal for a later
-                # open or manual resolution.
+                self._batch_finish_committed(eid, files, journal_id)
+                return
+
+            # The success event never landed: the batch is uncommitted.
+            if entries is not None:
+                if self._batch_rollback_unit(
+                    entries, files, journal_id, eid
+                ):
+                    return
+                # Handle delete, provider access or file write-back failed:
+                # keep the whole scene for the next open.
+                return
+
+            # No usable snapshot.
+            if files or snapshot_present:
+                # A file still needs its pre-batch bytes but the only source
+                # of them is unreadable/missing, or a corrupt snapshot file
+                # survives: preserve the ENTIRE scene (files, markers,
+                # journal, snapshot) for a later open and never guess.
+                return
+
+            # No marker references this event and no snapshot file survives:
+            # only orphaned handles (the durable journal) can remain. Reap
+            # them from the journal and drop it strictly after success.
+            if self.release_journal_handles(journal_id):
+                self.drop_provision_journal(journal_id)
+
+    def _batch_finish_committed(
+        self, eid: str, files: dict, journal_id: str
+    ) -> None:
+        """Post-commit housekeeping: clear markers, then drop the artifacts.
+
+        The durable success event already makes the new versions authoritative
+        and their handles record-owned; nothing here is ever rolled back. A
+        marker-clear failure leaves that file's marker for the next open.
+        """
+        for key_id, path in files.items():
+            record = self._read_record(path)
+            marker = getattr(record, "pending_event", None)
+            if record is None or not isinstance(marker, dict):
+                continue
+            event_desc = marker.get("event")
+            marked_eid = (
+                event_desc.get("event_id")
+                if isinstance(event_desc, dict)
+                else None
+            )
+            if marked_eid != eid:
+                continue
+            record.pending_event = None
+            try:
+                self._write_atomic(path, record.to_json())
+            except OSError:
+                pass
+        self.drop_provision_journal(journal_id)
+        self._discard_batch_snapshot(eid)
+
+    def _batch_rollback_unit(
+        self, entries: list, files: dict, journal_id: str, eid: str
+    ) -> bool:
+        """Delete all new handles, then restore all old files.
+
+        Returns True only when every handle delete and every file write-back
+        has been verified, after which the provision journal and snapshot are
+        removed. Any failure returns False with the whole group and both
+        durable artifacts retained for the next open.
+        """
+        if not self._delete_batch_group_handles(journal_id, entries, files):
+            return False
+        for key_id, previous_bytes, _previous_dict in entries:
+            try:
+                self._write_bytes_atomic(
+                    self._path_for(key_id), previous_bytes
+                )
+            except OSError:
                 return False
-            if not self._delete_batch_group_handles(group, snapshot):
-                # A provider is unreachable or a delete failed: keep the whole
-                # group (keys and markers) and retry on the next open.
-                return False
-            for entry in snapshot["keys"]:
-                key_id = entry["key_id"]
-                previous = entry.get("previous")
-                path = self._path_for(key_id)
-                if previous is None:
-                    # Batch rotation never creates keys; this snapshot is
-                    # malformed -- leave the group rather than delete data.
-                    return False
-                try:
-                    self._write_atomic(path, previous)
-                except OSError:
-                    return False
-            self.drop_provision_journal(group.get("journal"))
-            self._discard_batch_snapshot(snapshot_id)
-            return True
+        # Old files are all restored and new handles all confirmed gone: now,
+        # and only now, may the rollback basis be removed.
+        self.drop_provision_journal(journal_id)
+        self._discard_batch_snapshot(eid)
+        return True
 
     def _delete_batch_group_handles(
-        self, group: dict, snapshot: dict
+        self, journal_id: str, entries: list, files: dict
     ) -> bool:
         """Delete every handle an uncommitted batch minted.
 
         Handles come from the durable provision journal and, defensively,
         from the delta between the on-disk versions and the snapshot's
-        pre-batch versions. Every owning provider must be reachable and every
-        delete must verify; otherwise the whole rollback is deferred.
+        pre-batch versions (the write set) plus any surviving marked file.
+        Every owning provider must be reachable and every delete must verify;
+        a single failure makes the whole rollback defer.
         """
         targets = set()
-        for provider_id, handle in self.read_provision_journal(
-            group.get("journal")
-        ):
+        for provider_id, handle in self.read_provision_journal(journal_id):
             targets.add((provider_id, handle))
-        previous_handles = set()
         previous_by_key = {}
-        for entry in snapshot["keys"]:
+        for key_id, _previous_bytes, previous_dict in entries:
             triples = set()
-            for ver in entry.get("previous", {}).get("versions", []):
-                triples.add(
-                    (ver.get("provider_id"), ver.get("handle"))
-                )
-            previous_handles |= triples
-            previous_by_key[entry["key_id"]] = triples
-        for key_id, path in group["files"].items():
+            for ver in previous_dict.get("versions", []):
+                triples.add((ver.get("provider_id"), ver.get("handle")))
+            previous_by_key[key_id] = triples
+        candidate_paths = {
+            key_id: self._path_for(key_id) for key_id, _, _ in entries
+        }
+        candidate_paths.update(files)
+        for key_id, path in candidate_paths.items():
             record = self._read_record(path)
             if record is None:
                 continue
@@ -1593,39 +1823,6 @@ class KeyStore:
             if not self._delete_provisioned_handle(provider_id, handle):
                 cleaned = False
         return cleaned
-
-    def _resolve_orphan_batch_snapshots(self, grouped=()) -> None:
-        """Reap batch snapshots left without a surviving marker group.
-
-        A crash after the snapshot/journal were created but before any file
-        landed leaves exactly these artifacts. A durable success event means
-        the handles are owned (housekeeping only); otherwise every journaled
-        handle is deleted first, strictly, and the snapshot is removed only
-        once the deletes verify.
-        """
-        directory = os.path.join(self.data_dir, self._BATCH_DIR)
-        try:
-            names = os.listdir(directory)
-        except OSError:
-            return
-        for name in names:
-            if not name.endswith(".json"):
-                continue
-            snapshot_id = name[:-5]
-            if snapshot_id in grouped:
-                continue
-            snapshot = self._read_batch_snapshot(snapshot_id)
-            if snapshot is None:
-                continue
-            try:
-                event = self.audit.get_event(snapshot_id)
-            except LedgerError:
-                continue
-            if event is None or event.outcome != audit_mod.OUTCOME_SUCCESS:
-                if not self.release_journal_handles(snapshot_id):
-                    continue
-            self.drop_provision_journal(snapshot_id)
-            self._discard_batch_snapshot(snapshot_id)
 
     def revoke(
         self, key_id: str, tenant_id: str, reason: str, operator: str
