@@ -737,24 +737,34 @@ class RestoreCoordinator:
         )
         if not committed:
             # The commit-point success append never happened (event absent or
-            # only a rejected terminal): remove every partial file and
-            # release every provider handle the batch minted. The journal
-            # also covers records whose file never landed; a single failed
-            # backend delete aborts this group's resolution -- files and
-            # journal stay put and the next open retries.
+            # only a rejected terminal). Delete EVERY minted handle BEFORE
+            # removing any file: with a journal the durable entry list is the
+            # source of truth; an older group that predates restore journals
+            # lists handles from the _restore-marked key files themselves
+            # (a restore only ever creates brand-new keys, so every handle in
+            # a landed group file belongs to the aborted batch). A provider
+            # that cannot be reached, or a single delete that fails, keeps the
+            # ENTIRE group -- every key file, the policy document and their
+            # markers -- for a retry on the next open; nothing is partially
+            # removed.
+            handles_deleted = True
             if group.journal:
                 if not self.store.release_journal_handles(group.journal):
-                    return False
-            for key_id, path in list(group.key_files.items()):
-                if not group.journal:
-                    # No journal available: fall back to the handles carried
-                    # by the landed files themselves. A failed delete must
-                    # not be hidden: leave the group for a later open.
+                    handles_deleted = False
+            else:
+                for key_id, path in list(group.key_files.items()):
                     record = self.store._read_record(path)
-                    if record is not None and not self.store.release_record_handles(
-                        record
+                    if record is None:
+                        continue
+                    if not self.store.release_record_handles(
+                        record, strict=True
                     ):
-                        return False
+                        handles_deleted = False
+            if not handles_deleted:
+                return False
+            # Only now, after every handle delete verified, are the files and
+            # the policy document removed.
+            for key_id, path in list(group.key_files.items()):
                 self.store.remove_file(key_id)
             if group.policy_file is not None:
                 self.policy_store.remove_restore_file(tenant_id)

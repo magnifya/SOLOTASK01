@@ -18,7 +18,7 @@ from .operations import OperationStore
 from .policy import PolicyError, PolicyStore, validate_rules
 from .provider import ProviderInvalidMaterial, ProviderUnavailable
 from .server import _resolve_committed_operation, serve
-from .store import IMPORT_CONFLICT, KeyStore, LockTimeout, is_valid_key_id
+from .store import IMPORT_CONFLICT, KeyStore, LockTimeout, is_valid_key_id, validate_batch_items
 
 DEFAULT_DATA_DIR = os.environ.get("KEYMGR_DATA_DIR", "keymgr_data")
 
@@ -70,6 +70,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_rotate.add_argument("--algorithm", required=True,
                           help="one of: %s" % ", ".join(SUPPORTED_ALGORITHMS))
     p_rotate.add_argument(
+        "--idempotency-key", required=True,
+        help="1-128 chars A-Za-z0-9._~- ; retries reuse the result",
+    )
+
+    p_batch_rotate = tenant_parser(
+        "batch-rotate",
+        help="atomically rotate 1-100 keys in one idempotent batch",
+    )
+    p_batch_rotate.add_argument(
+        "--items", required=True,
+        help='JSON array of {"key_id","algorithm"} items (1-100, unique ids)',
+    )
+    p_batch_rotate.add_argument(
         "--idempotency-key", required=True,
         help="1-128 chars A-Za-z0-9._~- ; retries reuse the result",
     )
@@ -240,7 +253,7 @@ def _terminal_rejection(
     body = {"error": message, "operation_id": op_id}
     kind = (operation.details or {}).get("kind")
     audit_key_id = (
-        None if kind == "restore"
+        None if kind in ("restore", "batch_rotate")
         else (key_id if is_valid_key_id(key_id) else None)
     )
     op_store.stage_terminal(
@@ -279,13 +292,14 @@ def _provider_terminal(
     body = {"error": message, "operation_id": op_id}
     details = operation.details or {}
     kind = details.get("kind")
-    action = (
-        audit_mod.ACTION_ROTATE
-        if kind == "rotate"
-        else audit_mod.ACTION_IMPORT
-    )
+    if kind == "batch_rotate":
+        action = audit_mod.ACTION_BATCH_ROTATE
+    elif kind == "rotate":
+        action = audit_mod.ACTION_ROTATE
+    else:
+        action = audit_mod.ACTION_IMPORT
     audit_key_id = (
-        None if kind == "restore"
+        None if kind in ("restore", "batch_rotate")
         else (
             details.get("key_id")
             if is_valid_key_id(details.get("key_id"))
@@ -642,6 +656,104 @@ def _run(argv: Optional[List[str]] = None) -> int:
                     audit_mod.ACTION_ROTATE, 404, "key not found",
                 )
             return 201, record.to_rotate_response()
+
+        return idempotent_run(
+            op_store, store, path, args.tenant_id, args.operator, body,
+            args.idempotency_key, lambda: None, execute,
+        )
+
+    if args.command == "batch-rotate":
+        # The Idempotency-Key is validated before anything else; a malformed
+        # key exits 2 with no audit event, operation record, key change or
+        # provider handle -- exactly like the HTTP endpoint.
+        if _idem_key_error(args.idempotency_key):
+            return 2
+        if not args.tenant_id:
+            return _fail("field tenant_id must be a non-empty string", 2)
+        # Parse/validate the items array before the binding lookup. These
+        # checks are side-effect free (the HTTP endpoint does the same before
+        # its idempotent guard): a refusal exits 2 with no audit event and
+        # never consumes the key.
+        try:
+            raw_items = json.loads(args.items)
+        except ValueError:
+            return _fail("field items must be valid JSON", 2)
+        items, message = validate_batch_items(raw_items)
+        if message is not None:
+            return _fail(message, 2)
+
+        body = {"tenant_id": args.tenant_id, "items": raw_items}
+        path = "/v1/keys/batch-rotate"
+
+        def execute(operation):
+            # Kind/exact request-order item set durable before any business
+            # check, so a 403/404 terminal replays from context alone.
+            op_store.update_details(
+                operation,
+                {
+                    "kind": "batch_rotate",
+                    "items": [
+                        {"key_id": key_id, "algorithm": algorithm}
+                        for key_id, algorithm in items
+                    ],
+                },
+            )
+            # Authorization follows rotate; the rejection event is a single
+            # batch_rotate with key_id null.
+            if not policies.is_allowed(
+                args.tenant_id, audit_mod.ACTION_ROTATE, args.operator
+            ):
+                return _terminal_rejection(
+                    op_store, store, operation,
+                    args.tenant_id, None,
+                    audit_mod.ACTION_BATCH_ROTATE, 403,
+                    "action not permitted by policy",
+                )
+
+            def stage_success(records_by_id):
+                op_store.stage_terminal(
+                    operation,
+                    201,
+                    {
+                        "items": [
+                            {
+                                "key_id": key_id,
+                                "version": records_by_id[key_id].current.version,
+                                "algorithm": records_by_id[key_id].current.algorithm,
+                                "public_key": records_by_id[key_id].current.public_key,
+                            }
+                            for key_id, _ in items
+                        ],
+                        "operation_id": operation.operation_id,
+                    },
+                )
+
+            status, result = store.batch_rotate(
+                args.tenant_id, items,
+                event_id=operation.operation_id,
+                lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
+                pre_commit=stage_success,
+            )
+            if status == store.BATCH_NOT_FOUND:
+                return _terminal_rejection(
+                    op_store, store, operation,
+                    args.tenant_id, None,
+                    audit_mod.ACTION_BATCH_ROTATE, 404, "key not found",
+                )
+            return (
+                201,
+                {
+                    "items": [
+                        {
+                            "key_id": key_id,
+                            "version": record.current.version,
+                            "algorithm": record.current.algorithm,
+                            "public_key": record.current.public_key,
+                        }
+                        for key_id, record in result
+                    ]
+                },
+            )
 
         return idempotent_run(
             op_store, store, path, args.tenant_id, args.operator, body,

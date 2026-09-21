@@ -17,12 +17,13 @@ from .crypto import SUPPORTED_ALGORITHMS
 from .operations import OperationStore
 from .policy import PolicyError, PolicyStore, validate_rules
 from .provider import ProviderInvalidMaterial, ProviderUnavailable
-from .store import IMPORT_CONFLICT, KeyStore, LockTimeout, is_valid_key_id
+from .store import IMPORT_CONFLICT, KeyStore, LockTimeout, is_valid_key_id, validate_batch_items
 
 _AUDIT_PATH = "/v1/audit"
 _POLICY_PATH = "/v1/policy"
 _OPERATIONS_PATH_RE = re.compile(r"^/v1/operations/([^/]+)$")
 _IMPORT_PATH = "/v1/keys/import"
+_BATCH_ROTATE_PATH = "/v1/keys/batch-rotate"
 _BACKUP_PATH = "/v1/backup"
 _RESTORE_PATH = "/v1/restore"
 _KEY_PATH_RE = re.compile(r"^/v1/keys/([^/]+)$")
@@ -183,11 +184,12 @@ def make_handler(
             """
             op_id = operation.operation_id
             body = {"error": message, "operation_id": op_id}
-            # The accurate key_id rule: a restore's events are always key_id
-            # null; rotate/import carry the (already validated) key_id.
+            # The accurate key_id rule: a restore's and a batch rotation's
+            # events are always key_id null; rotate/import carry the (already
+            # validated) key_id.
             kind = (operation.details or {}).get("kind")
             audit_key_id = (
-                None if kind == "restore"
+                None if kind in ("restore", "batch_rotate")
                 else (key_id if is_valid_key_id(key_id) else None)
             )
             audit_desc = {
@@ -226,13 +228,14 @@ def make_handler(
             body = {"error": message, "operation_id": op_id}
             details = operation.details or {}
             kind = details.get("kind")
-            action = (
-                audit_mod.ACTION_ROTATE
-                if kind == "rotate"
-                else audit_mod.ACTION_IMPORT
-            )
+            if kind == "batch_rotate":
+                action = audit_mod.ACTION_BATCH_ROTATE
+            elif kind == "rotate":
+                action = audit_mod.ACTION_ROTATE
+            else:
+                action = audit_mod.ACTION_IMPORT
             audit_key_id = (
-                None if kind == "restore"
+                None if kind in ("restore", "batch_rotate")
                 else (
                     details.get("key_id")
                     if is_valid_key_id(details.get("key_id"))
@@ -614,6 +617,10 @@ def make_handler(
                     self._import_key(parts, operator)
                     return
 
+                if path == _BATCH_ROTATE_PATH:
+                    self._batch_rotate_keys(parts, operator)
+                    return
+
                 if path == _BACKUP_PATH:
                     self._backup_tenant(parts, operator)
                     return
@@ -759,6 +766,124 @@ def make_handler(
                     )
                 # The success event committed in the same outbox transaction.
                 return 201, record.to_rotate_response()
+
+            self._idempotent_guard(
+                parts.path, tenant_id, operator, payload, idem_key, execute
+            )
+
+        def _parse_batch_items(self, raw):
+            """Validate a batch-rotate items array before the key is bound.
+
+            Thin HTTP wrapper over the shared, side-effect-free validator so
+            the CLI and the service accept exactly the same items shape.
+            """
+            return validate_batch_items(raw)
+
+        def _batch_rotate_keys(self, parts, operator: str) -> None:
+            """POST /v1/keys/batch-rotate.
+
+            The Idempotency-Key is checked before the body is read. Every
+            parse/parameter/items failure is a side-effect-free 400 (no audit
+            event, operation record, key change or provider handle) and never
+            consumes the key. After binding, authorization follows the
+            ``rotate`` action (a denial is a terminal 403 whose single
+            rejected ``batch_rotate`` event has key_id null); any unknown or
+            foreign key_id makes the whole batch a terminal 404 with zero
+            changes. On success every key gains one fresh version under the
+            rotate semantics, the batch commits atomically, and the response
+            items are in request order.
+            """
+            idem_key = self._idempotency_key()
+            if idem_key is None:
+                return
+            payload = self._read_json_object(audit=False)
+            if payload is None:
+                return
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                self._bad_request("field tenant_id must be a non-empty string")
+                return
+            tenant_id = self._tenant(parts, payload, audit=False)
+            if tenant_id is None:
+                return
+            items, error = self._parse_batch_items(payload.get("items"))
+            if error is not None:
+                self._bad_request(error)
+                return
+
+            def execute(operation):
+                # Kind and the exact request-order item set are durable before
+                # any business check, so a 403/404 terminal replays from
+                # context alone after a crash.
+                operation_store.update_details(
+                    operation,
+                    {
+                        "kind": "batch_rotate",
+                        "items": [
+                            {"key_id": key_id, "algorithm": algorithm}
+                            for key_id, algorithm in items
+                        ],
+                    },
+                )
+                # Authorization follows rotate and precedes existence; a
+                # denial is a bound terminal 403 with one rejected
+                # batch_rotate event (key_id null).
+                if not policy_store.is_allowed(
+                    tenant_id, audit_mod.ACTION_ROTATE, operator
+                ):
+                    return self._idempotent_rejection(
+                        operation, tenant_id, None,
+                        audit_mod.ACTION_BATCH_ROTATE, 403,
+                        "action not permitted by policy",
+                    )
+
+                def stage_success(records_by_id):
+                    # After every key file landed, before the single
+                    # commit-point append: stage the exact 201 body verbatim,
+                    # with items in REQUEST order.
+                    result_items = [
+                        {
+                            "key_id": key_id,
+                            "version": records_by_id[key_id].current.version,
+                            "algorithm": records_by_id[key_id].current.algorithm,
+                            "public_key": records_by_id[key_id].current.public_key,
+                        }
+                        for key_id, _ in items
+                    ]
+                    operation_store.stage_terminal(
+                        operation,
+                        201,
+                        {
+                            "items": result_items,
+                            "operation_id": operation.operation_id,
+                        },
+                    )
+
+                status, result = store.batch_rotate(
+                    tenant_id, items,
+                    event_id=operation.operation_id,
+                    lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
+                    pre_commit=stage_success,
+                )
+                if status == store.BATCH_NOT_FOUND:
+                    # Any unknown/foreign key_id fails the whole batch with no
+                    # change; the answer is identical to a missing key so
+                    # cross-tenant existence never leaks.
+                    return self._idempotent_rejection(
+                        operation, tenant_id, None,
+                        audit_mod.ACTION_BATCH_ROTATE, 404, "key not found",
+                    )
+                result_items = [
+                    {
+                        "key_id": key_id,
+                        "version": record.current.version,
+                        "algorithm": record.current.algorithm,
+                        "public_key": record.current.public_key,
+                    }
+                    for key_id, record in result
+                ]
+                # The single success event committed with the files.
+                return 201, {"items": result_items}
 
             self._idempotent_guard(
                 parts.path, tenant_id, operator, payload, idem_key, execute
@@ -1585,6 +1710,14 @@ def _resolve_committed_operation(store, policy_store, record, event):
     if event.outcome == audit_mod.OUTCOME_REJECTED:
         action = event.action
         terminal = details.get("terminal")
+        # A batch rotation is AUTHORIZED as rotate even though its audit
+        # action is batch_rotate; map back for the legacy no-terminal policy
+        # reconstruction below.
+        policy_action = (
+            audit_mod.ACTION_ROTATE
+            if action == audit_mod.ACTION_BATCH_ROTATE
+            else action
+        )
 
         def message_for(status: int) -> str:
             if status == 403:
@@ -1607,7 +1740,7 @@ def _resolve_committed_operation(store, policy_store, record, event):
         # durable action and the current state.
         # A policy denial outranks existence: it is reconstructed whenever the
         # tenant's policy currently rejects this operator/action.
-        if not policy_store.is_allowed(tenant_id, action, operator_id):
+        if not policy_store.is_allowed(tenant_id, policy_action, operator_id):
             return error(403, message_for(403))
         if kind == "restore":
             # A same-tenant conflict is reconstructed when any key from the
@@ -1664,6 +1797,41 @@ def _resolve_committed_operation(store, policy_store, record, event):
                     "operation_id": op_id,
                 },
             )
+    if kind == "batch_rotate":
+        # The batch's single event carries key_id null; the request-order
+        # item set is durable in details. Rebuild each item's committed
+        # version (the one minted at the event timestamp, else the current
+        # pointer). A key that is no longer readable makes the projection fall
+        # back to operation_id-only rather than fabricating a version.
+        result_items = []
+        complete = True
+        for one in details.get("items", []):
+            key_id = one.get("key_id")
+            key = (
+                store.get(key_id, tenant_id)
+                if is_valid_key_id(key_id)
+                else None
+            )
+            if key is None:
+                complete = False
+                break
+            ver = None
+            for candidate in key.versions:
+                if candidate.created_at == event.timestamp:
+                    ver = candidate
+                    break
+            if ver is None:
+                ver = key.current
+            result_items.append(
+                {
+                    "key_id": key_id,
+                    "version": ver.version,
+                    "algorithm": ver.algorithm,
+                    "public_key": ver.public_key,
+                }
+            )
+        if complete:
+            return 201, {"items": result_items, "operation_id": op_id}
     if kind == "import":
         key_id = event.key_id or details.get("key_id")
         key = store.get(key_id, tenant_id)

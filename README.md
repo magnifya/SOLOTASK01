@@ -59,6 +59,15 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 - `POST /v1/keys/{key_id}/rotate`，body `{tenant_id, algorithm}`，需
   `Idempotency-Key`。`201` → `{key_id, version, algorithm, public_key,
   operation_id}`，版本严格递增、只追加。
+- `POST /v1/keys/batch-rotate`，body
+  `{tenant_id, items:[{key_id, algorithm}, ...]}`，需 `Idempotency-Key`。
+  `items` 限 1–100 项，`key_id` 为不重复小写 UUID4，`algorithm` 仅
+  AES256/RSA2048；任一非法 `400` 且在幂等键绑定**之前**零副作用（不写审计、
+  操作、密钥或句柄）。按 `rotate` 授权：策略拒绝 `403`；任一 `key_id` 未知
+  或属于其它租户则整批 `404`（不泄露跨租户存在性），皆零变更。`201` →
+  `{items:[{key_id, version, algorithm, public_key}, ...], operation_id}`，
+  items 严格按请求序；各 key 沿用单键 rotate 语义，整批原子提交（共享一把
+  per-key 锁顺序、单一 provision/snapshot 记账、单条提交事件）。
 - `GET /v1/keys/{key_id}/versions/{version}` 与
   `GET /v1/keys/{key_id}/current` →
   `{key_id, version, created_at, algorithm, public_key}`；version 须为正整数。
@@ -89,7 +98,8 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 
 ## 幂等操作
 
-- rotate/import/restore（CLI：`rotate`/`import`/`restore`）必须携带**单一**
+- rotate/import/restore/batch-rotate（CLI：
+  `rotate`/`import`/`restore`/`batch-rotate`）必须携带**单一**
   `Idempotency-Key` 头（CLI 必填 `--idempotency-key`），值为 1–128 个
   `[A-Za-z0-9._~-]` 字符。缺失、为空、重复、非法一律 `400`（CLI `2`），且该
   校验先于请求体读取与一切业务：不写审计、操作记录、密钥或提供者句柄。
@@ -105,6 +115,10 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   succeeded；同租户冲突为 `409` conflict；`403/404/400` 与提供者/账本失败为
   failed（保留原状态码）。并发同键仅一个执行，其余等待；等待超 5 秒返回
   `503` timed_out（CLI `1`），等待方不写任何东西。
+- 多/单轮换互斥：批量轮换与单键 rotate 都按 `key_id` 排序获取 per-key
+  进程内锁 + `<key_id>.lock` fcntl 排他锁（整批共享一个 5 秒截止时刻）。对同一
+  key 的并发变更要么全在批量之前、要么全在之后；等待同一被占 key 超过 5 秒的
+  批量返回 `503` timed_out 且零副作用（此时尚无 journal、事件或句柄）。
 - `operation_id` 即该变更审计事件的 `event_id`，因此每个终态至多一条事件，
   HTTP 与 CLI 共用同一套记录，可跨入口用相同键重放或按 id 查询。
 - **崩溃一致性**：进程可在绑定、outbox 落盘、账本追加或清理任一步骤崩溃。
@@ -137,10 +151,12 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 ## 审计
 
 - 事件字段 `{event_id, tenant_id, action, key_id, outcome, timestamp}`；
-  `action` 为 `create/read/rotate/revoke/import/export/audit/tenant_conflict/
-  policy_read/policy_update/policy_delete`，`outcome` 为 `success/rejected`。
-  备份记 `export`、恢复记 `import`，两者 `key_id` 均为 null；恢复的所有事件
-  （含成功）`key_id` 为 null。
+  `action` 为 `create/read/rotate/batch_rotate/revoke/import/export/audit/
+  tenant_conflict/policy_read/policy_update/policy_delete`，`outcome` 为
+  `success/rejected`。备份记 `export`、恢复记 `import`，两者 `key_id` 均为
+  null；恢复的所有事件（含成功）`key_id` 为 null；批量轮换整批至多一条
+  `batch_rotate` 事件，成功与拒绝终态的 `key_id` 均为 null，可按
+  `action=batch_rotate` 筛选。
 - `GET /v1/audit`：单一租户来源；可选 `key_id`(UUID4)、`action`、
   `limit`(1–1000，默认 100)、`cursor`。→ `{events, next_cursor}`，按
   (timestamp, event_id) 升序；游标为 HMAC 签名令牌，绑定租户/筛选/快照，
@@ -151,7 +167,9 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   /策略文件先携带待提交事件原子落盘 → 耐久追加账本（提交点）→ 清标记；账本
   失败回滚文件并删除本次新建句柄，返回 `500`（CLI `1`）；崩溃后启动按标记/
   event_id 幂等补记或回滚，不重不漏。恢复是多文件 outbox（标记带
-  `"_restore":true` 与写集清单），只追加一条 `import` 事件。
+  `"_restore":true` 与写集清单），只追加一条 `import` 事件；批量轮换是多
+  key outbox（标记带 `"_batch_rotate":true`、写集 key_ids 与 provision/
+  snapshot 引用），只追加一条 `batch_rotate` 事件（`key_id` null）。
 
 ## 命令行
 
@@ -166,6 +184,9 @@ python -m keymgr current  --tenant-id t --key-id <id> --operator alice
 python -m keymgr version  --tenant-id t --key-id <id> --version 1 --operator alice
 python -m keymgr rotate   --tenant-id t --key-id <id> --algorithm AES256 \
                           --operator alice --idempotency-key rotate-0001
+python -m keymgr batch-rotate --tenant-id t --operator alice \
+                          --idempotency-key batch-0001 \
+                          --items '[{"key_id":"<id1>","algorithm":"AES256"},{"key_id":"<id2>","algorithm":"RSA2048"}]'
 python -m keymgr revoke   --tenant-id t --key-id <id> --reason r --operator alice
 python -m keymgr status   --tenant-id t --key-id <id> --operator alice
 # 导出/导入、备份/恢复
@@ -207,8 +228,14 @@ python -m keymgr policy --operator admin set|show|delete --tenant-id t [--rules 
 - 每个密钥为数据目录下 `<key_id>.json`（0600，fsync + 原子 rename），含
   append-only `versions` 与 `current_version`；轮换在 per-key 进程内锁 +
   `<key_id>.lock` fcntl 锁下读改写，并发不丢版本、不悬指针。
-- 导入/恢复在提供者调用前先建按 event_id 命名的 provision journal，每铸一个
-  句柄即耐久登记；提交后句柄归记录所有并删除 journal，未提交（冲突、提供者
-  故障、账本失败、崩溃）则幂等删除全部已铸句柄，不留孤儿后端对象。
+- 导入/恢复/批量轮换在提供者调用前先建按 event_id 命名的 provision journal，
+  每铸一个句柄即耐久登记；提交后句柄归记录所有并删除 journal，未提交（冲突、
+  提供者故障、账本失败、崩溃）则幂等删除全部已铸句柄，不留孤儿后端对象。批量
+  轮换另在 `batch-rotations/<event_id>.json` 耐久记录每个 key 轮换前的整文件
+  字节（snapshot），未提交时据此把整组文件还原；snapshot 缺失则整组保留等待下
+  次启动，绝不猜测改写。
+- 旧 restore 记录可能没有 provision journal：未提交回滚时以 `_restore` 标记
+  的密钥文件列出整组句柄；提供者不可达或任一句柄删除失败时，保留整组密钥文件、
+  策略文件与标记，下一次启动重试，全部句柄确认删除后才移除整组文件。
 - 私钥与口令只存在于口令加密的包内或经提供者包装后的记录中；游标 HMAC 密钥
   存于 `audit.secret`(0600)。材料不会出现在任何响应、审计投影或错误信息中。

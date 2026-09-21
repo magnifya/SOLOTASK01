@@ -20,6 +20,7 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 ACTION_CREATE = "create"
 ACTION_READ = "read"
 ACTION_ROTATE = "rotate"
+ACTION_BATCH_ROTATE = "batch_rotate"
 ACTION_REVOKE = "revoke"
 ACTION_IMPORT = "import"
 ACTION_EXPORT = "export"
@@ -34,6 +35,7 @@ ACTIONS = (
     ACTION_CREATE,
     ACTION_READ,
     ACTION_ROTATE,
+    ACTION_BATCH_ROTATE,
     ACTION_REVOKE,
     ACTION_IMPORT,
     ACTION_EXPORT,
