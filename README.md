@@ -1,482 +1,214 @@
-# SOLOTASK01 多租户密码与密钥管理后端
+# SOLOTASK01 多租户密钥管理后端
 
-要实现一个多租户密钥管理后端，同时提供 HTTP 服务和命令行入口。技术选型用 Python 加 cryptography，不引入额外运行时依赖。密钥生成走 POST /v1/keys，请求体是 JSON，含 tenant_id、algorithm 与 label 三个字符串字段，algorithm 只接受 AES256 和 RSA2048；成功返回 201，响应含 key_id、algorithm 与 public_key，RSA2048 的 public_key 是 PEM 编码公钥，AES256 的 public_key 为 null。读取走 GET /v1/keys/{key_id}，返回 algorithm、label、created_at 与 public_key。缺少任一必填字段或 algorithm 不受支持时返回 400，错误信息需指出具体是哪个字段。命令行提供 gen 与 show 两个子命令，分别对应上面两个接口，打印单行 JSON 且字段名与 HTTP 响应完全一致。租户之间必须隔离，用另一个 tenant_id 查询同一 key_id 一律返回 404。私钥只保存在服务端，任何响应都不得包含私钥材料。密钥写入磁盘后重启服务仍可查到，created_at 不因重启而改变。
+一个多租户密钥管理服务，同时提供 HTTP API 与命令行入口。支持 AES256 / RSA2048
+密钥的生成、版本化轮换、吊销、加密导出/导入、租户级加密备份/恢复、按租户的
+操作者策略、只追加的审计账，以及可插拔的 KMS/HSM 提供者。轮换/导入/恢复是
+幂等变更：同一 `Idempotency-Key` 的重试只重放原结果，进程在任一步骤崩溃后
+重启都能据 `operation_id` 判定是否已耐久并一致收尾。私钥只保存在服务端，
+任何响应与审计投影都不含私钥、句柄或包装材料。
 
-## 安装
+## 依赖与安装
 
-仅需 Python 3.10+ 与 `cryptography`，无其他运行时依赖：
+Python 3.10+，仅一个运行时依赖：
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt   # cryptography>=3.4
 ```
 
-## 启动 HTTP 服务
+## 启动
 
 ```bash
 python -m keymgr --data-dir ./keymgr_data serve --host 127.0.0.1 --port 8080
 ```
 
-数据目录也可用环境变量 `KEYMGR_DATA_DIR` 指定。
-
-### KMS/HSM 提供者层
-
-私钥的生成、轮换、导入、导出与删除都经由一个可插拔的**提供者（provider）**完成，
-服务自身不再持有明文私钥。
-
-- 提供者由环境变量 `KEYMGR_PROVIDER` 选择：缺省（或显式设为 `local`）使用内置
-  本地软件提供者；其它值必须形如 `module:factory`，服务在**首次使用时**才
-  `import module` 并无参调用 `factory()` 建厂（惰性加载）。模块不存在、工厂缺失
-  或工厂抛错、返回对象不满足契约，一律返回 `503`（CLI 退出码 `1`），**绝不回退**
-  到本地提供者。
-- 工厂返回的对象必须具有非空字符串 `provider_id` 与字典 `capabilities`：
-  `{"algorithms":["AES256","RSA2048"], "operations":["generate","rotate",
-  "import_material","export_material","delete"]}`，并实现这五个无状态方法。
-  - `generate(algorithm)` 与 `rotate(algorithm)` 返回
-    `{handle, public_key, encrypted_material}`；
-  - `import_material(algorithm, public_key, material)` 导入明文材料并返回同样的
-    三元组；
-  - `export_material(handle)` 返回 `{public_key, encrypted_material}`；
-  - `delete(handle)` 删除后端对象且**幂等**。
-  后端在运行期抛出的任何异常都会被归一化为 `503`，响应只含固定文案
-  “key management provider is unavailable”，**句柄与材料绝不出现在任何响应或
-  审计投影中**。导入的材料不符合算法（如 AES256 材料不是 32 字节、RSA2048 公钥
-  与私钥不匹配）返回 `400`（CLI 退出码 `2`），错误只指名字段、不含材料。
-- **本地提供者**仍把材料保存在数据目录，但只用数据加密密钥（`local.dek`，
-  `0600`）以 AES-256-GCM 包装；句柄与包装材料登记在 `local-registry.json`
-  （`0600`，仅存包装后的材料）。密钥文件里保存的是每个版本的
-  `provider_id`、`handle`、`encrypted_material` 三元组，**不落盘明文私钥**。
-  服务启动时会把提供者层之前写入的旧记录（裸 `private_material`、空句柄）
-  自动校验、包装并登记为本地对象，重写文件后旧明文字段消失。
-- 一次生成 / 轮换 / 导入先向提供者换取三元组，再走既有的 outbox 事务；账本写失败
-  返回 `500`（CLI 退出码 `1`）时，除回滚密钥文件外还会调用该提供者的
-  `delete(handle)` 清理本次新建的后端对象（尽力而为，不掩盖账本错误）。
-- 轮换 / 导出 / 导入 / 恢复必须命中记录所登记的 `provider_id`：记录属于
-  当前未激活的提供者时返回 `503`，不会静默切换提供者；导入 / 恢复携带
-  `provider` 来源块但与当前提供者不符时同样 `503`。
-- 单 key 导出包与租户备份包的每个版本除原有字段外，附带
-  `provider:{provider_id, handle, encrypted_material}` 来源块；旧的
-  `keymgr-export-v1` 包没有该字段时一律按本地提供者处理。导入 / 恢复对来源块的
-  元数据、算法、句柄、材料逐字段校验：格式错误为 `400`（指出
-  `versions[i].provider.*` 等字段，全程不落盘、不留半成品）；跨租户占用与未知
-  key 仍为 `404`。材料永远只存在于口令加密的包内或经提供者包装后的记录中，
-  恢复在账本失败或崩溃回滚时同样删除已创建的提供者句柄。
-
-### 操作者标识
-
-
-除 `serve` 外，每个 HTTP 请求都必须携带**单一非空**请求头
-`X-Operator-Id: <operator>`（CLI 对应全局的 `--operator`，每个子命令都必填）；
-缺失、为空或重复均返回 `400`（CLI 退出 `2`）。该标识既用于审计，也作为租户
-策略中的 `subject` 参与鉴权。
-
-### 租户策略
-
-- `GET /v1/policy`：读取一个租户的策略。租户由**单一** `X-Tenant-Id` 头或
-  **单一** `?tenant_id=` 参数提供；两者同时给出、重复、缺失或为空均为 `400`
-  且错误指明 `tenant_id`（这类参数错误同时记一条不可见的 `tenant_conflict`
-  事件）。策略不存在返回 `404`。成功返回 `200`：
-  `{"tenant_id", "rules"}`，并记一条 `policy_read` 事件。
-- `PUT /v1/policy`：新建或整体替换策略。请求体 JSON 必须含非空字符串
-  `tenant_id` 与数组 `rules`；`X-Tenant-Id` 头 / `?tenant_id=` 可选但必须与
-  body 的 `tenant_id` 一致，冲突为 `400`。成功返回 `200`：
-  `{"tenant_id", "rules"}`，并记一条 `policy_update` 事件。
-- `DELETE /v1/policy`：删除策略。租户来源与 `GET` 相同（单一头或单一参数）。
-  成功（含策略本不存在的幂等删除）返回 `200`：
-  `{"tenant_id", "deleted": true}`，并记一条 `policy_delete` 事件。
-- `rules` 的每个元素含 `subject`、`actions`、`effect`：
-  - `subject` 为非空字符串且**区分大小写**；
-  - `actions` 为非空数组，元素只能是
-    `create` / `read` / `rotate` / `revoke` / `import` / `export` / `audit`，
-    元素须非空，单条规则内重复的动作会去重；
-  - `effect` 只能是 `allow` 或 `deny`；
-  - 出现未知字段、字段类型错误、或存在同 `subject` + 同 `effect` +
-    无序 `actions` 集合相同的重复规则，均为 `400`。`rules: []` 合法，表示
-    该租户的所有动作都被拒绝。
-- **执行规则**（作用于 create/read/rotate/revoke/import/export/audit 七个动作，
-  管理端点 policy_* 免检）：租户没有策略时一律允许；有策略时，匹配当前
-  `X-Operator-Id` 与动作的规则里 **deny 优先于 allow**，没有任何规则匹配则
-  拒绝。被策略拒绝返回 `403`，并记原动作名（如 `read`）、`outcome=rejected`
-  与当时已知的 `key_id`（create/import 解密前/audit 查询为 `null`）。参数校验
-  （`400`）先于授权，授权先于存在性判断；未知 key / 跨租户访问仍为 `404`。
-
-### 接口
-
-- `POST /v1/keys`，请求体 `{"tenant_id", "algorithm", "label"}`，
-  `algorithm` 仅支持 `AES256` / `RSA2048`。成功返回 `201`：
-  `{"key_id", "algorithm", "public_key"}`（RSA 返回 PEM 公钥，AES 返回 `null`）。
-- `GET /v1/keys/{key_id}`，用请求头 `X-Tenant-Id: <tenant>` 标识租户
-  （也支持 `?tenant_id=<tenant>` 查询参数）。成功返回 `200`：
-  `{"algorithm", "label", "created_at", "public_key"}`（current 版本的材料）。
-- `POST /v1/keys/{key_id}/rotate`，请求体 `{"tenant_id", "algorithm"}`，
-  `algorithm` 仅支持 `AES256` / `RSA2048`；也接受与 body 一致的
-  `X-Tenant-Id` / `?tenant_id=`。每次轮换生成**全新材料**、版本号严格递增
-  且不复用，`label` 沿用原 key。成功返回 `201`：
-  `{"key_id", "version", "algorithm", "public_key"}`。
-- `GET /v1/keys/{key_id}/versions/{version}`：读取指定历史版本，`version`
-  必须是正整数。成功返回 `200`：
-  `{"key_id", "version", "created_at", "algorithm", "public_key"}`。
-- `GET /v1/keys/{key_id}/current`：读取当前版本，字段同上。
-- `POST /v1/keys/{key_id}/revoke`：吊销密钥。请求体 JSON 含非空字符串
-  `tenant_id`、`reason`、`operator`；`X-Tenant-Id` / `?tenant_id=` 可选，
-  但必须与 body 的 `tenant_id` 一致，冲突返回 `400` 且错误指明
-  `tenant_id`。吊销把状态从 `active` 置为 `revoked`，并保存首次的
-  `reason`、`operator` 与 UTC `revoked_at`。成功返回 `200`：
-  `{"key_id", "status", "reason", "operator", "revoked_at"}`。
-  重复或并发吊销幂等：保留首次的值。
-- `GET /v1/keys/{key_id}/status`：查询吊销状态，租户来自 `X-Tenant-Id`
-  或 `?tenant_id=`（两者同时给出必须一致）。返回 `200`：
-  `{"key_id", "status", "reason", "operator", "revoked_at"}`；
-  `active`（含无状态字段的旧记录）时后三项为 `null`。
-- `POST /v1/keys/{key_id}/export`：加密导出整把密钥。请求体 JSON 含非空
-  字符串 `tenant_id`、`passphrase`；可附与 body 一致的 `X-Tenant-Id` /
-  `?tenant_id=`（冲突返回 `400` 且指明 `tenant_id`）。成功返回 `200`：
-  `{"format":"keymgr-export-v1","bundle": <不透明 base64>}`。bundle 以
-  passphrase 经 scrypt 派生密钥后用 AES-256-GCM 认证加密，内含 `label`、
-  全部版本（算法、时间、公钥、私有材料）、`current_version` 与吊销字段；
-  私钥与口令只存在于加密包内，响应与审计投影均不泄露。未知 key / 跨租户
-  统一 `404`。
-- `POST /v1/keys/import`：从加密包导入。请求体 JSON 含非空字符串
-  `tenant_id`、`passphrase`、`bundle`；同样接受与 body 一致的
-  `X-Tenant-Id` / `?tenant_id=`。解密失败、密文被篡改、`format`/版本错误
-  或缺字段返回 `400` 且错误指出具体字段（`passphrase` / `bundle` /
-  `versions[i].xxx` 等），全程不落盘、不留半成品。成功返回 `201`：
-  `{"key_id", "algorithm", "public_key"}`，并保留原 `key_id`、全部版本号、
-  `current`、`label` 与吊销状态。该租户已有同一 `key_id` 返回 `409` 且原
-  记录不变；`key_id` 已被其他租户占用时返回 `404`，跨租户不泄露存在性。
-- `POST /v1/backup`：租户级加密备份。请求体 JSON 含非空字符串 `tenant_id`、
-  `passphrase`；可附与 body 一致的 `X-Tenant-Id` / `?tenant_id=`
-  （冲突返回 `400` 且指明 `tenant_id`）。受 `export` 动作授权。成功返回
-  `200`：`{"format":"tenant-backup-v1","bundle": <不透明 base64>}`，
-  bundle 与单 key 导出同一套 scrypt + AES-256-GCM 信封（格式标签不同，
-  两类包不可互换），解密载荷为
-  `{format, tenant_id, keys, policy}`：`keys` 的每个元素为
-  `{key_id, label, current_version, status, reason, operator, revoked_at,
-  versions:[版本对象]}`；`policy` 为 `null` 或 `{"rules":[...]}`。
-  空租户备份为 `keys: []`、`policy: null`。私钥只存在于加密包内，响应与
-  审计投影均不泄露。
-- `POST /v1/restore`：租户级加密恢复。请求体 JSON 含非空字符串 `tenant_id`、
-  `passphrase`、`bundle`；同样接受与 body 一致的 `X-Tenant-Id` /
-  `?tenant_id=`。校验顺序：参数/解密/格式错误为 `400`（指出
-  `passphrase` / `bundle` / `keys[i].xxx` 等字段，全程不落盘）→ 受
-  `import` 动作授权（`403`）→ 包内 `tenant_id` 与请求租户不一致为
-  `404`（不泄露包归属）。之后做冲突检查：该租户已有同一 `key_id`、或
-  已有策略文档（即使包内 `policy` 为 `null`，恢复也绝不覆盖或删除既有
-  策略）返回 `409` 且一切不变；`key_id` 被其他租户占用返回 `404`。
-  无冲突时多个 key 文件与策略文件在同一逻辑事务内原子恢复，成功返回
-  `201`：`{"tenant_id", "key_ids", "policy_restored"}`；空包（`keys: []`、
-  `policy: null`）同样成功，`key_ids` 为 `[]`、`policy_restored` 为
-  `false`。
-- `GET /v1/audit`：查询本租户的审计事件。租户由**单一** `X-Tenant-Id`
-  头或**单一** `?tenant_id=` 参数提供；缺失、重复、为空或两者冲突均返回
-  `400` 且错误信息指出 `tenant_id`。可选筛选：`key_id`（非 UUID4 返回
-  `400`）、`action`（`create` / `read` / `rotate` / `revoke` / `import` /
-  `export` / `audit` / `tenant_conflict` / `policy_read` / `policy_update` /
-  `policy_delete` 十一值之一）、`limit`（默认 `100`，范围
-  `1–1000`）、`cursor`（上一页返回的不透明游标）。返回
-  `{"events", "next_cursor"}`，事件按 `timestamp`、`event_id` 升序；
-  `next_cursor` 为 `null` 表示到末页。未知但合法的 `key_id` 返回空列表。
-  游标绑定租户、筛选条件与快照：失效、被篡改或改变筛选/租户均返回 `400`
-  且错误指出 `cursor`；分页保证不重不漏。审计查询本身不记账。
-- 缺少必填字段、algorithm 不支持、version 非正整数、导入包口令/格式错误、或
-  header/query/body 提供了互相冲突的租户参数，返回 `400`，错误信息指明
-  具体字段；未知 key、未知版本及跨租户访问统一返回 `404`；同租户重复导入
-  返回 `409`。任何响应均不含私钥材料。
-
-### 幂等操作
-
-轮换、导入与租户恢复三个变更端点支持幂等：
-
-- `POST /v1/keys/{key_id}/rotate`、`POST /v1/keys/import`、
-  `POST /v1/restore`（CLI 对应 `rotate` / `import` / `restore` 子命令）
-  必须携带**单一** `Idempotency-Key` 请求头（CLI 为必填
-  `--idempotency-key`），值为 1–128 个 ASCII 字符，且只能取自
-  `[A-Za-z0-9._~-]`。缺失、为空、重复或含非法字符一律 `400`
-  （CLI 退出码 `2`），且**不产生任何副作用**（不写密钥、不记审计、
-  不铸造提供者句柄）。
-- 每个键值**全局唯一**地绑定一次操作。服务记录操作的 UUID4
-  `operation_id`、`tenant_id`、操作者、路径、规范化请求体（键排序的
-  紧凑 JSON）、状态、HTTP 状态码与响应体。记录持久化在
-  `operations/<operation_id>.json`（`0600`），绑定索引在
-  `operations/index.json`，二者的读-改-写由一个进程内锁加
-  `operations.lock` 上的 `fcntl` 排他锁串行化。
-- **相同绑定重试**：再次提交完全相同的键 + 租户 + 操作者 + 路径 +
-  规范化体时，直接重放首次的 HTTP 状态码、响应体与审计事件
-  （`operation_id` 相同），业务逻辑绝不执行第二次。成功响应
-  （`201`）与错误响应都附加 `operation_id`；错误体只含 `error` 与
-  `operation_id` 两个字段。
-- **同键不同绑定**：同一个 `Idempotency-Key` 被用于不同的租户/操作者/
-  路径/请求体时返回 `409`（CLI 退出码 `3`），错误体给出**已有**
-  `operation_id`，不执行新请求。
-- 导入/恢复的解密是无副作用的：已绑定键在解密之前即判定重放/冲突；
-  未绑定键若口令错误或包被篡改返回 `400` 且**不占用**该幂等键，改用
-  正确口令后同一键仍可成功。
-- 操作状态为 `pending` / `succeeded` / `failed` / `conflict` /
-  `timed_out`：业务成功为 `201`（`succeeded`）；提供者故障为 `503`
-  （`failed`）；账本/持久化失败为 `500`（`failed`）；同租户冲突为
-  `409`（`conflict`，CLI `3`）；策略拒绝 `403`、未知/跨租户 `404`
-  等均记为 `failed` 并保留各自状态码。
-- **锁等待超时**：并发同键仅一个请求执行，其余等待首个请求到达终态；
-  等待超过 5 秒仍未完成则返回 `503` timed_out（CLI 退出码 `1`），
-  等待方**不**写密钥、不记审计、不铸造句柄，也不改动首个操作的记录。
-- **并发同键仅一次提交**：全局绑定锁保证同一键的并发请求中只有一个
-  进入执行，其余全部重放同一结果、共享同一个 `operation_id`。
-
-#### `GET /v1/operations/{operation_id}`
-
-要求单一 `X-Operator-Id` 与单一租户来源（单一 `X-Tenant-Id` 头或单一
-`?tenant_id=` 参数，规则同审计查询）。操作必须同时属于该租户与该操作者：
-
-- 成功 `200` 返回
-  `{"operation_id","tenant_id","status","http_status","response"}`；
-  `pending` 时 `http_status` 与 `response` 均为 `null`。
-- 未知 id、非法 UUID、跨租户或跨操作者访问一律 `404`，不泄露存在性。
-- CLI 对应 `operation --tenant-id <t> --operator <o>
-  --operation-id <id>` 子命令，打印同形单行 JSON。
-
-#### 崩溃与跨接口一致性
-
-- 幂等操作的 `operation_id` 即该变更审计事件的 `event_id`，因此
-  HTTP 与 CLI 共用同一套操作记录：一边发起的操作，另一边用相同
-  `Idempotency-Key` 重试会重放同一结果，也能通过 `operation_id` 查到。
-- 进程在操作 `pending` 时崩溃，下次启动（服务启动或任意 CLI 调用）在
-  key/restore 的 outbox 恢复**之后**按 `operation_id`（即事件 id）收尾：
-  事件已入帐则判定已提交，据持久化的变更事实重建 `201` 响应并置为
-  `succeeded`；事件未入帐则判定从未提交，置为 `failed`（`500`），
-  半成品密钥文件与提供者句柄由既有的 outbox / provision 恢复清理。
-  CLI 与 HTTP 行为一致。
-
-### 版本与轮换
-
-每个 key 的首个版本为 `1`；每个版本独立保存创建时间、算法、公钥与私有材料，
-历史版本只追加、不可覆盖。`current` 指针始终指向最新版本。轮换在
-per-key 锁（进程内锁 + `fcntl` 跨进程锁）保护下做读-改-写并原子落盘，
-因此并发轮换不会丢版本、不会留下悬空指针；写入失败只丢弃临时文件，
-旧数据保持完整。重启后版本历史、当前指针、`label`、各版本时间与公钥均可读。
-
-## 审计
-
-密钥的生成、读取（含当前版本、历史版本、状态查询）、轮换、吊销、导入与导出
-（含租户级备份）都会写入持久化审计账。每条事件字段为 `event_id`、`tenant_id`、
-`action`、`key_id`、`outcome`、`timestamp`（UTC）；`action` 为 `create` /
-`read` / `rotate` / `revoke` / `import` / `export` / `audit` /
-`tenant_conflict` / `policy_read` / `policy_update` / `policy_delete`，
-`outcome` 为 `success` / `rejected`。
-租户级备份记 `action=export`、租户级恢复记 `action=import`，两者的
-`key_id` 均为 `null`；参数级的租户缺失/冲突仍记不可见的
-`action=tenant_conflict`。
-
-- 租户已确定且 `key_id` 合法时，事件同时记录两个标识，且仅该请求租户可见。
-  未知或跨租户的访问（含导出、跨租户导入冲突、恢复包内租户不一致）记为
-  `outcome=rejected`，只对请求租户可见，不泄露密钥归属。导入（含租户级
-  恢复）在解密成功前尚不知 `key_id`，这类拒绝事件的 `key_id` 为 `null`；
-  租户级恢复的全部审计事件（含成功）`key_id` 均为 `null`；未知但合法的
-  `key_id` 在审计查询中返回空。
-- 被租户策略拒绝的动作记一条**原动作名**（不是策略动作）、
-  `outcome=rejected`、携带当时已知 `key_id` 的事件（如对未知 key 的
-  `read` 拒绝会带上该 key_id；create、成功解密前的 import、audit 查询为
-  `null`）。审计查询本身**成功时不记账**，仅在被策略拒绝时记一条
-  `action=audit`、`outcome=rejected`、`key_id=null` 的事件。
-- 策略管理记 `policy_read` / `policy_update` / `policy_delete` 三种
-  `success` 事件（`key_id` 为 `null`），仅该租户可见；这些管理动作本身
-  不受租户策略约束。
-- 租户缺失、为空、标识非法（`key_id` 非 UUID4）或头/查询/体提供的租户互相
-  不一致时，记一条 `action=tenant_conflict`、`outcome=rejected` 的事件，
-  其 `tenant_id` 与 `key_id` 均为 `null`，任何租户都查不到它。
-- 审计账只追加，存于数据目录的 `audit.log`（每行一个 JSON）。变更（生成 /
-  轮换 / 吊销 / 导入）与其事件在同一逻辑事务提交：先把事件作为待提交标记
-  随密钥文件原子落盘，再 durable 追加账本，最后清除标记；账本写失败则回滚
-  密钥文件并对 HTTP 返回 `500`、CLI 以退出码 `1` 失败，绝不允许单边落盘。
-  导出只读，其审计事件随成功响应直接追加账本。进程在两步之间崩溃时，下次
-  启动依据待提交标记幂等补记账本（按 `event_id` 去重）。
-- 策略文档同样走 outbox 事务：`PUT` 先把策略文件（数据目录
-  `policies/<sha256(tenant_id)>.json`，权限 `0600`）连同待提交事件原子
-  落盘再追加账本；`DELETE` 用 `*.json.del` 墓碑标记包裹“删文件 → 记账本”
-  两步，崩溃后下次启动据墓碑幂等收尾（原文件仍在则回滚删除，否则补记并清理）。
-- 租户级恢复是跨多个 key 文件与至多一个策略文件的**多文件 outbox 事务**：
-  所有文件先携带同一个待提交事件与写集清单（marker 内带 `"_restore": true`
-  以区别于单文件 outbox）原子落盘，随后只向账本 durable 追加**一条**
-  `action=import`、`key_id=null` 事件，最后统一清除标记。账本失败时删除本次
-  新建的全部文件（既有文件永远不会被恢复覆盖，因为冲突检查先于写入），
-  HTTP 返回 `500`、CLI 退出码 `1`；进程在期间崩溃则下次启动按 event_id
-  分组：事件已入帐则清除标记完成事务，未入帐则删除全部半成品文件，两条路径
-  都幂等，不重不漏。空包恢复（`keys: []`、`policy: null`）不建文件但仍补记
-  一条成功事件。
-- 事件与查询投影均不含任何私钥材料。`GET /v1/audit` 成功时不产生审计事件。
-
-
-## 命令行
-
-除 `serve` 外，每个子命令都必须提供非空的 `--operator`（对应 HTTP 的
-`X-Operator-Id`，同时作为策略匹配的 `subject`）；缺失由 argparse 报错、
-为空以退出码 `2` 报错。
-
-`gen` / `show` 与上述接口一一对应，均打印单行 JSON，字段名与 HTTP 响应完全一致：
-
-```bash
-python -m keymgr --data-dir ./keymgr_data gen \
-  --tenant-id tenant-a --algorithm RSA2048 --label "my key" --operator alice
-python -m keymgr --data-dir ./keymgr_data show \
-  --tenant-id tenant-a --key-id <key_id> --operator alice
-```
-
-版本与轮换命令同样打印单行 JSON，字段与对应 HTTP 响应一致：
-
-```bash
-# 轮换：输出 {"key_id","version","algorithm","public_key","operation_id"}
-# rotate 必填 --idempotency-key；重试相同键复用同一结果
-python -m keymgr --data-dir ./keymgr_data rotate \
-  --tenant-id tenant-a --key-id <key_id> --algorithm AES256 --operator alice \
-  --idempotency-key rotate-0001
-# 指定历史版本：输出 {"key_id","version","created_at","algorithm","public_key"}
-python -m keymgr --data-dir ./keymgr_data version \
-  --tenant-id tenant-a --key-id <key_id> --version 1 --operator alice
-# 当前版本：字段同 version
-python -m keymgr --data-dir ./keymgr_data current \
-  --tenant-id tenant-a --key-id <key_id> --operator alice
-# 查询幂等操作：输出
-# {"operation_id","tenant_id","status","http_status","response"}
-python -m keymgr --data-dir ./keymgr_data operation \
-  --tenant-id tenant-a --operator alice --operation-id <operation_id>
-```
-
-吊销与状态查询同样打印单行 JSON，字段与对应 HTTP 响应一致：
-
-```bash
-# 吊销：输出 {"key_id","status","reason","operator","revoked_at"}
-# --operator 既是调用者（策略 subject）也记录为吊销操作者
-python -m keymgr --data-dir ./keymgr_data revoke \
-  --tenant-id tenant-a --key-id <key_id> --reason "compromised" --operator alice
-# 状态：字段同 revoke；active 时 reason/operator/revoked_at 为 null
-python -m keymgr --data-dir ./keymgr_data status \
-  --tenant-id tenant-a --key-id <key_id> --operator alice
-```
-
-加密导入 / 导出同样打印单行 JSON，字段与对应 HTTP 响应一致：
-
-```bash
-# 导出：输出 {"format","bundle"}，bundle 为不透明 base64
-python -m keymgr --data-dir ./keymgr_data export \
-  --tenant-id tenant-a --key-id <key_id> --passphrase 'hunter2' --operator alice
-# 导入：输出 {"key_id","algorithm","public_key","operation_id"}（201）
-# import 必填 --idempotency-key；重试相同键重放首次结果、不重复落库
-python -m keymgr --data-dir ./keymgr_data import \
-  --tenant-id tenant-b --passphrase 'hunter2' --bundle '<bundle>' \
-  --operator alice --idempotency-key import-0001
-```
-
-导出、导入分别写 `action=export` / `action=import` 的审计事件。
-
-租户级备份 / 恢复同样打印单行 JSON，字段与对应 HTTP 响应一致：
-
-```bash
-# 备份：输出 {"format":"tenant-backup-v1","bundle"}
-python -m keymgr --data-dir ./keymgr_data backup \
-  --tenant-id tenant-a --passphrase 'hunter2' --operator alice
-# 恢复：输出 {"tenant_id","key_ids","policy_restored","operation_id"}
-# restore 必填 --idempotency-key
-python -m keymgr --data-dir ./keymgr_data restore \
-  --tenant-id tenant-a --passphrase 'hunter2' --bundle '<bundle>' \
-  --operator alice --idempotency-key restore-0001
-```
-
-备份、恢复分别写 `action=export` / `action=import`、`key_id=null` 的审计
-事件；口令缺失/错误、bundle 格式错误以退出码 `2` 报错，策略拒绝以 `3`、
-同租户冲突（已有 key_id 或已有策略）以 `3`、包内租户不一致或跨租户占用以
-`4` 报错，账本写失败、提供者不可用或锁等待超时（timed_out）以 `1` 失败。
-`rotate` / `import` / `restore` 的非法 `--idempotency-key` 以退出码 `2`
-报错且无副作用；同键不同绑定以退出码 `3` 报错并给出已有 `operation_id`。
-
-审计查询同样打印单行 JSON，字段与 `GET /v1/audit` 响应一致
-（`{"events","next_cursor"}`）：
-
-```bash
-# 查询本租户事件；--key-id / --action / --limit / --cursor 均可选
-python -m keymgr --data-dir ./keymgr_data audit \
-  --tenant-id tenant-a --action rotate --limit 100 --operator alice
-# 用上一页输出里的 next_cursor 继续翻页（其为空串/null 时即末页）
-python -m keymgr --data-dir ./keymgr_data audit \
-  --tenant-id tenant-a --cursor '<next_cursor>' --operator alice
-```
-
-策略管理用 `policy show|set|delete` 子命令，均需 `--operator` 与
-`--tenant-id`，输出与对应 HTTP 响应同形（`set` 另需 `--rules`，值为
-JSON 数组字符串）：
-
-```bash
-# 输出 {"tenant_id","rules"}
-python -m keymgr --data-dir ./keymgr_data policy --operator admin set \
-  --tenant-id tenant-a \
-  --rules '[{"subject":"alice","actions":["read","create"],"effect":"allow"}]'
-# 输出 {"tenant_id","rules"}
-python -m keymgr --data-dir ./keymgr_data policy --operator admin show \
-  --tenant-id tenant-a
-# 输出 {"tenant_id","deleted":true}
-python -m keymgr --data-dir ./keymgr_data policy --operator admin delete \
-  --tenant-id tenant-a
-```
-
-非法的 `--key-id` / `--action` / `--limit` 或失效篡改的 `--cursor` 以
-退出码 `2` 报错，错误信息指出具体字段。导出/导入的口令缺失、口令错误或
-bundle 格式、版本、字段错误，以及策略 `--rules` 的任何校验错误同样以
-退出码 `2` 报错。
-
-被租户策略拒绝（HTTP `403`）以退出码 `3` 报错；同租户重复导入已存在的
-`key_id` 也以退出码 `3` 报错（对应 HTTP `409`，原记录不变）。
-
-未知 key/版本/策略或跨租户访问以退出码 `4` 报错；非法 algorithm / version
-（非正整数）等参数错误以退出码 `2` 报错，错误信息指明字段；审计账写失败
-以退出码 `1` 失败（对应 HTTP `500`）。
+数据目录也可用环境变量 `KEYMGR_DATA_DIR` 指定（CLI 默认 `keymgr_data`）。
+提供者由 `KEYMGR_PROVIDER` 选择（缺省或 `local` 为内置本地提供者，其它值为
+`module:factory`，首次使用时才惰性加载，绝不回退本地）。
 
 ## 基础测试
 
 ```bash
-python -m compileall -q keymgr                       # 语法编译检查
-python -c "from keymgr.crypto import generate_key; generate_key('AES256'); generate_key('RSA2048')"
+python -m compileall -q keymgr
+python3 -c "from keymgr.crypto import generate_key; generate_key('AES256'); generate_key('RSA2048')"
 curl -s -X POST http://127.0.0.1:8080/v1/keys \
   -H 'Content-Type: application/json' \
   -d '{"tenant_id":"a","algorithm":"AES256","label":"t"}'
 ```
 
-## 持久化与安全说明
+## 通用约定
 
-- 每个密钥以 `<key_id>.json` 原子落盘（权限 `0600`）：文件内含 append-only
-  的 `versions` 数组与 `current_version` 指针。旧版本不可覆盖，重启后历史、
-  当前指针、`label`、各版本时间与公钥均可读，时间戳不随重启改变。
-- 轮换在 per-key 锁（进程内锁 + `<key_id>.lock` 上的 `fcntl` 排他锁）保护下
-  读-改-写，并经 fsync + `os.replace` 原子提交：并发不丢版本、指针不悬空，
-  写入失败只清理临时文件而不破坏旧数据。
-- 私钥不经由密钥文件明文保存：每个版本只持久化提供者三元组
-  `provider_id` / `handle` / `encrypted_material`（本地提供者用 `local.dek`
-  做 AES-256-GCM 包装，见“KMS/HSM 提供者层”）；所有响应投影
-  （create/get/rotate/version/current/revoke/status）都不包含句柄或材料字段。
-  提供者层之前的裸 `private_material` 旧记录在启动时被本地提供者自动包装接管。
-- 吊销状态（`status`、`reason`、`operator`、`revoked_at`）随密钥记录
-  原子落盘，重启后保持不变；重复或并发吊销幂等，始终保留首次的值。
-  无状态字段的旧记录按 `active` 处理。
-- `key_id` 为 UUID4，读取时校验格式以杜绝路径穿越；未知 key、未知版本与
-  跨租户访问一律 `404`，不泄露密钥是否存在。
-- 导出包 `keymgr-export-v1` 为不透明的单层 base64 令牌：内部 JSON 信封记录
-  `scrypt`（随机盐、固定成本参数）派生的 AES-256-GCM 密钥与随机 nonce，
-  密文以 `format` 作为附加认证数据。口令错误或任何篡改都在 GCM 认证处失败，
-  不会解出半截明文；KDF 参数只接受本服务发出的固定集合，拒绝伪造信封请求
-  任意内存。解密后的载荷逐字段校验（`label`、连续 `1..N` 的版本、算法、
-  公钥/私有材料、`current_version`、吊销字段），缺字段或版本错误以 `400`
-  指出具体字段。导入沿用每 key 锁 + 原子落盘 + outbox 事务，账本失败回滚、
-  崩溃幂等补记，重启后导入的全部版本与状态均可读。
-- 租户备份包 `tenant-backup-v1` 复用同一 scrypt + AES-256-GCM 信封与固定
-  KDF 参数，仅格式 AAD 标签不同（与 `keymgr-export-v1` 互不接受）；载荷
-  `{format, tenant_id, keys, policy}` 逐字段校验（key 投影与单 key 导出同
-  一套版本/吊销校验，`keys` 允许空数组、`key_id` 不可重复，`policy` 为
-  `null` 或带合法 `rules` 的对象），缺字段/版本错误以 `400` 指出
-  `keys[i].xxx` 等具体字段。恢复走多文件 outbox 事务（见上文“审计”），
-  冲突先于任何写入检查，既有 key/策略文件绝不被覆盖。
-- 审计账为数据目录下的 `audit.log`（每行一个 JSON，只追加），追加由进程内锁
-  + `audit.log.lock` 上的 `fcntl` 排他锁串行化并 fsync，`seq` 单调不乱序。
-  生成 / 轮换 / 吊销采用“密钥文件携带待提交事件 → 追加账本 → 清除标记”的
-  outbox 事务：账本写失败回滚密钥文件，HTTP 返回 `500`、CLI 退出 `1`，
-  变更与事件绝不单边落盘；崩溃后启动按标记幂等补记（按 `event_id` 去重）。
-- 审计游标是 HMAC 签名的不透明令牌，密钥存于数据目录 `audit.secret`
-  （权限 `0600`），绑定租户、筛选、`limit` 与该可见结果集的快照指纹；
-  篡改、改租户/筛选或可见事件集变化都会令游标失效（`400` / 退出 `2`），
-  其他租户的活动不影响本租户游标。事件按 `timestamp`、`event_id` 升序，
-  分页不重不漏。审计事件与响应投影均不含私钥材料。
+- 除 `serve` 外每个请求都需单一非空头 `X-Operator-Id: <operator>`（CLI 为
+  必填 `--operator`）；缺失/为空/重复均 `400`（CLI 退出 `2`）。操作者既是
+  审计主体也是策略 `subject`。
+- 租户来源：单一 `X-Tenant-Id` 头或单一 `?tenant_id=` 参数；允许 body 携带
+  `tenant_id` 的端点，头/参数/体必须一致。缺失、重复、冲突均 `400` 且错误指
+  `tenant_id`，并记一条任何租户都不可见的 `tenant_conflict` 事件（幂等端点在
+  幂等键绑定**之前**的参数/解析错误例外：不写任何审计、操作、密钥或句柄）。
+- 错误 HTTP 状态与 CLI 退出码：`400→2`、`403→3`、`409→3`、`404→4`、
+  `500/503→1`；成功 `0`。普通错误体仅 `{"error": ...}`；幂等变更的错误体仅
+  `{"error", "operation_id"}`，成功体额外含 `operation_id`。
+- `key_id` 为小写 UUID4，非法值是 `400`；未知对象与跨租户访问统一 `404`，
+  不泄露存在性。
+
+## HTTP 接口
+
+- `POST /v1/keys`，body `{tenant_id, algorithm, label}`，`algorithm` 仅
+  `AES256`/`RSA2048`。`201` → `{key_id, algorithm, public_key}`（AES 的
+  `public_key` 为 null，RSA 为 PEM）。
+- `GET /v1/keys/{key_id}` → `{algorithm, label, created_at, public_key}`。
+- `POST /v1/keys/{key_id}/rotate`，body `{tenant_id, algorithm}`，需
+  `Idempotency-Key`。`201` → `{key_id, version, algorithm, public_key,
+  operation_id}`，版本严格递增、只追加。
+- `GET /v1/keys/{key_id}/versions/{version}` 与
+  `GET /v1/keys/{key_id}/current` →
+  `{key_id, version, created_at, algorithm, public_key}`；version 须为正整数。
+- `POST /v1/keys/{key_id}/revoke`，body `{tenant_id, reason, operator}` →
+  `{key_id, status, reason, operator, revoked_at}`；重复/并发吊销幂等，保留
+  首次值。
+- `GET /v1/keys/{key_id}/status`：字段同 revoke；active 时后三项为 null。
+- `POST /v1/keys/{key_id}/export`，body `{tenant_id, passphrase}` →
+  `{format:"keymgr-export-v1", bundle}`，bundle 为不透明 base64（scrypt +
+  AES-256-GCM，`format` 作为 AAD）。
+- `POST /v1/keys/import`，body `{tenant_id, passphrase, bundle}`，需
+  `Idempotency-Key`。`201` → `{key_id, algorithm, public_key, operation_id}`，
+  保留原 key_id、全部版本、label、current 与吊销状态。同租户已有 key_id 为
+  `409`，key_id 被其它租户占用为 `404`；口令/篡改/格式错误为 `400` 且不占用
+  幂等键。
+- `POST /v1/backup`，body `{tenant_id, passphrase}` →
+  `{format:"tenant-backup-v1", bundle}`；载荷
+  `{format, tenant_id, keys, policy}`，空租户为 `keys:[]、policy:null`。
+- `POST /v1/restore`，body `{tenant_id, passphrase, bundle}`，需
+  `Idempotency-Key`。校验顺序：参数/解密/格式 `400` → 授权 `403` → 包内
+  tenant 不符 `404` → 同租户 key_id/策略冲突 `409`（绝不覆盖既有策略）→
+  多文件原子恢复 `201` → `{tenant_id, key_ids, policy_restored,
+  operation_id}`。空包同样成功（`key_ids:[]`、`policy_restored:false`）。
+- `GET /v1/policy` / `PUT /v1/policy` / `DELETE /v1/policy`：读/替换/删除
+  租户策略，见下。
+- `GET /v1/audit`：本租户审计查询，见下。
+- `GET /v1/operations/{operation_id}`：查询幂等操作，见下。
+
+## 幂等操作
+
+- rotate/import/restore（CLI：`rotate`/`import`/`restore`）必须携带**单一**
+  `Idempotency-Key` 头（CLI 必填 `--idempotency-key`），值为 1–128 个
+  `[A-Za-z0-9._~-]` 字符。缺失、为空、重复、非法一律 `400`（CLI `2`），且该
+  校验先于请求体读取与一切业务：不写审计、操作记录、密钥或提供者句柄。
+- 键全局唯一，绑定记录 `operation_id`(UUID4)、租户、操作者、路径、规范化体
+  （键排序紧凑 JSON）、状态、HTTP 状态与响应；存于 `operations/<id>.json`
+  (0600) 与 `operations/index.json`，进程内锁 + `operations.lock` 的 fcntl
+  排他锁串行化。
+- 相同绑定重试：直接重放首次状态码、响应体与审计事件（同一
+  `operation_id`，业务不执行第二次）。同键不同绑定：`409`（CLI `3`），错误
+  体给出已有 `operation_id`。绑定前的导入/恢复解密无副作用：口令错误 `400`
+  不占用该键。
+- 状态：`pending`/`succeeded`/`failed`/`conflict`/`timed_out`。成功为 `201`
+  succeeded；同租户冲突为 `409` conflict；`403/404/400` 与提供者/账本失败为
+  failed（保留原状态码）。并发同键仅一个执行，其余等待；等待超 5 秒返回
+  `503` timed_out（CLI `1`），等待方不写任何东西。
+- `operation_id` 即该变更审计事件的 `event_id`，因此每个终态至多一条事件，
+  HTTP 与 CLI 共用同一套记录，可跨入口用相同键重放或按 id 查询。
+- **崩溃一致性**：进程可在绑定、outbox 落盘、账本追加或清理任一步骤崩溃。
+  重启（或任一 CLI 入口）在 key/restore outbox 恢复之后，按同一
+  `operation_id` 判定：事件已入帐即已提交，据耐久事实重建原 `201`/`403`/
+  `404`/`409` 响应与审计投影并置终态（拒绝终态的状态码随事件持久化，严格
+  重放）；事件未入帐则置 failed(`500`)，半成品文件、提供者句柄与标记由
+  outbox/provision 恢复回滚。不重复记账（账本按 event_id 去重），不误判。
+- `GET /v1/operations/{operation_id}`：需单一操作者与单一租户来源；操作须
+  同时属于该租户与操作者，否则一律 `404`。`200` →
+  `{operation_id, tenant_id, status, http_status, response}`，pending 时后两
+  项为 null。CLI：`operation --tenant-id --operator --operation-id`。
+
+## 策略
+
+- `GET/PUT/DELETE /v1/policy`，租户由单一头或单一参数提供（PUT 也可由 body
+  的 `tenant_id` 提供，来源须一致）。GET → `{tenant_id, rules}`（无策略
+  `404`）；PUT body `{tenant_id, rules}` 整体替换；DELETE 幂等，→
+  `{tenant_id, deleted:true}`。
+- 规则元素 `{subject, actions, effect}`：`subject` 为区分大小写的非空字符串；
+  `actions` 为非空数组，取值
+  `create/read/rotate/revoke/import/export/audit`，单条内重复去重；`effect`
+  为 `allow`/`deny`；未知字段、类型错误、同 subject+effect+无序动作集的重复
+  规则均 `400`；`rules:[]` 合法（全拒绝）。
+- 执行：管理动作 policy_* 免检；租户无策略时全部允许；有策略时匹配规则中
+  deny 优先于 allow，无匹配则拒绝 → `403`，并记一条原动作名、
+  `outcome=rejected`、携带当时已知 `key_id` 的事件（create/解密前的 import/
+  audit 查询为 null）。参数校验先于授权，授权先于存在性判断。
+
+## 审计
+
+- 事件字段 `{event_id, tenant_id, action, key_id, outcome, timestamp}`；
+  `action` 为 `create/read/rotate/revoke/import/export/audit/tenant_conflict/
+  policy_read/policy_update/policy_delete`，`outcome` 为 `success/rejected`。
+  备份记 `export`、恢复记 `import`，两者 `key_id` 均为 null；恢复的所有事件
+  （含成功）`key_id` 为 null。
+- `GET /v1/audit`：单一租户来源；可选 `key_id`(UUID4)、`action`、
+  `limit`(1–1000，默认 100)、`cursor`。→ `{events, next_cursor}`，按
+  (timestamp, event_id) 升序；游标为 HMAC 签名令牌，绑定租户/筛选/快照，
+  被篡改或条件变化为 `400`。查询成功不记账，被策略拒绝才记一条
+  `audit/rejected`（key_id null）。
+- 账本为数据目录 `audit.log`（每行一个 JSON，只追加，进程内锁 +
+  `audit.log.lock` fcntl 串行并 fsync，seq 单调）。变更走 outbox 事务：密钥
+  /策略文件先携带待提交事件原子落盘 → 耐久追加账本（提交点）→ 清标记；账本
+  失败回滚文件并删除本次新建句柄，返回 `500`（CLI `1`）；崩溃后启动按标记/
+  event_id 幂等补记或回滚，不重不漏。恢复是多文件 outbox（标记带
+  `"_restore":true` 与写集清单），只追加一条 `import` 事件。
+
+## 命令行
+
+所有子命令除 `serve` 外都需 `--operator`，租户命令需 `--tenant-id`；输出为
+单行 JSON，字段与对应 HTTP 响应一致。
+
+```bash
+# 密钥
+python -m keymgr gen      --tenant-id t --algorithm RSA2048 --label k --operator alice
+python -m keymgr show     --tenant-id t --key-id <id> --operator alice
+python -m keymgr current  --tenant-id t --key-id <id> --operator alice
+python -m keymgr version  --tenant-id t --key-id <id> --version 1 --operator alice
+python -m keymgr rotate   --tenant-id t --key-id <id> --algorithm AES256 \
+                          --operator alice --idempotency-key rotate-0001
+python -m keymgr revoke   --tenant-id t --key-id <id> --reason r --operator alice
+python -m keymgr status   --tenant-id t --key-id <id> --operator alice
+# 导出/导入、备份/恢复
+python -m keymgr export   --tenant-id t --key-id <id> --passphrase pw --operator alice
+python -m keymgr import   --tenant-id t --passphrase pw --bundle <b> \
+                          --operator alice --idempotency-key import-0001
+python -m keymgr backup   --tenant-id t --passphrase pw --operator alice
+python -m keymgr restore  --tenant-id t --passphrase pw --bundle <b> \
+                          --operator alice --idempotency-key restore-0001
+# 审计 / 操作 / 策略
+python -m keymgr audit    --tenant-id t --action rotate --limit 100 --operator alice
+python -m keymgr operation --tenant-id t --operator alice --operation-id <id>
+python -m keymgr policy --operator admin set|show|delete --tenant-id t [--rules '<json>']
+```
+
+## KMS/HSM 提供者
+
+- 工厂返回对象须有非空 `provider_id`、`capabilities`
+  （algorithms 含 AES256/RSA2048；operations 含
+  generate/rotate/import_material/export_material/delete）及这五个方法。
+  generate/rotate/import_material → `{handle, public_key, encrypted_material}`；
+  export_material(handle) → `{public_key, encrypted_material}`；delete(handle)
+  幂等。模块缺失/工厂失败/契约不符/后端异常一律 `503`（CLI `1`），固定文案
+  "key management provider is unavailable"，绝不回退；导入材料不符算法（AES
+  非 32 字节、RSA 公私钥不匹配等）为 `400`，错误只指名字段。
+- 本地提供者用 `local.dek`(0600) 以 AES-256-GCM 包装材料，句柄与包装材料登
+  记在 `local-registry.json`(0600)；密钥文件每个版本只存
+  `{provider_id, handle, encrypted_material}` 三元组，导出包/备份包版本额外
+  带 `provider` 来源块，旧 `keymgr-export-v1` 包无来源块时按本地处理。
+- 轮换/导出/导入/恢复必须命中记录登记的 provider：记录属于未激活提供者，或
+  导入/恢复来源块与当前提供者不符，均 `503`，不静默切换。
+- 启动时安全扫描旧记录：仅当本地提供者活动时，把裸 `private_material`/空句
+  柄的旧版本校验并包装为本地对象，先包装后原子重写，失败保持原文件字节不
+  变（新建句柄随即释放，不影响启动）；配置了外部提供者时启动与普通读取既不
+  加载提供者也不改写旧记录（此类记录在导出/轮换时 `503`）。
+
+## 持久化与限制
+
+- 每个密钥为数据目录下 `<key_id>.json`（0600，fsync + 原子 rename），含
+  append-only `versions` 与 `current_version`；轮换在 per-key 进程内锁 +
+  `<key_id>.lock` fcntl 锁下读改写，并发不丢版本、不悬指针。
+- 导入/恢复在提供者调用前先建按 event_id 命名的 provision journal，每铸一个
+  句柄即耐久登记；提交后句柄归记录所有并删除 journal，未提交（冲突、提供者
+  故障、账本失败、崩溃）则幂等删除全部已铸句柄，不留孤儿后端对象。
+- 私钥与口令只存在于口令加密的包内或经提供者包装后的记录中；游标 HMAC 密钥
+  存于 `audit.secret`(0600)。材料不会出现在任何响应、审计投影或错误信息中。

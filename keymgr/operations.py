@@ -78,6 +78,22 @@ def is_valid_idempotency_key(value) -> bool:
     return True
 
 
+def state_for_http_status(http_status: int) -> str:
+    """Map a terminal response's HTTP status to its operation state.
+
+    201 is the only success; an explicit request conflict (409) is the
+    "conflict" state. Every other terminal refusal (400/403/404) or backend
+    failure (500/503) records as "failed". A crash-recovered operation whose
+    audit event is durable therefore lands in the same state the original
+    request would have, including a reconstructed rejection.
+    """
+    if http_status == 201:
+        return STATUS_SUCCEEDED
+    if http_status == 409:
+        return STATUS_CONFLICT
+    return STATUS_FAILED
+
+
 def normalize_body(body: Optional[dict]) -> str:
     """Canonical JSON form of a request body for binding comparison.
 
@@ -493,11 +509,15 @@ class OperationStore:
         Must run *after* the key-store and restore outbox recovery, so the
         ledger already reflects every half-committed mutation. For each
         pending operation: when its event reached the ledger the operation
-        committed -- ``resolve_committed(record, event)`` rebuilds
-        ``(http_status, response)`` from the now-durable state; otherwise it
-        never committed and is recorded as a 500 failure. The response
-        resolver is best effort: if it cannot rebuild the projection the
-        operation is still marked succeeded (the mutation did commit) with an
+        is durable -- ``resolve_committed(record, event)`` rebuilds
+        ``(http_status, response)`` from the now-durable state and the
+        operation is finished in :func:`state_for_http_status` (a successful
+        201, a 409 conflict, or a 403/404 failure whose rejection event is
+        the durable fact); otherwise it never committed and is recorded as a
+        500 failure (the outbox/provision recovery has already removed its
+        half-written files and minted handles). The response resolver is
+        best effort: if it cannot rebuild the projection the operation is
+        still marked succeeded (the mutation did commit) with an
         operation_id-only response rather than left pending forever.
         """
         try:
@@ -530,7 +550,12 @@ class OperationStore:
                         http_status, response = 201, {
                             "operation_id": record.operation_id
                         }
-                self.finish(record, STATUS_SUCCEEDED, http_status, response)
+                self.finish(
+                    record,
+                    state_for_http_status(http_status),
+                    http_status,
+                    response,
+                )
             else:
                 self.finish(
                     record,

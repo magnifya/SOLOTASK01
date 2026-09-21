@@ -269,6 +269,10 @@ class KeyStore:
         # First finish/roll back interrupted single-key outbox transactions
         # (their resolution keeps the key's handles and drops the journal) ...
         self._recover_pending_events()
+        # ... then take over raw pre-provider records once, at startup, while
+        # the local provider is active (a plain file scan; an external
+        # module:factory provider is never imported or configured here) ...
+        self._migrate_legacy_records()
         # ... then delete handles provisioned by attempts that died before
         # their commit point (their audit event never reached the ledger and
         # no pending marker references it). Multi-file restore groups are
@@ -499,12 +503,65 @@ class KeyStore:
         for provider_id, handle in self.read_provision_journal(journal_id):
             self._delete_provisioned_handle(provider_id, handle)
 
-    def _take_over_legacy(self, record: KeyRecord) -> None:
-        """Lazily adopt raw pre-provider versions into the local provider.
+    def _migrate_legacy_records(self) -> None:
+        """Startup sweep adopting raw pre-provider records into local.
 
-        Only runs while the local provider is the active provider; a legacy
-        version touched while a module:factory provider is active is refused
-        by :meth:`_provider_for` instead (503) and nothing is rewritten. Every
+        Runs only while the built-in local provider is active. With a
+        module:factory provider configured the sweep does nothing: it never
+        imports that provider or rewrites a local-owned record (the record is
+        refused 503 by the owning-provider gates instead, with no fallback).
+        Only files that genuinely hold a raw legacy version are opened with
+        the provider, so a data directory of modern records creates no DEK or
+        registry and loads no provider on startup -- plain reads stay
+        provider-free.
+
+        Every candidate is adopted under its per-key locks: each raw version
+        is validated and wrapped by the local provider, then the file is
+        rewritten once atomically so the plaintext field disappears. A
+        validation or write failure leaves the original file byte-for-byte
+        intact (the just-minted handles are released) and never aborts
+        startup; the record can be retried by a later export/backup.
+        """
+        if not provider_mod.active_is_local():
+            return
+        try:
+            names = os.listdir(self.data_dir)
+        except OSError:
+            return
+        for name in names:
+            if not (name.endswith(".json") and is_valid_key_id(name[:-5])):
+                continue
+            key_id = name[:-5]
+            path = os.path.join(self.data_dir, name)
+            # One provider-free peek: only a record that actually carries a
+            # raw legacy version proceeds to wrapping.
+            record = self._read_record(path)
+            if record is None or not any(
+                ver.provider_id == LOCAL_PROVIDER_ID and not ver.handle
+                for ver in record.versions
+            ):
+                continue
+            try:
+                with self._key_lock(key_id), self._file_lock(key_id):
+                    # Re-read under the locks: another process may have
+                    # adopted the record since the unlocked directory scan.
+                    locked = self._read_record(path)
+                    if locked is None:
+                        continue
+                    self._take_over_legacy(locked)
+            except Exception:
+                # The original file is untouched and any minted handles were
+                # already released inside _take_over_legacy; skip this
+                # record rather than failing startup.
+                continue
+
+    def _take_over_legacy(self, record: KeyRecord) -> None:
+        """Adopt raw pre-provider versions into the local provider.
+
+        Callers hold the key's in-process and cross-process locks. Only runs
+        while the local provider is the active provider; a legacy version
+        touched while a module:factory provider is active is refused by
+        :meth:`_provider_for` instead (503) and nothing is rewritten. Every
         version is validated and wrapped *before* the file is rewritten once,
         atomically: if validation or the write fails the original file stays
         byte-for-byte intact and the handles just minted are released.
@@ -575,6 +632,7 @@ class KeyStore:
         key_id,
         action: str,
         outcome: str,
+        event_id: Optional[str] = None,
     ) -> None:
         """Record one attempt against a key.
 
@@ -582,6 +640,10 @@ class KeyStore:
         absent (create) or a legal UUID4, both identifiers are recorded and
         the event is visible to that tenant only. A missing/empty/illegal
         identifier collapses to an invisible tenant_conflict with null ids.
+
+        ``event_id`` names the event explicitly: an idempotent mutation's
+        terminal rejection uses its operation_id, so the failure event is
+        stable across a crash and replays instead of being written twice.
         """
         if (
             isinstance(tenant_id, str)
@@ -597,7 +659,9 @@ class KeyStore:
                 audit_mod.ACTION_AUDIT,
             )
         ):
-            event = self.audit.new_event(tenant_id, action, key_id, outcome)
+            event = self.audit.new_event(
+                tenant_id, action, key_id, outcome, event_id=event_id
+            )
         else:
             event = self.audit.new_event(
                 None,
@@ -922,29 +986,58 @@ class KeyStore:
             # migrated.
             provider = self._provider_for(record.current.provider_id)
             previous = record.to_json()
+            # Mint the committing event and its provision journal *before*
+            # the provider call: a crash after the backend mints the new
+            # version's handle but before the commit point is reaped at the
+            # next open exactly like an import (event absent -> handle
+            # deleted, key file left at its prior version).
             next_number = record.current_version + 1
             created_at = datetime.now(timezone.utc).isoformat()
-            triple = provider.rotate(algorithm)
-            record.append_version(
-                VersionRecord(
-                    version=next_number,
-                    created_at=created_at,
-                    algorithm=algorithm,
-                    public_key=triple.public_key,
-                    provider_id=provider.provider_id,
-                    handle=triple.handle,
-                    encrypted_material=triple.encrypted_material,
-                )
-            )
             event = self.audit.new_event(
                 tenant_id, audit_mod.ACTION_ROTATE, key_id,
                 audit_mod.OUTCOME_SUCCESS, timestamp=created_at,
                 event_id=event_id,
             )
-            self._commit_mutation(
-                path, record, event, previous,
-                provider=provider, new_handles=(triple.handle,),
+            journal_id, journal_path = self._new_provision_journal(
+                event.event_id
             )
+            try:
+                triple = provider.rotate(algorithm)
+                self._append_provision(
+                    journal_path, provider.provider_id, triple.handle
+                )
+                record.append_version(
+                    VersionRecord(
+                        version=next_number,
+                        created_at=created_at,
+                        algorithm=algorithm,
+                        public_key=triple.public_key,
+                        provider_id=provider.provider_id,
+                        handle=triple.handle,
+                        encrypted_material=triple.encrypted_material,
+                    )
+                )
+                try:
+                    self._commit_mutation(
+                        path, record, event, previous,
+                        provider=provider, new_handles=(triple.handle,),
+                        journal_id=journal_id,
+                    )
+                except BaseException:
+                    # Ledger/write failure: the file was already rolled back
+                    # inside _commit_mutation; make sure the backend object is
+                    # gone as well (the journal is the crash safety net).
+                    try:
+                        provider.delete(triple.handle)
+                    except Exception:
+                        pass
+                    raise
+            except BaseException:
+                self.drop_provision_journal(journal_id)
+                raise
+            # Committed: the new handle is owned by the appended version and
+            # the durable event makes the journal obsolete.
+            self.drop_provision_journal(journal_id)
         return record
 
     def revoke(

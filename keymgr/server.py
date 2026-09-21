@@ -1,6 +1,8 @@
 """HTTP service exposing the key and audit APIs."""
 
+import hashlib
 import json
+import os
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -159,11 +161,31 @@ def make_handler(
             # "conflict" state. Every other terminal refusal (400/403/404) or
             # backend failure (500/503) records as "failed"; a lock-wait
             # timeout is recorded separately as "timed_out".
-            if http_status == 201:
-                return operations_mod.STATUS_SUCCEEDED
-            if http_status == 409:
-                return operations_mod.STATUS_CONFLICT
-            return operations_mod.STATUS_FAILED
+            return operations_mod.state_for_http_status(http_status)
+
+        def _idempotent_rejection(
+            self, operation, tenant_id, key_id, action, http_status, message
+        ):
+            """Write the single terminal rejection event of a bound op.
+
+            The terminal status is first merged into the persisted operation
+            details and then the rejection event is appended named after the
+            operation_id, so on a crash between the two: if the event is not
+            durable the op is recovered as an uncommitted failure (nothing was
+            written to roll back), and once it is durable startup recovery
+            replays this exact 403/404/409 instead of guessing it from the
+            current policy or store state. The ledger dedupes on event_id, so
+            a retry never writes the event twice. Returns
+            ``(http_status, body)`` for the idempotent guard.
+            """
+            details = dict(operation.details or {})
+            details["terminal"] = http_status
+            operation_store.update_details(operation, details)
+            store.audit_attempt(
+                tenant_id, key_id, action, audit_mod.OUTCOME_REJECTED,
+                event_id=operation.operation_id,
+            )
+            return http_status, {"error": message}
 
         def _timed_out_body(self, operation_id: str) -> dict:
             return {
@@ -302,33 +324,37 @@ def make_handler(
             return False
 
         # -- parsing helpers ---------------------------------------------
-        def _read_json_object(self):
+        def _read_json_object(self, audit: bool = True):
             """Return the request body as a dict, or None after responding.
 
-            A body that cannot be parsed carries no usable tenant, so an
-            invisible tenant_conflict is written before the 400; if that
-            ledger write fails the 400 is skipped and a 500 is sent instead.
+            A body that cannot be parsed carries no usable tenant. By default
+            an invisible tenant_conflict is written before the 400 (and a
+            ledger failure turns the answer into 500). The idempotent
+            mutation endpoints pass ``audit=False``: an Idempotency-Key has
+            already been validated on them, but no operation is bound yet, so
+            a parse/parameter failure must leave no audit event, operation
+            record, key or provider handle behind.
             """
             try:
                 length = int(self.headers.get("Content-Length", 0))
             except ValueError:
-                if self._record_conflict():
+                if not audit or self._record_conflict():
                     self._bad_request("invalid Content-Length")
                 return None
             raw = self.rfile.read(length) if length > 0 else b""
             try:
                 payload = json.loads(raw.decode("utf-8"))
             except (ValueError, UnicodeDecodeError):
-                if self._record_conflict():
+                if not audit or self._record_conflict():
                     self._bad_request("request body must be valid JSON")
                 return None
             if not isinstance(payload, dict):
-                if self._record_conflict():
+                if not audit or self._record_conflict():
                     self._bad_request("request body must be a JSON object")
                 return None
             return payload
 
-        def _tenant(self, parts, body=_MISSING):
+        def _tenant(self, parts, body=_MISSING, audit: bool = True):
             """Resolve tenant from X-Tenant-Id / query / JSON body.
 
             Returns the tenant id, or None after sending 400. A duplicated
@@ -336,10 +362,12 @@ def make_handler(
             400 naming tenant_id, as is any disagreement between the sources;
             several sources carrying the *same* value are accepted. Every
             failure is written to the ledger as an invisible tenant_conflict
-            event.
+            event, except on the idempotent endpoints before their key is
+            bound (``audit=False``): such a parameter failure must leave no
+            audit event behind.
             """
             def fail(message: str) -> None:
-                if self._record_conflict():
+                if not audit or self._record_conflict():
                     self._bad_request(message)
 
             headers = self.headers.get_all("X-Tenant-Id") or []
@@ -430,18 +458,19 @@ def make_handler(
                 return None
             return int(raw)
 
-        def _bad_key_id(self, key_id) -> bool:
+        def _bad_key_id(self, key_id, audit: bool = True) -> bool:
             """Reject a malformed key_id as a 400 naming the field.
 
             Only a strict RFC 4122 UUID4 passes; anything else is a parameter
-            error (never a 404, so an invalid id cannot probe existence). The
-            rejection is recorded as an invisible tenant_conflict event.
+            error (never a 404, so an invalid id cannot probe existence). By
+            default the rejection is recorded as an invisible
+            tenant_conflict event; the idempotent endpoints pass ``audit=False``
+            before their key is bound so the 400 has no side effect.
             """
             if is_valid_key_id(key_id):
                 return False
-            if not self._record_conflict():
-                return True
-            self._bad_request("field key_id must be a UUID4")
+            if not audit or self._record_conflict():
+                self._bad_request("field key_id must be a UUID4")
             return True
 
         # -- POST ---------------------------------------------------------
@@ -546,41 +575,32 @@ def make_handler(
             self._send_json(201, record.to_create_response())
 
         def _rotate_key(self, key_id: str, parts, operator: str) -> None:
-            payload = self._read_json_object()
-            if payload is None:
-                return
-            # Validate the Idempotency-Key before any tenant resolution or
-            # audit write, so an invalid header is a side-effect-free 400.
+            # Validate the Idempotency-Key before reading or parsing the body
+            # (and before any tenant resolution, audit write or provider
+            # call): a missing/duplicate/illegal header is a side-effect-free
+            # 400, and so is every later parse/parameter failure on this
+            # endpoint until the key is actually bound.
             idem_key = self._idempotency_key()
             if idem_key is None:
+                return
+            payload = self._read_json_object(audit=False)
+            if payload is None:
                 return
             body_tenant = payload.get("tenant_id")
             if not isinstance(body_tenant, str) or not body_tenant:
                 # The body must itself carry a non-empty tenant_id.
-                if not self._record_conflict():
-                    return
                 self._bad_request("field tenant_id must be a non-empty string")
                 return
-            tenant_id = self._tenant(parts, payload)
+            tenant_id = self._tenant(parts, payload, audit=False)
             if tenant_id is None:
                 return
-            if self._bad_key_id(key_id):
+            if self._bad_key_id(key_id, audit=False):
                 return
             if not isinstance(payload.get("algorithm"), str):
-                if not self._record_attempt(
-                    tenant_id, key_id, audit_mod.ACTION_ROTATE,
-                    audit_mod.OUTCOME_REJECTED,
-                ):
-                    return
                 self._bad_request("missing required field: algorithm")
                 return
             algorithm = payload["algorithm"]
             if algorithm not in SUPPORTED_ALGORITHMS:
-                if not self._record_attempt(
-                    tenant_id, key_id, audit_mod.ACTION_ROTATE,
-                    audit_mod.OUTCOME_REJECTED,
-                ):
-                    return
                 self._bad_request(
                     "unsupported value for field algorithm: %r (supported: %s)"
                     % (algorithm, ", ".join(SUPPORTED_ALGORITHMS))
@@ -589,15 +609,16 @@ def make_handler(
 
             def execute(operation):
                 # Authorization follows validation and precedes existence; a
-                # denial records a rejected rotate event and returns 403.
+                # denial is a bound terminal 403 whose single rejection event
+                # is named after the operation_id.
                 if not policy_store.is_allowed(
                     tenant_id, audit_mod.ACTION_ROTATE, operator
                 ):
-                    store.audit_attempt(
-                        tenant_id, key_id, audit_mod.ACTION_ROTATE,
-                        audit_mod.OUTCOME_REJECTED,
+                    return self._idempotent_rejection(
+                        operation, tenant_id, key_id,
+                        audit_mod.ACTION_ROTATE, 403,
+                        "action not permitted by policy",
                     )
-                    return 403, {"error": "action not permitted by policy"}
                 operation_store.update_details(
                     operation,
                     {"kind": "rotate", "key_id": key_id,
@@ -609,11 +630,10 @@ def make_handler(
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                 )
                 if record is None:
-                    store.audit_attempt(
-                        tenant_id, key_id, audit_mod.ACTION_ROTATE,
-                        audit_mod.OUTCOME_REJECTED,
+                    return self._idempotent_rejection(
+                        operation, tenant_id, key_id,
+                        audit_mod.ACTION_ROTATE, 404, "key not found",
                     )
-                    return 404, {"error": "key not found"}
                 # The success event committed in the same outbox transaction.
                 return 201, record.to_rotate_response()
 
@@ -730,47 +750,38 @@ def make_handler(
         def _import_key(self, parts, operator: str) -> None:
             """POST /v1/keys/import.
 
-            Decryption/tamper/format errors are 400s naming passphrase or
-            bundle and never touch disk. A key_id the tenant already owns is
-            a 409 that leaves the original record untouched; the same key_id
-            owned by another tenant answers 404 so existence never leaks
-            across tenants.
+            The Idempotency-Key is checked before the body is even read.
+            Every subsequent parse/decrypt/parameter failure is a
+            side-effect-free 400 (no audit event, no operation record, no
+            provider handle) and never consumes the key. Once the key is
+            bound, a policy denial / unknown key / conflict is a terminal
+            state whose single rejection event is named after the
+            operation_id. A key_id the tenant already owns is a 409 that
+            leaves the original record untouched; the same key_id owned by
+            another tenant answers 404 so existence never leaks across
+            tenants.
             """
-            payload = self._read_json_object()
-            if payload is None:
-                return
-            # Validate the Idempotency-Key first: an invalid/missing header is
-            # a side-effect-free 400 (no audit event, no provider call).
             idem_key = self._idempotency_key()
             if idem_key is None:
                 return
+            payload = self._read_json_object(audit=False)
+            if payload is None:
+                return
             body_tenant = payload.get("tenant_id")
             if not isinstance(body_tenant, str) or not body_tenant:
-                if not self._record_conflict():
-                    return
                 self._bad_request("field tenant_id must be a non-empty string")
                 return
-            tenant_id = self._tenant(parts, payload)
+            tenant_id = self._tenant(parts, payload, audit=False)
             if tenant_id is None:
                 return
             passphrase = payload.get("passphrase")
             if not isinstance(passphrase, str) or not passphrase:
-                if not self._record_attempt(
-                    tenant_id, None, audit_mod.ACTION_IMPORT,
-                    audit_mod.OUTCOME_REJECTED,
-                ):
-                    return
                 self._bad_request(
                     "field passphrase must be a non-empty string"
                 )
                 return
             bundle = payload.get("bundle")
             if not isinstance(bundle, str) or not bundle:
-                if not self._record_attempt(
-                    tenant_id, None, audit_mod.ACTION_IMPORT,
-                    audit_mod.OUTCOME_REJECTED,
-                ):
-                    return
                 self._bad_request("field bundle must be a non-empty string")
                 return
             # An already-bound key replays/conflicts before we decrypt, so a
@@ -782,42 +793,32 @@ def make_handler(
                 return
             # Decrypting/authenticating the bundle is side-effect free, so it
             # stays outside the idempotent binding: a wrong passphrase or a
-            # tampered bundle is a plain 400 and never consumes the key.
+            # tampered bundle is a plain 400 with no audit event and never
+            # consumes the key.
             try:
                 decoded = keybundle.decode_bundle(bundle, passphrase)
-            except keybundle.WrongPassphrase as exc:
-                if not self._record_attempt(
-                    tenant_id, None, audit_mod.ACTION_IMPORT,
-                    audit_mod.OUTCOME_REJECTED,
-                ):
-                    return
-                self._bad_request(str(exc))
-                return
-            except keybundle.InvalidBundle as exc:
-                if not self._record_attempt(
-                    tenant_id, None, audit_mod.ACTION_IMPORT,
-                    audit_mod.OUTCOME_REJECTED,
-                ):
-                    return
+            except keybundle.BundleError as exc:
                 self._bad_request(str(exc))
                 return
 
             def execute(operation):
-                # Authorization precedes the conflict check: a denial is 403
-                # even when the key_id already exists for another tenant.
+                key_id = decoded["key_id"]
+                # Authorization precedes the conflict check: a denial is a
+                # bound terminal 403 even when the key_id already exists for
+                # another tenant.
                 if not policy_store.is_allowed(
                     tenant_id, audit_mod.ACTION_IMPORT, operator
                 ):
-                    store.audit_attempt(
-                        tenant_id, decoded["key_id"],
-                        audit_mod.ACTION_IMPORT, audit_mod.OUTCOME_REJECTED,
+                    return self._idempotent_rejection(
+                        operation, tenant_id, key_id,
+                        audit_mod.ACTION_IMPORT, 403,
+                        "action not permitted by policy",
                     )
-                    return 403, {"error": "action not permitted by policy"}
                 # ProviderInvalidMaterial propagates to the guard (400). The
                 # existence check and the create are atomic in the store.
                 operation_store.update_details(
                     operation,
-                    {"kind": "import", "key_id": decoded["key_id"]},
+                    {"kind": "import", "key_id": key_id},
                 )
                 status, record = store.import_bundle(
                     tenant_id, decoded,
@@ -825,18 +826,18 @@ def make_handler(
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                 )
                 if status == IMPORT_CONFLICT:
-                    store.audit_attempt(
-                        tenant_id, record.key_id, audit_mod.ACTION_IMPORT,
-                        audit_mod.OUTCOME_REJECTED,
-                    )
                     if record.tenant_id == tenant_id:
-                        return (
-                            409,
-                            {"error": "key_id already exists for this tenant"},
+                        return self._idempotent_rejection(
+                            operation, tenant_id, record.key_id,
+                            audit_mod.ACTION_IMPORT, 409,
+                            "key_id already exists for this tenant",
                         )
                     # Same answer as a missing key: never confirm another
                     # tenant owns this key_id.
-                    return 404, {"error": "key not found"}
+                    return self._idempotent_rejection(
+                        operation, tenant_id, record.key_id,
+                        audit_mod.ACTION_IMPORT, 404, "key not found",
+                    )
                 # The success event committed in the same transaction as file.
                 return 201, record.to_create_response()
 
@@ -899,48 +900,37 @@ def make_handler(
         def _restore_tenant(self, parts, operator: str) -> None:
             """POST /v1/restore.
 
-            Decryption/tamper/format errors are 400s naming passphrase or
-            bundle and never touch disk. Authorization (import) follows
-            validation and precedes the in-bundle tenant check: a bundle
-            naming another tenant answers 404. A key_id or policy already
-            present for this tenant is a 409 that changes nothing; an id
-            occupied by another tenant answers 404. Every audit event for a
-            restore carries key_id null.
+            The Idempotency-Key is checked before the body is read. Parse,
+            parameter and decryption failures are side-effect-free 400s (no
+            audit event, no operation record, no provider handle) and never
+            consume the key. After the key is bound, authorization (import)
+            precedes the in-bundle tenant check: a bundle naming another
+            tenant answers 404. A key_id or policy already present for this
+            tenant is a terminal 409 that changes nothing; an id occupied by
+            another tenant answers 404. Every audit event for a restore
+            carries key_id null and is named after the operation_id.
             """
-            payload = self._read_json_object()
-            if payload is None:
-                return
-            # Validate the Idempotency-Key first: a side-effect-free 400.
             idem_key = self._idempotency_key()
             if idem_key is None:
                 return
+            payload = self._read_json_object(audit=False)
+            if payload is None:
+                return
             body_tenant = payload.get("tenant_id")
             if not isinstance(body_tenant, str) or not body_tenant:
-                if not self._record_conflict():
-                    return
                 self._bad_request("field tenant_id must be a non-empty string")
                 return
-            tenant_id = self._tenant(parts, payload)
+            tenant_id = self._tenant(parts, payload, audit=False)
             if tenant_id is None:
                 return
             passphrase = payload.get("passphrase")
             if not isinstance(passphrase, str) or not passphrase:
-                if not self._record_attempt(
-                    tenant_id, None, audit_mod.ACTION_IMPORT,
-                    audit_mod.OUTCOME_REJECTED,
-                ):
-                    return
                 self._bad_request(
                     "field passphrase must be a non-empty string"
                 )
                 return
             bundle = payload.get("bundle")
             if not isinstance(bundle, str) or not bundle:
-                if not self._record_attempt(
-                    tenant_id, None, audit_mod.ACTION_IMPORT,
-                    audit_mod.OUTCOME_REJECTED,
-                ):
-                    return
                 self._bad_request("field bundle must be a non-empty string")
                 return
             # An already-bound key replays/conflicts before we decrypt, so a
@@ -950,15 +940,11 @@ def make_handler(
             ):
                 return
             # Decrypting/authenticating the bundle is side-effect free, so it
-            # stays outside the idempotent binding.
+            # stays outside the idempotent binding; a failure is a 400 with no
+            # audit event and never consumes the key.
             try:
                 decoded = tenantbundle.decode_bundle(bundle, passphrase)
             except tenantbundle.TenantBundleError as exc:
-                if not self._record_attempt(
-                    tenant_id, None, audit_mod.ACTION_IMPORT,
-                    audit_mod.OUTCOME_REJECTED,
-                ):
-                    return
                 self._bad_request(str(exc))
                 return
 
@@ -967,19 +953,19 @@ def make_handler(
                 if not policy_store.is_allowed(
                     tenant_id, audit_mod.ACTION_IMPORT, operator
                 ):
-                    store.audit_attempt(
-                        tenant_id, None, audit_mod.ACTION_IMPORT,
-                        audit_mod.OUTCOME_REJECTED,
+                    return self._idempotent_rejection(
+                        operation, tenant_id, None,
+                        audit_mod.ACTION_IMPORT, 403,
+                        "action not permitted by policy",
                     )
-                    return 403, {"error": "action not permitted by policy"}
                 if decoded["tenant_id"] != tenant_id:
                     # The sealed bundle belongs to another tenant: answer like
                     # a missing object so existence never leaks.
-                    store.audit_attempt(
-                        tenant_id, None, audit_mod.ACTION_IMPORT,
-                        audit_mod.OUTCOME_REJECTED,
+                    return self._idempotent_rejection(
+                        operation, tenant_id, None,
+                        audit_mod.ACTION_IMPORT, 404,
+                        "tenant backup not found",
                     )
-                    return 404, {"error": "tenant backup not found"}
                 # ProviderInvalidMaterial (400) and LedgerError (500)
                 # propagate to the guard; the coordinator has already removed
                 # every written file on a ledger failure.
@@ -1008,16 +994,17 @@ def make_handler(
                             "policy_restored": result.policy_restored,
                         },
                     )
-                store.audit_attempt(
-                    tenant_id, None, audit_mod.ACTION_IMPORT,
-                    audit_mod.OUTCOME_REJECTED,
-                )
                 if result.status == restore_mod.RESTORE_SAME_TENANT_CONFLICT:
-                    return (
-                        409,
-                        {"error": "backup target already contains this data"},
+                    return self._idempotent_rejection(
+                        operation, tenant_id, None,
+                        audit_mod.ACTION_IMPORT, 409,
+                        "backup target already contains this data",
                     )
-                return 404, {"error": "tenant backup not found"}
+                return self._idempotent_rejection(
+                    operation, tenant_id, None,
+                    audit_mod.ACTION_IMPORT, 404,
+                    "tenant backup not found",
+                )
 
             self._idempotent_guard(
                 parts.path, tenant_id, operator, payload, idem_key, execute
@@ -1425,18 +1412,85 @@ def make_handler(
     return KeyHandler
 
 
-def _resolve_committed_operation(store, record, event):
-    """Rebuild the 201 response of a committed-but-unfinished operation.
+def _resolve_committed_operation(store, policy_store, record, event):
+    """Rebuild the terminal response of a committed-but-unfinished operation.
 
     Runs during startup recovery after the key/restore outbox recovery has
-    made the mutation durable. The audit event's timestamp/key_id and the
-    operation's stashed ``details`` identify what was created. Returns
+    made the mutation durable. The audit event named after the operation_id
+    is the durable fact: a ``success`` event rebuilds the original 201
+    response, while a ``rejected`` event rebuilds the exact 403/404/409
+    terminal (its state, error body and audit projection) from the recorded
+    action/key_id and the current tenant state. Returns
     ``(http_status, response)``.
     """
     op_id = record.operation_id
     details = record.details or {}
     kind = details.get("kind")
     tenant_id = record.tenant_id
+    operator_id = record.operator_id
+
+    def error(status: int, message: str):
+        return status, {"error": message, "operation_id": op_id}
+
+    if event.outcome == audit_mod.OUTCOME_REJECTED:
+        action = event.action
+        terminal = details.get("terminal")
+
+        def message_for(status: int) -> str:
+            if status == 403:
+                return "action not permitted by policy"
+            if status == 409:
+                if kind == "restore":
+                    return "backup target already contains this data"
+                return "key_id already exists for this tenant"
+            if kind == "restore":
+                return "tenant backup not found"
+            return "key not found"
+
+        # The original terminal status is persisted with the event: replay it
+        # verbatim, so a policy change or a state change after the crash can
+        # never turn a 403 into a 404/409 or vice versa.
+        if terminal in (403, 404, 409):
+            return error(terminal, message_for(terminal))
+
+        # Older records without the stashed terminal: infer once from the
+        # durable action and the current state.
+        # A policy denial outranks existence: it is reconstructed whenever the
+        # tenant's policy currently rejects this operator/action.
+        if not policy_store.is_allowed(tenant_id, action, operator_id):
+            return error(403, message_for(403))
+        if kind == "restore":
+            # A same-tenant conflict is reconstructed when any key from the
+            # write set now belongs to the tenant, a restored policy exists,
+            # or (empty bundle) the persistent empty-restore marker is on
+            # disk. Every other rejection (in-bundle tenant mismatch, foreign
+            # occupation) replays as 404. Restore events always carry
+            # key_id null.
+            for key_id in details.get("key_ids", []):
+                raw = store.read_raw(key_id)
+                if raw is not None and raw.tenant_id == tenant_id:
+                    return error(409, message_for(409))
+            if details.get("policy_restored") and policy_store.get(
+                tenant_id
+            ) is not None:
+                return error(409, message_for(409))
+            digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()
+            marker = os.path.join(
+                store.data_dir, "restore-empty-" + digest + ".json"
+            )
+            if os.path.exists(marker):
+                return error(409, message_for(409))
+            return error(404, message_for(404))
+        if kind == "import":
+            key_id = event.key_id or details.get("key_id")
+            raw = store.read_raw(key_id) if is_valid_key_id(key_id) else None
+            if raw is not None and raw.tenant_id == tenant_id:
+                return error(409, message_for(409))
+            return error(404, message_for(404))
+        # rotate (and any unknown shape): a rejected rotate means the key was
+        # unknown or foreign at commit time and no version was appended.
+        return error(404, message_for(404))
+
     if kind == "rotate":
         key_id = event.key_id or details.get("key_id")
         key = store.get(key_id, tenant_id)
@@ -1494,7 +1548,7 @@ def serve(host: str, port: int, data_dir: str) -> None:
     operation_store = OperationStore(data_dir, audit_log)
     operation_store.recover_pending(
         lambda record, event: _resolve_committed_operation(
-            store, record, event
+            store, policy_store, record, event
         )
     )
     httpd = ThreadingHTTPServer(
