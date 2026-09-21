@@ -269,6 +269,9 @@ class KeyStore:
         # First finish/roll back interrupted single-key outbox transactions
         # (their resolution keeps the key's handles and drops the journal) ...
         self._recover_pending_events()
+        # ... then adopt pre-provider records (raw private_material, empty
+        # handle) into the local provider at startup while it is active ...
+        self._migrate_legacy_records()
         # ... then delete handles provisioned by attempts that died before
         # their commit point (their audit event never reached the ledger and
         # no pending marker references it). Multi-file restore groups are
@@ -556,6 +559,61 @@ class KeyStore:
                 except Exception:
                     pass
             raise
+
+    def _migrate_legacy_records(self) -> None:
+        """At startup, adopt raw pre-provider records into the local provider.
+
+        Runs only while the built-in local provider is active; with an
+        external ``KEYMGR_PROVIDER`` configured this is a no-op that neither
+        imports that provider nor creates local state (a legacy record then
+        surfaces 503 if an operation needs its material, never silently
+        handled locally). Records are scanned first and the local provider is
+        configured only when at least one record actually has a raw version,
+        so opening the store for plain reads loads no provider at all. Each
+        record is validated/wrapped under its key locks in one atomic
+        rewrite; a failure leaves that file byte-for-byte intact (and releases
+        the handles the attempt minted) without stopping startup or touching
+        another record.
+        """
+        if not provider_mod.active_is_local():
+            return
+        candidates = []
+        try:
+            names = os.listdir(self.data_dir)
+        except OSError:
+            return
+        for name in names:
+            if not (name.endswith(".json") and is_valid_key_id(name[:-5])):
+                continue
+            path = os.path.join(self.data_dir, name)
+            record = self._read_record(path)
+            if record is None or record.pending_event:
+                # An in-flight outbox/restore marker belongs to its own
+                # recovery path; never rewrite that file from here.
+                continue
+            if any(
+                ver.provider_id == LOCAL_PROVIDER_ID and not ver.handle
+                for ver in record.versions
+            ):
+                candidates.append((record.key_id, path))
+        if not candidates:
+            # No legacy material: startup never touches local.dek, the
+            # registry or any provider.
+            return
+        for key_id, path in candidates:
+            try:
+                with self._key_lock(key_id), self._file_lock(key_id):
+                    # Re-read under the locks: another process may have
+                    # migrated the record while this one scanned.
+                    record = self._read_record(path)
+                    if record is None or record.pending_event:
+                        continue
+                    self._take_over_legacy(record)
+            except Exception:
+                # Validation/write failed: _take_over_legacy already kept the
+                # original file and released the handles it minted. Leave the
+                # record for a later open and continue with the rest.
+                continue
 
     # -- audit bookkeeping -------------------------------------------------
     def audit_conflict(self) -> None:

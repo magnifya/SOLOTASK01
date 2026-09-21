@@ -36,6 +36,8 @@ import time
 import uuid
 from typing import Callable, NamedTuple, Optional
 
+from .audit import OUTCOME_REJECTED
+
 try:  # fcntl is POSIX-only; idempotency still works without cross-process locks.
     import fcntl
 except ImportError:  # pragma: no cover - non-POSIX platforms
@@ -106,6 +108,61 @@ class BeginResult(NamedTuple):
     record: Optional["OperationRecord"]
 
 
+class MutationOutcome(NamedTuple):
+    """The terminal result an executor produces for one bound operation.
+
+    A mutation is either a committed change (``committed`` 201) or a refusal:
+    ``status`` is the HTTP status to replay (403/404/409), ``body`` is the
+    stored error/success body (without ``operation_id``; the guard adds it).
+    A refusal also records exactly one audit event, named after the
+    ``operation_id`` (so the rejection survives a crash and a retry replays
+    the identical terminal), described by ``audit_spec``:
+    ``(tenant_id, key_id, action)`` with ``outcome=rejected``. A committed
+    outcome's success event was already appended by the store's outbox
+    transaction, so ``audit_spec`` is None there.
+    """
+
+    status: int
+    body: dict
+    committed: bool = False
+    audit_spec: Optional[tuple] = None  # (tenant_id, key_id, action)
+
+
+def terminal_state(http_status: int) -> str:
+    """Map a terminal HTTP status to its persisted operation state."""
+    if http_status == 201:
+        return STATUS_SUCCEEDED
+    if http_status == 409:
+        return STATUS_CONFLICT
+    return STATUS_FAILED
+
+
+def error_body(http_status: int, operation_id: str) -> dict:
+    """The canonical error body for an idempotent mutation.
+
+    Error responses contain exactly ``error`` and ``operation_id`` -- never
+    handles, material or any other field.
+    """
+    if http_status == 503:
+        message = "key management provider is unavailable"
+    elif http_status == 403:
+        message = "action not permitted by policy"
+    elif http_status == 409:
+        message = "request conflicts with existing state"
+    elif http_status == 404:
+        message = "not found"
+    else:
+        message = "request failed"
+    return {"error": message, "operation_id": operation_id}
+
+
+def timed_out_body(operation_id: str) -> dict:
+    return {
+        "error": "operation timed out waiting for a lock",
+        "operation_id": operation_id,
+    }
+
+
 class OperationRecord:
     """One persisted idempotent operation."""
 
@@ -123,6 +180,7 @@ class OperationRecord:
         created_at: Optional[str] = None,
         updated_at: Optional[str] = None,
         details: Optional[dict] = None,
+        audit_spec: Optional[list] = None,
     ) -> None:
         self.operation_id = operation_id
         self.tenant_id = tenant_id
@@ -139,6 +197,10 @@ class OperationRecord:
         # crash-recovery resolver can rebuild the committed response without
         # the original request (e.g. a restore's write set).
         self.details = details
+        # The rejected-event projection [tenant_id, key_id, action] the
+        # terminal carries; persisted before the ledger append so a crash
+        # between the append and finish still replays the exact terminal.
+        self.audit_spec = audit_spec
 
     # The operation_id is the audit event_id of the mutation it wraps, so the
     # two subsystems resolve a crash by the same identifier.
@@ -160,6 +222,7 @@ class OperationRecord:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "details": self.details,
+            "audit_spec": self.audit_spec,
         }
 
     @classmethod
@@ -177,6 +240,7 @@ class OperationRecord:
             created_at=data.get("created_at"),
             updated_at=data.get("updated_at"),
             details=data.get("details"),
+            audit_spec=data.get("audit_spec"),
         )
 
     def is_terminal(self) -> bool:
@@ -461,6 +525,69 @@ class OperationStore:
         finally:
             self._unlocked(fd)
 
+    def finish_rejected(
+        self,
+        record: OperationRecord,
+        http_status: int,
+        response: dict,
+        audit_spec: tuple,
+    ) -> None:
+        """Record a refused terminal (403/404/409) with exactly one event.
+
+        The event is named after the ``operation_id`` (it is the mutation's
+        audit event), so every terminal -- a rejection included -- owns at
+        most one ledger line and a retry/another entry point replays the same
+        projection. The terminal description is persisted first; the rejected
+        event is then appended once (the ledger dedupes on event_id); only
+        then is the record marked terminal. A crash at any step is resolved by
+        :meth:`recover_pending` from the ledger plus the persisted
+        ``audit_spec``, never double-booked.
+
+        ``audit_spec`` is ``(tenant_id, key_id, action)``; ``key_id`` is null
+        for a restore. Raises LedgerError if the event cannot be committed
+        (the record stays pending and recovery retries the idempotent append).
+        """
+        from .audit import AuditEvent
+
+        tenant_id, key_id, action = audit_spec
+        record.audit_spec = [tenant_id, key_id, action]
+        record.http_status = http_status
+        record.response = response
+        # Persist the terminal intent before the ledger append: a crash here
+        # leaves a pending record whose audit_spec lets recovery finish it.
+        self._persist(record)
+        event = AuditEvent(
+            event_id=record.event_id,
+            tenant_id=tenant_id,
+            action=action,
+            key_id=key_id,
+            outcome=OUTCOME_REJECTED,
+            timestamp=record.created_at or "",
+        )
+        if not event.timestamp:
+            from datetime import datetime, timezone
+
+            event.timestamp = datetime.now(timezone.utc).isoformat()
+        # Idempotent on event_id; a recovery-driven retry cannot double-book.
+        self.audit.append(event)
+        try:
+            self.finish(
+                record, terminal_state(http_status), http_status, response
+            )
+        except OSError:
+            # The event committed but the terminal rewrite did not land; the
+            # pending record on disk already carries http_status/response/
+            # audit_spec, so recover_pending reaches this same terminal at the
+            # next open. The caller still answers the committed refusal.
+            record.status = terminal_state(http_status)
+
+    def _persist(self, record: OperationRecord) -> None:
+        fd = self._locked()
+        try:
+            self._write_record(record)
+        finally:
+            self._unlocked(fd)
+
     def get(
         self, operation_id: str, tenant_id: str, operator_id: str
     ) -> Optional[OperationRecord]:
@@ -492,13 +619,22 @@ class OperationStore:
 
         Must run *after* the key-store and restore outbox recovery, so the
         ledger already reflects every half-committed mutation. For each
-        pending operation: when its event reached the ledger the operation
-        committed -- ``resolve_committed(record, event)`` rebuilds
-        ``(http_status, response)`` from the now-durable state; otherwise it
-        never committed and is recorded as a 500 failure. The response
-        resolver is best effort: if it cannot rebuild the projection the
-        operation is still marked succeeded (the mutation did commit) with an
-        operation_id-only response rather than left pending forever.
+        pending operation the decision is made purely from whether its event
+        (named after the operation_id) reached the ledger:
+
+        * the event is absent -- the operation never committed; it is
+          recorded as a 500 failure (the outbox/provision recovery already
+          rolled back its files, handles and markers);
+        * the event is present with ``outcome=rejected`` -- the refusal did
+          commit; the persisted http status/body (403/404/409) is replayed
+          and the record reaches its original terminal, never re-booked;
+        * the event is present as a success -- ``resolve_committed(record,
+          event)`` rebuilds the ``201`` response from the now-durable state.
+
+        The response resolver is best effort: if it cannot rebuild the
+        projection the operation is still marked succeeded (the mutation did
+        commit) with an operation_id-only response rather than left pending
+        forever.
         """
         try:
             names = os.listdir(self.dir_path)
@@ -517,21 +653,7 @@ class OperationStore:
             except Exception:
                 # Cannot decide right now; leave it for a later open.
                 continue
-            if event is not None:
-                http_status, response = 201, {
-                    "operation_id": record.operation_id
-                }
-                if resolve_committed is not None:
-                    try:
-                        http_status, response = resolve_committed(
-                            record, event
-                        )
-                    except Exception:
-                        http_status, response = 201, {
-                            "operation_id": record.operation_id
-                        }
-                self.finish(record, STATUS_SUCCEEDED, http_status, response)
-            else:
+            if event is None:
                 self.finish(
                     record,
                     STATUS_FAILED,
@@ -539,3 +661,38 @@ class OperationStore:
                     {"error": "operation interrupted before commit",
                      "operation_id": record.operation_id},
                 )
+                continue
+            if event.outcome == OUTCOME_REJECTED:
+                # A refusal committed (policy denial / unknown or cross-tenant
+                # object / same-tenant conflict): replay the exact terminal
+                # finish_rejected persisted. A record without a usable status
+                # is un-rebuildable and stays honest as a 500 failure.
+                if record.http_status in (403, 404, 409) and record.response:
+                    self.finish(
+                        record,
+                        terminal_state(record.http_status),
+                        record.http_status,
+                        record.response,
+                    )
+                else:
+                    self.finish(
+                        record,
+                        STATUS_FAILED,
+                        500,
+                        {"error": "operation interrupted before commit",
+                         "operation_id": record.operation_id},
+                    )
+                continue
+            http_status, response = 201, {
+                "operation_id": record.operation_id
+            }
+            if resolve_committed is not None:
+                try:
+                    http_status, response = resolve_committed(
+                        record, event
+                    )
+                except Exception:
+                    http_status, response = 201, {
+                        "operation_id": record.operation_id
+                    }
+            self.finish(record, STATUS_SUCCEEDED, http_status, response)
