@@ -1204,6 +1204,10 @@ class KeyStore:
         marker = record.pending_event
         if not isinstance(marker, dict) or not marker:
             return record
+        if marker.get("_batch_rotate"):
+            # A multi-key batch marker is projected ONLY from its validated
+            # durable snapshot, never by trimming the in-memory image.
+            return self._committed_batch_record(record, marker)
         if self._marker_event_durable(marker):
             return record
         nested = marker.get("event")
@@ -1236,6 +1240,58 @@ class KeyStore:
             return record
         # create/import new files and any unrecognized marker shape: the
         # safe projection is "not here".
+        return None
+
+    def _committed_batch_record(
+        self, record: KeyRecord, marker: dict
+    ) -> Optional[KeyRecord]:
+        """Project a file carrying a ``_batch_rotate`` outbox marker.
+
+        A committed batch (its success event durable in the ledger) shows
+        the file as-is: the new versions are authoritative. An uncommitted
+        batch may ONLY be projected from the validated durable snapshot in
+        ``batch-rotations/<event_id>.json`` -- the filename, event_id,
+        tenant_id, complete unique key_ids and journal/snapshot references
+        must all agree and every ``previous_b64`` image must strictly
+        decode to a consistent KeyRecord. The record is hidden entirely
+        (None) when the marker is malformed, the action/tenant does not
+        match, the ledger cannot be read, or the snapshot is missing,
+        corrupt or mismatched: an uncommitted current is never exposed and
+        memory alone is never trusted.
+        """
+        event_desc = marker.get("event")
+        if not isinstance(event_desc, dict):
+            return None
+        if event_desc.get("action") != audit_mod.ACTION_BATCH_ROTATE:
+            return None
+        # The marker's tenant (flat and nested) must match the file's.
+        if marker.get("tenant_id") != record.tenant_id:
+            return None
+        if event_desc.get("tenant_id") != record.tenant_id:
+            return None
+        event_id = event_desc.get("event_id")
+        if not isinstance(event_id, str) or not event_id:
+            return None
+        try:
+            event = self.audit.get_event(event_id)
+        except LedgerError:
+            # The ledger cannot be read: hide the record rather than risk
+            # exposing an uncommitted current.
+            return None
+        if event is not None and event.outcome == audit_mod.OUTCOME_SUCCESS:
+            # Committed: the new versions are authoritative and shown.
+            return record
+        snapshot_id = marker.get("snapshot")
+        if not isinstance(snapshot_id, str) or not snapshot_id:
+            return None
+        entries = self._validated_batch_snapshot(
+            snapshot_id, self._read_batch_snapshot(snapshot_id), [marker]
+        )
+        if entries is None:
+            return None
+        for key_id, _previous_bytes, previous_record in entries:
+            if key_id == record.key_id:
+                return previous_record
         return None
 
     def _ensure_settled(self, record: KeyRecord) -> None:
@@ -1543,6 +1599,7 @@ class KeyStore:
                 event.event_id
             )
             snapshot_created = False
+            minted = []  # (provider, handle) pairs minted by this batch
             try:
                 self._write_batch_snapshot(
                     event.event_id, tenant_id, ordered_ids, previous_bytes
@@ -1556,7 +1613,6 @@ class KeyStore:
                     "journal": journal_id,
                     "snapshot": event.event_id,
                 }
-                minted = []  # (provider, handle) pairs minted by this batch
                 for key_id, algorithm in ordered:
                     record = records[key_id]
                     provider = self._provider_for(
@@ -1594,39 +1650,76 @@ class KeyStore:
                 self.audit.append(event)
             except BaseException as exc:
                 # Nothing committed: the durable success event never landed.
-                # First confirm every minted handle is gone (the in-memory
-                # pairs plus the durable journal, which is the crash-safe
-                # superset) WITHOUT dropping the journal yet, then restore
-                # every key file to its exact pre-batch bytes (that rewrite
-                # also clears the pending marker). The provision journal, the
-                # batch snapshot and any surviving marker are removed only
-                # once the handle deletes AND the file restores have ALL been
-                # verified. A single failed delete or rewrite keeps the whole
-                # group and every retry basis for the next open; nothing is
-                # partially cleaned up.
+                if not snapshot_created:
+                    # The failure happened before the snapshot was durable,
+                    # so no handle was minted and no key file was touched
+                    # (both happen only after the snapshot lands). Only the
+                    # (possibly empty) journal may exist; drop it.
+                    self.drop_provision_journal(journal_id)
+                    raise
+                # Re-read and re-validate the durable snapshot instead of
+                # trusting this frame's memory: the filename, event_id,
+                # tenant_id, complete unique key_ids and journal/snapshot
+                # references must all agree, and every previous_b64 image
+                # must strictly decode to a consistent KeyRecord, before it
+                # may serve as the rollback write set.
+                entries = self._validated_batch_snapshot(
+                    event.event_id,
+                    self._read_batch_snapshot(event.event_id),
+                    [marker],
+                )
+                if entries is None:
+                    # The rollback basis cannot be trusted: keep the ENTIRE
+                    # scene (marked files, journal, snapshot) for startup
+                    # recovery rather than guessing at a rewrite.
+                    raise ProviderUnavailable(
+                        "could not validate the rollback snapshot of a "
+                        "failed batch rotation; the whole group and its "
+                        "snapshot/journal are retained for startup recovery"
+                    ) from exc
+                # Aggregate every new handle -- the in-memory pairs, the
+                # durable provision journal and the delta between the
+                # on-disk files and the validated snapshot images -- while
+                # the whole write set's locks are still held. A single
+                # unconfirmed delete means NO file is written back and NO
+                # artifact is cleared: the scene stays for a retry.
                 handles_cleaned = self._release_handles(minted)
-                if not self.release_journal_handles(journal_id):
+                files = {
+                    key_id: self._path_for(key_id) for key_id in ordered_ids
+                }
+                if not self._delete_batch_group_handles(
+                    journal_id, entries, files
+                ):
                     handles_cleaned = False
+                if not handles_cleaned:
+                    raise ProviderUnavailable(
+                        "could not delete every handle provisioned by a "
+                        "failed batch rotation; the whole group and its "
+                        "snapshot/journal are retained for startup recovery"
+                    ) from exc
+                # Every new handle is confirmed gone: restore the complete
+                # old write set byte-for-byte (which also clears the pending
+                # markers). Only when every write-back has landed may the
+                # journal and snapshot be dropped.
                 files_restored = True
-                for key_id in ordered_ids:
+                for key_id, previous, _previous_record in entries:
                     try:
                         self._write_bytes_atomic(
-                            self._path_for(key_id), previous_bytes[key_id]
+                            self._path_for(key_id), previous
                         )
                     except OSError:
-                        # The file may still carry the pending marker; startup
-                        # recovery restores it from the durable snapshot. Never
-                        # discard the rollback basis below.
+                        # The file may still carry the pending marker;
+                        # startup recovery restores it from the durable
+                        # snapshot. Never discard the rollback basis below.
                         files_restored = False
-                if not (handles_cleaned and files_restored):
+                if not files_restored:
                     raise ProviderUnavailable(
-                        "could not fully roll back a failed batch rotation; "
-                        "the whole group and its snapshot/journal are "
-                        "retained for startup recovery"
+                        "could not restore every key file of a failed batch "
+                        "rotation; the snapshot/journal are retained for "
+                        "startup recovery"
                     ) from exc
                 self.drop_provision_journal(journal_id)
-                if snapshot_created:
-                    self._discard_batch_snapshot(event.event_id)
+                self._discard_batch_snapshot(event.event_id)
                 raise
 
             # Phase 3: commit point passed. Clear markers as best-effort
