@@ -112,16 +112,30 @@ class RestoreCoordinator:
             # Re-read under the locks: a record listed above may have been
             # rotated or revoked since the unlocked directory scan.
             records = []
+            live_records = []
             for key_id in key_ids:
                 record = self.store.read_raw(key_id)
-                if record is not None and record.tenant_id == tenant_id:
-                    records.append(record)
+                if record is None or record.tenant_id != tenant_id:
+                    continue
+                # Never back up an uncommitted current: project the last
+                # committed state from the batch snapshot when the key is
+                # parked in an uncommitted batch-rotation window. A record
+                # with no trustworthy committed view is omitted rather than
+                # sealing not-yet-committed material.
+                view = self.store._committed_view(record)
+                if view is not None and view.tenant_id == tenant_id:
+                    records.append(view)
+                    # Legacy adoption rewrites the on-disk file; it may run
+                    # only on the live record, never on a reconstructed parked
+                    # view (which would mutate the retained recovery scene).
+                    if view is record:
+                        live_records.append(view)
             # Lazily take over any raw pre-provider versions here, under the
             # same key locks, so the backup is one committed view. This only
             # imports/wraps while the local provider is active; with an
             # external provider active a legacy version fails 503 and the
             # backup is refused without a fallback.
-            for record in records:
+            for record in live_records:
                 self.store.prepare_backup_record(record)
             rules = self.policy_store.get(tenant_id)
             return {
