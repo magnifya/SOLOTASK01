@@ -715,6 +715,13 @@ class KeyStore:
         """
         if not provider_mod.active_is_local():
             return
+        if isinstance(record.pending_event, dict) and record.pending_event:
+            # A read/backup must never rewrite a file whose transaction is
+            # unresolved (event not durable): the trimmed committed view is a
+            # projection only, and a rewrite would discard the recovery
+            # scene. Committed markers (event durable) are safe.
+            if not self._marker_event_durable(record.pending_event):
+                return
         local = provider_mod.configure_local(self.data_dir)
         adopted = []
         new_versions = []
@@ -1144,16 +1151,135 @@ class KeyStore:
             )
         return record
 
+    def _marker_event_durable(self, marker) -> bool:
+        """True when a pending marker's SUCCESS event reached the ledger.
+
+        Markers carry the event nested under ``"event"`` (the multi-file
+        shapes) or flat (single-key outbox). Only a durable ``success`` event
+        commits the file change: a durable ``rejected`` terminal with the same
+        id can coexist with a preserved (parked) scene when an in-request
+        rollback itself failed, and that state must still be treated as
+        uncommitted -- reads project the prior version and mutators wait for
+        crash recovery. An unreadable ledger is treated as not durable.
+        """
+        if not isinstance(marker, dict):
+            return False
+        nested = marker.get("event")
+        desc = nested if isinstance(nested, dict) else marker
+        event_id = desc.get("event_id") if isinstance(desc, dict) else None
+        if not isinstance(event_id, str) or not event_id:
+            return False
+        try:
+            event = self.audit.get_event(event_id)
+        except LedgerError:
+            return False
+        return (
+            event is not None
+            and event.outcome == audit_mod.OUTCOME_SUCCESS
+        )
+
+    def _committed_record(
+        self, record: KeyRecord
+    ) -> Optional[KeyRecord]:
+        """Project only the durable state of a file read from disk.
+
+        A key file can carry an outbox pending marker while a transaction is
+        in flight or because the process crashed before recovery settled it.
+        A marker whose event is already in the ledger is effectively
+        committed (only marker-clear housekeeping remains) and is shown. A
+        marker whose event is NOT durable hides its uncommitted change:
+
+        * a rotate/batch-rotate appends one new version: that trailing
+          version and the advanced ``current_version`` are stripped, so no
+          uncommitted current, handle or material is ever projected; if no
+          committed version remains the key is hidden entirely;
+        * create/import write a brand-new file and restore writes brand-new
+          key files: an uncommitted one is hidden entirely.
+
+        The ledger being unreadable is treated conservatively as
+        "not durable", so an outage can never expose an uncommitted current.
+        The passed object is freshly parsed from one file read and is local
+        to the caller, so mutating its view never touches disk.
+        """
+        marker = record.pending_event
+        if not isinstance(marker, dict) or not marker:
+            return record
+        if self._marker_event_durable(marker):
+            return record
+        nested = marker.get("event")
+        desc = nested if isinstance(nested, dict) else marker
+        if marker.get("_restore"):
+            # A restore only ever creates brand-new key files; an
+            # uncommitted one (rolled back, or parked pending recovery) must
+            # not become visible.
+            return None
+        action = desc.get("action") if isinstance(desc, dict) else None
+        if action in (
+            audit_mod.ACTION_ROTATE,
+            audit_mod.ACTION_BATCH_ROTATE,
+        ):
+            if len(record.versions) <= 1:
+                return None
+            record.versions = record.versions[:-1]
+            record.current_version = record.versions[-1].version
+            return record
+        if action == audit_mod.ACTION_REVOKE:
+            # A pending revoke marker is always a first-time active->revoked
+            # transition (an idempotent repeat revoke appends without a
+            # marker), and it adds no version: its pre-image is this same
+            # record while still active. Project that rather than hiding an
+            # existing key or showing uncommitted revocation state.
+            record.status = "active"
+            record.reason = None
+            record.operator = None
+            record.revoked_at = None
+            return record
+        # create/import new files and any unrecognized marker shape: the
+        # safe projection is "not here".
+        return None
+
+    def _ensure_settled(self, record: KeyRecord) -> None:
+        """Refuse a mutation while the file still owes crash recovery.
+
+        A pending outbox marker whose event is NOT durable means a previous
+        transaction on this file crashed and its scene is intentionally
+        preserved (e.g. a batch-rotation group waiting on a repaired
+        snapshot). Writing a new version or a revocation now would overwrite
+        the marker and the rollback basis and could interleave recovery with
+        a single-key rotate. Such a mutation is refused as a transient
+        backend condition (503) until a startup recovery settles the file; a
+        durable event behind the marker is just uncleared housekeeping and is
+        allowed.
+        """
+        marker = record.pending_event
+        if (
+            isinstance(marker, dict)
+            and marker
+            and not self._marker_event_durable(marker)
+        ):
+            raise ProviderUnavailable(
+                "key file is awaiting crash recovery"
+            )
+
     def get(self, key_id: str, tenant_id: str) -> Optional[KeyRecord]:
-        """Return the record only when it belongs to the tenant, else None."""
+        """Return the record's committed view only when it belongs to tenant.
+
+        Unknown key, foreign ownership and a file whose only content is an
+        uncommitted transaction all look the same (None), so existence never
+        leaks across tenants and an uncommitted current is never exposed. The
+        read runs under the key locks so it cannot observe a half-written
+        rotation.
+        """
         if not _KEY_ID_RE.fullmatch(key_id):
             return None
-        record = self._read_record(self._path_for(key_id))
-        if record is None or record.tenant_id != tenant_id:
-            # Same result whether the key is missing or owned by another
-            # tenant: never confirm the existence of another tenant's key.
-            return None
-        return record
+        path = self._path_for(key_id)
+        with self.key_locks(key_id):
+            record = self._read_record(path)
+            if record is None or record.tenant_id != tenant_id:
+                # Same result whether the key is missing or owned by another
+                # tenant: never confirm the existence of another tenant's key.
+                return None
+            return self._committed_record(record)
 
     def rotate(
         self,
@@ -1183,6 +1309,10 @@ class KeyStore:
             record = self._read_record(path)
             if record is None or record.tenant_id != tenant_id:
                 return None
+            # Never rotate a file that still owes crash recovery: that would
+            # overwrite its preserved marker/rollback basis and interleave a
+            # single-key rotate with batch recovery.
+            self._ensure_settled(record)
             # A version is rotated on the provider that owns the record;
             # switching providers mid-key is refused (503), never silently
             # migrated.
@@ -1390,6 +1520,10 @@ class KeyStore:
                     # Existence/ownership for the WHOLE batch is resolved
                     # before a journal, handle or file write exists.
                     return self.BATCH_NOT_FOUND, key_id
+                # A parked crash scene (unresolved, non-durable marker) makes
+                # the whole batch a transient 503 rather than overwriting the
+                # preserved retry basis.
+                self._ensure_settled(record)
                 records[key_id] = record
                 path = self._path_for(key_id)
                 # Capture the file's exact pre-batch bytes under the held
@@ -1532,6 +1666,11 @@ class KeyStore:
         journal independently, or they would delete handles while the marked
         files and snapshot still need an all-or-nothing rollback -- the
         durable retry basis would be discarded halfway.
+
+        A batch's provision journal is always named after its event id, so a
+        marker naming a different journal id is inconsistent (corrupt/tampered)
+        and defers nothing beyond the event id it carries: such a group parks
+        in batch recovery rather than stalling an unrelated journal.
         """
         owned = set()
         try:
@@ -1544,8 +1683,18 @@ class KeyStore:
             record = self._read_record(os.path.join(self.data_dir, name))
             marker = getattr(record, "pending_event", None)
             if isinstance(marker, dict) and marker.get("_batch_rotate"):
+                event_desc = marker.get("event")
+                eid = (
+                    event_desc.get("event_id")
+                    if isinstance(event_desc, dict)
+                    else None
+                )
                 journal_id = marker.get("journal")
-                if isinstance(journal_id, str) and journal_id:
+                if is_valid_key_id(eid):
+                    owned.add(eid)
+                if isinstance(journal_id, str) and is_valid_key_id(
+                    journal_id
+                ) and journal_id == eid:
                     owned.add(journal_id)
         # A snapshot is named after the event id, which is also its provision
         # journal id, so every surviving snapshot defers that journal.
@@ -1605,18 +1754,18 @@ class KeyStore:
                 if isinstance(event_desc, dict)
                 else None
             )
-            if not isinstance(eid, str) or not eid:
+            if not isinstance(eid, str) or not is_valid_key_id(eid):
                 # A marker whose event cannot be identified cannot be safely
                 # resolved either way; leave it (and its files) untouched.
                 continue
             group = marker_groups.get(eid)
             if group is None:
-                group = {
-                    "files": {},
-                    "journal": marker.get("journal"),
-                }
+                group = {"files": {}, "markers": []}
                 marker_groups[eid] = group
             group["files"][record.key_id] = path
+            # Keep the marker verbatim: the snapshot validation must confirm
+            # every residual marker agrees with it.
+            group["markers"].append(marker)
 
         # Presence matters separately from readability: a corrupt snapshot
         # file still defers its journal and parks its (marker-bearing) group.
@@ -1630,22 +1779,86 @@ class KeyStore:
                 snapshot_present=eid in snapshots,
             )
 
-    def _batch_snapshot_entries(self, snapshot, marker_keys) -> Optional[list]:
-        """Validate a batch snapshot's complete write set.
+    def _strict_previous_record(
+        self, key_id: str, tenant_id: str, data
+    ) -> Optional[KeyRecord]:
+        """Validate one snapshot image as a trusted pre-batch KeyRecord.
 
-        Returns ``[(key_id, previous_bytes, previous_dict), ...]`` in snapshot
-        order, or None when the snapshot is missing/corrupt/incomplete for the
-        marked group. ``previous_bytes`` are the exact whole-file bytes
-        restored on rollback; ``previous_dict`` is their parsed object used to
-        compute the handle delta. Current snapshots store the bytes base64
-        (``previous_b64``); older snapshots stored the parsed object
-        (``previous``) and are accepted for compatibility. Every file that
-        still carries the batch's marker MUST have a pre-batch image, or
-        restoring it would require guessing -- such a snapshot is unusable.
+        The decoded ``previous_b64`` bytes must form a KeyRecord whose
+        ``key_id`` and ``tenant_id`` match the snapshot entry, whose versions
+        are a non-empty, strictly contiguous 1..n sequence with sane fields,
+        whose ``current_version`` validly points at the last version, and
+        which carries no pending marker (a snapshot captures a committed
+        file, never a file mid-transaction). Anything less returns None so
+        the caller treats the snapshot as untrusted and parks the group
+        instead of guessing.
         """
-        if not isinstance(snapshot, dict):
+        from .crypto import SUPPORTED_ALGORITHMS
+
+        if not isinstance(data, dict):
             return None
-        raw_entries = snapshot.get("keys")
+        try:
+            record = KeyRecord.from_json(data)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if record.key_id != key_id or record.tenant_id != tenant_id:
+            return None
+        if record.pending_event:
+            return None
+        if not record.versions:
+            return None
+        for index, ver in enumerate(record.versions, start=1):
+            if ver.version != index:
+                return None
+            if not isinstance(ver.created_at, str) or not ver.created_at:
+                return None
+            if ver.algorithm not in SUPPORTED_ALGORITHMS:
+                return None
+            if not isinstance(ver.provider_id, str) or not ver.provider_id:
+                return None
+            if not isinstance(ver.handle, str):
+                return None
+        # current_version must be a valid pointer at the last version.
+        if record.current_version != len(record.versions):
+            return None
+        if record.get_version(record.current_version) is None:
+            return None
+        return record
+
+    def _validated_batch_snapshot(
+        self,
+        snapshot_id: str,
+        raw_snapshot,
+        markers,
+    ) -> Optional[list]:
+        """Cross-validate the snapshot filename, payload and residual markers.
+
+        Every durable reference of the attempt must agree before the snapshot
+        may serve as a rollback write set: the filename event id, the
+        payload's ``event_id``/``tenant_id``, the complete unique
+        ``key_ids`` set, and each surviving marker's event/journal/snapshot
+        references and key set. Every ``previous_b64`` value must decode
+        strictly (strict base64 -> UTF-8 JSON -> validated KeyRecord via
+        :meth:`_strict_previous_record`).
+
+        Returns the COMPLETE write set as
+        ``[(key_id, previous_bytes, KeyRecord), ...]`` sorted by key_id, or
+        None when the snapshot is absent/corrupt/semantically mismatched. A
+        partial marker set (some files already restored/finalized) still
+        validates: the snapshot -- never the surviving files -- defines the
+        full write set.
+        """
+        # The filename *is* the event id; it must be a canonical UUID4.
+        if not is_valid_key_id(snapshot_id):
+            return None
+        if not isinstance(raw_snapshot, dict):
+            return None
+        if raw_snapshot.get("event_id") != snapshot_id:
+            return None
+        tenant_id = raw_snapshot.get("tenant_id")
+        if not isinstance(tenant_id, str) or not tenant_id:
+            return None
+        raw_entries = raw_snapshot.get("keys")
         if not isinstance(raw_entries, list) or not raw_entries:
             return None
         entries = []
@@ -1656,45 +1869,141 @@ class KeyStore:
             key_id = entry.get("key_id")
             if not is_valid_key_id(key_id) or key_id in seen:
                 return None
-            if "previous_b64" in entry:
-                encoded = entry.get("previous_b64")
-                if not isinstance(encoded, str):
-                    return None
-                try:
-                    raw_bytes = base64.b64decode(encoded, validate=True)
-                    previous_dict = json.loads(raw_bytes.decode("utf-8"))
-                except (ValueError, UnicodeDecodeError):
-                    return None
-            else:
-                previous_dict = entry.get("previous")
-                if not isinstance(previous_dict, dict):
-                    return None
-                raw_bytes = json.dumps(previous_dict).encode("utf-8")
-            if not isinstance(previous_dict, dict):
+            # previous_b64 is mandatory and must decode STRICTLY: lenient
+            # base64 or bytes that are not JSON make the snapshot unusable.
+            encoded = entry.get("previous_b64")
+            if not isinstance(encoded, str):
+                return None
+            try:
+                raw_bytes = base64.b64decode(encoded, validate=True)
+                data = json.loads(raw_bytes.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return None
+            record = self._strict_previous_record(key_id, tenant_id, data)
+            if record is None:
                 return None
             seen.add(key_id)
-            entries.append((key_id, raw_bytes, previous_dict))
-        if not set(marker_keys) <= seen:
-            # The snapshot does not describe every file still marked: it
-            # cannot restore the whole group, so it is unusable.
-            return None
+            entries.append((key_id, raw_bytes, record))
+        entries.sort(key=lambda item: item[0])
+
+        # Every residual marker must be consistent with the snapshot and with
+        # each other: same event, tenant, journal/snapshot references and the
+        # exact complete key set.
+        for marker in markers:
+            if not isinstance(marker, dict) or not marker.get(
+                "_batch_rotate"
+            ):
+                return None
+            event_desc = marker.get("event")
+            if not isinstance(event_desc, dict):
+                return None
+            if event_desc.get("event_id") != snapshot_id:
+                return None
+            if event_desc.get("tenant_id") != tenant_id:
+                return None
+            if marker.get("tenant_id") != tenant_id:
+                return None
+            # The provision journal and the snapshot are both named after the
+            # event id.
+            if marker.get("journal") != snapshot_id:
+                return None
+            if marker.get("snapshot") != snapshot_id:
+                return None
+            marked = marker.get("key_ids")
+            if not isinstance(marked, list):
+                return None
+            marked_set = set()
+            for value in marked:
+                if not is_valid_key_id(value) or value in marked_set:
+                    return None
+                marked_set.add(value)
+            # The residual marker's complete unique key set must equal the
+            # snapshot's complete write set -- a subset or a mismatch means
+            # the artifacts do not provably belong to one attempt.
+            if marked_set != seen:
+                return None
         return entries
+
+    def _rescan_batch_markers(self, eid: str) -> Tuple[dict, list]:
+        """Re-read, under the group locks, the files still carrying event eid.
+
+        Returns ``({key_id: path}, [marker, ...])`` reflecting the on-disk
+        scene at decision time. Another process completing the same recovery
+        or the concurrent request may have restored/finalized files since the
+        unlocked scan, so the committed-vs-rollback decision must use this
+        fresh view, never the stale one.
+        """
+        files: dict = {}
+        markers: list = []
+        try:
+            names = os.listdir(self.data_dir)
+        except OSError:
+            return files, markers
+        for name in names:
+            if not (name.endswith(".json") and is_valid_key_id(name[:-5])):
+                continue
+            path = os.path.join(self.data_dir, name)
+            record = self._read_record(path)
+            marker = getattr(record, "pending_event", None)
+            if not isinstance(marker, dict) or not marker.get(
+                "_batch_rotate"
+            ):
+                continue
+            event_desc = marker.get("event")
+            marked_eid = (
+                event_desc.get("event_id")
+                if isinstance(event_desc, dict)
+                else None
+            )
+            if marked_eid == eid:
+                files[record.key_id] = path
+                markers.append(marker)
+        return files, markers
 
     def _recover_batch_unit(
         self, eid: str, group: Optional[dict], snapshot: Optional[dict],
         snapshot_present: bool = False,
     ) -> None:
-        """Resolve one batch event: commit-finalize or whole-group rollback."""
+        """Resolve one batch event: commit-finalize or whole-group rollback.
+
+        The whole write set is locked in sorted key_id order (in-process lock
+        plus the per-key fcntl lock), so recovery never interleaves with a
+        single-key rotate on a shared key. Under those locks the scene and
+        the snapshot are re-read and cross-validated, and only then does the
+        ledger decide:
+
+        * durable success event -> the batch committed: keep the new
+          versions, clear surviving markers, drop journal/snapshot residue;
+        * otherwise, with a trusted complete snapshot -> delete every new
+          handle (journal plus the on-disk/pre-image delta) FIRST, then
+          byte-for-byte restore every old file, and only after both fully
+          verify remove journal and snapshot;
+        * snapshot missing/corrupt/semantically mismatched -> park the
+          ENTIRE scene for a later open: never delete a new handle, rewrite a
+          key file, clear a marker or drop the snapshot/journal, and never
+          expose the uncommitted current.
+        """
         files = dict(group["files"]) if group else {}
-        journal_id = (
-            group.get("journal") if group and group.get("journal") else eid
+        # The lock set covers every still-marked file and (once validated)
+        # every key in the snapshot's complete write set.
+        pre_entries = self._validated_batch_snapshot(
+            eid, snapshot, list(group["markers"]) if group else []
         )
-        entries = self._batch_snapshot_entries(snapshot, files)
-        snapshot_keys = (
-            {key_id for key_id, _, _ in entries} if entries else set()
+        pre_snapshot_keys = (
+            {key_id for key_id, _, _ in pre_entries}
+            if pre_entries is not None
+            else set()
         )
-        lock_keys = sorted(set(files) | snapshot_keys)
+        lock_keys = sorted(set(files) | pre_snapshot_keys)
         with self.multi_key_locks(lock_keys):
+            # Re-read the scene and the snapshot while holding every lock of
+            # the write set, so nothing below acts on a stale observation.
+            files, markers = self._rescan_batch_markers(eid)
+            snapshot_path = self._batch_snapshot_path(eid)
+            present_now = os.path.exists(snapshot_path)
+            current_snapshot = (
+                self._read_batch_snapshot(eid) if present_now else None
+            )
             try:
                 event = self.audit.get_event(eid)
             except LedgerError:
@@ -1702,32 +2011,38 @@ class KeyStore:
                 # later open rather than guessing committed-vs-not.
                 return
             if event is not None and event.outcome == audit_mod.OUTCOME_SUCCESS:
-                self._batch_finish_committed(eid, files, journal_id)
+                self._batch_finish_committed(eid, files, eid)
                 return
 
-            # The success event never landed: the batch is uncommitted.
+            # The success event never landed: the batch is uncommitted. The
+            # snapshot is trusted only after its filename, payload and every
+            # residual marker fully agree and every pre-batch image parses.
+            entries = self._validated_batch_snapshot(
+                eid, current_snapshot, markers
+            )
             if entries is not None:
-                if self._batch_rollback_unit(
-                    entries, files, journal_id, eid
-                ):
+                if self._batch_rollback_unit(entries, files, eid, eid):
                     return
                 # Handle delete, provider access or file write-back failed:
                 # keep the whole scene for the next open.
                 return
 
-            # No usable snapshot.
-            if files or snapshot_present:
+            # No trusted snapshot.
+            if files or present_now:
                 # A file still needs its pre-batch bytes but the only source
-                # of them is unreadable/missing, or a corrupt snapshot file
-                # survives: preserve the ENTIRE scene (files, markers,
-                # journal, snapshot) for a later open and never guess.
+                # is missing/unreadable/semantically mismatched, or a corrupt
+                # snapshot file survives: preserve the ENTIRE scene (files,
+                # markers, journal, snapshot) for a later open and never
+                # guess, delete a new handle or expose the uncommitted
+                # current.
                 return
 
             # No marker references this event and no snapshot file survives:
-            # only orphaned handles (the durable journal) can remain. Reap
-            # them from the journal and drop it strictly after success.
-            if self.release_journal_handles(journal_id):
-                self.drop_provision_journal(journal_id)
+            # only orphaned handles (the durable journal named after the
+            # event) can remain. Reap them from the journal and drop it
+            # strictly after success.
+            if self.release_journal_handles(eid):
+                self.drop_provision_journal(eid)
 
     def _batch_finish_committed(
         self, eid: str, files: dict, journal_id: str
@@ -1735,7 +2050,9 @@ class KeyStore:
         """Post-commit housekeeping: clear markers, then drop the artifacts.
 
         The durable success event already makes the new versions authoritative
-        and their handles record-owned; nothing here is ever rolled back. A
+        and their handles record-owned; nothing here is ever rolled back. The
+        snapshot is not consulted (it is rollback-only data) and a corrupt or
+        mismatched snapshot does not matter: the durable event is the fact. A
         marker-clear failure leaves that file's marker for the next open.
         """
         for key_id, path in files.items():
@@ -1766,12 +2083,14 @@ class KeyStore:
 
         Returns True only when every handle delete and every file write-back
         has been verified, after which the provision journal and snapshot are
-        removed. Any failure returns False with the whole group and both
-        durable artifacts retained for the next open.
+        removed. The write set is the snapshot's COMPLETE validated set (not
+        just the files still marked), so a partially-cleared marker group is
+        still restored as a whole. Any failure returns False with the whole
+        group and both durable artifacts retained for the next open.
         """
         if not self._delete_batch_group_handles(journal_id, entries, files):
             return False
-        for key_id, previous_bytes, _previous_dict in entries:
+        for key_id, previous_bytes, _previous_record in entries:
             try:
                 self._write_bytes_atomic(
                     self._path_for(key_id), previous_bytes
@@ -1790,19 +2109,20 @@ class KeyStore:
         """Delete every handle an uncommitted batch minted.
 
         Handles come from the durable provision journal and, defensively,
-        from the delta between the on-disk versions and the snapshot's
-        pre-batch versions (the write set) plus any surviving marked file.
-        Every owning provider must be reachable and every delete must verify;
-        a single failure makes the whole rollback defer.
+        from the delta between the on-disk versions and the validated
+        snapshot pre-batch versions (the write set) plus any surviving marked
+        file. Every owning provider must be reachable and every delete must
+        verify; a single failure makes the whole rollback defer.
         """
         targets = set()
         for provider_id, handle in self.read_provision_journal(journal_id):
             targets.add((provider_id, handle))
         previous_by_key = {}
-        for key_id, _previous_bytes, previous_dict in entries:
-            triples = set()
-            for ver in previous_dict.get("versions", []):
-                triples.add((ver.get("provider_id"), ver.get("handle")))
+        for key_id, _previous_bytes, previous_record in entries:
+            triples = {
+                (ver.provider_id, ver.handle)
+                for ver in previous_record.versions
+            }
             previous_by_key[key_id] = triples
         candidate_paths = {
             key_id: self._path_for(key_id) for key_id, _, _ in entries
@@ -1841,6 +2161,7 @@ class KeyStore:
             record = self._read_record(path)
             if record is None or record.tenant_id != tenant_id:
                 return None
+            self._ensure_settled(record)
             event = self.audit.new_event(
                 tenant_id, audit_mod.ACTION_REVOKE, key_id,
                 audit_mod.OUTCOME_SUCCESS,
@@ -1861,7 +2182,12 @@ class KeyStore:
     def get_version(
         self, key_id: str, tenant_id: str, version: int
     ) -> Optional[tuple]:
-        """Return (record, version_record); None if key/version not accessible."""
+        """Return (record, version_record) over the committed view.
+
+        None if the key/version is not accessible or the requested version
+        belongs to an uncommitted transaction (it then reads as absent, never
+        projected).
+        """
         record = self.get(key_id, tenant_id)
         if record is None:
             return None
@@ -1925,8 +2251,13 @@ class KeyStore:
             return None
         path = self._path_for(key_id)
         with self._key_lock(key_id), self._file_lock(key_id):
-            record = self._read_record(path)
-            if record is None or record.tenant_id != tenant_id:
+            on_disk = self._read_record(path)
+            if on_disk is None or on_disk.tenant_id != tenant_id:
+                return None
+            # Never seal an uncommitted current: project only the durable
+            # state (the view, not the file, is trimmed).
+            record = self._committed_record(on_disk)
+            if record is None:
                 return None
             # Adopt a raw legacy record now, under the key locks and only
             # while the local provider is active. When a module:factory

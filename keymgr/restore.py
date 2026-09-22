@@ -115,7 +115,12 @@ class RestoreCoordinator:
             for key_id in key_ids:
                 record = self.store.read_raw(key_id)
                 if record is not None and record.tenant_id == tenant_id:
-                    records.append(record)
+                    # Project only durable state: a file still carrying an
+                    # unresolved outbox marker must not leak an uncommitted
+                    # current, handle or material into the sealed backup.
+                    record = self.store._committed_record(record)
+                    if record is not None:
+                        records.append(record)
             # Lazily take over any raw pre-provider versions here, under the
             # same key locks, so the backup is one committed view. This only
             # imports/wraps while the local provider is active; with an
