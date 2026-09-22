@@ -101,6 +101,11 @@ DEFAULT_LOCK_TIMEOUT = 5.0
 # Sentinel: surviving batch artifacts disagree about their tenant.
 _TENANT_MISMATCH = object()
 
+# Sentinel: a markerless file is named by a surviving, non-committed batch
+# snapshot whose pre-image cannot be proven, so the record must be hidden
+# entirely rather than projected from disk.
+_HIDE_UNCOMMITTED = object()
+
 
 class LockTimeout(Exception):
     """A guarded key could not be locked within the allowed wait.
@@ -1303,6 +1308,16 @@ class KeyStore:
         """
         marker = record.pending_event
         if not isinstance(marker, dict) or not marker:
+            # A markerless file can still belong to an unfinished batch: the
+            # process may have restored/cleared some files before crashing,
+            # leaving only the snapshot/journal. Project the durable pre-image
+            # (or hide the record when that cannot be proven) rather than
+            # exposing an uncommitted current that recovery may overwrite.
+            view = self._markerless_batch_view(record)
+            if view is _HIDE_UNCOMMITTED:
+                return None
+            if view is not None:
+                return view
             return record
         if marker.get("_batch_rotate"):
             # Batch groups are projected exclusively from the durable
@@ -1387,6 +1402,78 @@ class KeyStore:
             ):
                 return True
         return False
+
+    def _markerless_batch_view(self, record: KeyRecord):
+        """Project a markerless file named by a surviving batch snapshot.
+
+        Markers can vanish on part of a group (a partial rollback/finalize, a
+        crash mid-clear, or tampering) while the durable snapshot/journal of a
+        batch that never committed survive. Such a file must not expose its
+        on-disk (possibly new) versions:
+
+        * the snapshot is missing/unreadable/corrupt/semantically mismatched,
+          names another tenant, the event is an action/tenant mismatch, or the
+          ledger cannot be read -> ``_HIDE_UNCOMMITTED`` (hide entirely);
+        * a trusted complete snapshot names this key -> its validated pre-image
+          is returned (tagged as a projection so legacy adoption never rewrites
+          the preserved scene);
+        * no surviving snapshot names this key -> None (no batch in flight; the
+          on-disk record is the committed view).
+        """
+        for snapshot_id in self._list_batch_snapshot_ids():
+            if not is_valid_key_id(snapshot_id):
+                continue
+            raw_snapshot = self._read_batch_snapshot(snapshot_id)
+            if not isinstance(raw_snapshot, dict):
+                # A surviving but corrupt snapshot that cannot be tied to this
+                # key is conservatively ignored here: the write-set block in
+                # _ensure_settled / recovery independently parks the group.
+                continue
+            tenant_id = raw_snapshot.get("tenant_id")
+            if tenant_id != record.tenant_id:
+                continue
+            keys = raw_snapshot.get("keys")
+            if not isinstance(keys, list):
+                continue
+            if not any(
+                isinstance(entry, dict)
+                and entry.get("key_id") == record.key_id
+                for entry in keys
+            ):
+                continue
+            # This surviving snapshot names the file. The ledger is the commit
+            # authority; an outage or a mismatched durable event hides rather
+            # than projects either view.
+            try:
+                event = self.audit.get_event(snapshot_id)
+            except LedgerError:
+                return _HIDE_UNCOMMITTED
+            if event is not None:
+                if (
+                    event.outcome == audit_mod.OUTCOME_SUCCESS
+                    and event.action == audit_mod.ACTION_BATCH_ROTATE
+                    and event.tenant_id == record.tenant_id
+                ):
+                    # Committed residue: the on-disk file is authoritative (it
+                    # already has no marker). Do not project the pre-image.
+                    continue
+                # A durable success with a mismatched action/tenant, or a
+                # durable rejection: the batch never provably committed; hide
+                # until recovery/operator settles the id collision.
+                if event.outcome == audit_mod.OUTCOME_SUCCESS:
+                    return _HIDE_UNCOMMITTED
+            # Not committed: rebuild the pre-image from the validated snapshot.
+            entries = self._validated_batch_snapshot(
+                snapshot_id, raw_snapshot, []
+            )
+            if entries is None:
+                return _HIDE_UNCOMMITTED
+            for key_id, _raw_bytes, previous_record in entries:
+                if key_id == record.key_id:
+                    previous_record._unsettled_projection = True
+                    return previous_record
+            return _HIDE_UNCOMMITTED
+        return None
 
     def _ensure_settled(self, record: KeyRecord) -> None:
         """Refuse a mutation while the file still owes crash recovery.
@@ -1704,6 +1791,13 @@ class KeyStore:
             # Defined before the try so the abort path can union the pairs
             # this frame minted even when the provider faulted mid-batch.
             minted = []
+            # Set when append() returned without raising but the post-append
+            # ledger fact does not prove THIS batch committed (unreadable
+            # ledger, missing event, or a same-id event whose action/tenant
+            # differ). append returning normally usually means the line is
+            # durable, so such ambiguity must PARK the scene, never roll back:
+            # startup recovery makes the commit decision from the ledger.
+            commit_unverifiable = False
             try:
                 self._write_batch_snapshot(
                     event.event_id, tenant_id, ordered_ids, previous_bytes
@@ -1751,7 +1845,48 @@ class KeyStore:
                     pre_commit(records)
                 # Phase 2: the single ledger append is the commit point.
                 self.audit.append(event)
+                # append() dedupes silently on event_id without comparing
+                # action/tenant: a pre-existing durable event with the SAME id
+                # but a different action or tenant returns "success" without
+                # writing anything. Re-read the durable fact and require the
+                # ledger to now hold exactly this batch_rotate success for
+                # this tenant before treating the append as the commit point.
+                try:
+                    committed = self.audit.get_event(event.event_id)
+                except LedgerError:
+                    # append() itself re-reads the whole ledger and fsynced the
+                    # line before returning, so a fresh read error is a
+                    # transient outage AFTER a durable commit, not a missing
+                    # event: trust the fsynced append and proceed. Startup
+                    # recovery reconciles from the ledger when it is readable.
+                    committed = event
+                if (
+                    committed is None
+                    or committed.outcome != audit_mod.OUTCOME_SUCCESS
+                    or committed.action != audit_mod.ACTION_BATCH_ROTATE
+                    or committed.tenant_id != tenant_id
+                ):
+                    # The read succeeded but the durable fact under this id is
+                    # absent or belongs to a different action/tenant: a same-id
+                    # collision. Our append was deduped and did NOT write, so
+                    # this batch never committed; rolling back would clobber the
+                    # foreign record. Park the whole scene for startup instead.
+                    commit_unverifiable = True
+                    raise LedgerError(
+                        "the batch rotation commit event could not be "
+                        "confirmed as the expected batch_rotate success event"
+                    )
             except BaseException as exc:
+                if commit_unverifiable:
+                    # The append returned but the durable fact is missing or
+                    # belongs to a different action/tenant: neither commit nor
+                    # rollback is provable. Retain the ENTIRE scene (marked
+                    # files, snapshot, journal, minted handles) unchanged for
+                    # startup recovery; delete nothing and write no event.
+                    raise ProviderUnavailable(
+                        "could not confirm the batch rotation commit; the "
+                        "whole group is retained for startup recovery"
+                    ) from exc
                 # Establish the commit decision from the ledger before
                 # touching anything. The append is the last step, so a
                 # durable success event means every phase-1 file and the
@@ -1783,6 +1918,23 @@ class KeyStore:
                     return self.BATCH_ROTATED, [
                         (key_id, records[key_id]) for key_id, _ in request_order
                     ]
+                if (
+                    durable is not None
+                    and durable.outcome == audit_mod.OUTCOME_SUCCESS
+                ):
+                    # A durable SUCCESS event carries this event id but its
+                    # action or tenant does not match this batch: the id
+                    # collides with a different committed mutation, so neither
+                    # "committed" nor "roll back" is provable. Mirror startup
+                    # recovery and PARK the whole scene -- no handle delete,
+                    # no file write-back, no artifact removal, no success
+                    # event -- until an operator/startup settles it. Rolling
+                    # back here would clobber a foreign committed record.
+                    raise ProviderUnavailable(
+                        "a durable event with this id does not match the "
+                        "batch rotation; the whole group is retained for "
+                        "startup recovery"
+                    ) from exc
                 # Nothing committed: the durable success event is absent.
                 # Roll back strictly from the re-read durable snapshot, not
                 # from this frame's memory; the helper raises
