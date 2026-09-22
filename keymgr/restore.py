@@ -32,6 +32,7 @@ from typing import Dict, Iterator, List, NamedTuple, Optional
 
 from . import audit as audit_mod
 from . import tenantbundle
+from .artifacts import PHASE_COMMITTED, PHASE_ROLLED_BACK, PHASE_STAGED
 from .audit import AuditEvent, LedgerError
 from .policy import Rule
 from .provider import ProviderUnavailable
@@ -260,6 +261,7 @@ class RestoreCoordinator:
         event_id: Optional[str] = None,
         lock_timeout: Optional[float] = None,
         pre_commit=None,
+        mirror=None,
     ) -> RestoreResult:
         """Atomically restore a validated tenant payload.
 
@@ -298,6 +300,8 @@ class RestoreCoordinator:
             journal_id, journal_path = self.store._new_provision_journal(
                 event.event_id, event.tenant_id, event.action
             )
+            if mirror is not None:
+                mirror.provision(journal_id)
             committed = False
             try:
                 # Phase 0: complete ALL version validation and provider
@@ -312,7 +316,7 @@ class RestoreCoordinator:
                     )
                     records.append(
                         self.store.record_from_backup(
-                            tenant_id, entry, journal_path
+                            tenant_id, entry, journal_path, mirror
                         )
                     )
 
@@ -350,9 +354,12 @@ class RestoreCoordinator:
                             conflict=Conflict(kind="policy", owner=tenant_id),
                         )
                     result = self._commit_empty(
-                        tenant_id, event, pre_commit=pre_commit
+                        tenant_id, event, pre_commit=pre_commit,
+                        mirror=mirror,
                     )
                     committed = True
+                    if mirror is not None:
+                        mirror.phase(PHASE_COMMITTED)
                     return result
 
                 marker = {
@@ -364,6 +371,10 @@ class RestoreCoordinator:
                     # Ties the marker group to the attempt's handle journal.
                     "journal": journal_id,
                 }
+                if mirror is not None:
+                    # The write set (including any policy document) is about
+                    # to land carrying the shared marker.
+                    mirror.phase(PHASE_STAGED)
 
                 # All locks are already held; _commit runs the file/ledger
                 # transaction without re-acquiring them. It removes the write
@@ -374,6 +385,8 @@ class RestoreCoordinator:
                 )
                 if result.status == RESTORE_CREATED:
                     committed = True
+                    if mirror is not None:
+                        mirror.phase(PHASE_COMMITTED)
                 return result
             finally:
                 if committed:
@@ -393,9 +406,14 @@ class RestoreCoordinator:
                             "aborted restore; cleanup will be retried at "
                             "startup"
                         )
+                    if mirror is not None:
+                        # Every minted handle verified gone and (for the
+                        # multi-file path) the write set removed: the rollback
+                        # is complete.
+                        mirror.phase(PHASE_ROLLED_BACK)
 
     def _commit_empty(self, tenant_id: str, event: AuditEvent,
-                      pre_commit=None) -> RestoreResult:
+                      pre_commit=None, mirror=None) -> RestoreResult:
         """Commit an empty restore: idempotency marker + one import event.
 
         The marker file first lands carrying the pending event, the event is
@@ -421,6 +439,9 @@ class RestoreCoordinator:
             "policy": False,
         }
         self.store._write_atomic(path, marker)
+        if mirror is not None:
+            # Tie the empty-restore marker to the mirror before the append.
+            mirror.note_restore_empty(path)
         try:
             if pre_commit is not None:
                 pre_commit()

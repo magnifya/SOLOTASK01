@@ -42,6 +42,7 @@ def make_handler(
     policy_store: PolicyStore,
     coordinator: "restore_mod.RestoreCoordinator",
     operation_store: "OperationStore",
+    artifact_store=None,
 ) -> type:
     """Build a BaseHTTPRequestHandler subclass bound to the stores."""
 
@@ -273,15 +274,17 @@ def make_handler(
             """Bind the Idempotency-Key and run an idempotent mutation.
 
             ``key`` is the already-validated Idempotency-Key. ``executor`` is
-            ``executor(operation) -> (http_status, response_body)`` and
-            performs the mutation once; it may raise ProviderUnavailable /
-            ProviderInvalidMaterial / LedgerError / LockTimeout. On a new
-            binding the operation is persisted pending, executed once and
-            recorded with its terminal status/response; an identical retry
-            replays the stored result (no new audit event); a
-            same-key/different-binding request gets 409 naming the original
-            operation; waiting on an in-flight owner beyond 5 s answers
-            timed_out (503) without writing anything.
+            ``executor(operation, mirror) -> (http_status, response_body)``
+            and performs the mutation once; it may raise
+            ProviderUnavailable / ProviderInvalidMaterial / LedgerError /
+            LockTimeout. On a new binding the operation is persisted pending,
+            its 0600/fsynced artifact mirror is created BEFORE any provider
+            call, the mutation is executed once and the operation is recorded
+            with its terminal status/response; an identical retry replays the
+            stored result (no new audit event); a same-key/different-binding
+            request gets 409 naming the original operation; waiting on an
+            in-flight owner beyond 5 s answers timed_out (503) without
+            writing anything.
             """
             normalized = operations_mod.normalize_body(payload)
             begin = operation_store.begin(
@@ -294,8 +297,43 @@ def make_handler(
                 return
             operation = begin.record
             op_id = operation.operation_id
+            # The mirror is durable before the executor calls any provider:
+            # it cross-references the operation record, the provision journal,
+            # the restore marker / batch snapshot and every new handle.
             try:
-                http_status, body = executor(operation)
+                mirror = (
+                    artifact_store.create(operation)
+                    if artifact_store is not None
+                    else None
+                )
+            except OSError as exc:
+                # The binding landed but the mirror could not be created: no
+                # provider was called, so nothing committed. Finalize the
+                # bound op failed(500); the next open reconciles without a
+                # mirror using the legacy recovery rules.
+                body = {
+                    "error": "audit ledger failure: %s" % exc,
+                    "operation_id": op_id,
+                }
+                operation_store.finish(
+                    operation, operations_mod.STATUS_FAILED, 500, body
+                )
+                self._send_json(500, body)
+                return
+            try:
+                self._idempotent_run_body(
+                    operation, op_id, executor, mirror
+                )
+            finally:
+                if artifact_store is not None and mirror is not None:
+                    # Committed: verified ownership then dropped; uncommitted:
+                    # dropped only once every rollback artifact is gone. A
+                    # mirror that cannot be verified survives for startup.
+                    artifact_store.after_terminal(mirror)
+
+        def _idempotent_run_body(self, operation, op_id, executor, mirror):
+            try:
+                http_status, body = executor(operation, mirror)
             except LockTimeout:
                 # Lock wait exceeded 5 s: no key, audit event or handle was
                 # written. Record and answer timed_out (503).
@@ -724,7 +762,7 @@ def make_handler(
                 )
                 return
 
-            def execute(operation):
+            def execute(operation, mirror=None):
                 # The operation kind and the exact key_id rule are durable
                 # before the authorization check, so even a 403 terminal can
                 # be replayed verbatim after a crash from context alone.
@@ -733,6 +771,12 @@ def make_handler(
                     {"kind": "rotate", "key_id": key_id,
                      "algorithm": algorithm},
                 )
+                if mirror is not None:
+                    # Kind/action/write set land in the mirror BEFORE the
+                    # policy check and provider call.
+                    mirror.describe(
+                        {"kind": "rotate", "write_set": [key_id]}
+                    )
                 # Authorization follows validation and precedes existence; a
                 # denial is a bound terminal 403 whose single rejection event
                 # is named after the operation_id.
@@ -758,6 +802,7 @@ def make_handler(
                     event_id=operation.operation_id,
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                     pre_commit=stage_success,
+                    mirror=mirror,
                 )
                 if record is None:
                     return self._idempotent_rejection(
@@ -811,7 +856,7 @@ def make_handler(
                 self._bad_request(error)
                 return
 
-            def execute(operation):
+            def execute(operation, mirror=None):
                 # Kind and the exact request-order item set are durable before
                 # any business check, so a 403/404 terminal replays from
                 # context alone after a crash.
@@ -825,6 +870,15 @@ def make_handler(
                         ],
                     },
                 )
+                if mirror is not None:
+                    # The whole batch's write set is mirrored before the
+                    # authorization check / any provider call.
+                    mirror.describe(
+                        {
+                            "kind": "batch_rotate",
+                            "write_set": [key_id for key_id, _ in items],
+                        }
+                    )
                 # Authorization follows rotate and precedes existence; a
                 # denial is a bound terminal 403 with one rejected
                 # batch_rotate event (key_id null).
@@ -864,6 +918,7 @@ def make_handler(
                     event_id=operation.operation_id,
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                     pre_commit=stage_success,
+                    mirror=mirror,
                 )
                 if status == store.BATCH_NOT_FOUND:
                     # Any unknown/foreign key_id fails the whole batch with no
@@ -1049,7 +1104,7 @@ def make_handler(
                 self._bad_request(str(exc))
                 return
 
-            def execute(operation):
+            def execute(operation, mirror=None):
                 key_id = decoded["key_id"]
                 # Kind and exact key_id rule are durable before any business
                 # check, so a 403/404/409 terminal replays from context alone.
@@ -1057,6 +1112,10 @@ def make_handler(
                     operation,
                     {"kind": "import", "key_id": key_id},
                 )
+                if mirror is not None:
+                    mirror.describe(
+                        {"kind": "import", "write_set": [key_id]}
+                    )
                 # Authorization precedes the conflict check: a denial is a
                 # bound terminal 403 even when the key_id already exists for
                 # another tenant.
@@ -1083,6 +1142,7 @@ def make_handler(
                     event_id=operation.operation_id,
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                     pre_commit=stage_success,
+                    mirror=mirror,
                 )
                 if status == IMPORT_CONFLICT:
                     if record.tenant_id == tenant_id:
@@ -1207,7 +1267,7 @@ def make_handler(
                 self._bad_request(str(exc))
                 return
 
-            def execute(operation):
+            def execute(operation, mirror=None):
                 key_ids = sorted(k["key_id"] for k in decoded["keys"])
                 writes_policy = decoded["policy"] is not None
                 # Kind and write-set facts are durable before any business
@@ -1221,6 +1281,14 @@ def make_handler(
                         "policy_restored": writes_policy,
                     },
                 )
+                if mirror is not None:
+                    mirror.describe(
+                        {
+                            "kind": "restore",
+                            "write_set": key_ids,
+                            "policy": writes_policy,
+                        }
+                    )
                 # Authorization (import) precedes the in-bundle tenant check.
                 if not policy_store.is_allowed(
                     tenant_id, audit_mod.ACTION_IMPORT, operator
@@ -1258,6 +1326,7 @@ def make_handler(
                     event_id=operation.operation_id,
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                     pre_commit=stage_success,
+                    mirror=mirror,
                 )
                 if result.status == restore_mod.RESTORE_CREATED:
                     # The single success event committed with the files.
@@ -1864,15 +1933,24 @@ def serve(host: str, port: int, data_dir: str) -> None:
     policy_store = PolicyStore(data_dir, audit_log)
     coordinator = restore_mod.RestoreCoordinator(store, policy_store)
     operation_store = OperationStore(data_dir, audit_log)
+    # The artifact mirrors settle next (after the outbox recovery): a
+    # consistent mirror is cleaned, a fully rolled-back attempt's mirror is
+    # dropped, and an unprovable scene keeps both its evidence and its
+    # operation pending for a later open.
+    from .artifacts import ArtifactStore
+
+    artifact_store = ArtifactStore(data_dir, store, audit_log)
+    artifact_store.settle_pending(operation_store)
     operation_store.recover_pending(
         lambda record, event: _resolve_committed_operation(
             store, policy_store, record, event
-        )
+        ),
+        is_parked=artifact_store.is_parked,
     )
     httpd = ThreadingHTTPServer(
         (host, port),
         make_handler(
-            store, policy_store, coordinator, operation_store
+            store, policy_store, coordinator, operation_store, artifact_store
         ),
     )
     httpd.daemon_threads = True

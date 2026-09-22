@@ -194,6 +194,7 @@ def test_empty_restore_marker_committed_is_finalized(env):
 # -- HTTP surface --------------------------------------------------------------
 class HttpServer:
     def __init__(self, env):
+        from keymgr.artifacts import ArtifactStore
         from keymgr.server import make_handler
         from http.server import ThreadingHTTPServer
 
@@ -202,10 +203,15 @@ class HttpServer:
         policy_store = PolicyStore(env.data_dir, audit_log)
         coordinator = RestoreCoordinator(store, policy_store)
         operation_store = OperationStore(env.data_dir, audit_log)
-        operation_store.recover_pending()
+        artifact_store = ArtifactStore(env.data_dir, store, audit_log)
+        artifact_store.settle_pending(operation_store)
+        operation_store.recover_pending(is_parked=artifact_store.is_parked)
         self.httpd = ThreadingHTTPServer(
             ("127.0.0.1", 0),
-            make_handler(store, policy_store, coordinator, operation_store),
+            make_handler(
+                store, policy_store, coordinator, operation_store,
+                artifact_store,
+            ),
         )
         self.port = self.httpd.server_address[1]
         self.thread = threading.Thread(target=self.httpd.serve_forever)

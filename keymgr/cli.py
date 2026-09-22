@@ -383,7 +383,7 @@ def _idem_serve_existing(op_store, kind, record) -> "Optional[int]":
 
 
 def idempotent_run(op_store, store, path, tenant_id, operator, body, key,
-                   validator, executor, decoder=None):
+                   validator, executor, decoder=None, artifact_store=None):
     """CLI counterpart of the HTTP idempotency guard.
 
     Returns a process exit code. ``validator()`` runs cheap side-effect-free
@@ -393,8 +393,8 @@ def idempotent_run(op_store, store, path, tenant_id, operator, body, key,
     but expensive validation -- bundle decryption -- *after* an already-bound
     key has been replayed/conflicted but *before* a new key is bound, so a
     wrong passphrase neither masks a replay nor consumes the key.
-    ``executor(operation) -> (http_status, body)`` runs once for a new binding
-    and may raise ProviderInvalidMaterial / ProviderUnavailable /
+    ``executor(operation, mirror) -> (http_status, body)`` runs once for a new
+    binding and may raise ProviderInvalidMaterial / ProviderUnavailable /
     LedgerError / LockTimeout.
     """
     if _idem_key_error(key):
@@ -429,8 +429,43 @@ def idempotent_run(op_store, store, path, tenant_id, operator, body, key,
 
     operation = begin.record
     op_id = operation.operation_id
+    # The mirror is durable before the executor calls any provider: it
+    # cross-references the operation record, the provision journal, the
+    # restore marker / batch snapshot and every new handle.
     try:
-        http_status, resp = executor(operation)
+        mirror = (
+            artifact_store.create(operation)
+            if artifact_store is not None
+            else None
+        )
+    except OSError as exc:
+        # Binding landed but the mirror could not be created; no provider was
+        # called and nothing committed. Finalize failed(500) (CLI exit 1); the
+        # next open reconciles without a mirror via the legacy rules.
+        body_err = {
+            "error": "audit ledger failure: %s" % exc,
+            "operation_id": op_id,
+        }
+        op_store.finish(
+            operation, operations_mod.STATUS_FAILED, 500, body_err
+        )
+        return _emit_operation_result(500, body_err)
+    try:
+        exit_code = _idempotent_run_body(
+            op_store, store, executor, operation, op_id, mirror
+        )
+    finally:
+        if artifact_store is not None and mirror is not None:
+            # Committed: verified ownership then dropped; uncommitted: dropped
+            # only once every rollback artifact is gone. A mirror that cannot
+            # be verified survives for the next startup.
+            artifact_store.after_terminal(mirror)
+    return exit_code
+
+
+def _idempotent_run_body(op_store, store, executor, operation, op_id, mirror):
+    try:
+        http_status, resp = executor(operation, mirror)
     except LockTimeout:
         body_err = {
             "error": "operation timed out waiting for a lock",
@@ -525,10 +560,15 @@ def _run(argv: Optional[List[str]] = None) -> int:
     # Resolve any operations left pending by a crashed CLI/server run, after
     # the key/restore outbox recovery above has settled the mutation.
     op_store = OperationStore(args.data_dir, audit_log)
+    from .artifacts import ArtifactStore
+
+    artifact_store = ArtifactStore(args.data_dir, store, audit_log)
+    artifact_store.settle_pending(op_store)
     op_store.recover_pending(
         lambda record, event: _resolve_committed_operation(
             store, policies, record, event
-        )
+        ),
+        is_parked=artifact_store.is_parked,
     )
 
     if not getattr(args, "operator", None):
@@ -620,7 +660,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
         }
         path = "/v1/keys/%s/rotate" % args.key_id
 
-        def execute(operation):
+        def execute(operation, mirror=None):
             # Kind/exact key_id are durable before the authorization check so
             # a 403 terminal replays from context alone after a crash.
             op_store.update_details(
@@ -628,6 +668,10 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 {"kind": "rotate", "key_id": args.key_id,
                  "algorithm": args.algorithm},
             )
+            if mirror is not None:
+                mirror.describe(
+                    {"kind": "rotate", "write_set": [args.key_id]}
+                )
             if not policies.is_allowed(
                 args.tenant_id, audit_mod.ACTION_ROTATE, args.operator
             ):
@@ -648,6 +692,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 event_id=operation.operation_id,
                 lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                 pre_commit=stage_success,
+                mirror=mirror,
             )
             if record is None:
                 return _terminal_rejection(
@@ -660,6 +705,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
         return idempotent_run(
             op_store, store, path, args.tenant_id, args.operator, body,
             args.idempotency_key, lambda: None, execute,
+            artifact_store=artifact_store,
         )
 
     if args.command == "batch-rotate":
@@ -685,7 +731,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
         body = {"tenant_id": args.tenant_id, "items": raw_items}
         path = "/v1/keys/batch-rotate"
 
-        def execute(operation):
+        def execute(operation, mirror=None):
             # Kind/exact request-order item set durable before any business
             # check, so a 403/404 terminal replays from context alone.
             op_store.update_details(
@@ -698,6 +744,13 @@ def _run(argv: Optional[List[str]] = None) -> int:
                     ],
                 },
             )
+            if mirror is not None:
+                mirror.describe(
+                    {
+                        "kind": "batch_rotate",
+                        "write_set": [key_id for key_id, _ in items],
+                    }
+                )
             # Authorization follows rotate; the rejection event is a single
             # batch_rotate with key_id null.
             if not policies.is_allowed(
@@ -733,6 +786,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 event_id=operation.operation_id,
                 lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                 pre_commit=stage_success,
+                mirror=mirror,
             )
             if status == store.BATCH_NOT_FOUND:
                 return _terminal_rejection(
@@ -758,6 +812,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
         return idempotent_run(
             op_store, store, path, args.tenant_id, args.operator, body,
             args.idempotency_key, lambda: None, execute,
+            artifact_store=artifact_store,
         )
 
     if args.command == "version":
@@ -928,13 +983,17 @@ def _run(argv: Optional[List[str]] = None) -> int:
             decoded.update(payload)
             return None
 
-        def execute(operation):
+        def execute(operation, mirror=None):
             key_id = decoded["key_id"]
             # Kind/exact key_id durable before any business check.
             op_store.update_details(
                 operation,
                 {"kind": "import", "key_id": key_id},
             )
+            if mirror is not None:
+                mirror.describe(
+                    {"kind": "import", "write_set": [key_id]}
+                )
             if not policies.is_allowed(
                 args.tenant_id, audit_mod.ACTION_IMPORT, args.operator
             ):
@@ -955,6 +1014,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 event_id=operation.operation_id,
                 lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                 pre_commit=stage_success,
+                mirror=mirror,
             )
             if status == IMPORT_CONFLICT:
                 if record.tenant_id == args.tenant_id:
@@ -974,6 +1034,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
         return idempotent_run(
             op_store, store, path, args.tenant_id, args.operator, body,
             args.idempotency_key, validator, execute, decoder,
+            artifact_store=artifact_store,
         )
 
     if args.command == "backup":
@@ -1046,7 +1107,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
             decoded.update(payload)
             return None
 
-        def execute(operation):
+        def execute(operation, mirror=None):
             key_ids = sorted(k["key_id"] for k in decoded["keys"])
             writes_policy = decoded["policy"] is not None
             # Kind/write-set durable before any business check; restore
@@ -1059,6 +1120,14 @@ def _run(argv: Optional[List[str]] = None) -> int:
                     "policy_restored": writes_policy,
                 },
             )
+            if mirror is not None:
+                mirror.describe(
+                    {
+                        "kind": "restore",
+                        "write_set": key_ids,
+                        "policy": writes_policy,
+                    }
+                )
             if not policies.is_allowed(
                 args.tenant_id, audit_mod.ACTION_IMPORT, args.operator
             ):
@@ -1090,6 +1159,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 event_id=operation.operation_id,
                 lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                 pre_commit=stage_success,
+                mirror=mirror,
             )
             if result.status == restore_mod.RESTORE_CREATED:
                 return (
@@ -1117,6 +1187,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
         return idempotent_run(
             op_store, store, path, args.tenant_id, args.operator, body,
             args.idempotency_key, validator, execute, decoder,
+            artifact_store=artifact_store,
         )
 
     if args.command == "operation":

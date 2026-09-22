@@ -16,6 +16,7 @@ from typing import Iterator, List, Optional, Tuple
 from . import audit as audit_mod
 from . import keybundle
 from . import provider as provider_mod
+from .artifacts import PHASE_COMMITTED, PHASE_ROLLED_BACK, PHASE_STAGED
 from .audit import AuditEvent, AuditLog, LedgerError
 from .provider import (
     LOCAL_PROVIDER_ID,
@@ -1689,6 +1690,7 @@ class KeyStore:
         event_id: Optional[str] = None,
         lock_timeout: Optional[float] = None,
         pre_commit=None,
+        mirror=None,
     ) -> Optional[KeyRecord]:
         """Append a new version with fresh material.
 
@@ -1733,6 +1735,8 @@ class KeyStore:
             journal_id, journal_path = self._new_provision_journal(
                 event.event_id, event.tenant_id, event.action
             )
+            if mirror is not None:
+                mirror.provision(journal_id)
             minted_handle = None
             try:
                 triple = provider.rotate(algorithm)
@@ -1740,6 +1744,10 @@ class KeyStore:
                 self._append_provision(
                     journal_path, provider.provider_id, triple.handle
                 )
+                if mirror is not None:
+                    mirror.add_handle(
+                        provider.provider_id, triple.handle
+                    )
                 record.append_version(
                     VersionRecord(
                         version=next_number,
@@ -1754,6 +1762,9 @@ class KeyStore:
                 # _commit_mutation deletes the minted handle itself when the
                 # append fails; the provision journal is the durable crash
                 # safety net and is retried below on any failure.
+                if mirror is not None:
+                    # The key file is about to land: the write set is staged.
+                    mirror.phase(PHASE_STAGED)
                 self._commit_mutation(
                     path, record, event, previous,
                     provider=provider, new_handles=(triple.handle,),
@@ -1780,10 +1791,17 @@ class KeyStore:
                         "could not delete a handle provisioned by a failed "
                         "rotation; cleanup will be retried at startup"
                     ) from exc
+                if mirror is not None:
+                    # Full rollback verified by the journal reconciliation:
+                    # record the phase so mirror cleanup/startup need not
+                    # re-derive it.
+                    mirror.phase(PHASE_ROLLED_BACK)
                 raise
             # Committed: the new handle is owned by the appended version and
             # the durable success event makes the journal obsolete.
             self.drop_provision_journal(journal_id)
+            if mirror is not None:
+                mirror.phase(PHASE_COMMITTED)
         return record
 
     # -- atomic batch rotation --------------------------------------------
@@ -1885,6 +1903,7 @@ class KeyStore:
         event_id: Optional[str] = None,
         lock_timeout: Optional[float] = None,
         pre_commit=None,
+        mirror=None,
     ) -> Tuple[str, object]:
         """Atomically append one fresh version to many keys.
 
@@ -1942,6 +1961,8 @@ class KeyStore:
             journal_id, journal_path = self._new_provision_journal(
                 event.event_id, event.tenant_id, event.action
             )
+            if mirror is not None:
+                mirror.provision(journal_id, snapshot=event.event_id)
             # Defined before the try so the abort path can union the pairs
             # this frame minted even when the provider faulted mid-batch.
             minted = []
@@ -1975,6 +1996,10 @@ class KeyStore:
                     self._append_provision(
                         journal_path, provider.provider_id, triple.handle
                     )
+                    if mirror is not None:
+                        mirror.add_handle(
+                            provider.provider_id, triple.handle
+                        )
                     record.append_version(
                         VersionRecord(
                             version=next_number,
@@ -1993,6 +2018,9 @@ class KeyStore:
                     self._write_atomic(
                         self._path_for(key_id), record.to_json()
                     )
+                if mirror is not None:
+                    # The whole write set is durable and marked: staged.
+                    mirror.phase(PHASE_STAGED)
                 # The whole write set is durable: stage the exact idempotent
                 # response before the single commit-point append.
                 if pre_commit is not None:
@@ -2069,6 +2097,8 @@ class KeyStore:
                     self._batch_finalize_after_commit(
                         ordered, records, journal_id, event.event_id
                     )
+                    if mirror is not None:
+                        mirror.phase(PHASE_COMMITTED)
                     return self.BATCH_ROTATED, [
                         (key_id, records[key_id]) for key_id, _ in request_order
                     ]
@@ -2098,6 +2128,11 @@ class KeyStore:
                 self._batch_abort_uncommitted(
                     event.event_id, tenant_id, journal_id, minted
                 )
+                if mirror is not None:
+                    # Every new handle deleted and every old file restored:
+                    # the rollback was fully verified before artifacts were
+                    # dropped.
+                    mirror.phase(PHASE_ROLLED_BACK)
                 raise
 
             # Phase 3: commit point passed. Clear markers as best-effort
@@ -2106,6 +2141,8 @@ class KeyStore:
             self._batch_finalize_after_commit(
                 ordered, records, journal_id, event.event_id
             )
+            if mirror is not None:
+                mirror.phase(PHASE_COMMITTED)
             return self.BATCH_ROTATED, [
                 (key_id, records[key_id]) for key_id, _ in request_order
             ]
@@ -2919,7 +2956,8 @@ class KeyStore:
         self._take_over_legacy(record)
         return record
 
-    def _adopt_imported_version(self, ver: dict, journal: Optional[str] = None) -> tuple:
+    def _adopt_imported_version(self, ver: dict, journal: Optional[str] = None,
+                                mirror=None) -> tuple:
         """Adopt one validated bundle version through its target provider.
 
         Returns (VersionRecord, provider). A ``provider`` provenance block
@@ -2948,6 +2986,10 @@ class KeyStore:
         )
         if journal is not None:
             self._append_provision(journal, target.provider_id, triple.handle)
+        if mirror is not None:
+            # The mirror records the freshly minted handle together with the
+            # journal entry, so the two durable artifacts always agree.
+            mirror.add_handle(target.provider_id, triple.handle)
         public_key = (
             triple.public_key
             if triple.public_key is not None
@@ -3012,6 +3054,7 @@ class KeyStore:
         event_id: Optional[str] = None,
         lock_timeout: Optional[float] = None,
         pre_commit=None,
+        mirror=None,
     ) -> tuple:
         """Persist a validated export payload under the importing tenant.
 
@@ -3046,13 +3089,15 @@ class KeyStore:
             journal_id, journal_path = self._new_provision_journal(
                 event.event_id, event.tenant_id, event.action
             )
+            if mirror is not None:
+                mirror.provision(journal_id)
             committed = False
             adopted = []  # (provider, handle) pairs minted by this attempt
             try:
                 versions = []
                 for ver in payload["versions"]:
                     version_record, target = self._adopt_imported_version(
-                        ver, journal_path
+                        ver, journal_path, mirror
                     )
                     versions.append(version_record)
                     adopted.append((target, version_record.handle))
@@ -3076,6 +3121,8 @@ class KeyStore:
                 # A failure here rolls the just-created file back inside
                 # _commit_mutation; the finally block then reconciles the
                 # minted handles and the provision journal.
+                if mirror is not None:
+                    mirror.phase(PHASE_STAGED)
                 self._commit_mutation(
                     path, record, event, None,
                     journal_id=journal_id,
@@ -3085,6 +3132,8 @@ class KeyStore:
                 # The handles are owned by the new record and the durable
                 # success event makes the journal obsolete.
                 self.drop_provision_journal(journal_id)
+                if mirror is not None:
+                    mirror.phase(PHASE_COMMITTED)
                 return IMPORT_CREATED, record
             finally:
                 if not committed:
@@ -3140,7 +3189,8 @@ class KeyStore:
         return self._read_record(self._path_for(key_id))
 
     def record_from_backup(
-        self, tenant_id: str, entry: dict, journal: Optional[str] = None
+        self, tenant_id: str, entry: dict, journal: Optional[str] = None,
+        mirror=None,
     ) -> KeyRecord:
         """Build an unsaved KeyRecord from a validated backup keys[i] entry.
 
@@ -3157,7 +3207,7 @@ class KeyStore:
         try:
             for ver in entry["versions"]:
                 version_record, target = self._adopt_imported_version(
-                    ver, journal
+                    ver, journal, mirror
                 )
                 versions.append(version_record)
                 adopted.append((target, version_record.handle))

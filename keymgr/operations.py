@@ -580,6 +580,7 @@ class OperationStore:
         resolve_committed: Optional[
             Callable[["OperationRecord", object], "tuple[int, dict]"]
         ] = None,
+        is_parked: Optional[Callable[[str], bool]] = None,
     ) -> None:
         """Finish operations left pending by a crashed process.
 
@@ -608,6 +609,12 @@ class OperationStore:
             operation_id = name[:-5]
             record = self._read_record(operation_id)
             if record is None or record.status != STATUS_PENDING:
+                continue
+            # The artifact-mirror settlement runs first: a surviving mirror
+            # whose evidence is incomplete/inconsistent (unreadable ledger,
+            # uncertain commit, corrupt/missing basis) keeps the operation
+            # pending for a later open rather than guessing a terminal.
+            if is_parked is not None and is_parked(operation_id):
                 continue
             event = None
             try:

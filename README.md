@@ -127,6 +127,25 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `404`/`409` 响应与审计投影并置终态（拒绝终态的状态码随事件持久化，严格
   重放）；事件未入帐则置 failed(`500`)，半成品文件、提供者句柄与标记由
   outbox/provision 恢复回滚。不重复记账（账本按 event_id 去重），不误判。
+- **operation 工件镜像**：rotate/import/restore/batch-rotate 在幂等键绑定
+  记录耐久**之后**、首次调用提供者**之前**，原子创建
+  `operation-artifacts/<operation_id>.json`（0600、temp 文件 fsync 后 rename；
+  非幂等入口与未绑定请求不创建该目录）。镜像是一次尝试全部耐久工件的交叉
+  索引，记录租户、操作者、路径、规范化请求体、`kind`/审计动作、完整写集
+  （rotate/import 为该 key_id，batch 为全部 key_id，restore 为全部新建
+  key_id 及是否含策略）、阶段（`bound`→`provisioning`→`staged`→
+  `committed`/`rolled_back`）、`provisions/<id>.json` 引用（batch 另引用
+  `batch-rotations/<id>.json`，空 restore 另记录其 `restore-empty-*`
+  标记）以及每铸一个句柄即登记的新句柄 `provider_id`/`handle`；镜像与 journal
+  条目同步落盘，二者永不矛盾。请求到达终态后：事件确认且 action/tenant/
+  operation 一致、写集文件拥有全部新句柄且 journal/snapshot 已清，才删镜像
+  并保留新版本；事件未入账时，先由 outbox 恢复幂等删除全部新句柄并恢复可信
+  旧写集，证据清零才删镜像。账本不可读、提交不确定（同 id 事件 action/tenant
+  不符）、镜像缺失/损坏、镜像与 `operations/<id>.json` 绑定不一致、引用缺失/
+  不一致或 batch snapshot 损坏时，**保留整组证据**（镜像、标记、journal、
+  snapshot 与句柄），不猜测回滚也不暴露未提交 current：该 operation 保持
+  `pending`，请求/重启返回 `500`/`503` 等待下次重试。无镜像的旧 journal 与旧
+  restore 标记沿用原有恢复规则，镜像从不强制存在。
 - `GET /v1/operations/{operation_id}`：需单一操作者与单一租户来源；操作须
   同时属于该租户与操作者，否则一律 `404`。`200` →
   `{operation_id, tenant_id, status, http_status, response}`，pending 时后两
@@ -242,3 +261,10 @@ python -m keymgr policy --operator admin set|show|delete --tenant-id t [--rules 
   策略文件与标记，下一次启动重试，全部句柄确认删除后才移除整组文件。
 - 私钥与口令只存在于口令加密的包内或经提供者包装后的记录中；游标 HMAC 密钥
   存于 `audit.secret`(0600)。材料不会出现在任何响应、审计投影或错误信息中。
+- rotate/import/restore/batch-rotate 另有 0600 的 operation 工件镜像
+  `operation-artifacts/<operation_id>.json`：绑定后、调用提供者前创建，交叉
+  关联 `operations/<id>.json`、`provisions/<id>.json`、restore 标记（含空
+  restore 标记）或 batch snapshot，记录租户/操作者/路径/规范请求/动作/写集/
+  阶段及新句柄；确认提交并核对句柄归属后随 journal/snapshot 一并清理，未提交
+  时待全部新句柄删除、旧写集恢复后清理，任何证据缺失或不一致则整组保留（详见
+  “幂等操作”一节）。
