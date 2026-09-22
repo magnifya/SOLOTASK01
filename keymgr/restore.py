@@ -602,13 +602,18 @@ class RestoreCoordinator:
             self.policy_store.remove_restore_file(tenant_id)
 
     # -- crash recovery ----------------------------------------------------
-    def recover(self) -> None:
+    def recover(self, only_event: Optional[str] = None) -> None:
         """Finish or roll back restores interrupted by a crash.
 
         Files still carrying the shared marker are grouped by the embedded
         event id. When the event reached the ledger the transaction commits
         (markers are cleared); otherwise it never committed and every file of
         the group is removed. Both paths are idempotent.
+
+        ``only_event`` restricts the whole sweep (key files, policy files and
+        empty markers) to one event id: the request-path takeover of a dead
+        owner's pending restore settles exactly that attempt instead of
+        waiting for the next process start.
         """
         groups: Dict[str, _PendingGroup] = {}
 
@@ -620,6 +625,10 @@ class RestoreCoordinator:
                 groups[eid] = group
             return group
 
+        def marker_event_id(marker: dict):
+            event = marker.get("event")
+            return event.get("event_id") if isinstance(event, dict) else None
+
         data_dir = self.store.data_dir
         try:
             names = os.listdir(data_dir)
@@ -627,7 +636,10 @@ class RestoreCoordinator:
             names = []
         for name in names:
             if name.startswith(_EMPTY_MARKER_PREFIX) and name.endswith(".json"):
-                self._recover_empty_marker(os.path.join(data_dir, name))
+                if only_event is None or self._empty_marker_names_event(
+                    os.path.join(data_dir, name), only_event
+                ):
+                    self._recover_empty_marker(os.path.join(data_dir, name))
                 continue
             if not (name.endswith(".json") and _is_uuid(name[:-5])):
                 continue
@@ -635,6 +647,8 @@ class RestoreCoordinator:
             record = self.store._read_record(path)
             marker = getattr(record, "pending_event", None)
             if not isinstance(marker, dict) or not marker.get("_restore"):
+                continue
+            if only_event is not None and marker_event_id(marker) != only_event:
                 continue
             group_for(marker).key_files[record.key_id] = path
 
@@ -652,6 +666,8 @@ class RestoreCoordinator:
                 continue
             owner, rules, pending = doc
             if not isinstance(pending, dict) or not pending.get("_restore"):
+                continue
+            if only_event is not None and marker_event_id(pending) != only_event:
                 continue
             group = group_for(pending)
             group.policy_file = path
@@ -683,9 +699,26 @@ class RestoreCoordinator:
 
         # Journals with no marker group (crash before the first file landed)
         # are swept last; their event never committed as a success.
-        self._resolve_orphan_journals(skip=group_journals)
+        self._resolve_orphan_journals(
+            skip=group_journals, only_event=only_event
+        )
 
-    def _resolve_orphan_journals(self, skip=()) -> None:
+    @staticmethod
+    def _empty_marker_names_event(path: str, event_id: str) -> bool:
+        """Whether an empty-restore marker file currently names ``event_id``."""
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                marker = json.load(fh)
+        except (OSError, ValueError):
+            return False
+        if not isinstance(marker, dict):
+            return False
+        event = marker.get("event")
+        return (
+            isinstance(event, dict) and event.get("event_id") == event_id
+        )
+
+    def _resolve_orphan_journals(self, skip=(), only_event=None) -> None:
         """Reap provision journals left by restore attempts with no marker.
 
         A crash after provider adoption but before the first file landed
@@ -695,7 +728,7 @@ class RestoreCoordinator:
         ``rejected`` provider-failure terminal, every recorded handle is
         deleted. The journal is dropped only once all deletes succeed.
         Journals still tied to a marker group (including an unresolved one)
-        are skipped.
+        are skipped. ``only_event`` limits the sweep to one journal id.
         """
         directory = os.path.join(self.store.data_dir, "provisions")
         try:
@@ -706,6 +739,8 @@ class RestoreCoordinator:
             if not name.endswith(".json"):
                 continue
             journal_id = name[:-5]
+            if only_event is not None and journal_id != only_event:
+                continue
             if journal_id in skip:
                 continue
             event = None

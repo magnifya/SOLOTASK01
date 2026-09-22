@@ -79,6 +79,33 @@ class ArtifactUnavailable(Exception):
     """
 
 
+class TakeoverResult:
+    """Outcome of :meth:`ArtifactStore.takeover` for a same-binding retry.
+
+    ``kind`` is one of:
+
+    * ``"execute"`` -- the dead owner left no committed event and no residual
+      evidence; a fresh ``bound`` mirror was (re)built and the caller must run
+      the executor once under the SAME operation_id;
+    * ``"terminal"`` -- a durable own event (or the stored staged result)
+      settles the operation; the caller replays the now-terminal record
+      without executing anything;
+    * ``"parked"`` -- the evidence is missing/corrupt/inconsistent or the
+      outbox cannot yet be settled; the operation STAYS pending (the caller
+      answers 500/503 and retries later). Nothing may be executed.
+    """
+
+    EXECUTE = "execute"
+    TERMINAL = "terminal"
+    PARKED = "parked"
+
+    def __init__(self, kind: str, mirror: Optional["ArtifactMirror"] = None,
+                 record=None) -> None:
+        self.kind = kind
+        self.mirror = mirror
+        self.record = record
+
+
 def _new_timestamp() -> str:
     from datetime import datetime, timezone
 
@@ -189,10 +216,10 @@ class ArtifactStore:
         # sites always pass a recovered store).
         self.audit = audit_log if audit_log is not None else key_store.audit
         self._lock = threading.Lock()
-        # Operation ids whose mirror could not be settled at this startup:
-        # the operation store must leave them pending for a later open rather
-        # than guessing a terminal.
         self._parked: set = set()
+        # Ids adjudicated from a present mirror during the latest startup
+        # settlement; the missing-mirror sweep must not re-park them.
+        self._adjudicated: set = set()
 
     # -- paths / io --------------------------------------------------------
     def path_for(self, operation_id: str) -> str:
@@ -300,6 +327,153 @@ class ArtifactStore:
         if not self._residual_evidence(descriptor):
             self.discard(mirror.operation_id)
 
+    # -- request-path takeover of a dead owner's attempt ------------------
+    def takeover(self, operation_store, record, settle_outbox,
+                 resolve_committed=None):
+        """Take over a still-pending operation after acquiring its lease.
+
+        The caller (a same-binding HTTP/CLI retry) already holds the dead
+        owner's execution lease. This decides, purely from durable facts and
+        WITHOUT calling any provider itself:
+
+        * settle the attempt's outbox evidence (markers/journal/snapshot) via
+          ``settle_outbox(kind, operation_id)``;
+        * a durable own event -> finalize the operation from the staged result
+          and return ``terminal`` for verbatim replay;
+        * the event never landed and every rollback artifact is gone -> drop a
+          spent mirror, rebuild a fresh ``bound`` mirror and return ``execute``
+          so the caller runs the attempt ONCE under the SAME operation_id;
+        * a missing/corrupt/inconsistent mirror with residual evidence, an
+          unreadable ledger, a foreign same-id event, or an outbox that cannot
+          yet settle -> return ``parked`` (operation stays pending; the caller
+          answers 500/503 and retries). Nothing is guessed and no uncommitted
+          current is exposed.
+        """
+        operation_id = record.operation_id
+        mirror_path = self.path_for(operation_id)
+        mirror_present = os.path.exists(mirror_path)
+        descriptor = self._read_descriptor(operation_id) if mirror_present else None
+
+        if (
+            descriptor is not None
+            and not self._binding_matches(descriptor, record)
+        ):
+            # The mirror is a DIFFERENT attempt than the bound operation:
+            # never settle over it or execute against it.
+            self._parked.add(operation_id)
+            return TakeoverResult(TakeoverResult.PARKED)
+
+        # The kind is needed to drive outbox settlement; it is derivable from
+        # the durable operation details/path even when the mirror is missing
+        # or corrupt. If it cannot be derived at all, nothing is provable.
+        kind = self._infer_kind(record, descriptor)
+        if kind is None:
+            self._parked.add(operation_id)
+            return TakeoverResult(TakeoverResult.PARKED)
+
+        # Settle the durable outbox evidence first. This is ledger-driven and
+        # idempotent: a durable own event commits the files forward, otherwise
+        # minted handles are deleted and the old write set restored. A backend
+        # that cannot confirm a delete leaves the evidence in place. Any
+        # failure to settle (an unreadable ledger/dir, a torn parse) parks the
+        # attempt rather than risking a guess; parking is always retryable.
+        try:
+            settle_outbox(kind, operation_id)
+        except Exception:
+            self._parked.add(operation_id)
+            return TakeoverResult(TakeoverResult.PARKED)
+
+        event = None
+        try:
+            event = self.audit.get_event(operation_id)
+        except LedgerError:
+            self._parked.add(operation_id)
+            return TakeoverResult(TakeoverResult.PARKED)
+
+        if event is not None:
+            # The operation store decides own-vs-foreign and replays the
+            # staged 201/403/404/409 verbatim from durable context (it does
+            # not need the mirror). A foreign same-id event leaves the
+            # operation pending (finalize_pending returns False).
+            finalized = operation_store.finalize_pending(
+                record,
+                resolve_committed=resolve_committed,
+                is_parked=lambda _id: False,
+            )
+            if not finalized:
+                self._parked.add(operation_id)
+                return TakeoverResult(TakeoverResult.PARKED)
+            record = operation_store._read_record(operation_id)
+            if descriptor is not None:
+                # A healthy mirror can be cleaned once post-commit ownership
+                # verifies; a corrupt one is retained as evidence rather than
+                # discarded unverified.
+                self.after_terminal(
+                    ArtifactMirror(self, record, descriptor)
+                )
+            return TakeoverResult(TakeoverResult.TERMINAL, record=record)
+
+        # No durable event: the attempt never committed. Residual evidence
+        # (a journal, snapshot, key/policy marker or empty-restore marker)
+        # means the outbox could not fully roll back -- park and retry later.
+        if self._event_residual_evidence(operation_id):
+            self._parked.add(operation_id)
+            return TakeoverResult(TakeoverResult.PARKED)
+
+        if descriptor is not None:
+            # A PRESENT, healthy mirror whose outbox fully rolled back is the
+            # same scene startup settles as failed(500): finalize it that way
+            # (deterministic whether recovered by a restart or a retry) and
+            # drop the now-spent mirror. This is NOT re-executed -- the first
+            # attempt got far enough to keep its mirror, so its interruption
+            # is a recorded failure rather than a pre-provider mirror fault.
+            finalized = operation_store.finalize_pending(
+                operation_store._read_record(operation_id) or record,
+                resolve_committed=resolve_committed,
+                is_parked=lambda _id: False,
+            )
+            if not finalized:
+                self._parked.add(operation_id)
+                return TakeoverResult(TakeoverResult.PARKED)
+            record = operation_store._read_record(operation_id)
+            self.after_terminal(ArtifactMirror(self, record, descriptor))
+            return TakeoverResult(TakeoverResult.TERMINAL, record=record)
+
+        # MISSING or CORRUPT mirror -- the failure happened while creating the
+        # 0600 mirror before the first provider call. The event never landed
+        # and there is no residual evidence, so the mirror can be rebuilt:
+        # discard a torn file, create a fresh bound mirror and run the attempt
+        # ONCE under the SAME operation_id. A failure here propagates as
+        # OSError; the caller keeps the operation pending and answers 500/503.
+        if mirror_present:
+            if not self.discard(operation_id) and os.path.exists(mirror_path):
+                self._parked.add(operation_id)
+                return TakeoverResult(TakeoverResult.PARKED)
+        record = operation_store._read_record(operation_id) or record
+        mirror = self.create(record)
+        return TakeoverResult(TakeoverResult.EXECUTE, mirror=mirror, record=record)
+
+    @staticmethod
+    def _infer_kind(record, descriptor: Optional[dict]) -> Optional[str]:
+        """The attempt kind from the mirror, the stored details or the path."""
+        if descriptor is not None:
+            kind = descriptor.get("kind")
+            if isinstance(kind, str) and kind in _KIND_ACTIONS:
+                return kind
+        kind = (record.details or {}).get("kind") if record.details else None
+        if isinstance(kind, str) and kind in _KIND_ACTIONS:
+            return kind
+        path = record.path or ""
+        if path == "/v1/keys/batch-rotate":
+            return "batch_rotate"
+        if path == "/v1/keys/import":
+            return "import"
+        if path == "/v1/restore":
+            return "restore"
+        if path.startswith("/v1/keys/") and path.endswith("/rotate"):
+            return "rotate"
+        return None
+
     # -- startup settlement ------------------------------------------------
     def settle_pending(self, operation_store) -> None:
         """Settle surviving mirrors of crashed processes at startup.
@@ -313,9 +487,21 @@ class ArtifactStore:
         evidence set and parks the operation pending for a later open.
         """
         self._parked = set()
+        # Ids this pass explicitly adjudicated from a PRESENT mirror (commit
+        # verified-and-discarded, rollback verified-and-discarded, terminal
+        # housekeeping, or a mirror intentionally retained): the
+        # missing-mirror pass must not re-park these just because the mirror
+        # file was discarded here before the operation was finalized.
+        self._adjudicated = set()
         try:
             names = os.listdir(self.dir_path)
+        except FileNotFoundError:
+            names = []
         except OSError:
+            # The mirror directory exists but cannot be read: every
+            # mirror-required pending operation must be parked because its
+            # mirror can neither be confirmed nor ruled out.
+            self._park_all_mirror_required(operation_store)
             return
         for name in names:
             if not name.endswith(".json"):
@@ -326,15 +512,65 @@ class ArtifactStore:
                 # an operation/event: keep it for operator resolution.
                 continue
             self._settle_one(operation_id, operation_store)
+        # A mirror-required pending operation whose mirror file is MISSING
+        # (the process died at/around the 0600 mirror create) is parked too:
+        # without the cross-index nothing can be cross-checked, so the legacy
+        # no-mirror finalization must not run for it. Legacy operations bound
+        # before the mirror contract keep the old rules and are unaffected.
+        self._park_missing_mirrors(operation_store)
+
+    def _park_all_mirror_required(self, operation_store) -> None:
+        """Park every still-pending mirror-required operation."""
+        import os as _os
+
+        try:
+            names = _os.listdir(operation_store.dir_path)
+        except OSError:
+            return
+        for name in names:
+            if not name.endswith(".json") or name == "index.json":
+                continue
+            record = operation_store._read_record(name[:-5])
+            if (
+                record is not None
+                and not record.is_terminal()
+                and getattr(record, "mirror_required", False)
+            ):
+                self._parked.add(record.operation_id)
+
+    def _park_missing_mirrors(self, operation_store) -> None:
+        """Park mirror-required pending operations with no surviving mirror."""
+        try:
+            names = os.listdir(operation_store.dir_path)
+        except OSError:
+            return
+        for name in names:
+            if not name.endswith(".json") or name == "index.json":
+                continue
+            operation_id = name[:-5]
+            if operation_id in self._parked or operation_id in self._adjudicated:
+                continue
+            record = operation_store._read_record(operation_id)
+            if record is None or record.is_terminal():
+                continue
+            if not getattr(record, "mirror_required", False):
+                # Records predating the mirror contract are never forced to
+                # have one: legacy journal/marker recovery still applies.
+                continue
+            if os.path.exists(self.path_for(operation_id)):
+                continue
+            self._parked.add(operation_id)
 
     def _settle_one(self, operation_id: str, operation_store) -> None:
+        # The mirror file is present, so this id is adjudicated here and must
+        # not be revisited by the missing-mirror sweep (even when this method
+        # discards the mirror before the operation is finalized).
+        self._adjudicated.add(operation_id)
         descriptor = self._read_descriptor(operation_id)
-        if descriptor is None:
-            # Corrupt/unreadable mirror: preserve the evidence and park the
-            # operation rather than guessing.
-            self._parked.add(operation_id)
-            return
         record = operation_store._read_record(operation_id)
+        if descriptor is None:
+            self._settle_corrupt_mirror(operation_id, record)
+            return
         if record is None or not self._binding_matches(descriptor, record):
             # Mirror references a missing operation or a different binding:
             # the two durable records disagree, nothing can be guessed.
@@ -374,6 +610,45 @@ class ArtifactStore:
             self._parked.add(operation_id)
         else:
             self.discard(operation_id)
+
+    def _settle_corrupt_mirror(self, operation_id: str, record) -> None:
+        """Settle a present-but-unreadable mirror at startup.
+
+        A torn/corrupt mirror can still be outweighed by the ledger: the
+        event is the commit authority. When the bound record is pending and a
+        durable SUCCESS event carrying the right action and tenant is present
+        ("event in the ledger == committed"), the outbox recovery has already
+        committed the files forward and the operation finalizes normally --
+        the corrupt mirror is merely retained as evidence, not blocking.
+        Without that fact nothing is provable and the operation stays parked.
+        """
+        if record is None:
+            # No operation to cross-check the mirror against: preserve it.
+            self._parked.add(operation_id)
+            return
+        if record.is_terminal():
+            # Terminal records are never re-finalized; just retain the file.
+            return
+        expected_action = self._infer_kind(record, None)
+        expected_action = _KIND_ACTIONS.get(expected_action)
+        try:
+            event = self.audit.get_event(operation_id)
+        except LedgerError:
+            self._parked.add(operation_id)
+            return
+        if (
+            event is not None
+            and event.outcome == audit_mod.OUTCOME_SUCCESS
+            and event.tenant_id == record.tenant_id
+            and (
+                expected_action is None or event.action == expected_action
+            )
+        ):
+            # Committed despite the corrupt mirror: leave the file for the
+            # operator but do NOT park, so the operation finalizes from the
+            # ledger/staged result.
+            return
+        self._parked.add(operation_id)
 
     def _settle_terminal(self, descriptor: dict, record, event) -> None:
         """Discard a terminal operation's mirror only when its state verifies."""
@@ -508,7 +783,7 @@ class ArtifactStore:
         return False
 
     def _marker_names_event(self, operation_id: str) -> bool:
-        """Whether any key file still carries a pending marker for this id."""
+        """Whether any key/policy file still carries a pending marker for id."""
         directory = self.data_dir
         try:
             names = os.listdir(directory)
@@ -526,7 +801,10 @@ class ArtifactStore:
             desc = nested if isinstance(nested, dict) else marker
             if isinstance(desc, dict) and desc.get("event_id") == operation_id:
                 return True
-        # Policy files can carry the shared restore marker too.
+        return self._policy_marker_names_event(operation_id)
+
+    def _policy_marker_names_event(self, operation_id: str) -> bool:
+        """Whether a policy file carries a pending marker for this id."""
         policy_dir = os.path.join(self.data_dir, "policies")
         try:
             policy_names = os.listdir(policy_dir)
@@ -551,6 +829,56 @@ class ArtifactStore:
             desc = nested if isinstance(nested, dict) else pending
             if isinstance(desc, dict) and desc.get("event_id") == operation_id:
                 return True
+        return False
+
+    def _empty_marker_names_event(self, operation_id: str) -> bool:
+        """Whether any surviving empty-restore marker still names this id."""
+        directory = self.data_dir
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return True
+        for name in names:
+            if not (
+                name.startswith("restore-empty-") and name.endswith(".json")
+            ):
+                continue
+            path = os.path.join(directory, name)
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    marker = json.load(fh)
+            except (OSError, ValueError):
+                if os.path.exists(path):
+                    # Corrupt marker reference: treat as residual evidence.
+                    return True
+                continue
+            if not isinstance(marker, dict):
+                continue
+            event = marker.get("event")
+            if isinstance(event, dict) and event.get("event_id") == operation_id:
+                return True
+        return False
+
+    def _event_residual_evidence(self, operation_id: str) -> bool:
+        """Whether ANY uncommitted-attempt artifact survives for one id.
+
+        Mirror-independent counterpart of :meth:`_residual_evidence`, used when
+        a same-binding retry takes over an attempt whose mirror is missing or
+        was rebuilt: the provision journal, the batch snapshot, pending key/
+        policy markers and empty-restore markers are all scanned by event id.
+        A mirror that requires rollback evidence to be gone parks the attempt
+        while any of these survives.
+        """
+        if os.path.exists(self.key_store._provision_path(operation_id)):
+            return True
+        if os.path.exists(
+            self.key_store._batch_snapshot_path(operation_id)
+        ):
+            return True
+        if self._marker_names_event(operation_id):
+            return True
+        if self._empty_marker_names_event(operation_id):
+            return True
         return False
 
 

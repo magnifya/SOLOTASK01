@@ -157,10 +157,17 @@ class BeginResult(NamedTuple):
     operation), ``"replay"`` (a finished operation to replay) or
     ``"conflict"`` (the key is bound to a different request). A ``"replay"``
     may still be ``pending``; the caller waits via :meth:`await_terminal`.
+    For a ``"new"`` result ``lease_fd`` is an open file descriptor holding an
+    exclusive flock on ``operations/<id>.lease``: the owner executes the
+    attempt while holding it, and a process that dies releases it via the OS,
+    letting a same-binding retry detect that it must (re)build the mirror and
+    continue the SAME operation. Callers MUST release the fd once the
+    operation is answered.
     """
 
     kind: str
     record: Optional["OperationRecord"]
+    lease_fd: Optional[int] = None
 
 
 class OperationRecord:
@@ -180,6 +187,7 @@ class OperationRecord:
         created_at: Optional[str] = None,
         updated_at: Optional[str] = None,
         details: Optional[dict] = None,
+        mirror_required: bool = False,
     ) -> None:
         self.operation_id = operation_id
         self.tenant_id = tenant_id
@@ -196,6 +204,13 @@ class OperationRecord:
         # crash-recovery resolver can rebuild the committed response without
         # the original request (e.g. a restore's write set).
         self.details = details
+        # True for rotate/import/restore/batch-rotate bound under the artifact
+        # mirror contract: the attempt's crash evidence is the
+        # ``operation-artifacts/<id>.json`` mirror. A pending operation with
+        # this flag whose mirror is missing/corrupt/inconsistent can neither
+        # commit nor be rolled back and must stay pending (it never falls back
+        # to the legacy no-mirror finalization).
+        self.mirror_required = mirror_required
 
     # The operation_id is the audit event_id of the mutation it wraps, so the
     # two subsystems resolve a crash by the same identifier.
@@ -217,6 +232,7 @@ class OperationRecord:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "details": self.details,
+            "mirror_required": self.mirror_required,
         }
 
     @classmethod
@@ -234,6 +250,7 @@ class OperationRecord:
             created_at=data.get("created_at"),
             updated_at=data.get("updated_at"),
             details=data.get("details"),
+            mirror_required=bool(data.get("mirror_required", False)),
         )
 
     def is_terminal(self) -> bool:
@@ -289,6 +306,51 @@ class OperationStore:
     # -- paths / locking ---------------------------------------------------
     def _path_for(self, operation_id: str) -> str:
         return os.path.join(self.dir_path, operation_id + ".json")
+
+    def _lease_path(self, operation_id: str) -> str:
+        # The execution lease: the process that owns a pending attempt holds an
+        # exclusive flock on this file for the attempt's whole lifetime. A
+        # same-binding retry that finds the operation still pending takes over
+        # only once it can acquire this lock -- i.e. once the original owner
+        # process is gone (the fd is released by the OS on exit).
+        return os.path.join(self.dir_path, operation_id + ".lease")
+
+    def acquire_lease(self, operation_id: str, blocking: bool = True):
+        """Acquire the execution lease of one operation.
+
+        Returns an open fd holding the exclusive flock, or None when
+        ``blocking`` is False and a live owner still holds it. The lock file is
+        0600 and is created on first use; callers hold the fd until the
+        attempt is answered and close it (never unlink a live lease).
+        """
+        if fcntl is None:  # pragma: no cover - non-POSIX platforms
+            # No flock: a blocking fresh owner proceeds with the inert -1
+            # sentinel, but a non-blocking takeover probe can never prove the
+            # owner is gone, so it reports "busy" and the caller keeps waiting
+            # rather than racing a possibly-running owner.
+            return -1 if blocking else None
+        fd = os.open(
+            self._lease_path(operation_id), os.O_RDWR | os.O_CREAT, 0o600
+        )
+        try:
+            flags = fcntl.LOCK_EX if blocking else (
+                fcntl.LOCK_EX | fcntl.LOCK_NB
+            )
+            fcntl.flock(fd, flags)
+        except OSError:
+            os.close(fd)
+            return None
+        return fd
+
+    def release_lease(self, fd) -> None:
+        """Release an execution-lease fd (closing it drops the flock)."""
+        if fcntl is None:  # pragma: no cover - non-POSIX platforms
+            return
+        try:
+            if fd is not None and fd >= 0:
+                os.close(fd)
+        except OSError:
+            pass
 
     def _locked(self):
         """Take the in-process lock and the cross-process fcntl lock."""
@@ -455,11 +517,22 @@ class OperationStore:
                 status=STATUS_PENDING,
                 created_at=now,
                 updated_at=now,
+                mirror_required=True,
             )
-            self._write_record(record)
-            index["bindings"][scope] = operation_id
-            self._write_atomic(self._index_path, index)
-            return BeginResult("new", record)
+            # Acquire the execution lease BEFORE the binding becomes durable:
+            # the lock is taken while the global index lock is held, so the new
+            # owner is provably alive and holding its lease at the instant the
+            # key becomes bound -- no retry can ever observe a bound operation
+            # that nobody owns.
+            lease_fd = self.acquire_lease(operation_id)
+            try:
+                self._write_record(record)
+                index["bindings"][scope] = operation_id
+                self._write_atomic(self._index_path, index)
+            except BaseException:
+                self.release_lease(lease_fd)
+                raise
+            return BeginResult("new", record, lease_fd)
         finally:
             self._unlocked(fd)
 
@@ -610,66 +683,100 @@ class OperationStore:
             record = self._read_record(operation_id)
             if record is None or record.status != STATUS_PENDING:
                 continue
-            # The artifact-mirror settlement runs first: a surviving mirror
-            # whose evidence is incomplete/inconsistent (unreadable ledger,
-            # uncertain commit, corrupt/missing basis) keeps the operation
-            # pending for a later open rather than guessing a terminal.
-            if is_parked is not None and is_parked(operation_id):
-                continue
-            event = None
-            try:
-                event = self.audit.get_event(record.event_id)
-            except Exception:
-                # Cannot decide right now; leave it for a later open.
-                continue
-            if event is not None and not _event_matches_operation(
-                record, event
+            self.finalize_pending(
+                record,
+                resolve_committed=resolve_committed,
+                is_parked=is_parked,
+            )
+
+    def finalize_pending(
+        self,
+        record: "OperationRecord",
+        resolve_committed: Optional[
+            Callable[["OperationRecord", object], "tuple[int, dict]"]
+        ] = None,
+        is_parked: Optional[Callable[[str], bool]] = None,
+    ) -> bool:
+        """Finalize ONE still-pending operation from the durable facts.
+
+        Mirrors :meth:`recover_pending` for a single record and is used both at
+        startup and by a same-binding retry that has just taken a dead owner's
+        lease and settled the on-disk outbox/mirror state. Returns True when a
+        terminal was persisted, False when the operation must STAY pending:
+        its mirror parks it (missing/corrupt/inconsistent evidence), the
+        ledger is unreadable, a same-id event is a foreign action, or a
+        committed response cannot be rebuilt. Never guesses a rollback.
+        """
+        # The artifact-mirror settlement runs first: a surviving mirror
+        # whose evidence is incomplete/inconsistent (unreadable ledger,
+        # uncertain commit, corrupt/missing basis) keeps the operation
+        # pending for a later open rather than guessing a terminal.
+        if is_parked is not None and is_parked(record.operation_id):
+            return False
+        # Re-read under the lock window: never overwrite a record another
+        # process finalised between the caller's lookup and this decision.
+        fresh = self._read_record(record.operation_id)
+        if fresh is None:
+            return False
+        if fresh.is_terminal():
+            record.__dict__.update(fresh.__dict__)
+            return True
+        record = fresh
+        event = None
+        try:
+            event = self.audit.get_event(record.event_id)
+        except Exception:
+            # Cannot decide right now; leave it for a later open.
+            return False
+        if event is not None and not _event_matches_operation(
+            record, event
+        ):
+            # A durable event carries this operation's id but is not the
+            # operation's own event (tenant/action/outcome mismatch): the
+            # id collides with a different mutation, so the operation can
+            # be finalized neither as committed nor as failed. Leave it
+            # pending for operator/startup resolution rather than
+            # replaying a response the durable fact does not support.
+            return False
+        if event is not None:
+            details = record.details or {}
+            staged = details.get("result")
+            if (
+                isinstance(staged, dict)
+                and isinstance(staged.get("http_status"), int)
+                and isinstance(staged.get("response"), dict)
             ):
-                # A durable event carries this operation's id but is not the
-                # operation's own event (tenant/action/outcome mismatch): the
-                # id collides with a different mutation, so the operation can
-                # be finalized neither as committed nor as failed. Leave it
-                # pending for operator/startup resolution rather than
-                # replaying a response the durable fact does not support.
-                continue
-            if event is not None:
-                details = record.details or {}
-                staged = details.get("result")
-                if (
-                    isinstance(staged, dict)
-                    and isinstance(staged.get("http_status"), int)
-                    and isinstance(staged.get("response"), dict)
-                ):
-                    # The durable fact: replay the first status/response
-                    # byte-for-byte regardless of the current policy/state.
-                    http_status = int(staged["http_status"])
-                    response = staged["response"]
-                else:
-                    # Backwards-compatible recovery for records that
-                    # committed before the result was staged.
-                    http_status, response = 201, {
-                        "operation_id": record.operation_id
-                    }
-                    if resolve_committed is not None:
-                        try:
-                            http_status, response = resolve_committed(
-                                record, event
-                            )
-                        except Exception:
-                            http_status, response = 201, {
-                                "operation_id": record.operation_id
-                            }
-                self.finish(
-                    record,
-                    state_for_http_status(http_status),
-                    http_status,
-                    response,
-                )
+                # The durable fact: replay the first status/response
+                # byte-for-byte regardless of the current policy/state.
+                http_status = int(staged["http_status"])
+                response = staged["response"]
             else:
-                self.finish(
-                    record,
-                    STATUS_FAILED,
-                    500,
-                    {"error": "operation interrupted before commit",
-                     "operation_id": record.operation_id},
-                )
+                # Backwards-compatible recovery for records that
+                # committed before the result was staged.
+                http_status, response = 201, {
+                    "operation_id": record.operation_id
+                }
+                if resolve_committed is not None:
+                    try:
+                        http_status, response = resolve_committed(
+                            record, event
+                        )
+                    except Exception:
+                        http_status, response = 201, {
+                            "operation_id": record.operation_id
+                        }
+            self.finish(
+                record,
+                state_for_http_status(http_status),
+                http_status,
+                response,
+            )
+            return True
+        self.finish(
+            record,
+            STATUS_FAILED,
+            500,
+            {"error": "operation interrupted before commit",
+             "operation_id": record.operation_id},
+        )
+        return True

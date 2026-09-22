@@ -146,6 +146,22 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   snapshot 与句柄），不猜测回滚也不暴露未提交 current：该 operation 保持
   `pending`，请求/重启返回 `500`/`503` 等待下次重试。无镜像的旧 journal 与旧
   restore 标记沿用原有恢复规则，镜像从不强制存在。
+- **镜像创建失败不终结操作**：幂等键绑定（`operations/<id>.json` 与
+  index）耐久之后、首次调用提供者之前，若 0600 镜像创建抛出 `OSError`、
+  temp 文件 fsync/replace 失败或镜像目录不可读，**绝不**把操作终结为
+  failed/500，也不调用提供者、不写密钥/句柄、不写审计：已绑定 operation 的
+  完整上下文（租户、操作者、路径、规范化请求）原样保留，状态维持 `pending`，
+  以不含任何材料/句柄的 `503`（CLI 退出 `1`）等待重试。该绑定由一把
+  `operations/<id>.lease` 的 fcntl 执行租约守护：只有确认原进程已释放租约
+  （死亡或已返回）的同绑定请求才能接管。重启（或 GET operation）识别无镜像/
+  损坏镜像：账本中确属本操作（action/tenant/operation 一致）的成功事件即已
+  提交，照常收尾；事件未入账时，只有镜像缺失或损坏**且** journal/snapshot/
+  标记等证据全部归零（outbox 已幂等删除新句柄、恢复可信旧写集）才原地重建
+  `bound` 镜像并复用同一 `operation_id` 执行一次；现存且健康的镜像其回滚已
+  完成时按 failed(500) 收尾（重启与重试结果一致），证据不足则继续停放、隐藏
+  未提交 current，绝不猜测回滚。HTTP 与 CLI 可交叉用相同 `Idempotency-Key`
+  重试：成功、403/404/409 拒绝、409 冲突与提供者 503 失败仍按原契约以同一
+  `operation_id` 唯一记账、原样重放；清理失败不改动已提交结果。
 - `GET /v1/operations/{operation_id}`：需单一操作者与单一租户来源；操作须
   同时属于该租户与操作者，否则一律 `404`。`200` →
   `{operation_id, tenant_id, status, http_status, response}`，pending 时后两

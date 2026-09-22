@@ -986,57 +986,87 @@ class KeyStore:
         for name in names:
             if not (name.endswith(".json") and is_valid_key_id(name[:-5])):
                 continue
+            self._settle_pending_event_file(os.path.join(self.data_dir, name))
+
+    def recover_pending_event_now(self, event_id: str) -> None:
+        """Settle every single-key outbox marker naming one event id.
+
+        Request-path counterpart of :meth:`_recover_pending_events` for a
+        same-binding retry that has just taken a dead owner's execution lease:
+        only rotate/import markers (never restore/batch groups) are touched,
+        and only when they name ``event_id``. Idempotent and driven by the
+        ledger, exactly like the startup sweep.
+        """
+        try:
+            names = os.listdir(self.data_dir)
+        except OSError:
+            return
+        for name in names:
+            if not (name.endswith(".json") and is_valid_key_id(name[:-5])):
+                continue
             path = os.path.join(self.data_dir, name)
-            key_id = name[:-5]
-            with self._key_lock(key_id), self._file_lock(key_id):
-                record = self._read_record(path)
-                if record is None or not record.pending_event:
-                    continue
-                # A multi-file tenant restore transaction is resolved by the
-                # RestoreCoordinator (its manifest drives the shared event),
-                # and a multi-key batch-rotation group by
-                # _recover_batch_rotations; neither is resolved here.
-                if record.pending_event.get("_restore") or record.pending_event.get(
-                    "_batch_rotate"
-                ):
-                    continue
-                # append() is idempotent on event_id, so this is safe whether
-                # the crash happened before or after the ledger write.
-                event = AuditEvent.from_json(record.pending_event)
-                journal_id = record.pending_event.get("journal")
-                try:
-                    existing = self.audit.get_event(event.event_id)
-                except LedgerError:
-                    # The ledger cannot be read right now; leave the marker
-                    # in place for the next open rather than guessing.
-                    continue
-                if existing is not None and (
-                    existing.outcome != audit_mod.OUTCOME_SUCCESS
-                    or existing.action != event.action
-                    or existing.tenant_id != event.tenant_id
-                ):
-                    # A durable event already carries this id but is not
-                    # exactly this operation's success event (a rejection, or
-                    # an action/tenant collision): the scene can be settled
-                    # neither by committing nor by rolling back. Park it --
-                    # marker, journal and handles stay for operator/startup
-                    # resolution, and reads keep hiding the uncommitted
-                    # current.
-                    continue
-                try:
-                    self.audit.append(event)
-                    record.pending_event = None
-                    self._write_atomic(path, record.to_json())
-                except (LedgerError, OSError):
-                    # The ledger or directory is temporarily unwritable.
-                    # Leave the marker in place; it is retried on the next
-                    # open (the append is idempotent on event_id).
-                    continue
-                if isinstance(journal_id, str) and journal_id:
-                    # The import committed (event is in the ledger); its
-                    # minted handles are now owned by the key, so the
-                    # attempt's provision journal is finished.
-                    self.drop_provision_journal(journal_id)
+            record = self._read_record(path)
+            marker = getattr(record, "pending_event", None)
+            if not isinstance(marker, dict):
+                continue
+            desc = marker.get("event")
+            eid = desc.get("event_id") if isinstance(desc, dict) else None
+            if eid != event_id:
+                continue
+            self._settle_pending_event_file(path)
+
+    def _settle_pending_event_file(self, path: str) -> None:
+        """Resolve one key file's pending single-key outbox marker."""
+        key_id = os.path.basename(path)[:-5]
+        with self._key_lock(key_id), self._file_lock(key_id):
+            record = self._read_record(path)
+            if record is None or not record.pending_event:
+                return
+            # A multi-file tenant restore transaction is resolved by the
+            # RestoreCoordinator (its manifest drives the shared event),
+            # and a multi-key batch-rotation group by
+            # _recover_batch_rotations; neither is resolved here.
+            if record.pending_event.get("_restore") or record.pending_event.get(
+                "_batch_rotate"
+            ):
+                return
+            # append() is idempotent on event_id, so this is safe whether
+            # the crash happened before or after the ledger write.
+            event = AuditEvent.from_json(record.pending_event)
+            journal_id = record.pending_event.get("journal")
+            try:
+                existing = self.audit.get_event(event.event_id)
+            except LedgerError:
+                # The ledger cannot be read right now; leave the marker
+                # in place for the next open rather than guessing.
+                return
+            if existing is not None and (
+                existing.outcome != audit_mod.OUTCOME_SUCCESS
+                or existing.action != event.action
+                or existing.tenant_id != event.tenant_id
+            ):
+                # A durable event already carries this id but is not
+                # exactly this operation's success event (a rejection, or
+                # an action/tenant collision): the scene can be settled
+                # neither by committing nor by rolling back. Park it --
+                # marker, journal and handles stay for operator/startup
+                # resolution, and reads keep hiding the uncommitted
+                # current.
+                return
+            try:
+                self.audit.append(event)
+                record.pending_event = None
+                self._write_atomic(path, record.to_json())
+            except (LedgerError, OSError):
+                # The ledger or directory is temporarily unwritable.
+                # Leave the marker in place; it is retried on the next
+                # open (the append is idempotent on event_id).
+                return
+            if isinstance(journal_id, str) and journal_id:
+                # The import committed (event is in the ledger); its
+                # minted handles are now owned by the key, so the
+                # attempt's provision journal is finished.
+                self.drop_provision_journal(journal_id)
 
     def _commit_mutation(
         self,
@@ -2405,6 +2435,124 @@ class KeyStore:
                 eid, marker_groups.get(eid), snapshots.get(eid),
                 snapshot_present=eid in snapshots,
             )
+
+    def recover_batch_event_now(self, event_id: str) -> None:
+        """Settle one interrupted batch-rotation group on the request path.
+
+        Counterpart of :meth:`_recover_batch_rotations` for a same-binding
+        retry taking a dead owner's lease: it resolves only the group/snapshot
+        named ``event_id`` under the same locks and ledger rules. Also reaps
+        the attempt's own provision journal when neither a marker nor a
+        snapshot survives. Idempotent.
+        """
+        group = None
+        try:
+            names = os.listdir(self.data_dir)
+        except OSError:
+            names = []
+        for name in names:
+            if not (name.endswith(".json") and is_valid_key_id(name[:-5])):
+                continue
+            path = os.path.join(self.data_dir, name)
+            record = self._read_record(path)
+            marker = getattr(record, "pending_event", None)
+            if not isinstance(marker, dict) or not marker.get(
+                "_batch_rotate"
+            ):
+                continue
+            event_desc = marker.get("event")
+            eid = (
+                event_desc.get("event_id")
+                if isinstance(event_desc, dict)
+                else None
+            )
+            if eid != event_id:
+                continue
+            if group is None:
+                group = {"files": {}, "markers": []}
+            group["files"][record.key_id] = path
+            group["markers"].append(marker)
+
+        snapshot_present = event_id in self._list_batch_snapshot_ids()
+        snapshot = (
+            self._read_batch_snapshot(event_id) if snapshot_present else None
+        )
+        if group is not None or snapshot_present:
+            self._recover_batch_unit(
+                event_id, group, snapshot, snapshot_present=snapshot_present
+            )
+            return
+        # Neither a marker group nor a snapshot survives: the attempt can only
+        # have left an orphan provision journal named after the event. Reap it
+        # exactly like the startup sweep's no-evidence tail.
+        if self._provision_journal_present(event_id):
+            existing = None
+            try:
+                existing = self.audit.get_event(event_id)
+            except LedgerError:
+                return
+            committed = (
+                existing is not None
+                and existing.outcome == audit_mod.OUTCOME_SUCCESS
+            )
+            if committed and self._journal_event_is_foreign_success(
+                event_id, existing
+            ):
+                return
+            if not committed:
+                if not self.release_journal_handles(event_id):
+                    return
+            self.drop_provision_journal(event_id)
+
+    def _provision_journal_present(self, journal_id: str) -> bool:
+        return os.path.exists(self._provision_path(journal_id))
+
+    def recover_provision_journal_now(self, journal_id: str) -> None:
+        """Reap/finalize one single-key (rotate/import) provision journal.
+
+        Used by request-path takeover when no key marker names the event: a
+        durable matching success drops the journal (handles are record-owned);
+        otherwise every journaled handle is deleted idempotently before the
+        journal is removed. An unreadable ledger, a foreign same-id success or
+        a failed delete leaves everything in place (park).
+        """
+        path = self._provision_path(journal_id)
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                lines = fh.readlines()
+        except OSError:
+            return
+        entries = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            provider_id = entry.get("provider_id")
+            handle = entry.get("handle")
+            if isinstance(provider_id, str) and provider_id and isinstance(
+                handle, str
+            ) and handle:
+                entries.append((provider_id, handle))
+        event = None
+        try:
+            event = self.audit.get_event(journal_id)
+        except LedgerError:
+            return
+        if event is not None and event.outcome == audit_mod.OUTCOME_SUCCESS:
+            if self._journal_event_is_foreign_success(journal_id, event):
+                return
+            self._discard_provision_journal(path)
+            return
+        if self._rollback_provision_entries(entries):
+            self._discard_provision_journal(path)
 
     def _strict_previous_record(
         self, key_id: str, tenant_id: str, data

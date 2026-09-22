@@ -382,8 +382,112 @@ def _idem_serve_existing(op_store, kind, record) -> "Optional[int]":
     )
 
 
+def _idem_serve_terminal(kind, record) -> "Optional[int]":
+    """Serve a terminal/conflict bound key; None when unbound or still pending.
+
+    Unlike :func:`_idem_serve_existing` a still-pending binding is NOT waited
+    on here: the caller proceeds to the authoritative ``begin`` and either
+    waits for the live owner or takes over a dead owner's attempt.
+    """
+    if kind == "new":
+        return None
+    if kind == "conflict":
+        return _emit_operation_result(
+            409,
+            {
+                "error": "Idempotency-Key is already bound to a different "
+                "request",
+                "operation_id": record.operation_id,
+            },
+        )
+    if record.is_terminal():
+        return _emit_operation_result(record.http_status, record.response)
+    return None
+
+
+def _mirror_unavailable_exit(operation_id: str) -> int:
+    """Exit 1 / 503 for a bound op whose mirror could not be created/verified.
+
+    The operation stays pending with its full binding context; the message
+    names no path detail, handle or material.
+    """
+    return _emit_operation_result(
+        503,
+        {
+            "error": "operation temporarily unavailable; "
+            "retry with the same Idempotency-Key",
+            "operation_id": operation_id,
+        },
+    )
+
+
+def _settle_attempt_outbox(store, coordinator, kind: str,
+                           operation_id: str) -> None:
+    """Settle one taken-over attempt's durable outbox evidence (CLI side)."""
+    if kind in ("rotate", "import"):
+        store.recover_pending_event_now(operation_id)
+        store.recover_provision_journal_now(operation_id)
+    elif kind == "batch_rotate":
+        store.recover_batch_event_now(operation_id)
+    elif kind == "restore" and coordinator is not None:
+        coordinator.recover(only_event=operation_id)
+
+
+def _idem_takeover(op_store, store, coordinator, artifact_store, record,
+                   executor, resolve_committed):
+    """Continue a dead owner's still-pending attempt under the same op id."""
+    lease_fd = None
+    mirror = None
+    if not record.is_terminal():
+        lease_fd = op_store.acquire_lease(record.operation_id, blocking=False)
+        if lease_fd is None:
+            record = op_store.await_terminal(record)
+            if record.is_terminal():
+                return _emit_operation_result(record.http_status, record.response)
+            lease_fd = op_store.acquire_lease(record.operation_id, blocking=False)
+    if record.is_terminal():
+        return _emit_operation_result(record.http_status, record.response)
+    if lease_fd is None:
+        return _emit_operation_result(
+            503,
+            {
+                "error": "operation timed out waiting for a lock",
+                "operation_id": record.operation_id,
+            },
+        )
+    try:
+        try:
+            result = artifact_store.takeover(
+                op_store,
+                record,
+                lambda kind, op_id: _settle_attempt_outbox(
+                    store, coordinator, kind, op_id
+                ),
+                resolve_committed=resolve_committed,
+            )
+        except OSError:
+            return _mirror_unavailable_exit(record.operation_id)
+        if result.kind == result.TERMINAL:
+            rec = result.record or record
+            return _emit_operation_result(rec.http_status, rec.response)
+        if result.kind == result.PARKED:
+            return _mirror_unavailable_exit(record.operation_id)
+        operation = result.record
+        mirror = result.mirror
+        try:
+            return _idempotent_run_body(
+                op_store, store, executor, operation,
+                operation.operation_id, mirror,
+            )
+        finally:
+            artifact_store.after_terminal(mirror)
+    finally:
+        op_store.release_lease(lease_fd)
+
+
 def idempotent_run(op_store, store, path, tenant_id, operator, body, key,
-                   validator, executor, decoder=None, artifact_store=None):
+                   validator, executor, decoder=None, artifact_store=None,
+                   coordinator=None, resolve_committed=None):
     """CLI counterpart of the HTTP idempotency guard.
 
     Returns a process exit code. ``validator()`` runs cheap side-effect-free
@@ -396,6 +500,11 @@ def idempotent_run(op_store, store, path, tenant_id, operator, body, key,
     ``executor(operation, mirror) -> (http_status, body)`` runs once for a new
     binding and may raise ProviderInvalidMaterial / ProviderUnavailable /
     LedgerError / LockTimeout.
+
+    A still-pending identical binding either waits for its live owner or
+    takes over a dead owner's attempt under the SAME operation_id; a mirror
+    that cannot be created keeps the operation pending and exits 1 (503) for a
+    same-key retry rather than finalizing failed.
     """
     if _idem_key_error(key):
         return 2
@@ -408,9 +517,10 @@ def idempotent_run(op_store, store, path, tenant_id, operator, body, key,
 
     # An already-bound key replays/conflicts before the expensive decoder
     # (bundle decryption), so a bad passphrase on a retry never masks a
-    # replay or consumes the key.
+    # replay or consumes the key. A still-pending binding falls through to
+    # begin(), which is authoritative for the takeover.
     peek = op_store.peek(tenant_id, operator, path, normalized, key)
-    existing = _idem_serve_existing(op_store, peek.kind, peek.record)
+    existing = _idem_serve_terminal(peek.kind, peek.record)
     if existing is not None:
         return existing
 
@@ -423,44 +533,55 @@ def idempotent_run(op_store, store, path, tenant_id, operator, body, key,
     # begin() is authoritative for the bind (another process may have won
     # between the peek and here).
     begin = op_store.begin(tenant_id, operator, path, normalized, key)
-    existing = _idem_serve_existing(op_store, begin.kind, begin.record)
-    if existing is not None:
-        return existing
+    if begin.kind == "conflict":
+        return _idem_serve_existing(op_store, "conflict", begin.record)
+    if begin.kind == "replay":
+        if begin.record.is_terminal():
+            return _emit_operation_result(
+                begin.record.http_status, begin.record.response
+            )
+        if artifact_store is None:
+            return _idem_serve_existing(op_store, "replay", begin.record)
+        return _idem_takeover(
+            op_store, store, coordinator, artifact_store, begin.record,
+            executor, resolve_committed,
+        )
 
     operation = begin.record
     op_id = operation.operation_id
-    # The mirror is durable before the executor calls any provider: it
-    # cross-references the operation record, the provision journal, the
-    # restore marker / batch snapshot and every new handle.
+    lease_fd = begin.lease_fd
+    mirror = None
     try:
-        mirror = (
-            artifact_store.create(operation)
-            if artifact_store is not None
-            else None
-        )
-    except OSError as exc:
-        # Binding landed but the mirror could not be created; no provider was
-        # called and nothing committed. Finalize failed(500) (CLI exit 1); the
-        # next open reconciles without a mirror via the legacy rules.
-        body_err = {
-            "error": "audit ledger failure: %s" % exc,
-            "operation_id": op_id,
-        }
-        op_store.finish(
-            operation, operations_mod.STATUS_FAILED, 500, body_err
-        )
-        return _emit_operation_result(500, body_err)
-    try:
-        exit_code = _idempotent_run_body(
-            op_store, store, executor, operation, op_id, mirror
-        )
+        # The mirror is durable before the executor calls any provider: it
+        # cross-references the operation record, the provision journal, the
+        # restore marker / batch snapshot and every new handle.
+        try:
+            mirror = (
+                artifact_store.create(operation)
+                if artifact_store is not None
+                else None
+            )
+        except OSError:
+            # The binding landed but the 0600 mirror could not be created
+            # (OSError, temp-file replace failure, unreadable directory). No
+            # provider was called and no key, handle or audit event was
+            # written. Keep the fully bound operation PENDING -- never finish
+            # it failed/500 -- and exit 1 with a material-free 503: a retry of
+            # the same Idempotency-Key rebuilds the mirror and continues.
+            return _mirror_unavailable_exit(op_id)
+        try:
+            exit_code = _idempotent_run_body(
+                op_store, store, executor, operation, op_id, mirror
+            )
+        finally:
+            if artifact_store is not None and mirror is not None:
+                # Committed: verified ownership then dropped; uncommitted:
+                # dropped only once every rollback artifact is gone. A mirror
+                # that cannot be verified survives for the next startup.
+                artifact_store.after_terminal(mirror)
+        return exit_code
     finally:
-        if artifact_store is not None and mirror is not None:
-            # Committed: verified ownership then dropped; uncommitted: dropped
-            # only once every rollback artifact is gone. A mirror that cannot
-            # be verified survives for the next startup.
-            artifact_store.after_terminal(mirror)
-    return exit_code
+        op_store.release_lease(lease_fd)
 
 
 def _idempotent_run_body(op_store, store, executor, operation, op_id, mirror):
@@ -705,7 +826,9 @@ def _run(argv: Optional[List[str]] = None) -> int:
         return idempotent_run(
             op_store, store, path, args.tenant_id, args.operator, body,
             args.idempotency_key, lambda: None, execute,
-            artifact_store=artifact_store,
+            artifact_store=artifact_store, coordinator=coordinator,
+            resolve_committed=lambda rec, event:
+            _resolve_committed_operation(store, policies, rec, event),
         )
 
     if args.command == "batch-rotate":
@@ -812,7 +935,9 @@ def _run(argv: Optional[List[str]] = None) -> int:
         return idempotent_run(
             op_store, store, path, args.tenant_id, args.operator, body,
             args.idempotency_key, lambda: None, execute,
-            artifact_store=artifact_store,
+            artifact_store=artifact_store, coordinator=coordinator,
+            resolve_committed=lambda rec, event:
+            _resolve_committed_operation(store, policies, rec, event),
         )
 
     if args.command == "version":
@@ -1034,7 +1159,9 @@ def _run(argv: Optional[List[str]] = None) -> int:
         return idempotent_run(
             op_store, store, path, args.tenant_id, args.operator, body,
             args.idempotency_key, validator, execute, decoder,
-            artifact_store=artifact_store,
+            artifact_store=artifact_store, coordinator=coordinator,
+            resolve_committed=lambda rec, event:
+            _resolve_committed_operation(store, policies, rec, event),
         )
 
     if args.command == "backup":
@@ -1187,7 +1314,9 @@ def _run(argv: Optional[List[str]] = None) -> int:
         return idempotent_run(
             op_store, store, path, args.tenant_id, args.operator, body,
             args.idempotency_key, validator, execute, decoder,
-            artifact_store=artifact_store,
+            artifact_store=artifact_store, coordinator=coordinator,
+            resolve_committed=lambda rec, event:
+            _resolve_committed_operation(store, policies, rec, event),
         )
 
     if args.command == "operation":

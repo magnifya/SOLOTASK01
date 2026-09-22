@@ -144,11 +144,13 @@ def make_handler(
             """Resolve an already-bound key before expensive/decrypt work.
 
             Returns True when the response was sent (a replay or a conflict);
-            False when the key is unbound and the caller should proceed with
-            side-effect-free validation. This keeps a failed bundle decrypt
-            from consuming an Idempotency-Key, and makes a same-key/
-            different-binding request answer 409 even when its bundle would
-            not decrypt.
+            False when the key is unbound OR its owner process is gone and a
+            same-binding retry must take over the still-pending attempt (the
+            bundle is then decrypted and the guard runs the takeover, reusing
+            the same operation_id). This keeps a failed bundle decrypt from
+            consuming an Idempotency-Key, makes a same-key/different-binding
+            request answer 409 even when its bundle would not decrypt, and
+            waits on a still-LIVE owner rather than racing it.
             """
             normalized = operations_mod.normalize_body(payload)
             peek = operation_store.peek(
@@ -156,7 +158,31 @@ def make_handler(
             )
             if peek.kind == "new":
                 return False
-            return self._serve_existing_binding(peek.kind, peek.record)
+            if peek.kind == "conflict":
+                self._serve_existing_binding("conflict", peek.record)
+                return True
+            record = peek.record
+            if record.is_terminal():
+                self._serve_existing_binding("replay", record)
+                return True
+            # Pending. Probe the owner's execution lease: a live owner is
+            # waited on; a dead owner (lease free) falls through to takeover.
+            lease_fd = operation_store.acquire_lease(
+                record.operation_id, blocking=False
+            )
+            if lease_fd is None:
+                record = operation_store.await_terminal(record)
+                if record.is_terminal():
+                    self._serve_existing_binding("replay", record)
+                    return True
+                self._send_json(
+                    503, self._timed_out_body(record.operation_id)
+                )
+                return True
+            # Lease was free: do not keep it (the guard's takeover re-acquires
+            # it authoritatively after the bundle is decrypted).
+            operation_store.release_lease(lease_fd)
+            return False
 
         def _op_state_for_status(self, http_status: int) -> str:
             # 201 is the only success; an explicit request conflict is the
@@ -290,37 +316,41 @@ def make_handler(
             begin = operation_store.begin(
                 tenant_id, operator, path, normalized, key
             )
-            if begin.kind != "new":
-                # Lost a precheck->begin race or an explicit retry: replay or
-                # conflict, never execute.
-                self._serve_existing_binding(begin.kind, begin.record)
+            if begin.kind == "conflict":
+                self._serve_existing_binding("conflict", begin.record)
+                return
+            if begin.kind == "replay":
+                # Lost a precheck->begin race or an explicit retry. A terminal
+                # binding replays verbatim; a still-pending one either waits
+                # for its live owner or takes over a dead owner's attempt
+                # under the SAME operation_id -- never a second execution.
+                self._serve_replay_or_takeover(begin.record, executor)
                 return
             operation = begin.record
             op_id = operation.operation_id
-            # The mirror is durable before the executor calls any provider:
-            # it cross-references the operation record, the provision journal,
-            # the restore marker / batch snapshot and every new handle.
+            lease_fd = begin.lease_fd
+            mirror = None
             try:
-                mirror = (
-                    artifact_store.create(operation)
-                    if artifact_store is not None
-                    else None
-                )
-            except OSError as exc:
-                # The binding landed but the mirror could not be created: no
-                # provider was called, so nothing committed. Finalize the
-                # bound op failed(500); the next open reconciles without a
-                # mirror using the legacy recovery rules.
-                body = {
-                    "error": "audit ledger failure: %s" % exc,
-                    "operation_id": op_id,
-                }
-                operation_store.finish(
-                    operation, operations_mod.STATUS_FAILED, 500, body
-                )
-                self._send_json(500, body)
-                return
-            try:
+                # The mirror is durable before the executor calls any
+                # provider: it cross-references the operation record, the
+                # provision journal, the restore marker / batch snapshot and
+                # every new handle.
+                try:
+                    mirror = (
+                        artifact_store.create(operation)
+                        if artifact_store is not None
+                        else None
+                    )
+                except OSError:
+                    # The binding landed but the 0600 mirror could not be
+                    # created (OSError, temp-file replace failure, unreadable
+                    # directory). No provider was called and no key, handle or
+                    # audit event was written. Keep the FULLY bound operation
+                    # pending -- never finalize failed/500 -- and answer a
+                    # material-free 503: a retry of the same Idempotency-Key
+                    # rebuilds the mirror and continues this operation_id.
+                    self._mirror_unavailable(op_id)
+                    return
                 self._idempotent_run_body(
                     operation, op_id, executor, mirror
                 )
@@ -330,6 +360,111 @@ def make_handler(
                     # dropped only once every rollback artifact is gone. A
                     # mirror that cannot be verified survives for startup.
                     artifact_store.after_terminal(mirror)
+                operation_store.release_lease(lease_fd)
+
+        def _mirror_unavailable(self, operation_id: str) -> None:
+            """503 for a bound op whose mirror could not be created/verified.
+
+            The operation is kept pending with its full binding context; the
+            body names only the operation_id and a retry hint -- never a path
+            detail, a handle or material.
+            """
+            self._send_json(
+                503,
+                {
+                    "error": "operation temporarily unavailable; "
+                    "retry with the same Idempotency-Key",
+                    "operation_id": operation_id,
+                },
+            )
+
+        def _settle_attempt_outbox(self, kind: str, operation_id: str) -> None:
+            """Settle one taken-over attempt's durable outbox evidence.
+
+            Ledger-driven and idempotent: a durable own event commits the
+            files forward; otherwise the attempt's minted handles are deleted
+            and the trusted old write set restored. A backend that cannot
+            confirm a delete leaves the evidence in place (this does not
+            raise; the takeover re-checks residual evidence and parks).
+            """
+            if kind in ("rotate", "import"):
+                store.recover_pending_event_now(operation_id)
+                store.recover_provision_journal_now(operation_id)
+            elif kind == "batch_rotate":
+                store.recover_batch_event_now(operation_id)
+            elif kind == "restore":
+                coordinator.recover(only_event=operation_id)
+
+        def _serve_replay_or_takeover(self, record, executor) -> None:
+            """Replay a terminal binding, or continue a dead owner's attempt.
+
+            A still-pending identical binding first waits for its live owner
+            (up to 5 s). If the owner reaches a terminal the stored result is
+            replayed. If the owner process is gone (its execution lease is
+            free) the retry acquires the lease, settles the attempt's outbox
+            evidence and, only when no event committed and every rollback
+            artifact is gone, runs the executor ONCE under the SAME
+            operation_id with a rebuilt mirror. Missing/corrupt/inconsistent
+            evidence keeps the operation pending behind a 503 -- nothing is
+            guessed and no uncommitted current is exposed.
+            """
+            if not record.is_terminal():
+                # Fast path: the owner process already released its lease (it
+                # answered 503 on a mirror-create failure or died). Take over
+                # immediately instead of burning the 5 s wait budget.
+                lease_fd = operation_store.acquire_lease(
+                    record.operation_id, blocking=False
+                )
+                if lease_fd is None:
+                    # A live owner is still running the attempt: wait for its
+                    # terminal, then replay; if it stays busy past the budget
+                    # answer timed_out (503) without writing anything.
+                    record = operation_store.await_terminal(record)
+                    if record.is_terminal():
+                        self._serve_existing_binding("replay", record)
+                        return
+                    lease_fd = operation_store.acquire_lease(
+                        record.operation_id, blocking=False
+                    )
+            if record.is_terminal():
+                self._serve_existing_binding("replay", record)
+                return
+            if lease_fd is None:
+                self._send_json(503, self._timed_out_body(record.operation_id))
+                return
+            mirror = None
+            try:
+                try:
+                    result = artifact_store.takeover(
+                        operation_store,
+                        record,
+                        self._settle_attempt_outbox,
+                        resolve_committed=lambda rec, event: (
+                            _resolve_committed_operation(
+                                store, policy_store, rec, event
+                            )
+                        ),
+                    )
+                except OSError:
+                    self._mirror_unavailable(record.operation_id)
+                    return
+                if result.kind == result.TERMINAL:
+                    rec = result.record or record
+                    self._send_json(rec.http_status, rec.response)
+                    return
+                if result.kind == result.PARKED:
+                    self._mirror_unavailable(record.operation_id)
+                    return
+                # EXECUTE: continue the SAME operation with a rebuilt mirror.
+                operation = result.record
+                mirror = result.mirror
+                self._idempotent_run_body(
+                    operation, operation.operation_id, executor, mirror
+                )
+            finally:
+                if artifact_store is not None and mirror is not None:
+                    artifact_store.after_terminal(mirror)
+                operation_store.release_lease(lease_fd)
 
         def _idempotent_run_body(self, operation, op_id, executor, mirror):
             try:
