@@ -5,6 +5,7 @@ import json
 import os
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Optional
 from urllib.parse import parse_qs, urlsplit
 
 from . import audit as audit_mod
@@ -12,6 +13,7 @@ from . import keybundle
 from . import operations as operations_mod
 from . import restore as restore_mod
 from . import tenantbundle
+from .artifacts import ArtifactConflict, ArtifactStore
 from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
 from .operations import OperationStore
@@ -42,8 +44,12 @@ def make_handler(
     policy_store: PolicyStore,
     coordinator: "restore_mod.RestoreCoordinator",
     operation_store: "OperationStore",
+    artifact_store: "Optional[ArtifactStore]" = None,
 ) -> type:
     """Build a BaseHTTPRequestHandler subclass bound to the stores."""
+
+    if artifact_store is None:
+        artifact_store = ArtifactStore(store.data_dir, store.audit)
 
     class KeyHandler(BaseHTTPRequestHandler):
         server_version = "KeyMgr/1.0"
@@ -303,6 +309,9 @@ def make_handler(
                 operation_store.finish(
                     operation, operations_mod.STATUS_TIMED_OUT, 503, body
                 )
+                # The lock wait precedes every journal/handle/file write, so
+                # the staged mirror has no referenced evidence and is dropped.
+                self._settle_artifact(op_id)
                 self._send_json(503, body)
                 return
             except ProviderInvalidMaterial as exc:
@@ -314,6 +323,10 @@ def make_handler(
                     self._idempotent_provider_terminal(
                         operation, 400, str(exc)
                     )
+                    # Every minted handle was deleted and the journal dropped
+                    # before this propagated; settle removes the mirror (and
+                    # keeps it only if some evidence unexpectedly survives).
+                    self._settle_artifact(op_id)
                     return
                 except (OSError, LedgerError) as persist_exc:
                     body = {
@@ -335,6 +348,12 @@ def make_handler(
                         operation, 503,
                         "key management provider is unavailable",
                     )
+                    # A clean provider fault deleted every minted handle and
+                    # dropped the journal -> the mirror is dropped too. When a
+                    # delete could not be verified the journal survives: the
+                    # mirror stays as part of the retained evidence group and
+                    # is settled at startup after recovery reaps it.
+                    self._settle_artifact(op_id)
                     return
                 except (OSError, LedgerError) as persist_exc:
                     body = {
@@ -346,6 +365,20 @@ def make_handler(
                     )
                     self._send_json(500, body)
                     return
+            except ArtifactConflict:
+                # A surviving mirror belongs to a different binding: evidence
+                # is inconsistent and must be retained, never adopted. Answer
+                # 500 and leave the whole group for startup/operator handling.
+                body = {
+                    "error": "operation evidence is inconsistent; retained "
+                    "for retry",
+                    "operation_id": op_id,
+                }
+                operation_store.finish(
+                    operation, operations_mod.STATUS_FAILED, 500, body
+                )
+                self._send_json(500, body)
+                return
             except OSError as exc:
                 # Persisting the staged result (or another pre-commit write)
                 # failed before the commit-point append: the store already
@@ -374,7 +407,38 @@ def make_handler(
             body["operation_id"] = op_id
             state = self._op_state_for_status(http_status)
             operation_store.finish(operation, state, http_status, body)
+            # Success (201) or a bound rejection (403/404/409): every handle
+            # and file of the attempt is settled, so the mirror is removed; a
+            # surviving journal/snapshot/marker keeps it until startup.
+            self._settle_artifact(op_id)
             self._send_json(http_status, body)
+
+        def _stage_artifact(self, operation, action, write_set):
+            """Create the operation artifact mirror before a provider call.
+
+            Runs after the Idempotency-Key is bound (the operation record is
+            durable) and before any KMS/HSM call. The mirror is owner-only
+            (0600), fsynced and contains no material or passphrase.
+            """
+            return artifact_store.stage(
+                operation_id=operation.operation_id,
+                tenant_id=operation.tenant_id,
+                operator_id=operation.operator_id,
+                path=operation.path,
+                request_body=operation.request_body,
+                action=action,
+                kind=(operation.details or {}).get("kind", ""),
+                write_set=list(write_set or []),
+            )
+
+        @staticmethod
+        def _settle_artifact(op_id: str) -> None:
+            # Best effort: a removal failure leaves the mirror for the next
+            # startup recovery sweep and never fails the response.
+            try:
+                artifact_store.settle(op_id)
+            except OSError:
+                pass
 
         def log_message(self, fmt, *args):  # silence default stderr logging
             return
@@ -733,6 +797,12 @@ def make_handler(
                     {"kind": "rotate", "key_id": key_id,
                      "algorithm": algorithm},
                 )
+                # The artifact mirror is created after binding and before the
+                # first provider call: 0600/fsync, tied to the operation, the
+                # provision journal and this key's write set.
+                artifact = self._stage_artifact(
+                    operation, audit_mod.ACTION_ROTATE, [key_id]
+                )
                 # Authorization follows validation and precedes existence; a
                 # denial is a bound terminal 403 whose single rejection event
                 # is named after the operation_id.
@@ -758,6 +828,7 @@ def make_handler(
                     event_id=operation.operation_id,
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                     pre_commit=stage_success,
+                    artifact=artifact,
                 )
                 if record is None:
                     return self._idempotent_rejection(
@@ -825,6 +896,12 @@ def make_handler(
                         ],
                     },
                 )
+                # Artifact mirror after binding, before any provider call;
+                # the write set is every key of the batch, in request order.
+                artifact = self._stage_artifact(
+                    operation, audit_mod.ACTION_BATCH_ROTATE,
+                    [key_id for key_id, _ in items],
+                )
                 # Authorization follows rotate and precedes existence; a
                 # denial is a bound terminal 403 with one rejected
                 # batch_rotate event (key_id null).
@@ -864,6 +941,7 @@ def make_handler(
                     event_id=operation.operation_id,
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                     pre_commit=stage_success,
+                    artifact=artifact,
                 )
                 if status == store.BATCH_NOT_FOUND:
                     # Any unknown/foreign key_id fails the whole batch with no
@@ -1057,6 +1135,11 @@ def make_handler(
                     operation,
                     {"kind": "import", "key_id": key_id},
                 )
+                # Mirror after binding, before the owning-provider/import
+                # calls in the store.
+                artifact = self._stage_artifact(
+                    operation, audit_mod.ACTION_IMPORT, [key_id]
+                )
                 # Authorization precedes the conflict check: a denial is a
                 # bound terminal 403 even when the key_id already exists for
                 # another tenant.
@@ -1083,6 +1166,7 @@ def make_handler(
                     event_id=operation.operation_id,
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                     pre_commit=stage_success,
+                    artifact=artifact,
                 )
                 if status == IMPORT_CONFLICT:
                     if record.tenant_id == tenant_id:
@@ -1221,6 +1305,12 @@ def make_handler(
                         "policy_restored": writes_policy,
                     },
                 )
+                # Mirror after binding, before any provider adoption. Restore
+                # events project key_id null; the mirror still carries the
+                # whole write set internally (never exposed).
+                artifact = self._stage_artifact(
+                    operation, audit_mod.ACTION_IMPORT, key_ids
+                )
                 # Authorization (import) precedes the in-bundle tenant check.
                 if not policy_store.is_allowed(
                     tenant_id, audit_mod.ACTION_IMPORT, operator
@@ -1258,6 +1348,7 @@ def make_handler(
                     event_id=operation.operation_id,
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                     pre_commit=stage_success,
+                    artifact=artifact,
                 )
                 if result.status == restore_mod.RESTORE_CREATED:
                     # The single success event committed with the files.
@@ -1863,6 +1954,10 @@ def serve(host: str, port: int, data_dir: str) -> None:
     store = KeyStore(data_dir, audit_log)
     policy_store = PolicyStore(data_dir, audit_log)
     coordinator = restore_mod.RestoreCoordinator(store, policy_store)
+    # The operation artifact mirrors are retained/discarded only after the
+    # outbox recovery above has committed or rolled the evidence group back.
+    artifact_store = ArtifactStore(data_dir, audit_log)
+    artifact_store.recover()
     operation_store = OperationStore(data_dir, audit_log)
     operation_store.recover_pending(
         lambda record, event: _resolve_committed_operation(
@@ -1872,7 +1967,7 @@ def serve(host: str, port: int, data_dir: str) -> None:
     httpd = ThreadingHTTPServer(
         (host, port),
         make_handler(
-            store, policy_store, coordinator, operation_store
+            store, policy_store, coordinator, operation_store, artifact_store
         ),
     )
     httpd.daemon_threads = True

@@ -127,6 +127,22 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `404`/`409` 响应与审计投影并置终态（拒绝终态的状态码随事件持久化，严格
   重放）；事件未入帐则置 failed(`500`)，半成品文件、提供者句柄与标记由
   outbox/provision 恢复回滚。不重复记账（账本按 event_id 去重），不误判。
+- **operation 工件镜像**：rotate/import/restore/batch-rotate 在幂等键绑定
+  **之后**、第一次调用提供者**之前**，原子创建一个 0600、fsync 的镜像
+  `operation-artifacts/<operation_id>.json`（temp 文件 fsync 后改名并 fsync
+  目录），把操作与各耐久工件关联起来：记录租户、操作者、路径、规范化请求
+  （键排序紧凑 JSON）、动作、kind、完整写集、当前阶段（staged/provisioned/
+  files_written），以及对 `operations/<id>.json`、`provisions/<id>.json`
+  的引用（restore 另记空恢复标记、batch-rotate 另记 batch snapshot），并在
+  每铸一个新句柄的瞬间以 0600 原子重写登记其 `provider_id`/`handle`。镜像
+  只含收尾所需事实，绝无私钥、包装材料或口令，也从不经 HTTP/CLI 返回。
+  重启按 `operation_id` 收尾：账本事件确认且 action、tenant、operation 一致、
+  且无残留 pending 标记时，丢弃镜像并保留新版本；事件未入账且 provision
+  journal、batch snapshot、restore 标记均已清除（全部新句柄已确认删除、可信
+  旧写集已恢复）时丢弃镜像。账本不可读、提交无法确认、镜像或其引用缺失/损坏/
+  不一致（含同 id 但 action/tenant 不符的事件）、或 batch snapshot 损坏时，
+  **整组证据原样保留**，不猜测回滚、不暴露未提交 current，返回 500/503 等待
+  重试。无镜像的旧 journal/restore 记录仍沿用既有恢复规则，行为不变。
 - `GET /v1/operations/{operation_id}`：需单一操作者与单一租户来源；操作须
   同时属于该租户与操作者，否则一律 `404`。`200` →
   `{operation_id, tenant_id, status, http_status, response}`，pending 时后两
@@ -240,5 +256,13 @@ python -m keymgr policy --operator admin set|show|delete --tenant-id t [--rules 
 - 旧 restore 记录可能没有 provision journal：未提交回滚时以 `_restore` 标记
   的密钥文件列出整组句柄；提供者不可达或任一句柄删除失败时，保留整组密钥文件、
   策略文件与标记，下一次启动重试，全部句柄确认删除后才移除整组文件。
+- 每个幂等变更另有一个 0600/fsync 的 operation 工件镜像
+  `operation-artifacts/<operation_id>.json`，在幂等键绑定后、提供者调用前原子
+  创建，关联 `operations/`、`provisions/` 与 restore 标记或 batch snapshot，
+  记录租户、操作者、路径、规范请求、动作、写集、阶段及每铸即登记的新句柄
+  provider_id/handle；事件确认一致即随证据清理而丢弃并保留新版本，事件未入账、
+  引用存活、账本不可读、引用不一致或 snapshot 损坏时整组保留（500/503 等待重
+  试），不猜测回滚、不暴露未提交 current。镜像只供崩溃收尾，绝不通过 HTTP/CLI
+  返回且不含材料或口令。
 - 私钥与口令只存在于口令加密的包内或经提供者包装后的记录中；游标 HMAC 密钥
   存于 `audit.secret`(0600)。材料不会出现在任何响应、审计投影或错误信息中。

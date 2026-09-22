@@ -260,6 +260,7 @@ class RestoreCoordinator:
         event_id: Optional[str] = None,
         lock_timeout: Optional[float] = None,
         pre_commit=None,
+        artifact=None,
     ) -> RestoreResult:
         """Atomically restore a validated tenant payload.
 
@@ -298,6 +299,21 @@ class RestoreCoordinator:
             journal_id, journal_path = self.store._new_provision_journal(
                 event.event_id, event.tenant_id, event.action
             )
+            if artifact is not None:
+                artifact.link_provision_journal(journal_id)
+
+            # The phase becomes "files_written" once every file/policy of the
+            # write set (or the empty-restore marker) is durable; pre_commit
+            # runs strictly between that point and the ledger append for both
+            # the multi-file path and the empty-bundle path.
+            restore_pre_commit = pre_commit
+            if artifact is not None:
+                _user_pre_commit = pre_commit
+
+                def restore_pre_commit():  # noqa: F811
+                    artifact.set_phase("files_written")
+                    if _user_pre_commit is not None:
+                        _user_pre_commit()
             committed = False
             try:
                 # Phase 0: complete ALL version validation and provider
@@ -312,7 +328,8 @@ class RestoreCoordinator:
                     )
                     records.append(
                         self.store.record_from_backup(
-                            tenant_id, entry, journal_path
+                            tenant_id, entry, journal_path,
+                            artifact=artifact,
                         )
                     )
 
@@ -349,8 +366,16 @@ class RestoreCoordinator:
                             status=RESTORE_SAME_TENANT_CONFLICT,
                             conflict=Conflict(kind="policy", owner=tenant_id),
                         )
+                    if artifact is not None:
+                        # The empty-restore marker IS the write set's durable
+                        # artifact: reference it by data-dir-relative name so
+                        # crash recovery keeps the whole evidence group until
+                        # the marker is finalized or removed.
+                        artifact.set_restore_marker(
+                            os.path.basename(self._empty_marker_path(tenant_id))
+                        )
                     result = self._commit_empty(
-                        tenant_id, event, pre_commit=pre_commit
+                        tenant_id, event, pre_commit=restore_pre_commit
                     )
                     committed = True
                     return result
@@ -370,7 +395,7 @@ class RestoreCoordinator:
                 # set on failure; the finally below owns handle cleanup.
                 result = self._commit_locked(
                     tenant_id, key_ids, records, policy_rules, event, marker,
-                    pre_commit=pre_commit,
+                    pre_commit=restore_pre_commit,
                 )
                 if result.status == RESTORE_CREATED:
                     committed = True

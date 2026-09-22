@@ -12,6 +12,7 @@ from . import keybundle
 from . import operations as operations_mod
 from . import restore as restore_mod
 from . import tenantbundle
+from .artifacts import ArtifactConflict, ArtifactStore
 from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
 from .operations import OperationStore
@@ -383,7 +384,7 @@ def _idem_serve_existing(op_store, kind, record) -> "Optional[int]":
 
 
 def idempotent_run(op_store, store, path, tenant_id, operator, body, key,
-                   validator, executor, decoder=None):
+                   validator, executor, decoder=None, artifact_store=None):
     """CLI counterpart of the HTTP idempotency guard.
 
     Returns a process exit code. ``validator()`` runs cheap side-effect-free
@@ -397,6 +398,17 @@ def idempotent_run(op_store, store, path, tenant_id, operator, body, key,
     and may raise ProviderInvalidMaterial / ProviderUnavailable /
     LedgerError / LockTimeout.
     """
+
+    def settle(op_id: str) -> None:
+        # Discard the artifact mirror once its whole evidence group is gone;
+        # a retained journal/snapshot/marker keeps it for startup recovery.
+        if artifact_store is None:
+            return
+        try:
+            artifact_store.settle(op_id)
+        except OSError:
+            pass
+
     if _idem_key_error(key):
         return 2
     normalized = operations_mod.normalize_body(body)
@@ -439,12 +451,14 @@ def idempotent_run(op_store, store, path, tenant_id, operator, body, key,
         op_store.finish(
             operation, operations_mod.STATUS_TIMED_OUT, 503, body_err
         )
+        settle(op_id)
         return _emit_operation_result(503, body_err)
     except ProviderInvalidMaterial as exc:
         try:
             http_status, body_err = _provider_terminal(
                 op_store, store, operation, 400, str(exc)
             )
+            settle(op_id)
             return _emit_operation_result(http_status, body_err)
         except (OSError, LedgerError) as persist_exc:
             body_err = {
@@ -461,6 +475,7 @@ def idempotent_run(op_store, store, path, tenant_id, operator, body, key,
                 op_store, store, operation, 503,
                 "key management provider is unavailable",
             )
+            settle(op_id)
             return _emit_operation_result(http_status, body_err)
         except (OSError, LedgerError) as persist_exc:
             body_err = {
@@ -471,6 +486,16 @@ def idempotent_run(op_store, store, path, tenant_id, operator, body, key,
                 operation, operations_mod.STATUS_FAILED, 500, body_err
             )
             return _emit_operation_result(500, body_err)
+    except ArtifactConflict:
+        # Inconsistent surviving evidence: retain it and answer 500.
+        body_err = {
+            "error": "operation evidence is inconsistent; retained for retry",
+            "operation_id": op_id,
+        }
+        op_store.finish(
+            operation, operations_mod.STATUS_FAILED, 500, body_err
+        )
+        return _emit_operation_result(500, body_err)
     except OSError as exc:
         # A pre-commit staging/write failure happened before the commit-point
         # append: file and handles were rolled back, nothing committed.
@@ -492,6 +517,7 @@ def idempotent_run(op_store, store, path, tenant_id, operator, body, key,
     resp["operation_id"] = op_id
     state = operations_mod.state_for_http_status(http_status)
     op_store.finish(operation, state, http_status, resp)
+    settle(op_id)
     return _emit_operation_result(http_status, resp)
 
 
@@ -525,6 +551,10 @@ def _run(argv: Optional[List[str]] = None) -> int:
     # Resolve any operations left pending by a crashed CLI/server run, after
     # the key/restore outbox recovery above has settled the mutation.
     op_store = OperationStore(args.data_dir, audit_log)
+    # Retain/discard operation artifact mirrors only after the outbox
+    # recovery above has committed or rolled each evidence group back.
+    artifact_store = ArtifactStore(args.data_dir, audit_log)
+    artifact_store.recover()
     op_store.recover_pending(
         lambda record, event: _resolve_committed_operation(
             store, policies, record, event
@@ -541,6 +571,19 @@ def _run(argv: Optional[List[str]] = None) -> int:
         if policies.is_allowed(args.tenant_id, action, args.operator):
             return True
         return False  # caller returns _deny(...)
+
+    def stage_artifact(operation, action, write_set):
+        """Create the bound operation's 0600/fsync artifact mirror."""
+        return artifact_store.stage(
+            operation_id=operation.operation_id,
+            tenant_id=operation.tenant_id,
+            operator_id=operation.operator_id,
+            path=operation.path,
+            request_body=operation.request_body,
+            action=action,
+            kind=(operation.details or {}).get("kind", ""),
+            write_set=list(write_set or []),
+        )
 
     if args.command == "gen":
         if not args.tenant_id or args.algorithm not in SUPPORTED_ALGORITHMS:
@@ -628,6 +671,9 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 {"kind": "rotate", "key_id": args.key_id,
                  "algorithm": args.algorithm},
             )
+            artifact = stage_artifact(
+                operation, audit_mod.ACTION_ROTATE, [args.key_id]
+            )
             if not policies.is_allowed(
                 args.tenant_id, audit_mod.ACTION_ROTATE, args.operator
             ):
@@ -648,6 +694,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 event_id=operation.operation_id,
                 lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                 pre_commit=stage_success,
+                artifact=artifact,
             )
             if record is None:
                 return _terminal_rejection(
@@ -660,6 +707,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
         return idempotent_run(
             op_store, store, path, args.tenant_id, args.operator, body,
             args.idempotency_key, lambda: None, execute,
+            artifact_store=artifact_store,
         )
 
     if args.command == "batch-rotate":
@@ -698,6 +746,10 @@ def _run(argv: Optional[List[str]] = None) -> int:
                     ],
                 },
             )
+            artifact = stage_artifact(
+                operation, audit_mod.ACTION_BATCH_ROTATE,
+                [key_id for key_id, _ in items],
+            )
             # Authorization follows rotate; the rejection event is a single
             # batch_rotate with key_id null.
             if not policies.is_allowed(
@@ -733,6 +785,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 event_id=operation.operation_id,
                 lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                 pre_commit=stage_success,
+                artifact=artifact,
             )
             if status == store.BATCH_NOT_FOUND:
                 return _terminal_rejection(
@@ -758,6 +811,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
         return idempotent_run(
             op_store, store, path, args.tenant_id, args.operator, body,
             args.idempotency_key, lambda: None, execute,
+            artifact_store=artifact_store,
         )
 
     if args.command == "version":
@@ -935,6 +989,9 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 operation,
                 {"kind": "import", "key_id": key_id},
             )
+            artifact = stage_artifact(
+                operation, audit_mod.ACTION_IMPORT, [key_id]
+            )
             if not policies.is_allowed(
                 args.tenant_id, audit_mod.ACTION_IMPORT, args.operator
             ):
@@ -955,6 +1012,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 event_id=operation.operation_id,
                 lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                 pre_commit=stage_success,
+                artifact=artifact,
             )
             if status == IMPORT_CONFLICT:
                 if record.tenant_id == args.tenant_id:
@@ -974,6 +1032,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
         return idempotent_run(
             op_store, store, path, args.tenant_id, args.operator, body,
             args.idempotency_key, validator, execute, decoder,
+            artifact_store=artifact_store,
         )
 
     if args.command == "backup":
@@ -1059,6 +1118,9 @@ def _run(argv: Optional[List[str]] = None) -> int:
                     "policy_restored": writes_policy,
                 },
             )
+            artifact = stage_artifact(
+                operation, audit_mod.ACTION_IMPORT, key_ids
+            )
             if not policies.is_allowed(
                 args.tenant_id, audit_mod.ACTION_IMPORT, args.operator
             ):
@@ -1090,6 +1152,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 event_id=operation.operation_id,
                 lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                 pre_commit=stage_success,
+                artifact=artifact,
             )
             if result.status == restore_mod.RESTORE_CREATED:
                 return (
@@ -1117,6 +1180,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
         return idempotent_run(
             op_store, store, path, args.tenant_id, args.operator, body,
             args.idempotency_key, validator, execute, decoder,
+            artifact_store=artifact_store,
         )
 
     if args.command == "operation":

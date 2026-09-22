@@ -201,11 +201,18 @@ class HttpServer:
         store = KeyStore(env.data_dir, audit_log)
         policy_store = PolicyStore(env.data_dir, audit_log)
         coordinator = RestoreCoordinator(store, policy_store)
+        from keymgr.artifacts import ArtifactStore
+
+        artifact_store = ArtifactStore(env.data_dir, audit_log)
+        artifact_store.recover()
         operation_store = OperationStore(env.data_dir, audit_log)
         operation_store.recover_pending()
         self.httpd = ThreadingHTTPServer(
             ("127.0.0.1", 0),
-            make_handler(store, policy_store, coordinator, operation_store),
+            make_handler(
+                store, policy_store, coordinator, operation_store,
+                artifact_store,
+            ),
         )
         self.port = self.httpd.server_address[1]
         self.thread = threading.Thread(target=self.httpd.serve_forever)

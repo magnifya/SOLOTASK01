@@ -1689,6 +1689,7 @@ class KeyStore:
         event_id: Optional[str] = None,
         lock_timeout: Optional[float] = None,
         pre_commit=None,
+        artifact=None,
     ) -> Optional[KeyRecord]:
         """Append a new version with fresh material.
 
@@ -1733,6 +1734,8 @@ class KeyStore:
             journal_id, journal_path = self._new_provision_journal(
                 event.event_id, event.tenant_id, event.action
             )
+            if artifact is not None:
+                artifact.link_provision_journal(journal_id)
             minted_handle = None
             try:
                 triple = provider.rotate(algorithm)
@@ -1740,6 +1743,10 @@ class KeyStore:
                 self._append_provision(
                     journal_path, provider.provider_id, triple.handle
                 )
+                if artifact is not None:
+                    artifact.register_handle(
+                        provider.provider_id, triple.handle
+                    )
                 record.append_version(
                     VersionRecord(
                         version=next_number,
@@ -1751,6 +1758,18 @@ class KeyStore:
                         encrypted_material=triple.encrypted_material,
                     )
                 )
+                # The phase only becomes "files_written" once the key file
+                # carrying the pending marker is actually durable; pre_commit
+                # runs strictly between that write and the ledger append.
+                rotate_pre_commit = pre_commit
+                if artifact is not None:
+                    user_pre_commit = pre_commit
+
+                    def rotate_pre_commit(committed_record):  # noqa: F811
+                        artifact.set_phase("files_written")
+                        if user_pre_commit is not None:
+                            user_pre_commit(committed_record)
+
                 # _commit_mutation deletes the minted handle itself when the
                 # append fails; the provision journal is the durable crash
                 # safety net and is retried below on any failure.
@@ -1758,7 +1777,7 @@ class KeyStore:
                     path, record, event, previous,
                     provider=provider, new_handles=(triple.handle,),
                     journal_id=journal_id,
-                    pre_commit=pre_commit,
+                    pre_commit=rotate_pre_commit,
                 )
             except BaseException as exc:
                 # Provider fault, validation or ledger/write failure: the
@@ -1885,6 +1904,7 @@ class KeyStore:
         event_id: Optional[str] = None,
         lock_timeout: Optional[float] = None,
         pre_commit=None,
+        artifact=None,
     ) -> Tuple[str, object]:
         """Atomically append one fresh version to many keys.
 
@@ -1942,6 +1962,19 @@ class KeyStore:
             journal_id, journal_path = self._new_provision_journal(
                 event.event_id, event.tenant_id, event.action
             )
+            if artifact is not None:
+                artifact.link_provision_journal(journal_id)
+            # The phase becomes "files_written" once every phase-1 file
+            # carrying the shared marker is durable; pre_commit is the single
+            # hook that runs strictly between that write and the append.
+            batch_pre_commit = pre_commit
+            if artifact is not None:
+                _user_pre_commit = pre_commit
+
+                def batch_pre_commit(records_by_id):  # noqa: F811
+                    artifact.set_phase("files_written")
+                    if _user_pre_commit is not None:
+                        _user_pre_commit(records_by_id)
             # Defined before the try so the abort path can union the pairs
             # this frame minted even when the provider faulted mid-batch.
             minted = []
@@ -1956,6 +1989,8 @@ class KeyStore:
                 self._write_batch_snapshot(
                     event.event_id, tenant_id, ordered_ids, previous_bytes
                 )
+                if artifact is not None:
+                    artifact.link_snapshot(event.event_id)
                 marker = {
                     "_batch_rotate": True,
                     "event": event.to_json(),
@@ -1975,6 +2010,10 @@ class KeyStore:
                     self._append_provision(
                         journal_path, provider.provider_id, triple.handle
                     )
+                    if artifact is not None:
+                        artifact.register_handle(
+                            provider.provider_id, triple.handle
+                        )
                     record.append_version(
                         VersionRecord(
                             version=next_number,
@@ -1995,8 +2034,8 @@ class KeyStore:
                     )
                 # The whole write set is durable: stage the exact idempotent
                 # response before the single commit-point append.
-                if pre_commit is not None:
-                    pre_commit(records)
+                if batch_pre_commit is not None:
+                    batch_pre_commit(records)
                 # Phase 2: the single ledger append is the commit point.
                 self.audit.append(event)
                 # append() dedupes silently on event_id without comparing
@@ -2919,7 +2958,8 @@ class KeyStore:
         self._take_over_legacy(record)
         return record
 
-    def _adopt_imported_version(self, ver: dict, journal: Optional[str] = None) -> tuple:
+    def _adopt_imported_version(self, ver: dict, journal: Optional[str] = None,
+                                artifact=None) -> tuple:
         """Adopt one validated bundle version through its target provider.
 
         Returns (VersionRecord, provider). A ``provider`` provenance block
@@ -2948,6 +2988,8 @@ class KeyStore:
         )
         if journal is not None:
             self._append_provision(journal, target.provider_id, triple.handle)
+        if artifact is not None:
+            artifact.register_handle(target.provider_id, triple.handle)
         public_key = (
             triple.public_key
             if triple.public_key is not None
@@ -3012,6 +3054,7 @@ class KeyStore:
         event_id: Optional[str] = None,
         lock_timeout: Optional[float] = None,
         pre_commit=None,
+        artifact=None,
     ) -> tuple:
         """Persist a validated export payload under the importing tenant.
 
@@ -3046,13 +3089,26 @@ class KeyStore:
             journal_id, journal_path = self._new_provision_journal(
                 event.event_id, event.tenant_id, event.action
             )
+            if artifact is not None:
+                artifact.link_provision_journal(journal_id)
+            # The phase becomes "files_written" once the new key file carrying
+            # the pending marker is durable; pre_commit runs strictly between
+            # that write and the ledger append.
+            import_pre_commit = pre_commit
+            if artifact is not None:
+                _user_pre_commit = pre_commit
+
+                def import_pre_commit(committed_record):  # noqa: F811
+                    artifact.set_phase("files_written")
+                    if _user_pre_commit is not None:
+                        _user_pre_commit(committed_record)
             committed = False
             adopted = []  # (provider, handle) pairs minted by this attempt
             try:
                 versions = []
                 for ver in payload["versions"]:
                     version_record, target = self._adopt_imported_version(
-                        ver, journal_path
+                        ver, journal_path, artifact=artifact
                     )
                     versions.append(version_record)
                     adopted.append((target, version_record.handle))
@@ -3079,7 +3135,7 @@ class KeyStore:
                 self._commit_mutation(
                     path, record, event, None,
                     journal_id=journal_id,
-                    pre_commit=pre_commit,
+                    pre_commit=import_pre_commit,
                 )
                 committed = True
                 # The handles are owned by the new record and the durable
@@ -3140,7 +3196,8 @@ class KeyStore:
         return self._read_record(self._path_for(key_id))
 
     def record_from_backup(
-        self, tenant_id: str, entry: dict, journal: Optional[str] = None
+        self, tenant_id: str, entry: dict, journal: Optional[str] = None,
+        artifact=None,
     ) -> KeyRecord:
         """Build an unsaved KeyRecord from a validated backup keys[i] entry.
 
@@ -3157,7 +3214,7 @@ class KeyStore:
         try:
             for ver in entry["versions"]:
                 version_record, target = self._adopt_imported_version(
-                    ver, journal
+                    ver, journal, artifact=artifact
                 )
                 versions.append(version_record)
                 adopted.append((target, version_record.handle))
