@@ -1249,17 +1249,23 @@ class KeyStore:
                 # Committed: the new versions are authoritative; only
                 # marker-clear housekeeping remains.
                 return record
-            # A durable rejected terminal with the same id leaves the
-            # preserved scene uncommitted -- fall through to the snapshot.
-        snapshot_path = self._batch_snapshot_path(eid)
-        if not os.path.exists(snapshot_path):
-            return None
-        raw_snapshot = self._read_batch_snapshot(eid)
-        if raw_snapshot is None or raw_snapshot.get("tenant_id") != record.tenant_id:
-            return None
-        # This file's own marker carries the complete write set; it is enough
-        # to cross-validate every artifact of the attempt.
-        entries = self._validated_batch_snapshot(eid, raw_snapshot, [marker])
+            # A durable event under the same id that is a rejection, or whose
+            # action/tenant does not match THIS batch, is a semantic mismatch:
+            # the artifacts cannot be trusted as either the commit or the
+            # rollback basis, so the whole group is hidden and parked -- never
+            # projected from one still-intact marker's snapshot.
+            if (
+                event.outcome == audit_mod.OUTCOME_SUCCESS
+                or event.action != audit_mod.ACTION_BATCH_ROTATE
+                or event.tenant_id != record.tenant_id
+            ):
+                return None
+        # No durable event decides the batch: the pre-batch view may be
+        # projected only when EVERY surviving artifact of the WHOLE group
+        # agrees (not just this file's marker); one tampered/missing marker
+        # or snapshot hides the entire group, matching crash recovery's park
+        # rule.
+        entries = self._batch_group_basis(eid, record.tenant_id)
         if entries is None:
             return None
         for key_id, _raw_bytes, previous_record in entries:
@@ -1273,6 +1279,31 @@ class KeyStore:
                 previous_record._unsettled_projection = True
                 return previous_record
         return None
+
+    def _batch_group_basis(self, event_id: str, tenant_id: str) -> Optional[list]:
+        """Strictly validate the WHOLE surviving batch group for a projection.
+
+        Returns the snapshot's complete validated write set
+        (``[(key_id, previous_bytes, KeyRecord), ...]`` sorted by key_id) or
+        None whenever the rollback basis cannot be trusted. Unlike a check of
+        the calling file's marker alone, this rescans the directory for EVERY
+        key file still carrying this event's ``_batch_rotate`` marker and
+        cross-validates all of them against the one durable snapshot
+        (filename/event id/tenant/complete unique key set/journal and snapshot
+        references, plus each strictly decoded ``previous_b64`` image). A
+        single marker that disagrees -- a wrong journal/snapshot reference,
+        action, tenant or key set -- therefore hides every file of the group,
+        exactly as startup recovery parks it rather than guessing a write set.
+        A missing or corrupt snapshot likewise yields None.
+        """
+        _files, markers = self._rescan_batch_markers(event_id)
+        snapshot_path = self._batch_snapshot_path(event_id)
+        if not os.path.exists(snapshot_path):
+            return None
+        raw_snapshot = self._read_batch_snapshot(event_id)
+        if raw_snapshot is None or raw_snapshot.get("tenant_id") != tenant_id:
+            return None
+        return self._validated_batch_snapshot(event_id, raw_snapshot, markers)
 
     def _committed_record(
         self, record: KeyRecord
@@ -1407,18 +1438,65 @@ class KeyStore:
         bytes over the new version.
         """
         marker = record.pending_event
-        if (
-            isinstance(marker, dict)
-            and marker
-            and not self._marker_event_durable(marker)
-        ):
-            raise ProviderUnavailable(
-                "key file is awaiting crash recovery"
-            )
+        if isinstance(marker, dict) and marker:
+            if marker.get("_batch_rotate"):
+                # A batch marker is settled ONLY by a durable success event
+                # whose action and tenant actually match this group: a
+                # same-id event with another action/tenant is a mismatch that
+                # must park the file, never be treated as cleared
+                # housekeeping.
+                if not self._batch_marker_committed(marker, record.tenant_id):
+                    raise ProviderUnavailable(
+                        "key file is awaiting crash recovery"
+                    )
+            elif not self._marker_event_durable(marker):
+                raise ProviderUnavailable(
+                    "key file is awaiting crash recovery"
+                )
         if self._pending_batch_snapshot_for(record):
             raise ProviderUnavailable(
                 "key file is awaiting crash recovery"
             )
+
+    def _batch_marker_committed(
+        self, marker, tenant_id: Optional[str] = None
+    ) -> bool:
+        """Whether a ``_batch_rotate`` marker's batch is durably committed.
+
+        Committed means the ledger holds a ``success`` event under the
+        marker's event id whose action is ``batch_rotate`` and whose tenant
+        agrees with both the marker and (when given) the on-disk record. A
+        rejected terminal, a missing/unreadable ledger entry, or an action/
+        tenant mismatch all return False so the caller parks the group instead
+        of treating a corrupt or foreign artifact as post-commit housekeeping.
+        """
+        if not isinstance(marker, dict) or not marker.get("_batch_rotate"):
+            return False
+        desc = marker.get("event")
+        if not isinstance(desc, dict):
+            return False
+        eid = desc.get("event_id")
+        if not is_valid_key_id(eid):
+            return False
+        if desc.get("action") != audit_mod.ACTION_BATCH_ROTATE:
+            return False
+        marker_tenant = desc.get("tenant_id")
+        if not isinstance(marker_tenant, str) or not marker_tenant:
+            return False
+        if tenant_id is not None and marker_tenant != tenant_id:
+            return False
+        if marker.get("tenant_id") != marker_tenant:
+            return False
+        try:
+            event = self.audit.get_event(eid)
+        except LedgerError:
+            return False
+        return (
+            event is not None
+            and event.outcome == audit_mod.OUTCOME_SUCCESS
+            and event.action == audit_mod.ACTION_BATCH_ROTATE
+            and event.tenant_id == marker_tenant
+        )
 
     def get(self, key_id: str, tenant_id: str) -> Optional[KeyRecord]:
         """Return the record's committed view only when it belongs to tenant.
