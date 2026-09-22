@@ -360,7 +360,12 @@ class KeyStore:
             self.data_dir, self._PROVISION_DIR, journal_id + ".json"
         )
 
-    def _new_provision_journal(self, journal_id: str):
+    def _new_provision_journal(
+        self,
+        journal_id: str,
+        tenant_id: Optional[str] = None,
+        action: Optional[str] = None,
+    ):
         """Create one journal file for an import/restore attempt.
 
         The journal is named after the attempt's audit ``event_id``: a
@@ -368,22 +373,76 @@ class KeyStore:
         ledger whether that event committed — committed means keep every
         handle, otherwise delete them. Returns (journal_id, path). A crash
         before the journal exists simply means no handles were recorded yet.
+
+        The first line is a header naming the operation (its id, tenant and
+        action), so crash recovery can verify that a durable event carrying
+        the journal's id really is THIS attempt's commit event before
+        keeping the handles: a same-id event whose action or tenant
+        disagrees is a collision and must not orphan or adopt anything.
+        Journals written before the header existed simply have no first
+        line and fall back to the legacy id-only resolution.
         """
         directory = os.path.join(self.data_dir, self._PROVISION_DIR)
         os.makedirs(directory, exist_ok=True)
         path = self._provision_path(journal_id)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        os.close(fd)
+        try:
+            header = {"operation_id": journal_id}
+            if isinstance(tenant_id, str) and tenant_id:
+                header["tenant_id"] = tenant_id
+            if isinstance(action, str) and action:
+                header["action"] = action
+            line = json.dumps(header, separators=(",", ":")) + "\n"
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fd = -1
+                fh.write(line)
+                fh.flush()
+                os.fsync(fh.fileno())
+        except BaseException:
+            # The journal never landed and no handle can reference it yet;
+            # drop the partial file so a headerless journal cannot outlive
+            # the attempt and be misread as a legacy one.
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
+        finally:
+            if fd >= 0:
+                os.close(fd)
         return journal_id, path
 
     def _append_provision(self, path: str, provider_id: str, handle: str) -> None:
-        """Durably record one minted handle in an attempt's journal."""
+        """Durably record one minted handle in an attempt's journal.
+
+        The journal is rewritten atomically (temp file, fsync, 0600 rename)
+        rather than appended in place: a crash mid-write can never tear a
+        line and silently lose a handle record, which would orphan the
+        backend object. Callers always hold the attempt's key locks, so the
+        read-modify-write is serialized against every other writer.
+        """
         entry = {"provider_id": provider_id, "handle": handle}
         line = json.dumps(entry, separators=(",", ":")) + "\n"
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(line)
-            fh.flush()
-            os.fsync(fh.fileno())
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                existing = fh.read()
+        except OSError:
+            existing = ""
+        directory = os.path.dirname(path)
+        fd, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(existing + line)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def _discard_provision_journal(self, path: str) -> bool:
         """Drop an attempt's journal after it committed or rolled back.
@@ -567,6 +626,12 @@ class KeyStore:
                 # later open rather than deleting committed material.
                 continue
             if event is not None and event.outcome == audit_mod.OUTCOME_SUCCESS:
+                if self._journal_event_is_foreign_success(journal_id, event):
+                    # A durable success carries this id but its action or
+                    # tenant disagrees with the journal's operation header:
+                    # an id collision, neither commit nor rollback is
+                    # provable. Park the whole journal for resolution.
+                    continue
                 # Committed: handles belong to the durable records; housekeep
                 # the journal. A failed unlink simply retries on next open.
                 self._discard_provision_journal(path)
@@ -648,6 +713,67 @@ class KeyStore:
             ) and handle:
                 entries.append((provider_id, handle))
         return entries
+
+    def read_provision_journal_header(self, journal_id: str) -> Optional[dict]:
+        """Return the journal's operation header, or None when absent.
+
+        The header is the journal's first line and names the attempt's
+        operation (``operation_id``/``tenant_id``/``action``). Journals
+        written before headers existed have handle entries only and yield
+        None; a corrupt first line also yields None (the journal is then
+        resolved conservatively, as if it had no header).
+        """
+        if not journal_id:
+            return None
+        path = self._provision_path(journal_id)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                first = fh.readline()
+        except OSError:
+            return None
+        try:
+            header = json.loads(first)
+        except ValueError:
+            return None
+        if not isinstance(header, dict):
+            return None
+        if header.get("operation_id") != journal_id:
+            return None
+        return header
+
+    def _journal_event_is_commit(self, journal_id: str, event) -> bool:
+        """Whether a durable SUCCESS event is THIS journal's commit event.
+
+        The event must be a success whose action and tenant agree with the
+        journal's operation header. A journal without a readable header
+        (legacy format) falls back to id-only resolution, the historical
+        behavior. A mismatched event is an id collision: it neither commits
+        the journal's handles nor proves them uncommitted, and the caller
+        must park the journal rather than adopting or deleting anything.
+        """
+        if event is None or event.outcome != audit_mod.OUTCOME_SUCCESS:
+            return False
+        header = self.read_provision_journal_header(journal_id)
+        if header is None:
+            return True
+        action = header.get("action")
+        if isinstance(action, str) and action and event.action != action:
+            return False
+        tenant = header.get("tenant_id")
+        if isinstance(tenant, str) and tenant and event.tenant_id != tenant:
+            return False
+        return True
+
+    def _journal_event_is_foreign_success(self, journal_id: str, event) -> bool:
+        """Whether a durable SUCCESS event carries the id but is foreign.
+
+        Such a collision parks the journal: the handles can neither be
+        adopted (this attempt never committed) nor safely reaped without
+        resolution, so the whole journal is left for an operator/later open.
+        """
+        if event is None or event.outcome != audit_mod.OUTCOME_SUCCESS:
+            return False
+        return not self._journal_event_is_commit(journal_id, event)
 
     def release_journal_handles(self, journal_id: str) -> bool:
         """Idempotently delete every handle recorded in an attempt journal.
@@ -877,6 +1003,25 @@ class KeyStore:
                 # the crash happened before or after the ledger write.
                 event = AuditEvent.from_json(record.pending_event)
                 journal_id = record.pending_event.get("journal")
+                try:
+                    existing = self.audit.get_event(event.event_id)
+                except LedgerError:
+                    # The ledger cannot be read right now; leave the marker
+                    # in place for the next open rather than guessing.
+                    continue
+                if existing is not None and (
+                    existing.outcome != audit_mod.OUTCOME_SUCCESS
+                    or existing.action != event.action
+                    or existing.tenant_id != event.tenant_id
+                ):
+                    # A durable event already carries this id but is not
+                    # exactly this operation's success event (a rejection, or
+                    # an action/tenant collision): the scene can be settled
+                    # neither by committing nor by rolling back. Park it --
+                    # marker, journal and handles stay for operator/startup
+                    # resolution, and reads keep hiding the uncommitted
+                    # current.
+                    continue
                 try:
                     self.audit.append(event)
                     record.pending_event = None
@@ -1184,7 +1329,11 @@ class KeyStore:
         id can coexist with a preserved (parked) scene when an in-request
         rollback itself failed, and that state must still be treated as
         uncommitted -- reads project the prior version and mutators wait for
-        crash recovery. An unreadable ledger is treated as not durable.
+        crash recovery. The durable event must also BE this operation's
+        event: a same-id event whose action or tenant disagrees is an id
+        collision, not this mutation's commit point, and is treated as not
+        durable (the scene parks rather than exposing an uncommitted
+        current). An unreadable ledger is treated as not durable.
         """
         if not isinstance(marker, dict):
             return False
@@ -1197,10 +1346,15 @@ class KeyStore:
             event = self.audit.get_event(event_id)
         except LedgerError:
             return False
-        return (
-            event is not None
-            and event.outcome == audit_mod.OUTCOME_SUCCESS
-        )
+        if event is None or event.outcome != audit_mod.OUTCOME_SUCCESS:
+            return False
+        action = desc.get("action") if isinstance(desc, dict) else None
+        if isinstance(action, str) and action and event.action != action:
+            return False
+        tenant = desc.get("tenant_id") if isinstance(desc, dict) else None
+        if isinstance(tenant, str) and tenant and event.tenant_id != tenant:
+            return False
+        return True
 
     def _batch_committed_view(self, record: KeyRecord) -> Optional[KeyRecord]:
         """Project one file carrying an unsettled ``_batch_rotate`` marker.
@@ -1577,7 +1731,7 @@ class KeyStore:
                 event_id=event_id,
             )
             journal_id, journal_path = self._new_provision_journal(
-                event.event_id
+                event.event_id, event.tenant_id, event.action
             )
             minted_handle = None
             try:
@@ -1786,7 +1940,7 @@ class KeyStore:
                 event_id=event_id,
             )
             journal_id, journal_path = self._new_provision_journal(
-                event.event_id
+                event.event_id, event.tenant_id, event.action
             )
             # Defined before the try so the abort path can union the pairs
             # this frame minted even when the provider faulted mid-batch.
@@ -2889,7 +3043,9 @@ class KeyStore:
                 tenant_id, audit_mod.ACTION_IMPORT, key_id,
                 audit_mod.OUTCOME_SUCCESS, event_id=event_id,
             )
-            journal_id, journal_path = self._new_provision_journal(event.event_id)
+            journal_id, journal_path = self._new_provision_journal(
+                event.event_id, event.tenant_id, event.action
+            )
             committed = False
             adopted = []  # (provider, handle) pairs minted by this attempt
             try:

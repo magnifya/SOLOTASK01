@@ -296,7 +296,7 @@ class RestoreCoordinator:
                 audit_mod.OUTCOME_SUCCESS, event_id=event_id,
             )
             journal_id, journal_path = self.store._new_provision_journal(
-                event.event_id
+                event.event_id, event.tenant_id, event.action
             )
             committed = False
             try:
@@ -696,6 +696,13 @@ class RestoreCoordinator:
                 event is not None
                 and event.outcome == audit_mod.OUTCOME_SUCCESS
             )
+            if committed and self.store._journal_event_is_foreign_success(
+                journal_id, event
+            ):
+                # A durable success carries this id but is not the attempt's
+                # own event (action/tenant collision): park the journal for
+                # resolution rather than adopting or reaping its handles.
+                continue
             if not committed:
                 if not self.store.release_journal_handles(journal_id):
                     # A backend delete failed: retain the journal so the next
@@ -722,9 +729,24 @@ class RestoreCoordinator:
         if not event:
             return  # finalized marker: the committed batch's idempotency record
         try:
-            committed = self.store.audit.get_event(event["event_id"]) is not None
+            durable = self.store.audit.get_event(event["event_id"])
         except (LedgerError, KeyError, TypeError):
             return  # leave it for a later open to retry
+        committed = (
+            durable is not None
+            and durable.outcome == audit_mod.OUTCOME_SUCCESS
+            and durable.action == audit_mod.ACTION_IMPORT
+            and durable.tenant_id == marker.get("tenant_id")
+        )
+        if (
+            durable is not None
+            and durable.outcome == audit_mod.OUTCOME_SUCCESS
+            and not committed
+        ):
+            # A same-id success event that is not THIS restore's event (an
+            # action/tenant collision): neither finalize nor remove -- park
+            # the marker for operator/startup resolution.
+            return
         if committed:
             finalized = dict(marker)
             finalized["event"] = None
@@ -745,8 +767,23 @@ class RestoreCoordinator:
             # Leave the group untouched; a later open retries recovery.
             return False
         committed = (
-            event is not None and event.outcome == audit_mod.OUTCOME_SUCCESS
+            event is not None
+            and event.outcome == audit_mod.OUTCOME_SUCCESS
+            and event.action == audit_mod.ACTION_IMPORT
+            and event.tenant_id == tenant_id
         )
+        if (
+            event is not None
+            and event.outcome == audit_mod.OUTCOME_SUCCESS
+            and not committed
+        ):
+            # A durable SUCCESS event carries this id but its action or
+            # tenant does not match this restore: the id collides with a
+            # different committed mutation, so neither "committed" nor
+            # "roll back" is provable. Park the ENTIRE group -- every key
+            # file, the policy document, the markers and the journal -- for
+            # operator/startup resolution; delete nothing, finalize nothing.
+            return False
         if not committed:
             # The commit-point success append never happened (event absent or
             # only a rejected terminal). Delete EVERY minted handle BEFORE

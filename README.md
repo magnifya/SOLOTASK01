@@ -228,9 +228,12 @@ python -m keymgr policy --operator admin set|show|delete --tenant-id t [--rules 
 - 每个密钥为数据目录下 `<key_id>.json`（0600，fsync + 原子 rename），含
   append-only `versions` 与 `current_version`；轮换在 per-key 进程内锁 +
   `<key_id>.lock` fcntl 锁下读改写，并发不丢版本、不悬指针。
-- 导入/恢复/批量轮换在提供者调用前先建按 event_id 命名的 provision journal，
-  每铸一个句柄即耐久登记；提交后句柄归记录所有并删除 journal，未提交（冲突、
-  提供者故障、账本失败、崩溃）则幂等删除全部已铸句柄，不留孤儿后端对象。批量
+- 导入/恢复/批量轮换在提供者调用前先建按 event_id 命名的 provision journal
+  （首行耐久记录 operation_id、租户与动作，每铸一个句柄即以 0600 原子重写登记
+  provider_id 与句柄）；提交后句柄归记录所有并删除 journal，未提交（冲突、
+  提供者故障、账本失败、崩溃）则幂等删除全部已铸句柄，不留孤儿后端对象。恢复
+  依据 journal 头校验账本中同 id 事件确属本次操作（动作、租户一致）才判定已
+  提交；不一致即保留全部现场等待处理。批量
   轮换另在 `batch-rotations/<event_id>.json` 耐久记录每个 key 轮换前的整文件
   字节（snapshot），未提交时据此把整组文件还原；snapshot 缺失则整组保留等待下
   次启动，绝不猜测改写。

@@ -94,6 +94,47 @@ def state_for_http_status(http_status: int) -> str:
     return STATUS_FAILED
 
 
+# The audit action each operation kind commits with.
+_KIND_ACTIONS = {
+    "rotate": "rotate",
+    "batch_rotate": "batch_rotate",
+    "import": "import",
+    "restore": "import",
+}
+
+
+def _event_matches_operation(record: "OperationRecord", event) -> bool:
+    """Whether a durable ledger event is THIS operation's commit event.
+
+    Crash recovery decides committed-vs-not purely from the ledger, but the
+    event id alone is not enough: a durable event whose tenant, action or
+    outcome disagrees with the operation's recorded context belongs to a
+    different mutation that happens to carry the same id, and must not
+    finalize this operation either way. The tenant must always match the
+    operation record; the action/outcome are checked against the staged
+    terminal audit descriptor when one exists, else the event must be a
+    success whose action fits the operation kind (when the kind is known).
+    """
+    if event.tenant_id != record.tenant_id:
+        return False
+    details = record.details or {}
+    audit_desc = details.get("audit")
+    if isinstance(audit_desc, dict):
+        action = audit_desc.get("action")
+        if isinstance(action, str) and action and event.action != action:
+            return False
+        outcome = audit_desc.get("outcome")
+        if isinstance(outcome, str) and outcome and event.outcome != outcome:
+            return False
+        return True
+    if event.outcome != "success":
+        return False
+    expected = _KIND_ACTIONS.get(details.get("kind"))
+    if expected is not None and event.action != expected:
+        return False
+    return True
+
+
 def normalize_body(body: Optional[dict]) -> str:
     """Canonical JSON form of a request body for binding comparison.
 
@@ -573,6 +614,16 @@ class OperationStore:
                 event = self.audit.get_event(record.event_id)
             except Exception:
                 # Cannot decide right now; leave it for a later open.
+                continue
+            if event is not None and not _event_matches_operation(
+                record, event
+            ):
+                # A durable event carries this operation's id but is not the
+                # operation's own event (tenant/action/outcome mismatch): the
+                # id collides with a different mutation, so the operation can
+                # be finalized neither as committed nor as failed. Leave it
+                # pending for operator/startup resolution rather than
+                # replaying a response the durable fact does not support.
                 continue
             if event is not None:
                 details = record.details or {}
