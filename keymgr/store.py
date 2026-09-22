@@ -1735,10 +1735,19 @@ class KeyStore:
             journal_id, journal_path = self._new_provision_journal(
                 event.event_id, event.tenant_id, event.action
             )
-            if mirror is not None:
-                mirror.provision(journal_id)
             minted_handle = None
             try:
+                if mirror is not None:
+                    try:
+                        mirror.provision(journal_id)
+                    except OSError as exc:
+                        # Mirror tie-in failed with only an EMPTY journal and
+                        # before any provider call: scrub the journal and
+                        # strand the bound op pending for a same-id retry.
+                        self.drop_provision_journal(journal_id)
+                        from .artifacts import ArtifactStrandUnavailable
+
+                        raise ArtifactStrandUnavailable(str(exc), 500)
                 triple = provider.rotate(algorithm)
                 minted_handle = triple.handle
                 self._append_provision(
@@ -1778,6 +1787,13 @@ class KeyStore:
                 # deletes). If the backend delete cannot be verified the
                 # journal stays for the next open and the request answers 503
                 # rather than hiding an orphaned backend object.
+                from .artifacts import ArtifactStrandUnavailable
+
+                if isinstance(exc, ArtifactStrandUnavailable):
+                    # mirror.provision failed before any provider call with
+                    # only an empty journal, already dropped: keep the bound
+                    # op pending for a same-id retry (no rollback evidence).
+                    raise
                 cleaned = True
                 if minted_handle is not None:
                     try:
@@ -1794,14 +1810,25 @@ class KeyStore:
                 if mirror is not None:
                     # Full rollback verified by the journal reconciliation:
                     # record the phase so mirror cleanup/startup need not
-                    # re-derive it.
-                    mirror.phase(PHASE_ROLLED_BACK)
+                    # re-derive it. A failure of this bookkeeping rewrite must
+                    # never mask the original fault (the journal is already
+                    # gone; the next open retakes the strand from disk).
+                    try:
+                        mirror.phase(PHASE_ROLLED_BACK)
+                    except OSError:
+                        pass
                 raise
             # Committed: the new handle is owned by the appended version and
             # the durable success event makes the journal obsolete.
             self.drop_provision_journal(journal_id)
             if mirror is not None:
-                mirror.phase(PHASE_COMMITTED)
+                # The commit point already landed; a bookkeeping rewrite
+                # failure must not turn a committed rotation into a reported
+                # failure -- after_terminal/startup reconcile from disk.
+                try:
+                    mirror.phase(PHASE_COMMITTED)
+                except OSError:
+                    pass
         return record
 
     # -- atomic batch rotation --------------------------------------------
@@ -1962,7 +1989,17 @@ class KeyStore:
                 event.event_id, event.tenant_id, event.action
             )
             if mirror is not None:
-                mirror.provision(journal_id, snapshot=event.event_id)
+                try:
+                    mirror.provision(journal_id, snapshot=event.event_id)
+                except OSError as exc:
+                    # The mirror tie-in failed with only an EMPTY journal on
+                    # disk and no handle minted or provider called. Scrub the
+                    # journal and strand the bound op pending for a same-id
+                    # retry, never a failed(500) terminal.
+                    self.drop_provision_journal(journal_id)
+                    from .artifacts import ArtifactStrandUnavailable
+
+                    raise ArtifactStrandUnavailable(str(exc), 500)
             # Defined before the try so the abort path can union the pairs
             # this frame minted even when the provider faulted mid-batch.
             minted = []
@@ -2098,7 +2135,10 @@ class KeyStore:
                         ordered, records, journal_id, event.event_id
                     )
                     if mirror is not None:
-                        mirror.phase(PHASE_COMMITTED)
+                        try:
+                            mirror.phase(PHASE_COMMITTED)
+                        except OSError:
+                            pass
                     return self.BATCH_ROTATED, [
                         (key_id, records[key_id]) for key_id, _ in request_order
                     ]
@@ -2131,8 +2171,12 @@ class KeyStore:
                 if mirror is not None:
                     # Every new handle deleted and every old file restored:
                     # the rollback was fully verified before artifacts were
-                    # dropped.
-                    mirror.phase(PHASE_ROLLED_BACK)
+                    # dropped. A bookkeeping failure here must not mask the
+                    # completed rollback (journal/snapshot already gone).
+                    try:
+                        mirror.phase(PHASE_ROLLED_BACK)
+                    except OSError:
+                        pass
                 raise
 
             # Phase 3: commit point passed. Clear markers as best-effort
@@ -2142,7 +2186,12 @@ class KeyStore:
                 ordered, records, journal_id, event.event_id
             )
             if mirror is not None:
-                mirror.phase(PHASE_COMMITTED)
+                # Commit already durable; never let this bookkeeping write
+                # change the committed outcome.
+                try:
+                    mirror.phase(PHASE_COMMITTED)
+                except OSError:
+                    pass
             return self.BATCH_ROTATED, [
                 (key_id, records[key_id]) for key_id, _ in request_order
             ]
@@ -3089,11 +3138,19 @@ class KeyStore:
             journal_id, journal_path = self._new_provision_journal(
                 event.event_id, event.tenant_id, event.action
             )
-            if mirror is not None:
-                mirror.provision(journal_id)
             committed = False
             adopted = []  # (provider, handle) pairs minted by this attempt
             try:
+                if mirror is not None:
+                    try:
+                        mirror.provision(journal_id)
+                    except OSError as exc:
+                        # Empty journal, no provider call yet: drop it and
+                        # strand the bound op pending for a same-id retry.
+                        self.drop_provision_journal(journal_id)
+                        from .artifacts import ArtifactStrandUnavailable
+
+                        raise ArtifactStrandUnavailable(str(exc), 500)
                 versions = []
                 for ver in payload["versions"]:
                     version_record, target = self._adopt_imported_version(

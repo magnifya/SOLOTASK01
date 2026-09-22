@@ -26,6 +26,7 @@ still commits the single ``import`` event and reports success.
 import hashlib
 import json
 import os
+import sys
 import threading
 from contextlib import contextmanager
 from typing import Dict, Iterator, List, NamedTuple, Optional
@@ -300,10 +301,19 @@ class RestoreCoordinator:
             journal_id, journal_path = self.store._new_provision_journal(
                 event.event_id, event.tenant_id, event.action
             )
-            if mirror is not None:
-                mirror.provision(journal_id)
             committed = False
             try:
+                if mirror is not None:
+                    try:
+                        mirror.provision(journal_id)
+                    except OSError as exc:
+                        # Only an EMPTY journal exists and no provider was
+                        # called: drop it and strand the bound op pending so a
+                        # same-id retry rebuilds the mirror.
+                        self.store.drop_provision_journal(journal_id)
+                        from .artifacts import ArtifactStrandUnavailable
+
+                        raise ArtifactStrandUnavailable(str(exc), 500)
                 # Phase 0: complete ALL version validation and provider
                 # calls before the conflict recheck or any file write. The
                 # finally block reconciles every minted handle through the
@@ -359,7 +369,10 @@ class RestoreCoordinator:
                     )
                     committed = True
                     if mirror is not None:
-                        mirror.phase(PHASE_COMMITTED)
+                        try:
+                            mirror.phase(PHASE_COMMITTED)
+                        except OSError:
+                            pass
                     return result
 
                 marker = {
@@ -409,8 +422,18 @@ class RestoreCoordinator:
                     if mirror is not None:
                         # Every minted handle verified gone and (for the
                         # multi-file path) the write set removed: the rollback
-                        # is complete.
-                        mirror.phase(PHASE_ROLLED_BACK)
+                        # is complete. This bookkeeping write must not mask the
+                        # already-verified rollback. A pre-provider strand
+                        # failure (mirror tie-in failed with an empty journal)
+                        # keeps the mirror at ``bound`` for a same-id takeover
+                        # rather than downgrading it to rolled_back.
+                        from .artifacts import ArtifactStrandUnavailable
+
+                        if sys.exc_info()[0] is not ArtifactStrandUnavailable:
+                            try:
+                                mirror.phase(PHASE_ROLLED_BACK)
+                            except OSError:
+                                pass
 
     def _commit_empty(self, tenant_id: str, event: AuditEvent,
                       pre_commit=None, mirror=None) -> RestoreResult:
@@ -441,7 +464,19 @@ class RestoreCoordinator:
         self.store._write_atomic(path, marker)
         if mirror is not None:
             # Tie the empty-restore marker to the mirror before the append.
-            mirror.note_restore_empty(path)
+            try:
+                mirror.note_restore_empty(path)
+            except OSError as exc:
+                # Only the marker exists and no event is durable; remove it so
+                # the strand is clean, then keep the op pending for a same-id
+                # retry.
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                from .artifacts import ArtifactStrandUnavailable
+
+                raise ArtifactStrandUnavailable(str(exc), 500)
         try:
             if pre_commit is not None:
                 pre_commit()

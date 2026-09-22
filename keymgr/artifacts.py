@@ -38,7 +38,13 @@ import os
 import tempfile
 import threading
 import uuid
+from contextlib import contextmanager
 from typing import Dict, List, Optional
+
+try:  # cross-process attempt claims are POSIX fcntl locks.
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    fcntl = None
 
 from . import audit as audit_mod
 from .audit import LedgerError
@@ -79,6 +85,40 @@ class ArtifactUnavailable(Exception):
     """
 
 
+class ArtifactStrandUnavailable(Exception):
+    """A bound, still-pending attempt cannot be started or taken over now.
+
+    Raised on the request path when the 0600 mirror cannot be created
+    (``OSError`` making the directory/temp file/rename), or when a retry of a
+    bound pending operation finds surviving evidence it cannot reconcile and
+    cannot prove safe to restart. The operation STAYS pending: no provider is
+    called, no key/handle/audit is written, and the caller answers a
+    material-safe 500/503 so the next open or retry can rebuild the mirror and
+    replay the attempt under the SAME operation_id.
+
+    ``http_status`` is the response the caller sends (500 for a persistence
+    fault, 503 for a parked scene that a retry/restart may clear); the
+    operation record itself stays pending regardless.
+    """
+
+    def __init__(self, message: str = "", http_status: int = 503) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+
+
+class ArtifactAlreadyTerminal(Exception):
+    """A takeover re-read found the operation already at a terminal state.
+
+    The binding was observed pending before the claim, but the original owner
+    finished while the claim was being acquired. The caller replays the
+    freshly read terminal record verbatim instead of re-executing anything.
+    """
+
+    def __init__(self, record) -> None:
+        super().__init__("operation already terminal")
+        self.record = record
+
+
 def _new_timestamp() -> str:
     from datetime import datetime, timezone
 
@@ -111,7 +151,10 @@ class ArtifactMirror:
         """Merge request/action/write-set facts into the mirror (durable).
 
         Called once, still before any provider call: the kind, the audit
-        action and the exact write set become part of the crash evidence.
+        action and the exact write set become part of the crash evidence. A
+        durable-rewrite failure here happens with NO journal, handle, key or
+        event in existence, so it is a restartable strand fault (the operation
+        stays pending for a same-id retry) rather than a failed(500) terminal.
         """
         with self._lock:
             kind = facts.get("kind")
@@ -130,7 +173,10 @@ class ArtifactMirror:
                 self.descriptor["write_set"] = normalized
             if facts.get("policy") is not None:
                 self.descriptor["policy"] = bool(facts["policy"])
-            self._persist()
+            try:
+                self._persist()
+            except OSError as exc:
+                raise ArtifactStrandUnavailable(str(exc), 500)
         return self
 
     def provision(self, journal_id: str, snapshot: Optional[str] = None) -> None:
@@ -189,14 +235,142 @@ class ArtifactStore:
         # sites always pass a recovered store).
         self.audit = audit_log if audit_log is not None else key_store.audit
         self._lock = threading.Lock()
+        # Per-operation in-process attempt guards. fcntl serializes across
+        # processes, but flock is per-process, so threads inside one server
+        # process need this guard too.
+        self._thread_guards: Dict[str, threading.Lock] = {}
         # Operation ids whose mirror could not be settled at this startup:
         # the operation store must leave them pending for a later open rather
         # than guessing a terminal.
         self._parked: set = set()
 
+    def _thread_guard(self, operation_id: str) -> threading.Lock:
+        with self._lock:
+            guard = self._thread_guards.get(operation_id)
+            if guard is None:
+                guard = threading.Lock()
+                self._thread_guards[operation_id] = guard
+            return guard
+
     # -- paths / io --------------------------------------------------------
     def path_for(self, operation_id: str) -> str:
         return os.path.join(self.dir_path, operation_id + ".json")
+
+    def _claim_path(self, operation_id: str) -> str:
+        return os.path.join(self.dir_path, operation_id + ".lock")
+
+    @contextmanager
+    def _claim(self, operation_id: str, blocking: bool):
+        """Hold the in-process and cross-process attempt claims for one op.
+
+        Both an in-process per-id lock (the HTTP server is threaded while
+        flock is per-process) and an fcntl exclusive lock on
+        ``operation-artifacts/<id>.lock`` are held for the WHOLE
+        first-provider-call..terminal window: a concurrent HTTP/CLI retry in
+        any thread or process can only take the attempt over once the original
+        owner is truly gone, never while it is minting handles.
+
+        ``blocking=False`` raises :class:`BlockingIOError` when another owner
+        currently holds the claim; ``blocking=True`` waits. A storage fault
+        taking the claim raises :class:`ArtifactStrandUnavailable`.
+        """
+        guard = self._thread_guard(operation_id)
+        acquired = guard.acquire(blocking=blocking)
+        if not acquired:
+            raise BlockingIOError(operation_id)
+        fd = -1
+        locked = False
+        try:
+            os.makedirs(self.dir_path, exist_ok=True)
+            fd = os.open(
+                self._claim_path(operation_id),
+                os.O_RDWR | os.O_CREAT,
+                0o600,
+            )
+            if fcntl is not None:
+                flags = fcntl.LOCK_EX
+                if not blocking:
+                    flags |= fcntl.LOCK_NB
+                # LOCK_NB contention raises BlockingIOError, reported distinctly
+                # from a storage fault by the calling guard.
+                fcntl.flock(fd, flags)
+                locked = True
+            yield fd
+        except OSError as exc:
+            if isinstance(exc, BlockingIOError):
+                raise
+            raise ArtifactStrandUnavailable(str(exc), 500)
+        finally:
+            if fcntl is not None and locked and fd >= 0:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            guard.release()
+
+    def attempt(self, operation, blocking: bool, takeover: bool = False,
+                operation_store=None):
+        """Context manager owning one attempt's mirror + cross-process claim.
+
+        For a freshly bound operation (``takeover=False``) it creates the
+        ``bound`` mirror directly and never reads the ledger -- a fresh bind
+        has no prior evidence. For a retried identical binding whose operation
+        is still pending (``takeover=True``) it RE-READS the operation record
+        while holding the claim: if the original owner meanwhile reached a
+        terminal, ArtifactAlreadyTerminal carries the fresh record for exact
+        replay. Otherwise it takes the strand over under the SAME
+        operation_id, but only when the mirror is missing with zero surviving
+        evidence (a failed/stranded mirror creation) or is an intact ``bound``
+        mirror with no journal, snapshot, marker, handle or durable event --
+        i.e. the provider was never effectively called. Anything less provable
+        raises ArtifactStrandUnavailable: the operation stays pending, the
+        scene stays parked for the next process restart, and no provider is
+        called twice.
+        """
+        operation_id = operation.operation_id
+        return self._Attempt(
+            self, operation, operation_id, blocking, takeover,
+            operation_store,
+        )
+
+    class _Attempt:
+        def __init__(self, store, operation, operation_id, blocking,
+                     takeover, operation_store):
+            self.store = store
+            self.operation = operation
+            self.operation_id = operation_id
+            self.blocking = blocking
+            self.takeover = takeover
+            self.operation_store = operation_store
+            self._cm = None
+            self.mirror = None
+
+        def __enter__(self):
+            self._cm = self.store._claim(
+                self.operation_id, self.blocking
+            )
+            self._cm.__enter__()
+            try:
+                self.mirror = self.store._claim_strand(
+                    self.operation, self.takeover, self.operation_store
+                )
+                return self.mirror
+            except BaseException:
+                self._cm.__exit__(None, None, None)
+                self._cm = None
+                raise
+
+        def __exit__(self, exc_type, exc, tb):
+            try:
+                return None
+            finally:
+                if self._cm is not None:
+                    self._cm.__exit__(exc_type, exc, tb)
 
     def write_descriptor(self, descriptor: dict) -> None:
         """Atomically write one mirror (0600, fsynced before rename)."""
@@ -236,8 +410,129 @@ class ArtifactStore:
             return False
 
     def is_parked(self, operation_id: str) -> bool:
-        """Whether a pending operation's mirror must keep it pending."""
+        """Whether a pending operation must be kept pending at settlement.
+
+        Both genuinely parked evidence sets (corrupt/inconsistent, provider
+        down) and clean pre-provider strands waiting for a takeover retry keep
+        the operation pending: neither may be finalized failed(500), so the
+        request path is the only thing allowed to conclude them.
+        """
         return operation_id in self._parked
+
+    # -- request-path strand claim / takeover ------------------------------
+    def _event_durable(self, operation_id: str):
+        """Return the durable event for the id, or None; False if unreadable."""
+        try:
+            return self.audit.get_event(operation_id)
+        except LedgerError:
+            return False
+
+    def _clean_strand_descriptor(self, operation, descriptor: dict) -> bool:
+        """Whether the attempt provably never reached a provider.
+
+        Evidence required to (re)start a bound attempt under the same
+        operation_id: no durable event of any outcome, no provision journal,
+        no batch snapshot, no restore marker and no key/policy pending marker
+        naming this operation. Anything less returns False and the caller
+        parks instead of guessing.
+        """
+        if self.key_store is None:
+            return False
+        event = self._event_durable(operation.operation_id)
+        if event is False or event is not None:
+            # Unreadable ledger, or a durable commit/rejection: the startup
+            # settlement owns those; a request never re-runs them.
+            return False
+        return not self._residual_evidence(descriptor)
+
+    def _claim_strand(self, operation, takeover: bool,
+                      operation_store=None) -> ArtifactMirror:
+        """Create (fresh bind) or safely take over the attempt mirror.
+
+        Claim lock is held. A fresh bind never had an attempt, so its mirror
+        is created directly WITHOUT reading the ledger (a get_event there
+        would block behind a held audit lock before the first provider call).
+        Only an explicit takeover re-reads the operation record (the claim is
+        the serialization boundary with the original owner) and re-validates
+        the surviving evidence.
+        """
+        if not takeover:
+            try:
+                return self.create(operation)
+            except OSError as exc:
+                raise ArtifactStrandUnavailable(str(exc), 500)
+        operation_id = operation.operation_id
+        # Re-read the record UNDER the claim: the original owner may have
+        # reached a terminal after this request observed "pending" but before
+        # the claim was granted. Hand the fresh terminal to the caller for an
+        # exact replay rather than re-executing or wrongly parking it.
+        if operation_store is not None:
+            fresh = operation_store._read_record(operation_id)
+            if fresh is not None and fresh.is_terminal():
+                raise ArtifactAlreadyTerminal(fresh)
+        descriptor = self._read_descriptor(operation_id)
+        if descriptor is not None:
+            if not self._binding_matches(descriptor, operation):
+                raise ArtifactStrandUnavailable(
+                    "mirror does not match the operation binding"
+                )
+            return self._take_over(operation, descriptor)
+        if os.path.exists(self.path_for(operation_id)):
+            # Named on disk but unparseable: a corrupt mirror is evidence to
+            # preserve, never rebuilt over by a live request.
+            raise ArtifactStrandUnavailable("corrupt mirror")
+        # Missing mirror: the classic failed strand (mirror creation raised
+        # before the first provider call) -- only restartable when not a trace
+        # of the attempt survives and nothing committed under this id.
+        probe = {
+            "operation_id": operation_id,
+            "journal": None,
+            "snapshot": None,
+            "empty_marker": None,
+        }
+        if not self._clean_strand_descriptor(operation, probe):
+            raise ArtifactStrandUnavailable(
+                "missing mirror with surviving or uncertain evidence"
+            )
+        try:
+            return self.create(operation)
+        except OSError as exc:
+            raise ArtifactStrandUnavailable(str(exc), 500)
+
+    def _take_over(
+        self, operation, descriptor: dict
+    ) -> ArtifactMirror:
+        """Re-open an intact, never-committed mirror for a retried attempt.
+
+        Only a mirror that provably never reached a provider can be restarted
+        on the request path: it is still at the ``bound`` phase with no handle
+        recorded, has no provision journal/batch snapshot/marker and has no
+        durable event of any outcome. A mirror that reached provisioning (a
+        journal or a handle existed) is finalized by the startup crash rule
+        instead -- a request never re-executes it. The descriptor is reset to
+        a fresh ``bound`` image as the executor re-describes the write set.
+        """
+        phase = descriptor.get("phase")
+        if phase != PHASE_BOUND or descriptor.get("handles"):
+            raise ArtifactStrandUnavailable(
+                "mirror phase %r cannot be taken over" % phase
+            )
+        if descriptor.get("journal") or descriptor.get("snapshot"):
+            raise ArtifactStrandUnavailable(
+                "mirror already references a journal or snapshot"
+            )
+        if not self._clean_strand_descriptor(operation, descriptor):
+            raise ArtifactStrandUnavailable(
+                "surviving evidence blocks the mirror takeover"
+            )
+        # Reset the durable image to a fresh bound strand. Discard first so a
+        # stale reference can never ride along.
+        if not self.discard(operation.operation_id):
+            raise ArtifactStrandUnavailable("stale mirror could not be removed")
+        try:
+            return self.create(operation)
+        except OSError as exc:
+            raise ArtifactStrandUnavailable(str(exc), 500)
 
     # -- request-path lifecycle -------------------------------------------
     def create(self, operation) -> ArtifactMirror:
@@ -271,7 +566,7 @@ class ArtifactStore:
         return ArtifactMirror(self, operation, descriptor)
 
     def after_terminal(self, mirror: Optional[ArtifactMirror]) -> None:
-        """Request-path mirror cleanup once the operation reached a terminal.
+        """Request-path mirror cleanup once an attempt ran.
 
         Committed terminals verify ownership of every minted handle; refusal/
         failure terminals require the attempt's rollback artifacts to be gone.
@@ -279,6 +574,12 @@ class ArtifactStore:
         could not confirm, an unreadable ledger) is intentionally LEFT on
         disk: the next startup settles it, and until then the evidence stays
         complete.
+
+        A still-``bound`` mirror whose operation is PENDING (the describe/
+        provision step itself failed before a provider was called) is retained
+        too: the mirror stays the parked attempt's cross-reference until a
+        same-id HTTP/CLI retry takes it over. Only a mirror whose operation
+        actually reached a terminal is eligible for the bound-phase discard.
         """
         if mirror is None:
             return
@@ -290,7 +591,16 @@ class ArtifactStore:
             if self._committed_state_verified(descriptor):
                 self.discard(mirror.operation_id)
             return
-        if phase in (PHASE_ROLLED_BACK, PHASE_BOUND):
+        if phase == PHASE_BOUND:
+            # A rejection/provider terminal finalizes the operation and clears
+            # an untouched bound mirror; a strand failure leaves it pending and
+            # keeps the mirror as the parked attempt's index.
+            if getattr(mirror.operation, "status", None) == "pending":
+                return
+            if not self._residual_evidence(descriptor):
+                self.discard(mirror.operation_id)
+            return
+        if phase == PHASE_ROLLED_BACK:
             if not self._residual_evidence(descriptor):
                 self.discard(mirror.operation_id)
             return
@@ -316,7 +626,10 @@ class ArtifactStore:
         try:
             names = os.listdir(self.dir_path)
         except OSError:
-            return
+            # The mirror directory itself is unreadable: settle nothing and
+            # let the missing-mirror pass below park every bound operation
+            # rather than finalizing one without its evidence.
+            names = []
         for name in names:
             if not name.endswith(".json"):
                 continue
@@ -326,6 +639,37 @@ class ArtifactStore:
                 # an operation/event: keep it for operator resolution.
                 continue
             self._settle_one(operation_id, operation_store)
+        self._settle_missing_mirrors(names, operation_store)
+
+    def _settle_missing_mirrors(self, mirror_names, operation_store) -> None:
+        """Park pending operations of the mirrored generation with no mirror.
+
+        A ``mirror_required`` pending operation whose mirror never landed (the
+        0600 creation failed, or the process died on that exact syscall) is not
+        guessed into failed(500): with no evidence it stays pending as a clean
+        strand the next identical HTTP/CLI request takes over under the same
+        operation_id; with surviving evidence it is parked the same way until
+        a later open. Records predating mirrors (``mirror_required`` false)
+        keep the legacy recovery rules and are intentionally untouched.
+        """
+        present = {name[:-5] for name in mirror_names if name.endswith(".json")}
+        try:
+            op_names = os.listdir(operation_store.dir_path)
+        except OSError:
+            return
+        for name in op_names:
+            if not name.endswith(".json") or name == "index.json":
+                continue
+            operation_id = name[:-5]
+            if operation_id in present:
+                continue
+            record = operation_store._read_record(operation_id)
+            if record is None or record.is_terminal():
+                continue
+            if not getattr(record, "mirror_required", False):
+                # Legacy binding: no mirror was ever mandatory.
+                continue
+            self._parked.add(operation_id)
 
     def _settle_one(self, operation_id: str, operation_store) -> None:
         descriptor = self._read_descriptor(operation_id)
@@ -372,8 +716,37 @@ class ArtifactStore:
         # deliberately parked the scene (provider down, corrupt basis).
         if self._residual_evidence(descriptor):
             self._parked.add(operation_id)
+            return
+        if event is not None:
+            # A durable rejected terminal (403/404/409/503) with no residual
+            # file/journal: the rejection already committed and the operation
+            # store replays its staged result verbatim; the mirror is spent
+            # housekeeping. Never park a decided terminal for a retry.
+            self.discard(operation_id)
+            return
+        # No event and no residual evidence. Decide from whether the provider
+        # was ever reached: a mirror that stayed at ``bound`` (no journal/
+        # handle) represents an attempt interrupted exactly around mirror
+        # creation -- keep it pending (and retain the mirror as its index) so
+        # the next identical HTTP/CLI request takes it over under the same
+        # operation_id. A mirror that reached provisioning and was then fully
+        # rolled back (provider failure / conflict / ledger failure) is the
+        # legacy interruption: drop the mirror so the operation finalizes
+        # failed(500) exactly as before.
+        if self._never_provisioned(descriptor):
+            self._parked.add(operation_id)
         else:
             self.discard(operation_id)
+
+    @staticmethod
+    def _never_provisioned(descriptor: dict) -> bool:
+        """Whether the mirror proves the provider was never reached."""
+        return (
+            descriptor.get("phase") == PHASE_BOUND
+            and not descriptor.get("handles")
+            and not descriptor.get("journal")
+            and not descriptor.get("snapshot")
+        )
 
     def _settle_terminal(self, descriptor: dict, record, event) -> None:
         """Discard a terminal operation's mirror only when its state verifies."""

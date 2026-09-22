@@ -12,6 +12,10 @@ from . import keybundle
 from . import operations as operations_mod
 from . import restore as restore_mod
 from . import tenantbundle
+from .artifacts import (
+    ArtifactAlreadyTerminal,
+    ArtifactStrandUnavailable,
+)
 from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
 from .operations import OperationStore
@@ -106,49 +110,45 @@ def make_handler(
                 return None
             return value
 
-        def _serve_existing_binding(self, kind, record) -> bool:
-            """Send the response for a bound key. True if a response was sent.
-
-            Handles the conflict (409 naming the original operation), the
-            terminal replay (exact stored status/response, no re-execution) and
-            the in-flight replay (wait up to 5 s, else a non-mutating
-            timed_out 503). Returns False only for an unbound key.
-            """
-            if kind == "new":
-                return False
-            if kind == "conflict":
-                self._send_json(
-                    409,
-                    {
-                        "error": "Idempotency-Key is already bound to a "
-                        "different request",
-                        "operation_id": record.operation_id,
-                    },
-                )
-                return True
-            # replay
-            if not record.is_terminal():
-                record = operation_store.await_terminal(record)
-            if record.is_terminal():
-                self._send_json(record.http_status, record.response)
-                return True
-            # Owner still running after the wait budget: timed_out for this
-            # waiter without touching the owner's record.
+        def _serve_conflict(self, record) -> None:
             self._send_json(
-                503, self._timed_out_body(record.operation_id)
+                409,
+                {
+                    "error": "Idempotency-Key is already bound to a "
+                    "different request",
+                    "operation_id": record.operation_id,
+                },
             )
+
+        def _replay_terminal(self, record) -> None:
+            self._send_json(record.http_status, record.response)
+
+        def _serve_pending_wait(self, record) -> bool:
+            """Wait for a live owner's terminal, then replay/503.
+
+            Returns True when a response was sent. The waiter writes nothing:
+            on timeout the owner's still-pending record is left untouched.
+            """
+            record = operation_store.await_terminal(record)
+            if record.is_terminal():
+                self._replay_terminal(record)
+                return True
+            self._send_json(503, self._timed_out_body(record.operation_id))
             return True
 
         def _idempotent_precheck(self, path, tenant_id, operator, payload,
                                 key) -> bool:
             """Resolve an already-bound key before expensive/decrypt work.
 
-            Returns True when the response was sent (a replay or a conflict);
-            False when the key is unbound and the caller should proceed with
-            side-effect-free validation. This keeps a failed bundle decrypt
-            from consuming an Idempotency-Key, and makes a same-key/
-            different-binding request answer 409 even when its bundle would
-            not decrypt.
+            Returns True when the response was sent (a conflict or a terminal
+            replay); False when the caller should proceed with side-effect-free
+            validation. A still-PENDING binding is deliberately left open: the
+            idempotent guard is the single place that decides whether a live
+            owner is running (wait) or a dead owner left a restartable strand
+            (take over under the same operation_id). This keeps a failed
+            bundle decrypt from consuming an Idempotency-Key, and makes a
+            same-key/different-binding request answer 409 even when its bundle
+            would not decrypt.
             """
             normalized = operations_mod.normalize_body(payload)
             peek = operation_store.peek(
@@ -156,7 +156,13 @@ def make_handler(
             )
             if peek.kind == "new":
                 return False
-            return self._serve_existing_binding(peek.kind, peek.record)
+            if peek.kind == "conflict":
+                self._serve_conflict(peek.record)
+                return True
+            if peek.record.is_terminal():
+                self._replay_terminal(peek.record)
+                return True
+            return False
 
         def _op_state_for_status(self, http_status: int) -> str:
             # 201 is the only success; an explicit request conflict is the
@@ -269,6 +275,19 @@ def make_handler(
                 "operation_id": operation_id,
             }
 
+        def _strand_unavailable_body(self, operation_id: str) -> dict:
+            # Material-safe: no handle, material, passphrase or path detail.
+            return {
+                "error": "temporary storage failure, please retry",
+                "operation_id": operation_id,
+            }
+
+        def _send_strand_unavailable(self, operation_id, status: int) -> None:
+            # The operation stays PENDING (no provider/key/handle/audit was
+            # touched); the client retries with the same Idempotency-Key and
+            # reuses this operation_id.
+            self._send_json(status, self._strand_unavailable_body(operation_id))
+
         def _idempotent_guard(self, path, tenant_id, operator, payload, key,
                               executor) -> None:
             """Bind the Idempotency-Key and run an idempotent mutation.
@@ -285,55 +304,104 @@ def make_handler(
             request gets 409 naming the original operation; waiting on an
             in-flight owner beyond 5 s answers timed_out (503) without
             writing anything.
+
+            If the 0600 mirror cannot be created (an OSError making the
+            directory, temp file or rename) AFTER the key bound but BEFORE the
+            first provider call, the bound operation is left pending and the
+            request answers a material-safe 500/503: no provider, key, handle
+            or audit is written, and a later identical HTTP/CLI request
+            rebuilds the mirror and runs the attempt under the SAME
+            operation_id.
             """
             normalized = operations_mod.normalize_body(payload)
             begin = operation_store.begin(
                 tenant_id, operator, path, normalized, key
             )
-            if begin.kind != "new":
-                # Lost a precheck->begin race or an explicit retry: replay or
-                # conflict, never execute.
-                self._serve_existing_binding(begin.kind, begin.record)
+            if begin.kind == "conflict":
+                self._serve_conflict(begin.record)
                 return
-            operation = begin.record
-            op_id = operation.operation_id
-            # The mirror is durable before the executor calls any provider:
-            # it cross-references the operation record, the provision journal,
-            # the restore marker / batch snapshot and every new handle.
+            if begin.kind == "replay":
+                self._serve_replay_or_takeover(begin.record, executor)
+                return
+            self._run_owned_attempt(
+                begin.record, executor, blocking=True, takeover=False
+            )
+
+        def _serve_replay_or_takeover(self, record, executor) -> None:
+            """Resolve an identical binding: replay a terminal, wait for a live
+            owner, or take a dead owner's clean pre-provider strand over."""
+            if record.is_terminal():
+                self._replay_terminal(record)
+                return
+            if artifact_store is None:
+                self._serve_pending_wait(record)
+                return
+            # Still pending. First try to claim the attempt immediately: if a
+            # live owner (thread or process) holds it, fall back to the 5 s
+            # wait. A dead owner with a clean, never-committed strand hands it
+            # over under the same operation_id.
             try:
-                mirror = (
-                    artifact_store.create(operation)
-                    if artifact_store is not None
-                    else None
+                self._run_owned_attempt(
+                    record, executor, blocking=False, takeover=True
                 )
-            except OSError as exc:
-                # The binding landed but the mirror could not be created: no
-                # provider was called, so nothing committed. Finalize the
-                # bound op failed(500); the next open reconciles without a
-                # mirror using the legacy recovery rules.
-                body = {
-                    "error": "audit ledger failure: %s" % exc,
-                    "operation_id": op_id,
-                }
-                operation_store.finish(
-                    operation, operations_mod.STATUS_FAILED, 500, body
-                )
-                self._send_json(500, body)
+            except BlockingIOError:
+                self._serve_pending_wait(record)
+
+        def _run_owned_attempt(self, operation, executor, blocking,
+                              takeover) -> None:
+            """Run the attempt once, owning its mirror + claim for the window.
+
+            Used both by the binding winner (``takeover=False``) and by a
+            retried identical request taking a stranded pending attempt over
+            (``takeover=True``).
+            """
+            op_id = operation.operation_id
+            if artifact_store is None:
+                # Mirrors disabled (tests/legacy wiring): run directly.
+                self._idempotent_run_body(operation, op_id, executor, None)
                 return
+            attempt_cm = artifact_store.attempt(
+                operation, blocking, takeover=takeover,
+                operation_store=operation_store if takeover else None,
+            )
+            try:
+                mirror = attempt_cm.__enter__()
+            except ArtifactAlreadyTerminal as already:
+                # The owner reached a terminal while the claim was taken:
+                # replay its fresh stored result verbatim, execute nothing.
+                self._replay_terminal(already.record)
+                return
+            except ArtifactStrandUnavailable as exc:
+                # Mirror claim/creation failed with the op still bound and
+                # pending: surface 500/503 without finalizing it.
+                self._send_strand_unavailable(op_id, exc.http_status)
+                return
+            except BlockingIOError:
+                # A live owner holds the attempt; the caller waits.
+                raise
             try:
                 self._idempotent_run_body(
                     operation, op_id, executor, mirror
                 )
             finally:
-                if artifact_store is not None and mirror is not None:
-                    # Committed: verified ownership then dropped; uncommitted:
-                    # dropped only once every rollback artifact is gone. A
-                    # mirror that cannot be verified survives for startup.
+                # Committed: verified ownership then dropped; uncommitted:
+                # dropped only once every rollback artifact is gone. A
+                # mirror that cannot be verified survives for startup.
+                try:
                     artifact_store.after_terminal(mirror)
+                finally:
+                    attempt_cm.__exit__(None, None, None)
 
         def _idempotent_run_body(self, operation, op_id, executor, mirror):
             try:
                 http_status, body = executor(operation, mirror)
+            except ArtifactStrandUnavailable as exc:
+                # The mirror could not be described/tied in before the first
+                # provider call, or a clean strand could not be taken over.
+                # Nothing committed: leave the operation PENDING and answer
+                # 500/503. A same-key HTTP/CLI retry reuses the operation_id.
+                self._send_strand_unavailable(op_id, exc.http_status)
+                return
             except LockTimeout:
                 # Lock wait exceeded 5 s: no key, audit event or handle was
                 # written. Record and answer timed_out (503).

@@ -356,7 +356,12 @@ def _emit_operation_result(http_status: int, body: dict) -> int:
 
 
 def _idem_serve_existing(op_store, kind, record) -> "Optional[int]":
-    """Replay/conflict/wait for a bound key; None means the key is unbound."""
+    """Replay/conflict for a bound key.
+
+    Returns an exit code for conflict and for a terminal replay, or None when
+    the binding is new OR the operation is still pending (the caller decides
+    whether to wait for a live owner or take a stranded attempt over).
+    """
     if kind == "new":
         return None
     if kind == "conflict":
@@ -368,11 +373,16 @@ def _idem_serve_existing(op_store, kind, record) -> "Optional[int]":
                 "operation_id": record.operation_id,
             },
         )
-    if not record.is_terminal():
-        record = op_store.await_terminal(record)
     if record.is_terminal():
         return _emit_operation_result(record.http_status, record.response)
-    # Waiter outlived the 5 s budget: timed_out without mutating the owner.
+    return None
+
+
+def _idem_wait_then_serve(op_store, record) -> int:
+    """Wait for a live owner then replay its terminal, or emit 503 timed out."""
+    record = op_store.await_terminal(record)
+    if record.is_terminal():
+        return _emit_operation_result(record.http_status, record.response)
     return _emit_operation_result(
         503,
         {
@@ -380,6 +390,66 @@ def _idem_serve_existing(op_store, kind, record) -> "Optional[int]":
             "operation_id": record.operation_id,
         },
     )
+
+
+def _strand_unavailable_body(operation_id: str) -> dict:
+    """Material-safe body for a mirror/strand failure; op stays pending."""
+    return {
+        "error": "temporary storage failure, please retry",
+        "operation_id": operation_id,
+    }
+
+
+def _run_owned_attempt(op_store, store, artifact_store, executor, operation,
+                       blocking, takeover=False) -> int:
+    """Run one attempt under its mirror + cross-process claim.
+
+    Used by the binding winner (takeover=False) and by an identical retry that
+    takes a stranded pending attempt over (takeover=True). A mirror claim/
+    creation failure leaves the operation pending and returns the 500/503 exit
+    code without calling a provider or writing any key/handle/audit.
+    """
+    op_id = operation.operation_id
+    if artifact_store is None:
+        return _idempotent_run_body(
+            op_store, store, None, executor, operation, op_id, None
+        )
+    from .artifacts import (
+        ArtifactAlreadyTerminal,
+        ArtifactStrandUnavailable,
+    )
+
+    attempt_cm = artifact_store.attempt(
+        operation, blocking, takeover=takeover,
+        operation_store=op_store if takeover else None,
+    )
+    try:
+        mirror = attempt_cm.__enter__()
+    except ArtifactAlreadyTerminal as already:
+        # The owner reached a terminal while the claim was taken: replay its
+        # fresh stored result verbatim, execute nothing.
+        return _emit_operation_result(
+            already.record.http_status, already.record.response
+        )
+    except ArtifactStrandUnavailable as exc:
+        return _emit_operation_result(
+            exc.http_status, _strand_unavailable_body(op_id)
+        )
+    except BlockingIOError:
+        raise
+    try:
+        return _idempotent_run_body(
+            op_store, store, artifact_store, executor,
+            operation, op_id, mirror,
+        )
+    except ArtifactStrandUnavailable as exc:
+        # The mirror could not be described/tied in before the first provider
+        # call: keep the operation pending for a same-id retry.
+        return _emit_operation_result(
+            exc.http_status, _strand_unavailable_body(op_id)
+        )
+    finally:
+        attempt_cm.__exit__(None, None, None)
 
 
 def idempotent_run(op_store, store, path, tenant_id, operator, body, key,
@@ -423,49 +493,43 @@ def idempotent_run(op_store, store, path, tenant_id, operator, body, key,
     # begin() is authoritative for the bind (another process may have won
     # between the peek and here).
     begin = op_store.begin(tenant_id, operator, path, normalized, key)
-    existing = _idem_serve_existing(op_store, begin.kind, begin.record)
-    if existing is not None:
-        return existing
+    if begin.kind == "conflict":
+        return _idem_serve_existing(op_store, "conflict", begin.record)
+    if begin.kind == "replay":
+        if begin.record.is_terminal():
+            return _idem_serve_existing(op_store, "replay", begin.record)
+        # Still pending: take a stranded attempt over immediately; if a live
+        # owner (thread or process) holds the claim, wait for its terminal.
+        if artifact_store is not None:
+            try:
+                return _run_owned_attempt(
+                    op_store, store, artifact_store, executor,
+                    begin.record, blocking=False, takeover=True,
+                )
+            except BlockingIOError:
+                return _idem_wait_then_serve(op_store, begin.record)
+        return _idem_wait_then_serve(op_store, begin.record)
 
     operation = begin.record
-    op_id = operation.operation_id
-    # The mirror is durable before the executor calls any provider: it
-    # cross-references the operation record, the provision journal, the
-    # restore marker / batch snapshot and every new handle.
-    try:
-        mirror = (
-            artifact_store.create(operation)
-            if artifact_store is not None
-            else None
-        )
-    except OSError as exc:
-        # Binding landed but the mirror could not be created; no provider was
-        # called and nothing committed. Finalize failed(500) (CLI exit 1); the
-        # next open reconciles without a mirror via the legacy rules.
-        body_err = {
-            "error": "audit ledger failure: %s" % exc,
-            "operation_id": op_id,
-        }
-        op_store.finish(
-            operation, operations_mod.STATUS_FAILED, 500, body_err
-        )
-        return _emit_operation_result(500, body_err)
-    try:
-        exit_code = _idempotent_run_body(
-            op_store, store, executor, operation, op_id, mirror
-        )
-    finally:
-        if artifact_store is not None and mirror is not None:
-            # Committed: verified ownership then dropped; uncommitted: dropped
-            # only once every rollback artifact is gone. A mirror that cannot
-            # be verified survives for the next startup.
-            artifact_store.after_terminal(mirror)
-    return exit_code
+    return _run_owned_attempt(
+        op_store, store, artifact_store, executor, operation,
+        blocking=True, takeover=False,
+    )
 
 
-def _idempotent_run_body(op_store, store, executor, operation, op_id, mirror):
+def _idempotent_run_body(op_store, store, artifact_store, executor, operation,
+                         op_id, mirror):
+    from .artifacts import ArtifactStrandUnavailable
+
     try:
         http_status, resp = executor(operation, mirror)
+    except ArtifactStrandUnavailable as exc:
+        # The mirror could not be described/tied in before the first provider
+        # call: nothing committed, keep the operation pending for a same-id
+        # retry (exit 1).
+        return _emit_operation_result(
+            exc.http_status, _strand_unavailable_body(op_id)
+        )
     except LockTimeout:
         body_err = {
             "error": "operation timed out waiting for a lock",
@@ -527,6 +591,11 @@ def _idempotent_run_body(op_store, store, executor, operation, op_id, mirror):
     resp["operation_id"] = op_id
     state = operations_mod.state_for_http_status(http_status)
     op_store.finish(operation, state, http_status, resp)
+    if artifact_store is not None and mirror is not None:
+        # Committed: verified ownership then dropped; uncommitted: dropped
+        # only once every rollback artifact is gone. A mirror that cannot be
+        # verified survives for the next startup.
+        artifact_store.after_terminal(mirror)
     return _emit_operation_result(http_status, resp)
 
 

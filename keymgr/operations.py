@@ -180,6 +180,7 @@ class OperationRecord:
         created_at: Optional[str] = None,
         updated_at: Optional[str] = None,
         details: Optional[dict] = None,
+        mirror_required: bool = False,
     ) -> None:
         self.operation_id = operation_id
         self.tenant_id = tenant_id
@@ -196,6 +197,14 @@ class OperationRecord:
         # crash-recovery resolver can rebuild the committed response without
         # the original request (e.g. a restore's write set).
         self.details = details
+        # Whether this binding is of the mirrored generation: its 0600
+        # artifact mirror is created after the bind and before the first
+        # provider call. A pending operation of this generation whose mirror
+        # is missing is a RETRYABLE strand (the mirror creation failed or the
+        # process crashed right there), never a guessable failed(500). Old
+        # records without the flag keep the legacy recovery rules -- a mirror
+        # is never mandatory for them.
+        self.mirror_required = mirror_required
 
     # The operation_id is the audit event_id of the mutation it wraps, so the
     # two subsystems resolve a crash by the same identifier.
@@ -217,6 +226,7 @@ class OperationRecord:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "details": self.details,
+            "mirror_required": self.mirror_required,
         }
 
     @classmethod
@@ -234,6 +244,7 @@ class OperationRecord:
             created_at=data.get("created_at"),
             updated_at=data.get("updated_at"),
             details=data.get("details"),
+            mirror_required=bool(data.get("mirror_required", False)),
         )
 
     def is_terminal(self) -> bool:
@@ -455,6 +466,7 @@ class OperationStore:
                 status=STATUS_PENDING,
                 created_at=now,
                 updated_at=now,
+                mirror_required=True,
             )
             self._write_record(record)
             index["bindings"][scope] = operation_id
