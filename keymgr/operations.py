@@ -109,6 +109,97 @@ def normalize_body(body: Optional[dict]) -> str:
     )
 
 
+# Maps the durable operation kind to the audit action of its single terminal
+# event. Recovery uses it to verify that an event found under the
+# operation_id really is THIS operation's commit point (and not an id
+# collision belonging to a different action/tenant).
+_KIND_ACTIONS = {
+    "rotate": "rotate",
+    "import": "import",
+    "restore": "import",
+    "batch_rotate": "batch_rotate",
+}
+
+
+def expected_action_for(record: "OperationRecord"):
+    """The audit action a committed operation's event must carry (or None)."""
+    kind = (record.details or {}).get("kind")
+    return _KIND_ACTIONS.get(kind)
+
+
+def make_artifact_callbacks(operation_store: "OperationStore", key_store):
+    """Build ``(register, on_handle, on_group, rollback_uncommitted)``.
+
+    These wire the bound operation record to the durable crash-recovery
+    artifacts of rotate/import/restore/batch-rotate without either layer
+    importing the other:
+
+    * ``register(record, **fields)`` merges artifact references into the
+      0600-locked operation record;
+    * ``on_handle(provider_id, handle)`` mirrors one freshly journaled handle
+      the instant it is minted;
+    * ``on_group(journal=, snapshot=, write_set=, marker=)`` mirrors the
+      attempt's durable journal/snapshot/write-set before any handle exists;
+    * ``rollback_uncommitted(record)`` is offered to
+      :meth:`OperationStore.recover_pending` when no commit event exists. It
+      idempotently deletes every handle reachable through the mirror (the
+      last-resort source when the journal/snapshot were already independently
+      removed) and returns True only when every delete is verified. A single
+      failure parks the pending operation for a later open; the store-level
+      outbox recovery, which runs first, remains the primary rollback path.
+    """
+    def register(record, **fields):
+        operation_store.register_artifacts(record, **fields)
+
+    def on_handle(record):
+        def _cb(provider_id, handle):
+            operation_store.register_artifacts(
+                record,
+                handles=[{"provider_id": provider_id, "handle": handle}],
+            )
+        return _cb
+
+    def on_group(record):
+        def _cb(journal=None, snapshot=None, write_set=None, marker=None):
+            operation_store.register_artifacts(
+                record,
+                journal=journal,
+                snapshot=snapshot,
+                write_set=list(write_set or []),
+                marker=marker,
+            )
+        return _cb
+
+    def rollback_uncommitted(record) -> bool:
+        artifacts = (record.details or {}).get("_artifacts") or {}
+        handles = artifacts.get("handles") or []
+        cleaned = True
+        for pair in handles:
+            provider_id = pair.get("provider_id")
+            handle = pair.get("handle")
+            if not (
+                isinstance(provider_id, str)
+                and provider_id
+                and isinstance(handle, str)
+                and handle
+            ):
+                continue
+            # Idempotent: a handle already removed by the outbox sweep simply
+            # confirms; an unreachable provider reports False and parks the
+            # whole operation for a later open.
+            try:
+                deleted = key_store._delete_provisioned_handle(
+                    provider_id, handle
+                )
+            except Exception:
+                deleted = False
+            if not deleted:
+                cleaned = False
+        return cleaned
+
+    return register, on_handle, on_group, rollback_uncommitted
+
+
 class BeginResult(NamedTuple):
     """Outcome of :meth:`OperationStore.begin`.
 
@@ -463,6 +554,66 @@ class OperationStore:
         finally:
             self._unlocked(fd)
 
+    def register_artifacts(self, record: "OperationRecord", **fields) -> None:
+        """Durably record the crash-recovery artifacts of a bound operation.
+
+        The moment a provider call has minted a handle (and before any of it
+        can become unreachable), the request path registers the durable
+        references recovery needs to settle the group without trusting a
+        single artifact:
+
+        * ``provider_id``   -- the owning provider of every minted handle;
+        * ``journal``       -- the provisions/<event_id>.json handle journal;
+        * ``snapshot``      -- the batch-rotations/<event_id>.json snapshot;
+        * ``write_set``     -- every key_id the attempt may write;
+        * ``handles``       -- ``[{provider_id, handle}, ...]`` minted so far,
+          merged by identity so re-registration after each mint keeps the full
+          set;
+        * ``marker``        -- where the outbox marker lives ("key:<id>",
+          "policy:<tenant>", "restore-empty:<tenant>").
+
+        Written to the 0600 operation record atomically under the same
+        in-process + fcntl lock as every other record update. A crash right
+        after a provider call but before this merge is still covered by the
+        durable provision journal itself; this mirror is what lets operation
+        recovery delete handles when the journal has already been independently
+        removed. No handle, material or passphrase beyond the opaque handle
+        token is stored here, and operation projections never expose details.
+        """
+        merged = dict(record.details or {})
+        artifacts = dict(merged.get("_artifacts") or {})
+        handles = list(artifacts.get("handles") or [])
+        for pair in fields.pop("handles", []) or []:
+            if (
+                isinstance(pair, dict)
+                and isinstance(pair.get("provider_id"), str)
+                and pair["provider_id"]
+                and isinstance(pair.get("handle"), str)
+                and pair["handle"]
+            ):
+                token = {"provider_id": pair["provider_id"],
+                         "handle": pair["handle"]}
+                if token not in handles:
+                    handles.append(token)
+        if handles:
+            artifacts["handles"] = handles
+        write_set = list(artifacts.get("write_set") or [])
+        for key_id in fields.pop("write_set", []) or []:
+            if isinstance(key_id, str) and key_id and key_id not in write_set:
+                write_set.append(key_id)
+        if write_set:
+            artifacts["write_set"] = write_set
+        for name, value in fields.items():
+            if value is not None:
+                artifacts[name] = value
+        merged["_artifacts"] = artifacts
+        record.details = merged
+        fd = self._locked()
+        try:
+            self._write_record(record)
+        finally:
+            self._unlocked(fd)
+
     def stage_terminal(
         self,
         record: OperationRecord,
@@ -539,23 +690,36 @@ class OperationStore:
         resolve_committed: Optional[
             Callable[["OperationRecord", object], "tuple[int, dict]"]
         ] = None,
+        rollback_uncommitted: Optional[
+            Callable[["OperationRecord"], bool]
+        ] = None,
     ) -> None:
         """Finish operations left pending by a crashed process.
 
         Must run *after* the key-store and restore outbox recovery, so the
         ledger already reflects every half-committed mutation. For each
-        pending operation: when its event reached the ledger the operation
-        is durable and the terminal status/response persisted *with the
-        rejection/success context* (``details["result"]``) are replayed
-        verbatim -- the policy, the current object state and the (possibly no
-        longer decryptable) bundle are never consulted again, so a later
-        policy/state change cannot turn a 403 into a 404/409 or rewrite the
-        first response; only when no result was staged (older records) does
-        ``resolve_committed(record, event)`` rebuild a best-effort
-        projection. When the event never reached the ledger the operation
-        never committed and is recorded as a 500 failure (the outbox/
-        provision recovery has already removed its half-written files and
-        minted handles).
+        pending operation:
+
+        * when its event reached the ledger it is the commit point only when
+          its ``event_id`` (the lookup key), ``action`` and ``tenant_id`` all
+          agree with THIS operation -- an id collision with a different
+          action/tenant is never treated as a commit, the operation is left
+          pending and the scene is preserved for a later open. Once verified,
+          the terminal status/response persisted with the rejection/success
+          context (``details["result"]``) are replayed verbatim -- the policy,
+          the current object state and the (possibly no longer decryptable)
+          bundle are never consulted again, so a later policy/state change
+          cannot turn a 403 into a 404/409 or rewrite the first response; only
+          when no result was staged (older records) does
+          ``resolve_committed(record, event)`` rebuild a best-effort
+          projection.
+        * when the event never reached the ledger the operation never
+          committed: ``rollback_uncommitted(record)`` is offered the durable
+          artifact mirror (journal/snapshot/handle set) so it can delete any
+          minted handle the outbox sweeps could not tie to a surviving
+          artifact; only when that reports fully settled is the operation
+          recorded failed(500). A failed/False rollback leaves the operation
+          pending for a later open -- the scene is never partially resolved.
         """
         try:
             names = os.listdir(self.dir_path)
@@ -575,6 +739,12 @@ class OperationStore:
                 # Cannot decide right now; leave it for a later open.
                 continue
             if event is not None:
+                if not self._event_matches_operation(record, event):
+                    # A durable event carries this id but names a different
+                    # action or tenant (id collision/corruption): it is not
+                    # this operation's commit point. Leave the operation and
+                    # its scene untouched for a later open.
+                    continue
                 details = record.details or {}
                 staged = details.get("result")
                 if (
@@ -608,6 +778,18 @@ class OperationStore:
                     response,
                 )
             else:
+                # No event under this id: the mutation never reached its
+                # commit point. Let the caller reconcile any minted handle
+                # reachable only through the operation's artifact mirror; a
+                # report of failure parks the operation so a later open
+                # retries rather than finalizing while an orphan may exist.
+                if rollback_uncommitted is not None:
+                    try:
+                        settled = rollback_uncommitted(record)
+                    except Exception:
+                        settled = False
+                    if not settled:
+                        continue
                 self.finish(
                     record,
                     STATUS_FAILED,
@@ -615,3 +797,28 @@ class OperationStore:
                     {"error": "operation interrupted before commit",
                      "operation_id": record.operation_id},
                 )
+
+    @staticmethod
+    def _event_matches_operation(
+        record: "OperationRecord", event
+    ) -> bool:
+        """Whether a durable event is really this operation's terminal event.
+
+        The lookup already pins ``event_id`` (the operation_id). Recovery
+        additionally requires the action and tenant to agree with the bound
+        operation, so a same-id event belonging to another action or tenant
+        can never be mistaken for the commit point. Records predating the
+        kind/context fields are accepted on tenant agreement alone for
+        backwards compatibility.
+        """
+        if event.event_id != record.event_id:
+            return False
+        if (
+            event.tenant_id is not None
+            and event.tenant_id != record.tenant_id
+        ):
+            return False
+        expected_action = expected_action_for(record)
+        if expected_action is not None and event.action != expected_action:
+            return False
+        return True

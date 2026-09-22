@@ -525,10 +525,14 @@ def _run(argv: Optional[List[str]] = None) -> int:
     # Resolve any operations left pending by a crashed CLI/server run, after
     # the key/restore outbox recovery above has settled the mutation.
     op_store = OperationStore(args.data_dir, audit_log)
+    register_artifacts, handle_cb, group_cb, rollback_uncommitted = (
+        operations_mod.make_artifact_callbacks(op_store, store)
+    )
     op_store.recover_pending(
         lambda record, event: _resolve_committed_operation(
             store, policies, record, event
-        )
+        ),
+        rollback_uncommitted=rollback_uncommitted,
     )
 
     if not getattr(args, "operator", None):
@@ -628,6 +632,12 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 {"kind": "rotate", "key_id": args.key_id,
                  "algorithm": args.algorithm},
             )
+            register_artifacts(
+                operation,
+                journal=operation.operation_id,
+                write_set=[args.key_id],
+                marker="key:" + args.key_id,
+            )
             if not policies.is_allowed(
                 args.tenant_id, audit_mod.ACTION_ROTATE, args.operator
             ):
@@ -648,6 +658,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 event_id=operation.operation_id,
                 lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                 pre_commit=stage_success,
+                on_handle=handle_cb(operation),
             )
             if record is None:
                 return _terminal_rejection(
@@ -698,6 +709,11 @@ def _run(argv: Optional[List[str]] = None) -> int:
                     ],
                 },
             )
+            register_artifacts(
+                operation,
+                write_set=[key_id for key_id, _ in items],
+                marker="batch_rotate",
+            )
             # Authorization follows rotate; the rejection event is a single
             # batch_rotate with key_id null.
             if not policies.is_allowed(
@@ -733,6 +749,8 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 event_id=operation.operation_id,
                 lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                 pre_commit=stage_success,
+                on_handle=handle_cb(operation),
+                on_group=group_cb(operation),
             )
             if status == store.BATCH_NOT_FOUND:
                 return _terminal_rejection(
@@ -935,6 +953,12 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 operation,
                 {"kind": "import", "key_id": key_id},
             )
+            register_artifacts(
+                operation,
+                journal=operation.operation_id,
+                write_set=[key_id],
+                marker="key:" + key_id,
+            )
             if not policies.is_allowed(
                 args.tenant_id, audit_mod.ACTION_IMPORT, args.operator
             ):
@@ -955,6 +979,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 event_id=operation.operation_id,
                 lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                 pre_commit=stage_success,
+                on_handle=handle_cb(operation),
             )
             if status == IMPORT_CONFLICT:
                 if record.tenant_id == args.tenant_id:
@@ -1059,6 +1084,11 @@ def _run(argv: Optional[List[str]] = None) -> int:
                     "policy_restored": writes_policy,
                 },
             )
+            register_artifacts(
+                operation,
+                write_set=list(key_ids),
+                marker="restore",
+            )
             if not policies.is_allowed(
                 args.tenant_id, audit_mod.ACTION_IMPORT, args.operator
             ):
@@ -1090,6 +1120,8 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 event_id=operation.operation_id,
                 lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                 pre_commit=stage_success,
+                on_handle=handle_cb(operation),
+                on_group=group_cb(operation),
             )
             if result.status == restore_mod.RESTORE_CREATED:
                 return (

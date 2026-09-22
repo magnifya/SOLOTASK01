@@ -45,6 +45,10 @@ def make_handler(
 ) -> type:
     """Build a BaseHTTPRequestHandler subclass bound to the stores."""
 
+    _register_artifacts, _handle_cb, _group_cb, _ = (
+        operations_mod.make_artifact_callbacks(operation_store, store)
+    )
+
     class KeyHandler(BaseHTTPRequestHandler):
         server_version = "KeyMgr/1.0"
 
@@ -733,6 +737,15 @@ def make_handler(
                     {"kind": "rotate", "key_id": key_id,
                      "algorithm": algorithm},
                 )
+                # Durably tie the bound operation to the artifacts its
+                # rotation will mint (0600, locked) before any provider call.
+                # The provision journal is named after the operation_id.
+                _register_artifacts(
+                    operation,
+                    journal=operation.operation_id,
+                    write_set=[key_id],
+                    marker="key:" + key_id,
+                )
                 # Authorization follows validation and precedes existence; a
                 # denial is a bound terminal 403 whose single rejection event
                 # is named after the operation_id.
@@ -758,6 +771,7 @@ def make_handler(
                     event_id=operation.operation_id,
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                     pre_commit=stage_success,
+                    on_handle=_handle_cb(operation),
                 )
                 if record is None:
                     return self._idempotent_rejection(
@@ -864,6 +878,8 @@ def make_handler(
                     event_id=operation.operation_id,
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                     pre_commit=stage_success,
+                    on_handle=_handle_cb(operation),
+                    on_group=_group_cb(operation),
                 )
                 if status == store.BATCH_NOT_FOUND:
                     # Any unknown/foreign key_id fails the whole batch with no
@@ -1057,6 +1073,15 @@ def make_handler(
                     operation,
                     {"kind": "import", "key_id": key_id},
                 )
+                # Tie the bound operation to the import's artifacts before any
+                # provider call mints a handle. The provision journal is named
+                # after the operation_id.
+                _register_artifacts(
+                    operation,
+                    journal=operation.operation_id,
+                    write_set=[key_id],
+                    marker="key:" + key_id,
+                )
                 # Authorization precedes the conflict check: a denial is a
                 # bound terminal 403 even when the key_id already exists for
                 # another tenant.
@@ -1083,6 +1108,7 @@ def make_handler(
                     event_id=operation.operation_id,
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                     pre_commit=stage_success,
+                    on_handle=_handle_cb(operation),
                 )
                 if status == IMPORT_CONFLICT:
                     if record.tenant_id == tenant_id:
@@ -1221,6 +1247,14 @@ def make_handler(
                         "policy_restored": writes_policy,
                     },
                 )
+                # Pre-tie the operation to the planned restore write set; the
+                # coordinator mirrors the durable journal/snapshot and each
+                # minted handle as they land.
+                _register_artifacts(
+                    operation,
+                    write_set=list(key_ids),
+                    marker="restore",
+                )
                 # Authorization (import) precedes the in-bundle tenant check.
                 if not policy_store.is_allowed(
                     tenant_id, audit_mod.ACTION_IMPORT, operator
@@ -1258,6 +1292,8 @@ def make_handler(
                     event_id=operation.operation_id,
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                     pre_commit=stage_success,
+                    on_handle=_handle_cb(operation),
+                    on_group=_group_cb(operation),
                 )
                 if result.status == restore_mod.RESTORE_CREATED:
                     # The single success event committed with the files.
@@ -1864,10 +1900,14 @@ def serve(host: str, port: int, data_dir: str) -> None:
     policy_store = PolicyStore(data_dir, audit_log)
     coordinator = restore_mod.RestoreCoordinator(store, policy_store)
     operation_store = OperationStore(data_dir, audit_log)
+    _register, _on_handle, _on_group, rollback_uncommitted = (
+        operations_mod.make_artifact_callbacks(operation_store, store)
+    )
     operation_store.recover_pending(
         lambda record, event: _resolve_committed_operation(
             store, policy_store, record, event
-        )
+        ),
+        rollback_uncommitted=rollback_uncommitted,
     )
     httpd = ThreadingHTTPServer(
         (host, port),

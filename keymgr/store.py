@@ -744,7 +744,7 @@ class KeyStore:
             # unresolved (event not durable): the trimmed committed view is a
             # projection only, and a rewrite would discard the recovery
             # scene. Committed markers (event durable) are safe.
-            if not self._marker_event_durable(record.pending_event):
+            if not self._marker_event_durable(record.pending_event, record):
                 return
         local = provider_mod.configure_local(self.data_dir)
         adopted = []
@@ -850,8 +850,154 @@ class KeyStore:
             )
         self.audit.append(event)
 
+    # Single-file outbox markers whose uncommitted rollback is fully
+    # understood here. A batch_rotate group and a multi-file restore are
+    # resolved elsewhere.
+    _SINGLE_MARKER_ACTIONS = (
+        audit_mod.ACTION_CREATE,
+        audit_mod.ACTION_ROTATE,
+        audit_mod.ACTION_IMPORT,
+        audit_mod.ACTION_REVOKE,
+    )
+
+    def _marker_descriptor(self, marker) -> Optional[dict]:
+        """Return the event descriptor of a marker (nested or flat)."""
+        nested = marker.get("event")
+        desc = nested if isinstance(nested, dict) else marker
+        return desc if isinstance(desc, dict) else None
+
+    def _single_marker_valid(self, record: KeyRecord, marker) -> bool:
+        """Validate a single-file marker's identity before trusting it.
+
+        The descriptor must carry a UUID4 event id, a known single-file
+        action, the record's tenant and the record's key_id; a marker that
+        fails any of these is left untouched (the scene preserved) rather
+        than guessed at.
+        """
+        desc = self._marker_descriptor(marker)
+        if desc is None:
+            return False
+        eid = desc.get("event_id")
+        if not is_valid_key_id(eid):
+            return False
+        action = desc.get("action")
+        if action not in self._SINGLE_MARKER_ACTIONS:
+            return False
+        if desc.get("tenant_id") != record.tenant_id:
+            return False
+        if marker.get("tenant_id", record.tenant_id) != record.tenant_id:
+            return False
+        if desc.get("key_id") not in (None, record.key_id):
+            return False
+        return True
+
+    def _single_marker_event_matches(
+        self, record: KeyRecord, marker, event
+    ) -> bool:
+        """Whether a durable event is exactly this marker's commit event."""
+        desc = self._marker_descriptor(marker)
+        if desc is None or event is None:
+            return False
+        if event.event_id != desc.get("event_id"):
+            return False
+        if event.action != desc.get("action"):
+            return False
+        if event.tenant_id != record.tenant_id:
+            return False
+        if desc.get("key_id") is not None and event.key_id != desc.get("key_id"):
+            return False
+        return True
+
+    def _rollback_single_marker(
+        self, path: str, record: KeyRecord, marker
+    ) -> bool:
+        """Roll back an uncommitted single-file marker; True when settled.
+
+        Every minted handle is deleted idempotently FIRST (the provision
+        journal plus the version handle(s) present on disk that the aborted
+        change added); only once every delete is confirmed is the old file
+        restored: a rotate trims its one trailing version, a create/import
+        removes its brand-new file, a revoke restores the active fields. The
+        journal is dropped only after the write-back lands. A single failed
+        delete, an unreachable provider or a failed write keeps the ENTIRE
+        scene (file, marker, journal) for a later open. No event is appended.
+        """
+        desc = self._marker_descriptor(marker) or {}
+        action = desc.get("action")
+        journal_id = marker.get("journal")
+        if not isinstance(journal_id, str):
+            journal_id = None
+
+        targets = set()
+        for provider_id, handle in self.read_provision_journal(journal_id):
+            targets.add((provider_id, handle))
+        if action in (audit_mod.ACTION_CREATE, audit_mod.ACTION_IMPORT):
+            # A brand-new file: every handle on it belongs to the attempt.
+            for ver in record.versions:
+                if ver.handle:
+                    targets.add((ver.provider_id, ver.handle))
+        elif action == audit_mod.ACTION_ROTATE and record.versions:
+            # A rotate appends exactly one trailing version.
+            trailing = record.versions[-1]
+            if trailing.handle:
+                targets.add((trailing.provider_id, trailing.handle))
+
+        for provider_id, handle in targets:
+            if not self._delete_provisioned_handle(provider_id, handle):
+                # Provider unreachable or a delete unverified: keep the whole
+                # group of file, marker and journal for a later open.
+                return False
+
+        try:
+            if action in (audit_mod.ACTION_CREATE, audit_mod.ACTION_IMPORT):
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+            elif action == audit_mod.ACTION_ROTATE:
+                if len(record.versions) <= 1:
+                    # The rotating file must have had a prior version; if it
+                    # does not, the pre-image cannot be reconstructed, park.
+                    return False
+                record.versions = record.versions[:-1]
+                record.current_version = record.versions[-1].version
+                record.pending_event = None
+                self._write_atomic(path, record.to_json())
+            elif action == audit_mod.ACTION_REVOKE:
+                record.status = "active"
+                record.reason = None
+                record.operator = None
+                record.revoked_at = None
+                record.pending_event = None
+                self._write_atomic(path, record.to_json())
+            else:
+                return False
+        except OSError:
+            # Write-back failed: handles are already deleted idempotently and
+            # the marker/journal stay as the retry basis.
+            return False
+
+        if journal_id:
+            self.drop_provision_journal(journal_id)
+        return True
+
     def _recover_pending_events(self) -> None:
-        """Commit outbox events left pending by a crashed process."""
+        """Settle single-file outbox markers left by a crashed process.
+
+        The ledger is the ONLY commit authority:
+
+        * a durable SUCCESS event whose event_id, action and tenant all match
+          the marker means the change committed -- only the marker is cleared
+          (and the attempt's journal dropped); the new versions are never
+          rolled back and the event is never appended again;
+        * a durable event with a mismatching action/tenant, or an unreadable
+          ledger, parks the whole scene for a later open;
+        * no event (or a durable rejection) means the change never committed:
+          every minted handle is confirmed deleted first, the old file is
+          restored only afterwards, and the journal is removed last. Any
+          failed delete, write-back or ledger read retains the entire scene;
+          nothing is partially rolled back and no success event is written.
+        """
         try:
             names = os.listdir(self.data_dir)
         except OSError:
@@ -865,32 +1011,46 @@ class KeyStore:
                 record = self._read_record(path)
                 if record is None or not record.pending_event:
                     continue
-                # A multi-file tenant restore transaction is resolved by the
-                # RestoreCoordinator (its manifest drives the shared event),
-                # and a multi-key batch-rotation group by
-                # _recover_batch_rotations; neither is resolved here.
-                if record.pending_event.get("_restore") or record.pending_event.get(
-                    "_batch_rotate"
-                ):
+                marker = record.pending_event
+                # A multi-file tenant restore and a multi-key batch rotation
+                # are resolved by their own coordinators, never here.
+                if marker.get("_restore") or marker.get("_batch_rotate"):
                     continue
-                # append() is idempotent on event_id, so this is safe whether
-                # the crash happened before or after the ledger write.
-                event = AuditEvent.from_json(record.pending_event)
-                journal_id = record.pending_event.get("journal")
+                if not self._single_marker_valid(record, marker):
+                    # Unknown/garbled marker: preserve the scene rather than
+                    # guessing committed-vs-not.
+                    continue
+                eid = self._marker_descriptor(marker).get("event_id")
                 try:
-                    self.audit.append(event)
-                    record.pending_event = None
-                    self._write_atomic(path, record.to_json())
-                except (LedgerError, OSError):
-                    # The ledger or directory is temporarily unwritable.
-                    # Leave the marker in place; it is retried on the next
-                    # open (the append is idempotent on event_id).
+                    event = self.audit.get_event(eid)
+                except LedgerError:
+                    # Cannot decide right now; leave file, marker and journal
+                    # for a later open.
                     continue
-                if isinstance(journal_id, str) and journal_id:
-                    # The import committed (event is in the ledger); its
-                    # minted handles are now owned by the key, so the
-                    # attempt's provision journal is finished.
-                    self.drop_provision_journal(journal_id)
+                if event is not None:
+                    if event.outcome != audit_mod.OUTCOME_SUCCESS:
+                        # A durable rejection terminal under the same id: the
+                        # change never committed. Roll it back below.
+                        event = None
+                    elif not self._single_marker_event_matches(
+                        record, marker, event
+                    ):
+                        # Same id, different action/tenant: never treat this
+                        # as the commit point; park the scene untouched.
+                        continue
+                if event is not None:
+                    # Committed: post-commit housekeeping only.
+                    record.pending_event = None
+                    try:
+                        self._write_atomic(path, record.to_json())
+                    except OSError:
+                        continue
+                    journal_id = marker.get("journal")
+                    if isinstance(journal_id, str) and journal_id:
+                        self.drop_provision_journal(journal_id)
+                    continue
+                # Uncommitted: delete every handle, then restore the old file.
+                self._rollback_single_marker(path, record, marker)
 
     def _commit_mutation(
         self,
@@ -1175,14 +1335,18 @@ class KeyStore:
             )
         return record
 
-    def _marker_event_durable(self, marker) -> bool:
+    def _marker_event_durable(self, marker, record: Optional[KeyRecord] = None) -> bool:
         """True when a pending marker's SUCCESS event reached the ledger.
 
         Markers carry the event nested under ``"event"`` (the multi-file
         shapes) or flat (single-key outbox). Only a durable ``success`` event
-        commits the file change: a durable ``rejected`` terminal with the same
-        id can coexist with a preserved (parked) scene when an in-request
-        rollback itself failed, and that state must still be treated as
+        commits the file change, and it must carry the SAME event id, action
+        and tenant the marker names -- a same-id event belonging to another
+        action/tenant (a collision or corruption) is never a commit, so the
+        uncommitted view stays hidden and a mutator waits for crash recovery
+        to settle the id. A durable ``rejected`` terminal with the same id
+        can coexist with a preserved (parked) scene when an in-request
+        rollback itself failed, and that state is still treated as
         uncommitted -- reads project the prior version and mutators wait for
         crash recovery. An unreadable ledger is treated as not durable.
         """
@@ -1197,10 +1361,19 @@ class KeyStore:
             event = self.audit.get_event(event_id)
         except LedgerError:
             return False
-        return (
-            event is not None
-            and event.outcome == audit_mod.OUTCOME_SUCCESS
-        )
+        if event is None or event.outcome != audit_mod.OUTCOME_SUCCESS:
+            return False
+        marked_action = desc.get("action") if isinstance(desc, dict) else None
+        if marked_action is not None and event.action != marked_action:
+            return False
+        marked_tenant = desc.get("tenant_id") if isinstance(desc, dict) else None
+        if marked_tenant is None and isinstance(marker, dict):
+            marked_tenant = marker.get("tenant_id")
+        if marked_tenant is not None and event.tenant_id != marked_tenant:
+            return False
+        if record is not None and event.tenant_id != record.tenant_id:
+            return False
+        return True
 
     def _batch_committed_view(self, record: KeyRecord) -> Optional[KeyRecord]:
         """Project one file carrying an unsettled ``_batch_rotate`` marker.
@@ -1497,7 +1670,7 @@ class KeyStore:
         if (
             isinstance(marker, dict)
             and marker
-            and not self._marker_event_durable(marker)
+            and not self._marker_event_durable(marker, record)
         ):
             raise ProviderUnavailable(
                 "key file is awaiting crash recovery"
@@ -1535,6 +1708,7 @@ class KeyStore:
         event_id: Optional[str] = None,
         lock_timeout: Optional[float] = None,
         pre_commit=None,
+        on_handle=None,
     ) -> Optional[KeyRecord]:
         """Append a new version with fresh material.
 
@@ -1586,6 +1760,11 @@ class KeyStore:
                 self._append_provision(
                     journal_path, provider.provider_id, triple.handle
                 )
+                if on_handle is not None:
+                    # Mirror the now durably journaled handle into the bound
+                    # operation's 0600 record, so crash recovery can reconcile
+                    # it even if the journal is later removed independently.
+                    on_handle(provider.provider_id, triple.handle)
                 record.append_version(
                     VersionRecord(
                         version=next_number,
@@ -1731,6 +1910,8 @@ class KeyStore:
         event_id: Optional[str] = None,
         lock_timeout: Optional[float] = None,
         pre_commit=None,
+        on_handle=None,
+        on_group=None,
     ) -> Tuple[str, object]:
         """Atomically append one fresh version to many keys.
 
@@ -1810,6 +1991,17 @@ class KeyStore:
                     "journal": journal_id,
                     "snapshot": event.event_id,
                 }
+                if on_group is not None:
+                    # The snapshot and journal are durable before any handle
+                    # is minted; mirror their references, the shared marker
+                    # location and the full write set into the bound
+                    # operation record (0600, locked).
+                    on_group(
+                        journal=journal_id,
+                        snapshot=event.event_id,
+                        write_set=list(ordered_ids),
+                        marker="batch_rotate",
+                    )
                 for key_id, algorithm in ordered:
                     record = records[key_id]
                     provider = self._provider_for(
@@ -1821,6 +2013,8 @@ class KeyStore:
                     self._append_provision(
                         journal_path, provider.provider_id, triple.handle
                     )
+                    if on_handle is not None:
+                        on_handle(provider.provider_id, triple.handle)
                     record.append_version(
                         VersionRecord(
                             version=next_number,
@@ -2858,6 +3052,7 @@ class KeyStore:
         event_id: Optional[str] = None,
         lock_timeout: Optional[float] = None,
         pre_commit=None,
+        on_handle=None,
     ) -> tuple:
         """Persist a validated export payload under the importing tenant.
 
@@ -2900,6 +3095,10 @@ class KeyStore:
                     )
                     versions.append(version_record)
                     adopted.append((target, version_record.handle))
+                    if on_handle is not None:
+                        on_handle(
+                            version_record.provider_id, version_record.handle
+                        )
                 record = KeyRecord(
                     key_id=key_id,
                     tenant_id=tenant_id,
@@ -2984,7 +3183,8 @@ class KeyStore:
         return self._read_record(self._path_for(key_id))
 
     def record_from_backup(
-        self, tenant_id: str, entry: dict, journal: Optional[str] = None
+        self, tenant_id: str, entry: dict, journal: Optional[str] = None,
+        on_handle=None,
     ) -> KeyRecord:
         """Build an unsaved KeyRecord from a validated backup keys[i] entry.
 
@@ -3005,6 +3205,10 @@ class KeyStore:
                 )
                 versions.append(version_record)
                 adopted.append((target, version_record.handle))
+                if on_handle is not None:
+                    on_handle(
+                        version_record.provider_id, version_record.handle
+                    )
         except BaseException:
             # A later version failed a provider match or validation; release
             # every handle this record minted for its earlier versions. A

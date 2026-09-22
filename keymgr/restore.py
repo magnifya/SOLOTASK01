@@ -260,6 +260,8 @@ class RestoreCoordinator:
         event_id: Optional[str] = None,
         lock_timeout: Optional[float] = None,
         pre_commit=None,
+        on_handle=None,
+        on_group=None,
     ) -> RestoreResult:
         """Atomically restore a validated tenant payload.
 
@@ -298,6 +300,15 @@ class RestoreCoordinator:
             journal_id, journal_path = self.store._new_provision_journal(
                 event.event_id
             )
+            if on_group is not None:
+                # The attempt journal is durable before any handle is minted;
+                # mirror it plus the full planned write set into the bound
+                # operation record (0600, locked).
+                on_group(
+                    journal=journal_id,
+                    write_set=list(key_ids),
+                    marker="restore",
+                )
             committed = False
             try:
                 # Phase 0: complete ALL version validation and provider
@@ -312,7 +323,8 @@ class RestoreCoordinator:
                     )
                     records.append(
                         self.store.record_from_backup(
-                            tenant_id, entry, journal_path
+                            tenant_id, entry, journal_path,
+                            on_handle=on_handle,
                         )
                     )
 
@@ -722,9 +734,23 @@ class RestoreCoordinator:
         if not event:
             return  # finalized marker: the committed batch's idempotency record
         try:
-            committed = self.store.audit.get_event(event["event_id"]) is not None
+            event = self.store.audit.get_event(event["event_id"])
         except (LedgerError, KeyError, TypeError):
             return  # leave it for a later open to retry
+        if event is not None:
+            # The commit only counts when the durable event is exactly this
+            # empty restore: success, the import action and the marker's
+            # tenant. Any mismatch parks the marker for a later open.
+            marker_tenant = marker.get("tenant_id")
+            if (
+                event.outcome != audit_mod.OUTCOME_SUCCESS
+                or event.action != audit_mod.ACTION_IMPORT
+                or event.tenant_id != marker_tenant
+            ):
+                return
+            committed = True
+        else:
+            committed = False
         if committed:
             finalized = dict(marker)
             finalized["event"] = None
@@ -744,9 +770,21 @@ class RestoreCoordinator:
         except LedgerError:
             # Leave the group untouched; a later open retries recovery.
             return False
-        committed = (
-            event is not None and event.outcome == audit_mod.OUTCOME_SUCCESS
-        )
+        if event is not None and event.outcome == audit_mod.OUTCOME_SUCCESS:
+            # The durable event is the commit point ONLY when it really is
+            # this group's restore: same id (the lookup), the import action
+            # and the marker's tenant. A same-id event with another action or
+            # tenant (collision/corruption) neither commits nor rolls the
+            # group back -- the whole scene is preserved for a later open.
+            if (
+                event.event_id != eid
+                or event.action != audit_mod.ACTION_IMPORT
+                or event.tenant_id != tenant_id
+            ):
+                return False
+            committed = True
+        else:
+            committed = False
         if not committed:
             # The commit-point success append never happened (event absent or
             # only a rejected terminal). Delete EVERY minted handle BEFORE
