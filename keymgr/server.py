@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from . import audit as audit_mod
+from . import envelope as envelope_mod
 from . import keybundle
 from . import operations as operations_mod
 from . import restore as restore_mod
@@ -34,6 +35,8 @@ _KEY_PATH_RE = re.compile(r"^/v1/keys/([^/]+)$")
 _ROTATE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/rotate$")
 _REVOKE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/revoke$")
 _EXPORT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/export$")
+_ENCRYPT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/encrypt$")
+_DECRYPT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/decrypt$")
 _STATUS_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/status$")
 _VERSION_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/versions/([^/]+)$")
 _CURRENT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/current$")
@@ -719,6 +722,16 @@ def make_handler(
                     self._export_key(export_match.group(1), parts, operator)
                     return
 
+                encrypt_match = _ENCRYPT_PATH_RE.match(path)
+                if encrypt_match is not None:
+                    self._encrypt_key(encrypt_match.group(1), parts, operator)
+                    return
+
+                decrypt_match = _DECRYPT_PATH_RE.match(path)
+                if decrypt_match is not None:
+                    self._decrypt_key(decrypt_match.group(1), parts, operator)
+                    return
+
                 if path == _IMPORT_PATH:
                     self._import_key(parts, operator)
                     return
@@ -1116,6 +1129,212 @@ def make_handler(
                 return
             self._send_json(
                 200, {"format": keybundle.FORMAT, "bundle": bundle}
+            )
+
+        def _envelope_fields(self, tenant_id, key_id, action, payload,
+                             need_envelope: bool):
+            """Validate the shared encrypt/decrypt body fields.
+
+            Returns ``(plaintext_or_None, aad, parsed_envelope_or_None,
+            version_or_None)`` — only the fields relevant to the action are
+            populated — or None after a 400 response was sent. Every field
+            failure is a tenant-visible rejected attempt, exactly like the
+            export endpoint's passphrase check.
+            """
+            plaintext = None
+            parsed = None
+            version = None
+
+            def reject(message: str):
+                if not self._record_attempt(
+                    tenant_id, key_id, action, audit_mod.OUTCOME_REJECTED
+                ):
+                    return None
+                self._bad_request(message)
+                return None
+
+            if need_envelope:
+                token = payload.get("envelope")
+                if not isinstance(token, str) or not token:
+                    return reject("field envelope must be a non-empty string")
+                try:
+                    parsed = envelope_mod.parse_envelope(token)
+                except envelope_mod.EnvelopeError as exc:
+                    return reject(str(exc))
+            else:
+                raw_plaintext = payload.get("plaintext")
+                if not isinstance(raw_plaintext, str) or not raw_plaintext:
+                    return reject(
+                        "field plaintext must be a base64 string"
+                        if raw_plaintext is not None
+                        else "missing required field: plaintext"
+                    )
+                try:
+                    plaintext = envelope_mod.decode_request_b64(
+                        raw_plaintext, "plaintext"
+                    )
+                except envelope_mod.EnvelopeError as exc:
+                    return reject(str(exc))
+                raw_version = payload.get("version")
+                if raw_version is not None:
+                    if (
+                        not isinstance(raw_version, int)
+                        or isinstance(raw_version, bool)
+                        or raw_version < 1
+                    ):
+                        return reject(
+                            "field version must be a positive integer"
+                        )
+                    version = raw_version
+
+            aad = None
+            if "aad" in payload and payload["aad"] is not None:
+                if not isinstance(payload["aad"], str):
+                    return reject("field aad must be a base64 string")
+                try:
+                    aad = envelope_mod.decode_request_b64(
+                        payload["aad"], "aad"
+                    )
+                except envelope_mod.EnvelopeError as exc:
+                    return reject(str(exc))
+            return plaintext, aad, parsed, version
+
+        def _envelope_status_reply(self, tenant_id, key_id, action, status):
+            """Answer a store-level envelope refusal (404/409)."""
+            if status == store.ENVELOPE_REVOKED:
+                if not self._record_attempt(
+                    tenant_id, key_id, action, audit_mod.OUTCOME_REJECTED
+                ):
+                    return
+                self._send_json(409, {"error": "key is revoked"})
+                return
+            message = (
+                "version not found"
+                if status == store.ENVELOPE_VERSION_NOT_FOUND
+                else "key not found"
+            )
+            if not self._record_attempt(
+                tenant_id, key_id, action, audit_mod.OUTCOME_REJECTED
+            ):
+                return
+            self._send_json(404, {"error": message})
+
+        def _encrypt_key(self, key_id: str, parts, operator: str) -> None:
+            """POST /v1/keys/{key_id}/encrypt.
+
+            Seals the base64 ``plaintext`` into a keymgr-envelope-v1 token
+            under the requested version (default: current). Parameter errors
+            are 400 naming the field, an unknown/foreign key or version is
+            404, a revoked key is 409 and a provider outage is the generic
+            503. Only metadata reaches the audit ledger; the plaintext, the
+            data key and key material never appear in a response or event.
+            """
+            payload = self._read_json_object()
+            if payload is None:
+                return
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                if not self._record_conflict():
+                    return
+                self._bad_request("field tenant_id must be a non-empty string")
+                return
+            tenant_id = self._tenant(parts, payload)
+            if tenant_id is None:
+                return
+            if self._bad_key_id(key_id):
+                return
+            fields = self._envelope_fields(
+                tenant_id, key_id, audit_mod.ACTION_ENCRYPT, payload,
+                need_envelope=False,
+            )
+            if fields is None:
+                return
+            plaintext, aad, _, version = fields
+            if not self._enforce(
+                tenant_id, key_id, audit_mod.ACTION_ENCRYPT, operator
+            ):
+                return
+            try:
+                status, result = store.envelope_encrypt(
+                    key_id, tenant_id, version, plaintext, aad
+                )
+            except envelope_mod.EnvelopeError as exc:
+                self._bad_request(str(exc))
+                return
+            if status != store.ENVELOPE_OK:
+                self._envelope_status_reply(
+                    tenant_id, key_id, audit_mod.ACTION_ENCRYPT, status
+                )
+                return
+            token, _version_used = result
+            if not self._record_attempt(
+                tenant_id, key_id, audit_mod.ACTION_ENCRYPT,
+                audit_mod.OUTCOME_SUCCESS,
+            ):
+                return
+            self._send_json(
+                200, {"format": envelope_mod.FORMAT, "envelope": token}
+            )
+
+        def _decrypt_key(self, key_id: str, parts, operator: str) -> None:
+            """POST /v1/keys/{key_id}/decrypt.
+
+            Opens a keymgr-envelope-v1 token against the exact version it
+            names. A malformed envelope, tampering or an AAD mismatch is a
+            400 naming the field; an unknown/foreign key or version is 404;
+            a revoked key is 409. The plaintext is returned base64-encoded
+            and never touches the audit ledger.
+            """
+            payload = self._read_json_object()
+            if payload is None:
+                return
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                if not self._record_conflict():
+                    return
+                self._bad_request("field tenant_id must be a non-empty string")
+                return
+            tenant_id = self._tenant(parts, payload)
+            if tenant_id is None:
+                return
+            if self._bad_key_id(key_id):
+                return
+            fields = self._envelope_fields(
+                tenant_id, key_id, audit_mod.ACTION_DECRYPT, payload,
+                need_envelope=True,
+            )
+            if fields is None:
+                return
+            _, aad, parsed, _ = fields
+            if not self._enforce(
+                tenant_id, key_id, audit_mod.ACTION_DECRYPT, operator
+            ):
+                return
+            try:
+                status, plaintext = store.envelope_decrypt(
+                    key_id, tenant_id, parsed, aad
+                )
+            except envelope_mod.EnvelopeError as exc:
+                if not self._record_attempt(
+                    tenant_id, key_id, audit_mod.ACTION_DECRYPT,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._bad_request(str(exc))
+                return
+            if status != store.ENVELOPE_OK:
+                self._envelope_status_reply(
+                    tenant_id, key_id, audit_mod.ACTION_DECRYPT, status
+                )
+                return
+            if not self._record_attempt(
+                tenant_id, key_id, audit_mod.ACTION_DECRYPT,
+                audit_mod.OUTCOME_SUCCESS,
+            ):
+                return
+            self._send_json(
+                200,
+                {"plaintext": envelope_mod.encode_request_b64(plaintext)},
             )
 
         def _import_key(self, parts, operator: str) -> None:

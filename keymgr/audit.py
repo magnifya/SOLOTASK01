@@ -24,6 +24,8 @@ ACTION_BATCH_ROTATE = "batch_rotate"
 ACTION_REVOKE = "revoke"
 ACTION_IMPORT = "import"
 ACTION_EXPORT = "export"
+ACTION_ENCRYPT = "encrypt"
+ACTION_DECRYPT = "decrypt"
 ACTION_AUDIT = "audit"
 ACTION_TENANT_CONFLICT = "tenant_conflict"
 # Policy management actions. These are audited but are never themselves
@@ -39,6 +41,8 @@ ACTIONS = (
     ACTION_REVOKE,
     ACTION_IMPORT,
     ACTION_EXPORT,
+    ACTION_ENCRYPT,
+    ACTION_DECRYPT,
     ACTION_AUDIT,
     ACTION_TENANT_CONFLICT,
     ACTION_POLICY_READ,

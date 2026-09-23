@@ -8,6 +8,7 @@ import sys
 from typing import List, Optional
 
 from . import audit as audit_mod
+from . import envelope as envelope_mod
 from . import keybundle
 from . import operations as operations_mod
 from . import restore as restore_mod
@@ -104,6 +105,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_export = tenant_parser("export", help="export a key as an encrypted bundle")
     p_export.add_argument("--key-id", required=True)
     p_export.add_argument("--passphrase", required=True)
+
+    p_encrypt = tenant_parser(
+        "encrypt", help="encrypt data into a keymgr-envelope-v1 token"
+    )
+    p_encrypt.add_argument("--key-id", required=True)
+    p_encrypt.add_argument(
+        "--version", type=_positive_int, default=None,
+        help="key version to encrypt under (default: current)",
+    )
+    p_encrypt.add_argument("--plaintext", required=True,
+                           help="base64-encoded plaintext")
+    p_encrypt.add_argument("--aad", default=None,
+                           help="optional base64-encoded additional data")
+
+    p_decrypt = tenant_parser(
+        "decrypt", help="open a keymgr-envelope-v1 token"
+    )
+    p_decrypt.add_argument("--key-id", required=True)
+    p_decrypt.add_argument("--envelope", required=True,
+                           help="the base64 envelope token")
+    p_decrypt.add_argument("--aad", default=None,
+                           help="optional base64-encoded additional data")
 
     p_import = tenant_parser("import", help="import a key from an encrypted bundle")
     p_import.add_argument("--passphrase", required=True)
@@ -233,6 +256,28 @@ def _http_to_cli(http_status: int) -> int:
     return {201: 0, 200: 0, 400: 2, 403: 3, 409: 3, 404: 4}.get(
         http_status, 1
     )
+
+
+def _envelope_status_fail(store, tenant_id, key_id, action, status):
+    """Map a store-level envelope refusal to a CLI exit code, or None.
+
+    Mirrors the HTTP handler: a revoked key is a conflict (409 -> exit 3),
+    an unknown/foreign key or version is 404 (exit 4); each records one
+    rejected attempt event before failing.
+    """
+    if status == store.ENVELOPE_OK:
+        return None
+    if status == store.ENVELOPE_REVOKED:
+        if not _attempt(store, tenant_id, key_id, action,
+                        audit_mod.OUTCOME_REJECTED):
+            return 1
+        return _fail("key is revoked", 3)
+    if not _attempt(store, tenant_id, key_id, action,
+                    audit_mod.OUTCOME_REJECTED):
+        return 1
+    if status == store.ENVELOPE_VERSION_NOT_FOUND:
+        return _fail("version not found", 4)
+    return _fail("key not found", 4)
 
 
 def _terminal_rejection(
@@ -1012,6 +1057,106 @@ def _run(argv: Optional[List[str]] = None) -> int:
         ):
             return 1
         _print({"format": keybundle.FORMAT, "bundle": bundle})
+        return 0
+
+    if args.command == "encrypt":
+        if not args.tenant_id:
+            if not _conflict(store):
+                return 1
+            return _fail("field tenant_id must be a non-empty string", 2)
+        if not is_valid_key_id(args.key_id):
+            if not _conflict(store):
+                return 1
+            return _fail("field key_id must be a UUID4", 2)
+        try:
+            plaintext = envelope_mod.decode_request_b64(
+                args.plaintext, "plaintext"
+            )
+            aad = (
+                None
+                if args.aad is None
+                else envelope_mod.decode_request_b64(args.aad, "aad")
+            )
+        except envelope_mod.EnvelopeError as exc:
+            if not _attempt(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_ENCRYPT, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            return _fail(str(exc), 2)
+        if not allowed(audit_mod.ACTION_ENCRYPT):
+            return _deny(store, args.tenant_id, args.key_id,
+                         audit_mod.ACTION_ENCRYPT)
+        try:
+            status, result = store.envelope_encrypt(
+                args.key_id, args.tenant_id, args.version, plaintext, aad
+            )
+        except envelope_mod.EnvelopeError as exc:
+            return _fail(str(exc), 2)
+        except LedgerError as exc:
+            return _ledger_fail(exc)
+        code = _envelope_status_fail(store, args.tenant_id, args.key_id,
+                                     audit_mod.ACTION_ENCRYPT, status)
+        if code is not None:
+            return code
+        token, _version_used = result
+        if not _attempt(
+            store, args.tenant_id, args.key_id,
+            audit_mod.ACTION_ENCRYPT, audit_mod.OUTCOME_SUCCESS,
+        ):
+            return 1
+        _print({"format": envelope_mod.FORMAT, "envelope": token})
+        return 0
+
+    if args.command == "decrypt":
+        if not args.tenant_id:
+            if not _conflict(store):
+                return 1
+            return _fail("field tenant_id must be a non-empty string", 2)
+        if not is_valid_key_id(args.key_id):
+            if not _conflict(store):
+                return 1
+            return _fail("field key_id must be a UUID4", 2)
+        try:
+            parsed = envelope_mod.parse_envelope(args.envelope)
+            aad = (
+                None
+                if args.aad is None
+                else envelope_mod.decode_request_b64(args.aad, "aad")
+            )
+        except envelope_mod.EnvelopeError as exc:
+            if not _attempt(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_DECRYPT, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            return _fail(str(exc), 2)
+        if not allowed(audit_mod.ACTION_DECRYPT):
+            return _deny(store, args.tenant_id, args.key_id,
+                         audit_mod.ACTION_DECRYPT)
+        try:
+            status, plaintext = store.envelope_decrypt(
+                args.key_id, args.tenant_id, parsed, aad
+            )
+        except envelope_mod.EnvelopeError as exc:
+            if not _attempt(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_DECRYPT, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            return _fail(str(exc), 2)
+        except LedgerError as exc:
+            return _ledger_fail(exc)
+        code = _envelope_status_fail(store, args.tenant_id, args.key_id,
+                                     audit_mod.ACTION_DECRYPT, status)
+        if code is not None:
+            return code
+        if not _attempt(
+            store, args.tenant_id, args.key_id,
+            audit_mod.ACTION_DECRYPT, audit_mod.OUTCOME_SUCCESS,
+        ):
+            return 1
+        _print({"plaintext": envelope_mod.encode_request_b64(plaintext)})
         return 0
 
     if args.command == "import":

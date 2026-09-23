@@ -1,7 +1,8 @@
 # SOLOTASK01 多租户密钥管理后端
 
 一个多租户密钥管理服务，同时提供 HTTP API 与命令行入口。支持 AES256 / RSA2048
-密钥的生成、版本化轮换、吊销、加密导出/导入、租户级加密备份/恢复、按租户的
+密钥的生成、版本化轮换、吊销、信封加密/解密（keymgr-envelope-v1）、加密导出/导入、
+租户级加密备份/恢复、按租户的
 操作者策略、只追加的审计账，以及可插拔的 KMS/HSM 提供者。轮换/导入/恢复是
 幂等变更：同一 `Idempotency-Key` 的重试只重放原结果，进程在任一步骤崩溃后
 重启都能据 `operation_id` 判定是否已耐久并一致收尾。私钥只保存在服务端，
@@ -78,6 +79,17 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 - `POST /v1/keys/{key_id}/export`，body `{tenant_id, passphrase}` →
   `{format:"keymgr-export-v1", bundle}`，bundle 为不透明 base64（scrypt +
   AES-256-GCM，`format` 作为 AAD）。
+- `POST /v1/keys/{key_id}/encrypt`，body `{tenant_id, version?, plaintext,
+  aad?}`：`plaintext`/`aad` 为 base64，`version` 缺省为 current。用随机数据
+  密钥以 AES-256-GCM 加密数据，数据密钥再由该版本包装（AES256 用 AES-GCM，
+  RSA2048 用 RSA-OAEP-SHA256）。`200` → `{format:"keymgr-envelope-v1",
+  envelope}`，envelope 为 base64，解码后含 `key_id`、`version`、`algorithm`、
+  `nonce`、`tag`、`ciphertext`、`wrapped_key`、`wrap_nonce`（RSA 为 null）。
+- `POST /v1/keys/{key_id}/decrypt`，body `{tenant_id, envelope, aad?}` →
+  `{plaintext}`（base64）。envelope 须为上述格式且命名本 key 的某个版本；
+  缺字段、非法 base64、篡改、AAD 不符均 `400` 并指明字段；未知或跨租户
+  key/version 为 `404`；吊销 key 为 `409`；提供者不可用为 `503` 且沿用
+  脱敏文案。私钥、数据密钥与后端材料只存在于服务端，绝不进入响应或审计。
 - `POST /v1/keys/import`，body `{tenant_id, passphrase, bundle}`，需
   `Idempotency-Key`。`201` → `{key_id, algorithm, public_key, operation_id}`，
   保留原 key_id、全部版本、label、current 与吊销状态。同租户已有 key_id 为
@@ -159,7 +171,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `{tenant_id, deleted:true}`。
 - 规则元素 `{subject, actions, effect}`：`subject` 为区分大小写的非空字符串；
   `actions` 为非空数组，取值
-  `create/read/rotate/revoke/import/export/audit`，单条内重复去重；`effect`
+  `create/read/rotate/revoke/import/export/encrypt/decrypt/audit`，单条内重复去重；`effect`
   为 `allow`/`deny`；未知字段、类型错误、同 subject+effect+无序动作集的重复
   规则均 `400`；`rules:[]` 合法（全拒绝）。
 - 执行：管理动作 policy_* 免检；租户无策略时全部允许；有策略时匹配规则中
@@ -170,9 +182,11 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 ## 审计
 
 - 事件字段 `{event_id, tenant_id, action, key_id, outcome, timestamp}`；
-  `action` 为 `create/read/rotate/batch_rotate/revoke/import/export/audit/
-  tenant_conflict/policy_read/policy_update/policy_delete`，`outcome` 为
-  `success/rejected`。备份记 `export`、恢复记 `import`，两者 `key_id` 均为
+  `action` 为 `create/read/rotate/batch_rotate/revoke/import/export/encrypt/
+  decrypt/audit/tenant_conflict/policy_read/policy_update/policy_delete`，
+  `outcome` 为 `success/rejected`。encrypt/decrypt 成功与拒绝各记一条对应
+  action 的事件，仅含元数据（key_id、时间戳等），绝不含明文、AAD、数据
+  密钥或后端材料。备份记 `export`、恢复记 `import`，两者 `key_id` 均为
   null；恢复的所有事件（含成功）`key_id` 为 null；批量轮换整批至多一条
   `batch_rotate` 事件，成功与拒绝终态的 `key_id` 均为 null，可按
   `action=batch_rotate` 筛选。
@@ -210,6 +224,10 @@ python -m keymgr revoke   --tenant-id t --key-id <id> --reason r --operator alic
 python -m keymgr status   --tenant-id t --key-id <id> --operator alice
 # 导出/导入、备份/恢复
 python -m keymgr export   --tenant-id t --key-id <id> --passphrase pw --operator alice
+python -m keymgr encrypt  --tenant-id t --key-id <id> [--version 1] \
+                          --plaintext <b64> [--aad <b64>] --operator alice
+python -m keymgr decrypt  --tenant-id t --key-id <id> --envelope <b64> \
+                          [--aad <b64>] --operator alice
 python -m keymgr import   --tenant-id t --passphrase pw --bundle <b> \
                           --operator alice --idempotency-key import-0001
 python -m keymgr backup   --tenant-id t --passphrase pw --operator alice

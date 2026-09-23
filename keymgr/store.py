@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Iterator, List, Optional, Tuple
 
 from . import audit as audit_mod
+from . import envelope as envelope_mod
 from . import keybundle
 from . import provider as provider_mod
 from .artifacts import PHASE_COMMITTED, PHASE_ROLLED_BACK, PHASE_STAGED
@@ -962,6 +963,8 @@ class KeyStore:
                 audit_mod.ACTION_REVOKE,
                 audit_mod.ACTION_IMPORT,
                 audit_mod.ACTION_EXPORT,
+                audit_mod.ACTION_ENCRYPT,
+                audit_mod.ACTION_DECRYPT,
                 audit_mod.ACTION_AUDIT,
             )
         ):
@@ -2995,6 +2998,120 @@ class KeyStore:
                 self.export_payload(record), passphrase
             )
 
+    # -- envelope encryption ------------------------------------------------
+    # Outcomes of an envelope operation: ok, or a refusal the caller maps to
+    # 404 (unknown/foreign key, unknown version) or 409 (revoked key).
+    ENVELOPE_OK = "ok"
+    ENVELOPE_NOT_FOUND = "not_found"
+    ENVELOPE_VERSION_NOT_FOUND = "version_not_found"
+    ENVELOPE_REVOKED = "revoked"
+
+    def _envelope_version_view(self, key_id: str, tenant_id: str):
+        """Committed (status, record) view for an envelope operation.
+
+        The caller holds the key locks. Unknown, foreign and uncommitted
+        records all collapse to ENVELOPE_NOT_FOUND so existence never leaks
+        across tenants; a revoked key reports ENVELOPE_REVOKED.
+        """
+        path = self._path_for(key_id)
+        on_disk = self._read_record(path)
+        if on_disk is None or on_disk.tenant_id != tenant_id:
+            return self.ENVELOPE_NOT_FOUND, None
+        record = self._committed_record(on_disk)
+        if record is None:
+            return self.ENVELOPE_NOT_FOUND, None
+        if record.status == "revoked":
+            return self.ENVELOPE_REVOKED, None
+        return self.ENVELOPE_OK, record
+
+    def envelope_encrypt(
+        self,
+        key_id: str,
+        tenant_id: str,
+        version: Optional[int],
+        plaintext: bytes,
+        aad,
+    ) -> tuple:
+        """Seal ``plaintext`` into an envelope under one key version.
+
+        ``version`` None selects the current version. Returns
+        ``(status, result)``; on ENVELOPE_OK ``result`` is
+        ``(envelope_token, version_used)``. The version's material is
+        resolved through its owning provider (a provider that is not active
+        raises ProviderUnavailable -> 503); raw material, the data key and
+        the plaintext never leave the process.
+        """
+        if not is_valid_key_id(key_id):
+            return self.ENVELOPE_NOT_FOUND, None
+        with self.key_locks(key_id):
+            status, record = self._envelope_version_view(key_id, tenant_id)
+            if status != self.ENVELOPE_OK:
+                return status, None
+            ver = (
+                record.current
+                if version is None
+                else record.get_version(version)
+            )
+            if ver is None:
+                return self.ENVELOPE_VERSION_NOT_FOUND, None
+            # Adopt a raw legacy record now, under the key locks and only
+            # while the local provider is active (exactly like an export).
+            self._take_over_legacy(record)
+            provider = self._provider_for(ver.provider_id)
+            exported = provider.export_material(ver.handle)
+            public_key = exported.public_key
+            if public_key is None:
+                public_key = ver.public_key
+            token = envelope_mod.seal_envelope(
+                key_id, ver.version, ver.algorithm,
+                exported.encrypted_material, public_key, plaintext, aad,
+            )
+        return self.ENVELOPE_OK, (token, ver.version)
+
+    def envelope_decrypt(
+        self,
+        key_id: str,
+        tenant_id: str,
+        parsed: dict,
+        aad,
+    ) -> tuple:
+        """Open an envelope against the exact version it names.
+
+        ``parsed`` comes from envelope_mod.parse_envelope. An envelope whose
+        key_id does not match the addressed (existing) key raises
+        envelope_mod.EnvelopeError (-> 400); an unknown/foreign key is
+        ENVELOPE_NOT_FOUND (-> 404) like any other missing object. Returns
+        ``(status, plaintext)``. A tampered envelope or a mismatched AAD
+        raises envelope_mod.EnvelopeError (-> 400); a version whose provider
+        is not active raises ProviderUnavailable (-> 503).
+        """
+        if not is_valid_key_id(key_id):
+            return self.ENVELOPE_NOT_FOUND, None
+        with self.key_locks(key_id):
+            status, record = self._envelope_version_view(key_id, tenant_id)
+            if status != self.ENVELOPE_OK:
+                return status, None
+            if parsed["key_id"] != key_id:
+                # The addressed key exists but the envelope belongs to
+                # another key: a parameter error, never a cross-key use.
+                raise envelope_mod.EnvelopeError(
+                    "field key_id does not match the envelope"
+                )
+            ver = record.get_version(parsed["version"])
+            if ver is None:
+                return self.ENVELOPE_VERSION_NOT_FOUND, None
+            if ver.algorithm != parsed["algorithm"]:
+                raise envelope_mod.EnvelopeError(
+                    "field envelope.algorithm does not match the key version"
+                )
+            self._take_over_legacy(record)
+            provider = self._provider_for(ver.provider_id)
+            exported = provider.export_material(ver.handle)
+            plaintext = envelope_mod.open_envelope(
+                parsed, exported.encrypted_material, aad
+            )
+        return self.ENVELOPE_OK, plaintext
+
     def prepare_backup_record(self, record: KeyRecord) -> KeyRecord:
         """Lazily adopt a record's legacy versions for a tenant backup.
 
@@ -3004,7 +3121,6 @@ class KeyStore:
         """
         self._take_over_legacy(record)
         return record
-
     def _adopt_imported_version(self, ver: dict, journal: Optional[str] = None,
                                 mirror=None) -> tuple:
         """Adopt one validated bundle version through its target provider.
