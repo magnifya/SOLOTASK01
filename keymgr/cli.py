@@ -129,6 +129,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_encrypt.add_argument(
         "--aad", default=None, help="optional base64 additional authenticated data"
     )
+    p_encrypt.add_argument(
+        "--idempotency-key", default=None,
+        help="optional 1-128 chars A-Za-z0-9._~- ; retries replay one envelope",
+    )
 
     p_decrypt = tenant_parser(
         "decrypt", help="decrypt a keymgr-envelope-v1 token"
@@ -331,6 +335,8 @@ def _provider_terminal(
         action = audit_mod.ACTION_BATCH_ROTATE
     elif kind == "rotate":
         action = audit_mod.ACTION_ROTATE
+    elif kind == "encrypt":
+        action = audit_mod.ACTION_ENCRYPT
     else:
         action = audit_mod.ACTION_IMPORT
     audit_key_id = (
@@ -632,6 +638,302 @@ def _idempotent_run_body(op_store, store, artifact_store, executor, operation,
         # verified survives for the next startup.
         artifact_store.after_terminal(mirror)
     return _emit_operation_result(http_status, resp)
+
+
+# ------------------------------------------------- optional idempotent encrypt
+def _encrypt_finish_staged(op_store, store, operation) -> int:
+    """Finish an encrypt whose result is staged but its event did not commit.
+
+    CLI counterpart of the HTTP wrap-up: only the single event named after the
+    operation_id is (re-)appended (the ledger dedupes on event_id) and the
+    staged body is replayed; the provider is never called twice.
+    """
+    op_id = operation.operation_id
+    details = operation.details or {}
+    staged = details["result"]
+    http_status = int(staged["http_status"])
+    response = staged["response"]
+    audit_desc = details.get("audit") or {}
+    action = audit_desc.get("action", audit_mod.ACTION_ENCRYPT)
+    outcome = audit_desc.get("outcome", audit_mod.OUTCOME_SUCCESS)
+    tenant_id = audit_desc.get("tenant_id", operation.tenant_id)
+    key_id = details.get("key_id")
+    if not is_valid_key_id(key_id):
+        key_id = None
+    try:
+        store.audit_attempt(
+            tenant_id, key_id, action, outcome, event_id=op_id
+        )
+    except LedgerError:
+        return _emit_operation_result(
+            503, _strand_unavailable_body(op_id)
+        )
+    try:
+        op_store.finish(
+            operation,
+            operations_mod.state_for_http_status(http_status),
+            http_status,
+            response,
+        )
+    except OSError:
+        return _emit_operation_result(
+            500, _strand_unavailable_body(op_id)
+        )
+    return _emit_operation_result(http_status, response)
+
+
+def _encrypt_attempt(
+    op_store, store, policies, operation, key_id, tenant_id, operator,
+    requested_version, raw_plaintext, aad,
+) -> int:
+    """Run one bound idempotent encrypt attempt to one CLI exit code."""
+    op_id = operation.operation_id
+    # Commit-point event already durable (a crash after the append): finish up
+    # from the staged response only; never re-call the provider.
+    try:
+        durable = op_store.audit.get_event(op_id)
+    except LedgerError:
+        return _emit_operation_result(503, _strand_unavailable_body(op_id))
+    if durable is not None:
+        if not operations_mod._event_matches_operation(operation, durable):
+            return _emit_operation_result(
+                503, _strand_unavailable_body(op_id)
+            )
+        if op_store._finish_durable_staged(operation):
+            return _emit_operation_result(
+                operation.http_status, operation.response
+            )
+        return _emit_operation_result(503, _strand_unavailable_body(op_id))
+    details = operation.details or {}
+    staged = details.get("result")
+    if isinstance(staged, dict) and isinstance(staged.get("response"), dict):
+        return _encrypt_finish_staged(op_store, store, operation)
+    resumed = (
+        details.get("kind") == "encrypt"
+        and isinstance(details.get("version"), int)
+        and isinstance(details.get("provider_id"), str)
+    )
+    try:
+        if not resumed:
+            op_store.update_details(
+                operation,
+                {
+                    "kind": "encrypt",
+                    "key_id": key_id,
+                    "version_requested": requested_version,
+                },
+            )
+            if not policies.is_allowed(
+                tenant_id, audit_mod.ACTION_ENCRYPT, operator
+            ):
+                http_status, body = _terminal_rejection(
+                    op_store, store, operation, tenant_id, key_id,
+                    audit_mod.ACTION_ENCRYPT, 403,
+                    "action not permitted by policy",
+                )
+                op_store.finish(
+                    operation, operations_mod.STATUS_FAILED,
+                    http_status, body,
+                )
+                return _emit_operation_result(http_status, body)
+            try:
+                vstatus, _record, ver = store.crypto_version(
+                    key_id, tenant_id, requested_version
+                )
+            except ProviderUnavailable:
+                http_status, body = _provider_terminal(
+                    op_store, store, operation, 503,
+                    "key management provider is unavailable",
+                )
+                return _emit_operation_result(http_status, body)
+            if vstatus == store.CRYPTO_NOT_FOUND:
+                http_status, body = _terminal_rejection(
+                    op_store, store, operation, tenant_id, key_id,
+                    audit_mod.ACTION_ENCRYPT, 404, "key not found",
+                )
+                op_store.finish(
+                    operation, operations_mod.STATUS_FAILED,
+                    http_status, body,
+                )
+                return _emit_operation_result(http_status, body)
+            if vstatus == store.CRYPTO_REVOKED:
+                http_status, body = _terminal_rejection(
+                    op_store, store, operation, tenant_id, key_id,
+                    audit_mod.ACTION_ENCRYPT, 409, "key is revoked",
+                )
+                op_store.finish(
+                    operation, operations_mod.STATUS_FAILED,
+                    http_status, body,
+                )
+                return _emit_operation_result(http_status, body)
+        else:
+            try:
+                vstatus, _record, ver = store.crypto_version(
+                    key_id, tenant_id, details["version"]
+                )
+            except ProviderUnavailable:
+                http_status, body = _provider_terminal(
+                    op_store, store, operation, 503,
+                    "key management provider is unavailable",
+                )
+                return _emit_operation_result(http_status, body)
+            if vstatus == store.CRYPTO_NOT_FOUND:
+                http_status, body = _terminal_rejection(
+                    op_store, store, operation, tenant_id, key_id,
+                    audit_mod.ACTION_ENCRYPT, 404, "key not found",
+                )
+                op_store.finish(
+                    operation, operations_mod.STATUS_FAILED,
+                    http_status, body,
+                )
+                return _emit_operation_result(http_status, body)
+            if vstatus == store.CRYPTO_REVOKED:
+                http_status, body = _terminal_rejection(
+                    op_store, store, operation, tenant_id, key_id,
+                    audit_mod.ACTION_ENCRYPT, 409, "key is revoked",
+                )
+                op_store.finish(
+                    operation, operations_mod.STATUS_FAILED,
+                    http_status, body,
+                )
+                return _emit_operation_result(http_status, body)
+            if (
+                ver.provider_id != details["provider_id"]
+                or ver.algorithm != details.get("algorithm")
+            ):
+                return _emit_operation_result(
+                    503, _strand_unavailable_body(op_id)
+                )
+
+        if not resumed:
+            op_store.update_details(
+                operation,
+                {
+                    "version": ver.version,
+                    "algorithm": ver.algorithm,
+                    "provider_id": ver.provider_id,
+                },
+            )
+        try:
+            kek = store.material_for_version(ver)
+        except ProviderUnavailable:
+            http_status, body = _provider_terminal(
+                op_store, store, operation, 503,
+                "key management provider is unavailable",
+            )
+            return _emit_operation_result(http_status, body)
+        token = envelope.encode_envelope(
+            key_id=key_id,
+            version=ver.version,
+            algorithm=ver.algorithm,
+            kek=kek,
+            plaintext=raw_plaintext,
+            aad=aad,
+        )
+        response = {
+            "format": envelope.FORMAT,
+            "envelope": token,
+            "operation_id": op_id,
+        }
+        try:
+            op_store.stage_terminal(
+                operation,
+                200,
+                response,
+                audit={
+                    "action": audit_mod.ACTION_ENCRYPT,
+                    "outcome": audit_mod.OUTCOME_SUCCESS,
+                    "tenant_id": tenant_id,
+                    "key_id": key_id,
+                },
+            )
+            store.audit_attempt(
+                tenant_id, key_id, audit_mod.ACTION_ENCRYPT,
+                audit_mod.OUTCOME_SUCCESS, event_id=op_id,
+            )
+        except (OSError, LedgerError):
+            # The commit event is not durable: keep the op PENDING and hide
+            # the envelope. A retry finishes the staged body or re-runs the
+            # read-only provider phase; never finalize failed(500) here.
+            return _emit_operation_result(
+                500, _strand_unavailable_body(op_id)
+            )
+        try:
+            op_store.finish(
+                operation, operations_mod.STATUS_SUCCEEDED, 200, response
+            )
+        except OSError:
+            # Event durable but the terminal rewrite failed: stay pending;
+            # the next identical request finalizes from the staged body.
+            return _emit_operation_result(
+                500, _strand_unavailable_body(op_id)
+            )
+        return _emit_operation_result(200, response)
+    except (OSError, LedgerError):
+        # A durable-context rewrite or a terminal rejection's stage/append
+        # failed before commit: keep the operation pending for a same-key
+        # retry; the provider is never called twice.
+        return _emit_operation_result(500, _strand_unavailable_body(op_id))
+
+
+def _run_encrypt_attempt(op_store, operation, blocking, run_body) -> int:
+    """Own one encrypt attempt's claim and run it once (CLI counterpart)."""
+    op_id = operation.operation_id
+    try:
+        with op_store.attempt_claim(op_id, blocking=blocking):
+            fresh = op_store._read_record(op_id)
+            if fresh is not None and fresh.is_terminal():
+                return _emit_operation_result(
+                    fresh.http_status, fresh.response
+                )
+            return run_body(operation)
+    except BlockingIOError:
+        raise
+    except OSError:
+        return _emit_operation_result(500, _strand_unavailable_body(op_id))
+
+
+def run_idempotent_encrypt(
+    op_store, store, policies, path, tenant_id, operator, key_id, payload,
+    requested_version, raw_plaintext, aad, idem_key,
+) -> int:
+    """Bind an optional encrypt Idempotency-Key and run/replay one attempt.
+
+    The operation record stores only the SHA-256 digest of the normalized
+    body (never the plaintext/AAD); an identical HTTP/CLI retry replays the
+    same envelope and a same-key/different-body request exits 3 (409) naming
+    the original operation_id.
+    """
+    normalized = operations_mod.normalize_body(payload)
+    digest = operations_mod.request_digest(normalized)
+    begin = op_store.begin(
+        tenant_id, operator, path, digest, idem_key, mirror_required=False
+    )
+    if begin.kind == "conflict":
+        return _emit_operation_result(
+            409,
+            {
+                "error": "Idempotency-Key is already bound to a different "
+                "request",
+                "operation_id": begin.record.operation_id,
+            },
+        )
+
+    def run_body(operation):
+        return _encrypt_attempt(
+            op_store, store, policies, operation, key_id, tenant_id,
+            operator, requested_version, raw_plaintext, aad,
+        )
+
+    if begin.kind == "replay":
+        record = begin.record
+        if record.is_terminal():
+            return _emit_operation_result(record.http_status, record.response)
+        try:
+            return _run_encrypt_attempt(op_store, record, False, run_body)
+        except BlockingIOError:
+            return _idem_wait_then_serve(op_store, record)
+    return _run_encrypt_attempt(op_store, begin.record, True, run_body)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -1142,6 +1444,51 @@ def _run(argv: Optional[List[str]] = None) -> int:
         )
 
     if args.command == "encrypt":
+        idem_mode = args.idempotency_key is not None
+        if idem_mode:
+            # The optional Idempotency-Key is validated before any other
+            # parameter: a missing-value/illegal key exits 2 with no audit
+            # event, operation record or provider call -- the bind-time
+            # invariant of the HTTP endpoint.
+            if _idem_key_error(args.idempotency_key):
+                return 2
+            # Pre-bind parameter validation is side-effect free: tenant/key/
+            # plaintext/aad failures exit 2 WITHOUT a tenant_conflict or
+            # rejected event, and never consume the key.
+            if not args.tenant_id:
+                return _fail(
+                    "field tenant_id must be a non-empty string", 2
+                )
+            if not is_valid_key_id(args.key_id):
+                return _fail("field key_id must be a UUID4", 2)
+            try:
+                raw_plaintext = envelope.b64_decode_field(
+                    args.plaintext, "plaintext"
+                )
+            except envelope.EnvelopeError as exc:
+                return _fail(str(exc), 2)
+            aad = b""
+            if args.aad is not None:
+                try:
+                    aad = envelope.b64_decode_field(args.aad, "aad")
+                except envelope.EnvelopeError as exc:
+                    return _fail(str(exc), 2)
+            payload = {
+                "tenant_id": args.tenant_id,
+                "plaintext": args.plaintext,
+            }
+            if args.version is not None:
+                payload["version"] = args.version
+            if args.aad is not None:
+                payload["aad"] = args.aad
+            path = "/v1/keys/%s/encrypt" % args.key_id
+            return run_idempotent_encrypt(
+                op_store, store, policies, path, args.tenant_id,
+                args.operator, args.key_id, payload, args.version,
+                raw_plaintext, aad, args.idempotency_key,
+            )
+
+        # No Idempotency-Key: the historical, non-idempotent behavior.
         if not args.tenant_id:
             if not _conflict(store):
                 return 1

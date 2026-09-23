@@ -2976,6 +2976,59 @@ class KeyStore:
             "unsupported algorithm for envelope crypto: %r" % ver.algorithm
         )
 
+    def crypto_version(
+        self, key_id: str, tenant_id: str, version: Optional[int] = None
+    ) -> tuple:
+        """Resolve the committed key record and the requested key version.
+
+        Returns ``(status, record, ver)`` and performs NO provider call: the
+        version's ``provider_id``/``algorithm`` are durable facts, so the
+        optional idempotent envelope encrypt can record them (with the resolved
+        version and its provider) BEFORE it first asks the provider for the
+        key-encryption key. ``status`` is CRYPTO_OK/CRYPTO_NOT_FOUND/
+        CRYPTO_REVOKED; an unknown key, a foreign tenant and an unknown version
+        are indistinguishable CRYPTO_NOT_FOUND so existence never leaks. The
+        read runs under the key locks over the committed projection and adopts
+        a raw legacy record exactly like export (the adoption itself may call
+        the local provider, exactly as the historical single-step lookup did).
+        """
+        if not is_valid_key_id(key_id):
+            return self.CRYPTO_NOT_FOUND, None, None
+        path = self._path_for(key_id)
+        with self._key_lock(key_id), self._file_lock(key_id):
+            on_disk = self._read_record(path)
+            if on_disk is None or on_disk.tenant_id != tenant_id:
+                return self.CRYPTO_NOT_FOUND, None, None
+            # Never crypto against an uncommitted current: project only the
+            # durable state (the view, not the file, is trimmed).
+            record = self._committed_record(on_disk)
+            if record is None:
+                return self.CRYPTO_NOT_FOUND, None, None
+            # Adopt a raw legacy record now, under the key locks and only
+            # while the local provider is active (same rule as export).
+            self._take_over_legacy(record)
+            if record.status == "revoked":
+                return self.CRYPTO_REVOKED, record, None
+            if version is None:
+                ver = record.current
+            else:
+                ver = record.get_version(version)
+                if ver is None:
+                    return self.CRYPTO_NOT_FOUND, record, None
+            return self.CRYPTO_OK, record, ver
+
+    def material_for_version(self, ver: VersionRecord):
+        """Ask the version's owning provider for its envelope key (KEK).
+
+        The owning-provider gate is enforced here, exactly as the single-step
+        :meth:`crypto_material` did: a record owned by an inactive provider
+        raises ProviderUnavailable (503), never a silent fallback. Returns the
+        raw 32-byte AES key or the loaded RSA private key.
+        """
+        provider = self._provider_for(ver.provider_id)
+        exported = provider.export_material(ver.handle)
+        return self._kek_for_version(ver, exported.encrypted_material)
+
     def crypto_material(
         self, key_id: str, tenant_id: str, version: Optional[int] = None
     ) -> tuple:
@@ -2986,39 +3039,15 @@ class KeyStore:
         are the committed view. CRYPTO_NOT_FOUND covers an unknown key, a
         foreign tenant and an unknown version alike (existence never leaks);
         CRYPTO_REVOKED means the key is revoked (every version refuses
-        crypto). The read runs under the key locks over the committed
-        projection, adopts a raw legacy record exactly like export, and asks
-        the owning provider for the material -- a record owned by an inactive
-        provider raises ProviderUnavailable (503), never a silent fallback.
-        Nothing is persisted and no audit event is written here.
+        crypto). This is the provider-free :meth:`crypto_version` resolution
+        followed by :meth:`material_for_version`; nothing is persisted and no
+        audit event is written here.
         """
-        if not is_valid_key_id(key_id):
-            return self.CRYPTO_NOT_FOUND, None, None, None
-        path = self._path_for(key_id)
-        with self._key_lock(key_id), self._file_lock(key_id):
-            on_disk = self._read_record(path)
-            if on_disk is None or on_disk.tenant_id != tenant_id:
-                return self.CRYPTO_NOT_FOUND, None, None, None
-            # Never crypto against an uncommitted current: project only the
-            # durable state (the view, not the file, is trimmed).
-            record = self._committed_record(on_disk)
-            if record is None:
-                return self.CRYPTO_NOT_FOUND, None, None, None
-            # Adopt a raw legacy record now, under the key locks and only
-            # while the local provider is active (same rule as export).
-            self._take_over_legacy(record)
-            if record.status == "revoked":
-                return self.CRYPTO_REVOKED, record, None, None
-            if version is None:
-                ver = record.current
-            else:
-                ver = record.get_version(version)
-                if ver is None:
-                    return self.CRYPTO_NOT_FOUND, record, None, None
-            provider = self._provider_for(ver.provider_id)
-            exported = provider.export_material(ver.handle)
-            kek = self._kek_for_version(ver, exported.encrypted_material)
-            return self.CRYPTO_OK, record, ver, kek
+        status, record, ver = self.crypto_version(key_id, tenant_id, version)
+        if status != self.CRYPTO_OK:
+            return status, record, ver, None
+        kek = self.material_for_version(ver)
+        return self.CRYPTO_OK, record, ver, kek
 
     # -- export / import ---------------------------------------------------
     def _export_version(self, ver: VersionRecord) -> dict:

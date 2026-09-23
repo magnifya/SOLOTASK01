@@ -34,6 +34,7 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from typing import Callable, NamedTuple, Optional
 
 try:  # fcntl is POSIX-only; idempotency still works without cross-process locks.
@@ -81,13 +82,15 @@ def is_valid_idempotency_key(value) -> bool:
 def state_for_http_status(http_status: int) -> str:
     """Map a terminal response's HTTP status to its operation state.
 
-    201 is the only success; an explicit request conflict (409) is the
-    "conflict" state. Every other terminal refusal (400/403/404) or backend
-    failure (500/503) records as "failed". A crash-recovered operation whose
-    audit event is durable therefore lands in the same state the original
-    request would have, including a reconstructed rejection.
+    200/201 are success (201 is the mutating endpoints' created; the optional
+    idempotent envelope-encrypt recovery replays a 200); an explicit request
+    conflict (409) is the "conflict" state. Every other terminal refusal
+    (400/403/404) or backend failure (500/503) records as "failed". A
+    crash-recovered operation whose audit event is durable therefore lands in
+    the same state the original request would have, including a reconstructed
+    rejection.
     """
-    if http_status == 201:
+    if http_status in (200, 201):
         return STATUS_SUCCEEDED
     if http_status == 409:
         return STATUS_CONFLICT
@@ -100,6 +103,7 @@ _KIND_ACTIONS = {
     "batch_rotate": "batch_rotate",
     "import": "import",
     "restore": "import",
+    "encrypt": "encrypt",
 }
 
 
@@ -148,6 +152,18 @@ def normalize_body(body: Optional[dict]) -> str:
         separators=(",", ":"),
         ensure_ascii=False,
     )
+
+
+def request_digest(normalized_body: str) -> str:
+    """SHA-256 hex digest of a canonical request body for a durable binding.
+
+    The optional idempotent envelope-encrypt recovery persists only this
+    digest of the (still pre-bind, side-effect-free) normalized request, never
+    the body itself: the plaintext and AAD must not reach the operation file,
+    the ledger or any audit projection. It is used to verify that a pending
+    operation's durable context still matches the request a retry takes over.
+    """
+    return hashlib.sha256(normalized_body.encode("utf-8")).hexdigest()
 
 
 class BeginResult(NamedTuple):
@@ -290,6 +306,13 @@ class OperationStore:
         self._index_path = os.path.join(self.dir_path, _INDEX_NAME)
         self._lock_path = os.path.join(self.data_dir, _LOCK_NAME)
         self._index_lock = threading.Lock()
+        # Per-operation in-process owner guards for mirror-less bindings (the
+        # optional idempotent envelope encrypt): together with an fcntl lock on
+        # operations/<id>.lock they serialize the owner of one attempt against
+        # an identical retry in another thread or process, so the provider is
+        # never called twice for the same operation.
+        self._attempt_locks: dict = {}
+        self._attempt_locks_guard = threading.Lock()
         if audit_log is not None:
             self.audit = audit_log
         else:  # Import lazily-to-wire the concrete ledger without a cycle here.
@@ -322,6 +345,69 @@ class OperationStore:
                 os.close(fd)
         finally:
             self._index_lock.release()
+
+    # -- per-attempt owner claim (mirror-less idempotent operations) -------
+    def _attempt_inproc(self, operation_id: str) -> threading.Lock:
+        with self._attempt_locks_guard:
+            lock = self._attempt_locks.get(operation_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._attempt_locks[operation_id] = lock
+            return lock
+
+    def _attempt_lock_path(self, operation_id: str) -> str:
+        return os.path.join(self.dir_path, operation_id + ".lock")
+
+    @contextmanager
+    def attempt_claim(self, operation_id: str, blocking: bool):
+        """Hold the in-process + fcntl owner claim for one mirror-less attempt.
+
+        Used only by the optional idempotent envelope encrypt, which has no
+        artifact mirror to carry its claim: the whole bind..terminal window of
+        one attempt is serialized per operation so an identical retry in
+        another thread/process either waits for the live owner or takes a dead
+        owner's pending attempt over, but can never call the KMS/HSM provider
+        twice for the same ``operation_id``.
+
+        ``blocking=False`` raises :class:`BlockingIOError` when another owner
+        currently holds the claim; ``blocking=True`` waits. A storage fault
+        opening the lock file raises :class:`OSError`.
+        """
+        guard = self._attempt_inproc(operation_id)
+        acquired = guard.acquire(blocking=blocking)
+        if not acquired:
+            raise BlockingIOError(operation_id)
+        fd = -1
+        locked = False
+        try:
+            os.makedirs(self.dir_path, exist_ok=True)
+            fd = os.open(
+                self._attempt_lock_path(operation_id),
+                os.O_RDWR | os.O_CREAT,
+                0o600,
+            )
+            if fcntl is not None:
+                flags = fcntl.LOCK_EX
+                if not blocking:
+                    flags |= fcntl.LOCK_NB
+                # LOCK_NB contention raises BlockingIOError, reported to the
+                # caller's wait-vs-takeover decision; the finally still
+                # releases both claims as it propagates.
+                fcntl.flock(fd, flags)
+                locked = True
+            yield fd
+        finally:
+            if fcntl is not None and locked and fd >= 0:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            guard.release()
 
     def _write_atomic(self, path: str, payload: dict) -> None:
         fd, tmp_path = tempfile.mkstemp(dir=self.dir_path, suffix=".tmp")
@@ -421,6 +507,7 @@ class OperationStore:
         path: str,
         request_body: str,
         idempotency_key: str,
+        mirror_required: bool = True,
     ) -> BeginResult:
         """Bind the key and create/return the operation for one request.
 
@@ -430,6 +517,12 @@ class OperationStore:
         is returned as ``replay`` for an identical binding or ``conflict`` for
         a different one. Exactly one concurrent same-key request can win
         ``new``; the others observe the pending binding.
+
+        The optional idempotent envelope-encrypt recovery binds operations
+        that have NO artifact mirror (they mint no provider handle and change
+        no key file); it passes ``mirror_required=False`` so a pending encrypt
+        operation whose process died is retried/finished on the request path
+        rather than parked for a missing mirror.
         """
         scope = self._scope(tenant_id, operator_id, idempotency_key)
         fd = self._locked()
@@ -466,7 +559,7 @@ class OperationStore:
                 status=STATUS_PENDING,
                 created_at=now,
                 updated_at=now,
-                mirror_required=True,
+                mirror_required=mirror_required,
             )
             self._write_record(record)
             index["bindings"][scope] = operation_id
@@ -586,6 +679,33 @@ class OperationStore:
             return None
         return record
 
+    def _finish_durable_staged(self, record: OperationRecord) -> bool:
+        """Finish a pending op from the result staged before the event append.
+
+        Returns True when a well-formed staged ``{http_status, response}`` was
+        persisted with the durable event and the operation was finalized from
+        it; False when no replayable result was staged (the caller keeps the
+        operation pending -- a mirror-less encrypt response can never be
+        rebuilt, so re-executing it would diverge from the durable event).
+        """
+        details = record.details or {}
+        staged = details.get("result")
+        if not (
+            isinstance(staged, dict)
+            and isinstance(staged.get("http_status"), int)
+            and isinstance(staged.get("response"), dict)
+        ):
+            return False
+        http_status = int(staged["http_status"])
+        response = staged["response"]
+        self.finish(
+            record,
+            state_for_http_status(http_status),
+            http_status,
+            response,
+        )
+        return True
+
     # -- crash recovery ----------------------------------------------------
     def recover_pending(
         self,
@@ -643,6 +763,19 @@ class OperationStore:
                 # be finalized neither as committed nor as failed. Leave it
                 # pending for operator/startup resolution rather than
                 # replaying a response the durable fact does not support.
+                continue
+            if (record.details or {}).get("kind") == "encrypt":
+                # A mirror-less envelope encrypt is retryable end to end: it
+                # mints no handle and changes no file, so a process death with
+                # no durable event leaves the operation PENDING for the next
+                # identical HTTP/CLI request (it never becomes failed(500)).
+                # A durable event is only "finished up" from the response
+                # staged BEFORE the append; an encrypt response can never be
+                # rebuilt (a fresh data key yields a fresh envelope), so a
+                # durable event without its staged result also stays pending
+                # for the request path to conclude.
+                if event is not None and self._finish_durable_staged(record):
+                    pass
                 continue
             if event is not None:
                 details = record.details or {}

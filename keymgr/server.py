@@ -242,6 +242,8 @@ def make_handler(
                 action = audit_mod.ACTION_BATCH_ROTATE
             elif kind == "rotate":
                 action = audit_mod.ACTION_ROTATE
+            elif kind == "encrypt":
+                action = audit_mod.ACTION_ENCRYPT
             else:
                 action = audit_mod.ACTION_IMPORT
             audit_key_id = (
@@ -1180,6 +1182,39 @@ def make_handler(
         def _encrypt_key(self, key_id: str, parts, operator: str) -> None:
             """POST /v1/keys/{key_id}/encrypt.
 
+            Without an ``Idempotency-Key`` header the historical,
+            non-idempotent behavior is preserved byte-for-byte (every call
+            mints a fresh envelope). With a single valid key the optional
+            idempotent recovery runs: the first normalized request is bound
+            once and identical HTTP/CLI retries, a process restart and
+            ``GET /v1/operations/{operation_id}`` replay the SAME envelope and
+            audit event.
+            """
+            values = self.headers.get_all("Idempotency-Key") or []
+            if len(values) > 1:
+                # A duplicated optional header is a side-effect-free 400,
+                # exactly like the mandatory idempotent endpoints: no body
+                # read, tenant work, audit, operation or provider call.
+                self._bad_request(
+                    "duplicate Idempotency-Key (provide a single header)"
+                )
+                return
+            if values and not operations_mod.is_valid_idempotency_key(values[0]):
+                self._bad_request(
+                    "field Idempotency-Key must be 1-128 characters from "
+                    "A-Za-z0-9._~-"
+                )
+                return
+            if values:
+                self._encrypt_key_idempotent(
+                    key_id, parts, operator, values[0]
+                )
+                return
+            self._encrypt_key_legacy(key_id, parts, operator)
+
+        def _encrypt_key_legacy(self, key_id: str, parts, operator: str) -> None:
+            """POST /v1/keys/{key_id}/encrypt without an Idempotency-Key.
+
             Body ``{tenant_id, version?, plaintext, aad?}``; plaintext and aad
             are base64, version defaults to the current version. The answer
             carries only the opaque envelope token -- never the data key, the
@@ -1254,6 +1289,417 @@ def make_handler(
             self._send_json(
                 200, {"format": envelope.FORMAT, "envelope": token}
             )
+
+        # -- optional idempotent envelope encrypt --------------------------
+        def _encrypt_key_idempotent(
+            self, key_id, parts, operator, idem_key
+        ) -> None:
+            """Idempotent-recovery variant of envelope encrypt.
+
+            Every parse/parameter failure (tenant_id, key_id, version,
+            plaintext/aad base64, JSON shape) happens BEFORE the key is bound
+            and is therefore a side-effect-free 400: no audit event, operation
+            record or provider call, and the Idempotency-Key is never consumed.
+            The binding stores only the SHA-256 digest of the normalized body
+            (never the plaintext/AAD). After binding, authorization precedes
+            existence (403), unknown/cross-tenant is 404, a revoked version is
+            409 and a provider outage/switch is a sticky fixed 503; the exact
+            terminal is staged before its single event is appended.
+            """
+            payload = self._read_json_object(audit=False)
+            if payload is None:
+                return
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                self._bad_request("field tenant_id must be a non-empty string")
+                return
+            tenant_id = self._tenant(parts, payload, audit=False)
+            if tenant_id is None:
+                return
+            if self._bad_key_id(key_id, audit=False):
+                return
+            requested_version = payload.get("version")
+            if requested_version is not None and (
+                not isinstance(requested_version, int)
+                or isinstance(requested_version, bool)
+                or requested_version < 1
+            ):
+                self._bad_request(
+                    "field version must be a positive integer"
+                )
+                return
+            plaintext = payload.get("plaintext")
+            if not isinstance(plaintext, str):
+                self._bad_request(
+                    "field plaintext must be a base64 string"
+                    if "plaintext" in payload
+                    else "missing required field: plaintext"
+                )
+                return
+            try:
+                # Decoded only in process memory for the attempt; never
+                # persisted in the operation record, the ledger or a response.
+                raw_plaintext = envelope.b64_decode_field(
+                    plaintext, "plaintext"
+                )
+            except envelope.EnvelopeError as exc:
+                self._bad_request(str(exc))
+                return
+            aad = b""
+            if payload.get("aad") is not None:
+                try:
+                    aad = envelope.b64_decode_field(payload["aad"], "aad")
+                except envelope.EnvelopeError as exc:
+                    self._bad_request(str(exc))
+                    return
+
+            normalized = operations_mod.normalize_body(payload)
+            # The operation record stores ONLY this digest as its binding, so
+            # the plaintext/AAD never reach operations/<id>.json.
+            digest = operations_mod.request_digest(normalized)
+            begin = operation_store.begin(
+                tenant_id, operator, parts.path, digest, idem_key,
+                mirror_required=False,
+            )
+            if begin.kind == "conflict":
+                self._serve_conflict(begin.record)
+                return
+
+            def attempt(operation):
+                self._encrypt_attempt(
+                    operation, key_id, tenant_id, operator,
+                    requested_version, raw_plaintext, aad,
+                )
+
+            if begin.kind == "replay":
+                record = begin.record
+                if record.is_terminal():
+                    self._replay_terminal(record)
+                    return
+                try:
+                    self._run_encrypt_attempt(record, attempt, blocking=False)
+                except BlockingIOError:
+                    # A live owner (thread/process) holds the attempt: wait for
+                    # its terminal or answer timed_out (503), writing nothing.
+                    self._serve_pending_wait(record)
+                return
+            self._run_encrypt_attempt(begin.record, attempt, blocking=True)
+
+        def _run_encrypt_attempt(self, operation, attempt, blocking) -> None:
+            """Own one encrypt attempt's per-operation claim and run it once.
+
+            The in-process + fcntl claim serializes the whole attempt window
+            so an identical retry never calls the provider while a live owner
+            runs; a dead owner's pending attempt is taken over under the SAME
+            operation_id (export_material is read-only, so a safe re-call is
+            all a takeover needs).
+            """
+            op_id = operation.operation_id
+            try:
+                with operation_store.attempt_claim(op_id, blocking=blocking):
+                    fresh = operation_store._read_record(op_id)
+                    if fresh is not None and fresh.is_terminal():
+                        # The owner reached a terminal while the claim was
+                        # taken: replay its stored result, execute nothing.
+                        self._replay_terminal(fresh)
+                        return
+                    attempt(operation)
+            except BlockingIOError:
+                # Non-blocking contention with a live owner: the dispatcher
+                # waits for its terminal. Re-raise rather than answering.
+                raise
+            except OSError:
+                # The claim lock could not be created: the attempt body never
+                # ran, so keep the operation pending and answer a retryable
+                # fault (no provider/audit touched).
+                self._send_strand_unavailable(op_id, 500)
+
+        def _encrypt_terminal_rejection(
+            self, operation, tenant_id, key_id, http_status, message
+        ) -> None:
+            """Stage + append a bound encrypt rejection, finish and send it.
+
+            The 403/404/409 terminal is made durable BEFORE its single
+            ``rejected`` event (named after the operation_id) is appended, so
+            a crash and startup recovery replay the same status/body verbatim
+            instead of re-evaluating the policy or re-reading the object.
+            """
+            status, body = self._idempotent_rejection(
+                operation, tenant_id, key_id,
+                audit_mod.ACTION_ENCRYPT, http_status, message,
+            )
+            operation_store.finish(
+                operation, operations_mod.STATUS_FAILED, status, body
+            )
+            self._send_json(status, body)
+
+        def _encrypt_finish_staged(self, operation) -> None:
+            """Finish an encrypt attempt whose result is staged, event pending.
+
+            The exact terminal (its status and complete body) was fsynced to
+            the operation record before the commit-point append that did not
+            survive. Only the single event named after the operation_id is
+            (re-)appended -- the ledger dedupes on event_id, so this never
+            double-records -- and the stored body is replayed. The provider is
+            never called and a second envelope is never minted. A ledger or
+            record-write failure keeps the operation pending for another try.
+            """
+            op_id = operation.operation_id
+            details = operation.details or {}
+            staged = details["result"]
+            http_status = int(staged["http_status"])
+            response = staged["response"]
+            audit_desc = details.get("audit") or {}
+            action = audit_desc.get("action", audit_mod.ACTION_ENCRYPT)
+            outcome = audit_desc.get("outcome", audit_mod.OUTCOME_SUCCESS)
+            tenant_id = audit_desc.get("tenant_id", operation.tenant_id)
+            key_id = details.get("key_id")
+            if not is_valid_key_id(key_id):
+                key_id = None
+            try:
+                store.audit_attempt(
+                    tenant_id, key_id, action, outcome, event_id=op_id
+                )
+            except LedgerError:
+                self._send_strand_unavailable(op_id, 503)
+                return
+            try:
+                operation_store.finish(
+                    operation,
+                    operations_mod.state_for_http_status(http_status),
+                    http_status,
+                    response,
+                )
+            except OSError:
+                self._send_strand_unavailable(op_id, 500)
+                return
+            self._replay_terminal(operation)
+
+        def _encrypt_attempt(
+            self, operation, key_id, tenant_id, operator,
+            requested_version, raw_plaintext, aad,
+        ) -> None:
+            """Run one bound encrypt attempt to exactly one terminal response.
+
+            Durable facts are recorded in this order, each before the step it
+            governs: kind/key_id/binding (already bound) -> authorization ->
+            resolved version/algorithm/provider_id (before the first provider
+            call) -> the envelope response staged before the single success
+            event append (the commit point). The provider handle, data key,
+            KEK, plaintext and AAD are never written to the operation record.
+            """
+            op_id = operation.operation_id
+            # If the commit-point event is already durable (a crash between
+            # the append and the record finish), this is pure wrap-up: replay
+            # the response staged WITH the event, and never re-call the
+            # provider or mint a second envelope. A durable but foreign event
+            # (id collision) or an unreadable ledger keeps the op pending.
+            try:
+                durable = operation_store.audit.get_event(op_id)
+            except LedgerError:
+                self._send_strand_unavailable(op_id, 503)
+                return
+            if durable is not None:
+                if not operations_mod._event_matches_operation(
+                    operation, durable
+                ):
+                    self._send_strand_unavailable(op_id, 503)
+                    return
+                if operation_store._finish_durable_staged(operation):
+                    self._replay_terminal(operation)
+                else:
+                    # Event durable but its envelope response was not staged:
+                    # it cannot be rebuilt, so stay pending rather than
+                    # minting a divergent envelope.
+                    self._send_strand_unavailable(op_id, 503)
+                return
+            details = operation.details or {}
+            staged = details.get("result")
+            if isinstance(staged, dict) and isinstance(
+                staged.get("response"), dict
+            ):
+                # The exact terminal (a 200 envelope or a 403/404/409/503)
+                # was staged durably but its event append did not commit. This
+                # is wrap-up only: re-append the SAME event (idempotent on
+                # event_id) and finish with the staged body, never re-calling
+                # the provider or minting a second envelope.
+                self._encrypt_finish_staged(operation)
+                return
+            # A takeover skips a gate once that gate's durable facts exist:
+            # policy/existence were already decided when the resolved version
+            # was persisted, and the version pointer must stay pinned to the
+            # first attempt's current.
+            resumed = (
+                details.get("kind") == "encrypt"
+                and isinstance(details.get("version"), int)
+                and isinstance(details.get("provider_id"), str)
+            )
+            try:
+                if not resumed:
+                    operation_store.update_details(
+                        operation,
+                        {
+                            "kind": "encrypt",
+                            "key_id": key_id,
+                            # None means "lock current"; persisted so the
+                            # resolved version is stable across a takeover.
+                            "version_requested": requested_version,
+                        },
+                    )
+                    # Authorization follows validation and precedes existence.
+                    if not policy_store.is_allowed(
+                        tenant_id, audit_mod.ACTION_ENCRYPT, operator
+                    ):
+                        self._encrypt_terminal_rejection(
+                            operation, tenant_id, key_id, 403,
+                            "action not permitted by policy",
+                        )
+                        return
+                    # Provider-free resolution: unknown/foreign key is 404, a
+                    # revoked version (including an older one) is 409. A
+                    # legacy-record adoption fault (an unsettled projection)
+                    # is a sticky provider terminal like the material export.
+                    try:
+                        vstatus, _record, ver = store.crypto_version(
+                            key_id, tenant_id, requested_version
+                        )
+                    except ProviderUnavailable:
+                        self._idempotent_provider_terminal(
+                            operation, 503,
+                            "key management provider is unavailable",
+                        )
+                        return
+                    if vstatus == store.CRYPTO_NOT_FOUND:
+                        self._encrypt_terminal_rejection(
+                            operation, tenant_id, key_id, 404, "key not found"
+                        )
+                        return
+                    if vstatus == store.CRYPTO_REVOKED:
+                        self._encrypt_terminal_rejection(
+                            operation, tenant_id, key_id, 409, "key is revoked"
+                        )
+                        return
+                else:
+                    # Resume the provider phase: re-fetch the EXACT, immutable
+                    # version the first attempt resolved (so a later rotation
+                    # never changes the envelope's KEK), purely to obtain its
+                    # handle again. Its provider_id is the durable owner.
+                    resolved_version = details["version"]
+                    try:
+                        vstatus, _record, ver = store.crypto_version(
+                            key_id, tenant_id, resolved_version
+                        )
+                    except ProviderUnavailable:
+                        self._idempotent_provider_terminal(
+                            operation, 503,
+                            "key management provider is unavailable",
+                        )
+                        return
+                    if vstatus == store.CRYPTO_NOT_FOUND:
+                        self._encrypt_terminal_rejection(
+                            operation, tenant_id, key_id, 404, "key not found"
+                        )
+                        return
+                    if vstatus == store.CRYPTO_REVOKED:
+                        self._encrypt_terminal_rejection(
+                            operation, tenant_id, key_id, 409, "key is revoked"
+                        )
+                        return
+                    if (
+                        ver.provider_id != details["provider_id"]
+                        or ver.algorithm != details.get("algorithm")
+                    ):
+                        # An immutable version's owner cannot change; disagreeing
+                        # durable facts are an unprovable scene -- stay pending.
+                        self._send_strand_unavailable(op_id, 503)
+                        return
+
+                if not resumed:
+                    # Persist the resolved facts BEFORE the first provider
+                    # call, so a provider outage/switch is sticky and retried
+                    # against the SAME owning provider/version, and GET
+                    # operations can report them without any material.
+                    operation_store.update_details(
+                        operation,
+                        {
+                            "version": ver.version,
+                            "algorithm": ver.algorithm,
+                            "provider_id": ver.provider_id,
+                        },
+                    )
+
+                # The only backend call: read-only material export. An outage
+                # or an inactive/switched owning provider is a sticky terminal
+                # 503 with the fixed safe wording (one rejected event).
+                try:
+                    kek = store.material_for_version(ver)
+                except ProviderUnavailable:
+                    self._idempotent_provider_terminal(
+                        operation, 503,
+                        "key management provider is unavailable",
+                    )
+                    return
+                token = envelope.encode_envelope(
+                    key_id=key_id,
+                    version=ver.version,
+                    algorithm=ver.algorithm,
+                    kek=kek,
+                    plaintext=raw_plaintext,
+                    aad=aad,
+                )
+                response = {
+                    "format": envelope.FORMAT,
+                    "envelope": token,
+                    "operation_id": op_id,
+                }
+                # Stage the exact 200 body BEFORE the commit-point append: on
+                # a crash in between, recovery/takeover keeps the result
+                # hidden and the operation pending until the event is durable,
+                # then this exact envelope is replayed.
+                try:
+                    operation_store.stage_terminal(
+                        operation,
+                        200,
+                        response,
+                        audit={
+                            "action": audit_mod.ACTION_ENCRYPT,
+                            "outcome": audit_mod.OUTCOME_SUCCESS,
+                            "tenant_id": tenant_id,
+                            "key_id": key_id,
+                        },
+                    )
+                    store.audit_attempt(
+                        tenant_id, key_id, audit_mod.ACTION_ENCRYPT,
+                        audit_mod.OUTCOME_SUCCESS, event_id=op_id,
+                    )
+                except (OSError, LedgerError):
+                    # The event is not durable (the stage write or the commit
+                    # append failed): keep the operation PENDING and hide the
+                    # envelope. When the body was in fact staged, the next
+                    # same-key retry only re-appends and replays it; when the
+                    # stage itself failed, the retry resumes from the durable
+                    # version facts and re-runs the read-only provider call.
+                    self._send_strand_unavailable(op_id, 500)
+                    return
+                try:
+                    operation_store.finish(
+                        operation, operations_mod.STATUS_SUCCEEDED, 200,
+                        response,
+                    )
+                except OSError:
+                    # The commit event is durable but the terminal rewrite
+                    # failed: stay pending; the next identical request sees
+                    # the durable event and finalizes from the staged body.
+                    self._send_strand_unavailable(op_id, 500)
+                    return
+                self._send_json(200, response)
+            except (OSError, LedgerError):
+                # A durable-context rewrite or a terminal rejection's
+                # stage/append failed before its governed step committed:
+                # nothing is durable, so keep the operation pending and let a
+                # same-key retry resume (a staged body is only re-appended,
+                # the provider is never called twice).
+                self._send_strand_unavailable(op_id, 500)
 
         def _decrypt_key(self, key_id: str, parts, operator: str) -> None:
             """POST /v1/keys/{key_id}/decrypt.

@@ -85,11 +85,17 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   幂等键。
 - `POST /v1/keys/{key_id}/encrypt`，body
   `{tenant_id, version?, plaintext, aad?}`；`plaintext`、`aad` 为 base64，
-  `version` 缺省为 current。`200` →
-  `{format:"keymgr-envelope-v1", envelope}`，`envelope` 为 base64，内含
-  key_id、version、算法、nonce/tag、密文及**包装后的数据密钥**：每次生成新
-  的 256 位数据密钥，以 AES-256-GCM 加密明文；AES256 版本用 AES-GCM 包装数
-  据密钥，RSA2048 版本用 RSA-OAEP-SHA256 包装。
+  `version` 缺省为 current。**可携带单一可选 `Idempotency-Key` 头**：无头时
+  完全沿用旧行为（每次生成新信封，无 `operation_id`）；携带时启用幂等恢复。
+  无键 `200` → `{format:"keymgr-envelope-v1", envelope}`；有键 `200` →
+  `{format:"keymgr-envelope-v1", envelope, operation_id}`，`envelope` 为
+  base64，内含 key_id、version、算法、nonce/tag、密文及**包装后的数据密钥**：
+  每次生成新的 256 位数据密钥，以 AES-256-GCM 加密明文；AES256 版本用
+  AES-GCM 包装数据密钥，RSA2048 版本用 RSA-OAEP-SHA256 包装。幂等路径下
+  绑定记录只持久化规范化请求体的 SHA-256 摘要（明文/AAD 从不出现在
+  operation 记录、响应外的任何投影或审计中），并在首次调用提供者前耐久
+  锁定的 `version`、`algorithm`、`provider_id`：`version` 缺省时锁定首次
+  解析的 current，之后轮换不改变重放信封的 KEK。
 - `POST /v1/keys/{key_id}/decrypt`，body `{tenant_id, envelope, aad?}`，接
   受 `keymgr-envelope-v1`。`200` → `{plaintext}`（base64）。信封内 key_id
   必须与路径一致；缺字段、非法 base64、篡改、AAD 不符为 `400` 且错误指明
@@ -116,6 +122,34 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `Idempotency-Key` 头（CLI 必填 `--idempotency-key`），值为 1–128 个
   `[A-Za-z0-9._~-]` 字符。缺失、为空、重复、非法一律 `400`（CLI `2`），且该
   校验先于请求体读取与一切业务：不写审计、操作记录、密钥或提供者句柄。
+- 信封**加密** `POST /v1/keys/{key_id}/encrypt`（CLI `encrypt`）的
+  `Idempotency-Key`（CLI `--idempotency-key`）是**可选**的：不携带时沿用旧
+  行为（每次新信封、无 operation、无事件去重之外的记录），携带且合法时按下
+  述幂等恢复执行。其值规则、重复/非法头 `400`（CLI `2`）与必填端点一致；
+  tenant_id、key_id(UUID4)、`version`(正整数)、`plaintext`/`aad`(base64)
+  及信封格式的任何参数/解析错误都发生在幂等键绑定**之前**，一律 `400`
+  （CLI `2`）、零副作用（不写审计、operation，不调用提供者）且不消费该键。
+  绑定后：授权拒绝为终态 `403`（CLI `3`）并记一条携带 key_id 的
+  `encrypt/rejected`；未知键/版本或跨租户为 `404`（CLI `4`）；吊销版本（含
+  旧版本）为 `409`（CLI `3`）；同键不同规范化请求为 `409`（CLI `3`）并返回
+  原 `operation_id`。成功为 `200`
+  `{format:"keymgr-envelope-v1", envelope, operation_id}`。绑定记录只存规范
+  体的 SHA-256 摘要与 `key_id`、锁定的 `version`、`algorithm`、
+  `provider_id`、终态状态/响应；密钥材料、提供者句柄、AAD、明文绝不出现在
+  operation 记录、响应（信封密文令牌除外）或审计中。
+- 加密幂等恢复不铸提供者句柄、不改密钥文件，因此**没有** operation 工件镜像；
+  其 owner 由进程内 per-operation 锁 + `operations/<id>.lock` fcntl 排他锁
+  串行。终态响应（含信封）在唯一审计事件（`event_id=operation_id`，动作
+  `encrypt`）fsync 入帐**之前**先 stage 到 operation 记录：事件耐久即提交点，
+  之后的崩溃/重启/重试及 `GET /v1/operations/{operation_id}` 只据耐久事实原样
+  重放该信封与状态码；事件未耐久时 operation 保持 `pending`、隐藏结果，且
+  绝不第二次调用提供者——下次同键请求在 owner 锁下接管：已 stage 响应则只幂
+  等补记同一事件（账本按 event_id 去重）并重放原信封，未 stage 则从耐久的
+  version/provider 事实恢复（`export_material` 只读）。提供者不可用或记录属于
+  未激活/不匹配提供者时，绑定后返回固定 `503`
+  "key management provider is unavailable"（CLI `1`），该终态耐久、事件记
+  rejected，即使提供者恢复也原样重放，现场保留给原 provider。并发同键仅一个
+  执行，其余等待；等待超 5 秒返回 `503` timed_out（CLI `1`）且不写任何东西。
 - 键全局唯一，绑定记录 `operation_id`(UUID4)、租户、操作者、路径、规范化体
   （键排序紧凑 JSON）、状态、HTTP 状态与响应；存于 `operations/<id>.json`
   (0600) 与 `operations/index.json`，进程内锁 + `operations.lock` 的 fcntl
@@ -124,9 +158,10 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `operation_id`，业务不执行第二次）。同键不同绑定：`409`（CLI `3`），错误
   体给出已有 `operation_id`。绑定前的导入/恢复解密无副作用：口令错误 `400`
   不占用该键。
-- 状态：`pending`/`succeeded`/`failed`/`conflict`/`timed_out`。成功为 `201`
-  succeeded；同租户冲突为 `409` conflict；`403/404/400` 与提供者/账本失败为
-  failed（保留原状态码）。并发同键仅一个执行，其余等待；等待超 5 秒返回
+- 状态：`pending`/`succeeded`/`failed`/`conflict`/`timed_out`。成功为
+  `201` succeeded（变更端点）或 `200` succeeded（幂等信封加密）；同租户冲突
+  为 `409` conflict；`403/404/400` 与提供者/账本失败为 failed（保留原状态
+  码）。并发同键仅一个执行，其余等待；等待超 5 秒返回
   `503` timed_out（CLI `1`），等待方不写任何东西。
 - 多/单轮换互斥：批量轮换与单键 rotate 都按 `key_id` 排序获取 per-key
   进程内锁 + `<key_id>.lock` fcntl 排他锁（整批共享一个 5 秒截止时刻）。对同一
@@ -227,9 +262,10 @@ python -m keymgr status   --tenant-id t --key-id <id> --operator alice
 # 导出/导入、备份/恢复
 python -m keymgr export   --tenant-id t --key-id <id> --passphrase pw --operator alice
 # 信封加密/解密（plaintext/aad 为 base64，version 缺省 current）
+# encrypt 的 --idempotency-key 可选：给出则重试/重启/operation 查询重放同一信封
 python -m keymgr encrypt  --tenant-id t --key-id <id> \
                           --plaintext <base64> [--aad <base64>] [--version 1] \
-                          --operator alice
+                          --operator alice [--idempotency-key enc-0001]
 python -m keymgr decrypt  --tenant-id t --key-id <id> \
                           --envelope <keymgr-envelope-v1-base64> [--aad <base64>] \
                           --operator alice
