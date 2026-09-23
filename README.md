@@ -83,6 +83,19 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   保留原 key_id、全部版本、label、current 与吊销状态。同租户已有 key_id 为
   `409`，key_id 被其它租户占用为 `404`；口令/篡改/格式错误为 `400` 且不占用
   幂等键。
+- `POST /v1/keys/{key_id}/encrypt`，body
+  `{tenant_id, version?, plaintext, aad?}`；`plaintext`、`aad` 为 base64，
+  `version` 缺省为 current。`200` →
+  `{format:"keymgr-envelope-v1", envelope}`，`envelope` 为 base64，内含
+  key_id、version、算法、nonce/tag、密文及**包装后的数据密钥**：每次生成新
+  的 256 位数据密钥，以 AES-256-GCM 加密明文；AES256 版本用 AES-GCM 包装数
+  据密钥，RSA2048 版本用 RSA-OAEP-SHA256 包装。
+- `POST /v1/keys/{key_id}/decrypt`，body `{tenant_id, envelope, aad?}`，接
+  受 `keymgr-envelope-v1`。`200` → `{plaintext}`（base64）。信封内 key_id
+  必须与路径一致；缺字段、非法 base64、篡改、AAD 不符为 `400` 且错误指明
+  字段；未知或跨租户的 key/version 为 `404`；吊销版本（含旧版本）为 `409`；
+  提供者不可用为 `503`，沿用固定脱敏文案。私钥、数据密钥只存在于进程内存，
+  绝不进入响应或审计。
 - `POST /v1/backup`，body `{tenant_id, passphrase}` →
   `{format:"tenant-backup-v1", bundle}`；载荷
   `{format, tenant_id, keys, policy}`，空租户为 `keys:[]、policy:null`。
@@ -159,9 +172,9 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `{tenant_id, deleted:true}`。
 - 规则元素 `{subject, actions, effect}`：`subject` 为区分大小写的非空字符串；
   `actions` 为非空数组，取值
-  `create/read/rotate/revoke/import/export/audit`，单条内重复去重；`effect`
-  为 `allow`/`deny`；未知字段、类型错误、同 subject+effect+无序动作集的重复
-  规则均 `400`；`rules:[]` 合法（全拒绝）。
+  `create/read/rotate/revoke/import/export/encrypt/decrypt/audit`，单条内
+  重复去重；`effect` 为 `allow`/`deny`；未知字段、类型错误、同
+  subject+effect+无序动作集的重复规则均 `400`；`rules:[]` 合法（全拒绝）。
 - 执行：管理动作 policy_* 免检；租户无策略时全部允许；有策略时匹配规则中
   deny 优先于 allow，无匹配则拒绝 → `403`，并记一条原动作名、
   `outcome=rejected`、携带当时已知 `key_id` 的事件（create/解密前的 import/
@@ -170,11 +183,14 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 ## 审计
 
 - 事件字段 `{event_id, tenant_id, action, key_id, outcome, timestamp}`；
-  `action` 为 `create/read/rotate/batch_rotate/revoke/import/export/audit/
-  tenant_conflict/policy_read/policy_update/policy_delete`，`outcome` 为
-  `success/rejected`。备份记 `export`、恢复记 `import`，两者 `key_id` 均为
-  null；恢复的所有事件（含成功）`key_id` 为 null；批量轮换整批至多一条
-  `batch_rotate` 事件，成功与拒绝终态的 `key_id` 均为 null，可按
+  `action` 为 `create/read/rotate/batch_rotate/revoke/import/export/
+  encrypt/decrypt/audit/tenant_conflict/policy_read/policy_update/
+  policy_delete`，`outcome` 为 `success/rejected`。信封加密/解密事件只含
+  元数据（无 plaintext、aad、envelope、数据密钥或私钥）；策略拒绝写一条
+  对应 `encrypt`/`decrypt` 的 rejected 事件（携带 key_id），成功写对应
+  action 的 success 事件。备份记 `export`、恢复记 `import`，两者 `key_id`
+  均为 null；恢复的所有事件（含成功）`key_id` 为 null；批量轮换整批至多
+  一条 `batch_rotate` 事件，成功与拒绝终态的 `key_id` 均为 null，可按
   `action=batch_rotate` 筛选。
 - `GET /v1/audit`：单一租户来源；可选 `key_id`(UUID4)、`action`、
   `limit`(1–1000，默认 100)、`cursor`。→ `{events, next_cursor}`，按
@@ -210,6 +226,13 @@ python -m keymgr revoke   --tenant-id t --key-id <id> --reason r --operator alic
 python -m keymgr status   --tenant-id t --key-id <id> --operator alice
 # 导出/导入、备份/恢复
 python -m keymgr export   --tenant-id t --key-id <id> --passphrase pw --operator alice
+# 信封加密/解密（plaintext/aad 为 base64，version 缺省 current）
+python -m keymgr encrypt  --tenant-id t --key-id <id> \
+                          --plaintext <base64> [--aad <base64>] [--version 1] \
+                          --operator alice
+python -m keymgr decrypt  --tenant-id t --key-id <id> \
+                          --envelope <keymgr-envelope-v1-base64> [--aad <base64>] \
+                          --operator alice
 python -m keymgr import   --tenant-id t --passphrase pw --bundle <b> \
                           --operator alice --idempotency-key import-0001
 python -m keymgr backup   --tenant-id t --passphrase pw --operator alice

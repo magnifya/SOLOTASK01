@@ -8,6 +8,7 @@ import sys
 from typing import List, Optional
 
 from . import audit as audit_mod
+from . import envelope
 from . import keybundle
 from . import operations as operations_mod
 from . import restore as restore_mod
@@ -111,6 +112,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_import.add_argument(
         "--idempotency-key", required=True,
         help="1-128 chars A-Za-z0-9._~- ; retries reuse the result",
+    )
+
+    p_encrypt = tenant_parser(
+        "encrypt", help="envelope-encrypt base64 plaintext with a key version"
+    )
+    p_encrypt.add_argument("--key-id", required=True)
+    p_encrypt.add_argument(
+        "--plaintext", required=True,
+        help="base64 plaintext to encrypt",
+    )
+    p_encrypt.add_argument(
+        "--version", default=None, type=_positive_int,
+        help="key version to use (default: current)",
+    )
+    p_encrypt.add_argument(
+        "--aad", default=None, help="optional base64 additional authenticated data"
+    )
+
+    p_decrypt = tenant_parser(
+        "decrypt", help="decrypt a keymgr-envelope-v1 token"
+    )
+    p_decrypt.add_argument("--key-id", required=True)
+    p_decrypt.add_argument("--envelope", required=True)
+    p_decrypt.add_argument(
+        "--aad", default=None, help="optional base64 additional authenticated data"
     )
 
     p_backup = tenant_parser(
@@ -227,6 +253,15 @@ def _deny(store, tenant_id, key_id, action) -> int:
                       audit_mod.OUTCOME_REJECTED):
         return 1
     return _fail("action not permitted by policy", 3)
+
+
+def _crypto_reject(store, tenant_id, key_id, action, http_status,
+                   message) -> int:
+    """Audit a rejected encrypt/decrypt attempt and report its exit code."""
+    if not _attempt(store, tenant_id, key_id, action,
+                    audit_mod.OUTCOME_REJECTED):
+        return 1
+    return _fail(message, _http_to_cli(http_status))
 
 
 def _http_to_cli(http_status: int) -> int:
@@ -1105,6 +1140,139 @@ def _run(argv: Optional[List[str]] = None) -> int:
             args.idempotency_key, validator, execute, decoder,
             artifact_store=artifact_store,
         )
+
+    if args.command == "encrypt":
+        if not args.tenant_id:
+            if not _conflict(store):
+                return 1
+            return _fail("field tenant_id must be a non-empty string", 2)
+        if not is_valid_key_id(args.key_id):
+            if not _conflict(store):
+                return 1
+            return _fail("field key_id must be a UUID4", 2)
+        try:
+            raw_plaintext = envelope.b64_decode_field(
+                args.plaintext, "plaintext"
+            )
+        except envelope.EnvelopeError as exc:
+            return _crypto_reject(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_ENCRYPT, 400, str(exc),
+            )
+        aad = b""
+        if args.aad is not None:
+            try:
+                aad = envelope.b64_decode_field(args.aad, "aad")
+            except envelope.EnvelopeError as exc:
+                return _crypto_reject(
+                    store, args.tenant_id, args.key_id,
+                    audit_mod.ACTION_ENCRYPT, 400, str(exc),
+                )
+        if not allowed(audit_mod.ACTION_ENCRYPT):
+            return _deny(store, args.tenant_id, args.key_id,
+                         audit_mod.ACTION_ENCRYPT)
+        status, record, ver, kek = store.crypto_material(
+            args.key_id, args.tenant_id, args.version
+        )
+        if status == store.CRYPTO_NOT_FOUND:
+            return _crypto_reject(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_ENCRYPT, 404, "key not found",
+            )
+        if status == store.CRYPTO_REVOKED:
+            return _crypto_reject(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_ENCRYPT, 409, "key is revoked",
+            )
+        token = envelope.encode_envelope(
+            key_id=args.key_id,
+            version=ver.version,
+            algorithm=ver.algorithm,
+            kek=kek,
+            plaintext=raw_plaintext,
+            aad=aad,
+        )
+        if not _attempt(
+            store, args.tenant_id, args.key_id,
+            audit_mod.ACTION_ENCRYPT, audit_mod.OUTCOME_SUCCESS,
+        ):
+            return 1
+        _print({"format": envelope.FORMAT, "envelope": token})
+        return 0
+
+    if args.command == "decrypt":
+        if not args.tenant_id:
+            if not _conflict(store):
+                return 1
+            return _fail("field tenant_id must be a non-empty string", 2)
+        if not is_valid_key_id(args.key_id):
+            if not _conflict(store):
+                return 1
+            return _fail("field key_id must be a UUID4", 2)
+        aad = b""
+        if args.aad is not None:
+            try:
+                aad = envelope.b64_decode_field(args.aad, "aad")
+            except envelope.EnvelopeError as exc:
+                return _crypto_reject(
+                    store, args.tenant_id, args.key_id,
+                    audit_mod.ACTION_DECRYPT, 400, str(exc),
+                )
+        try:
+            opened = envelope.decode_envelope(args.envelope)
+        except envelope.EnvelopeError as exc:
+            return _crypto_reject(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_DECRYPT, 400, str(exc),
+            )
+        if opened.key_id != args.key_id:
+            return _crypto_reject(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_DECRYPT, 400,
+                "field envelope key_id does not match the request key_id",
+            )
+        if not allowed(audit_mod.ACTION_DECRYPT):
+            return _deny(store, args.tenant_id, args.key_id,
+                         audit_mod.ACTION_DECRYPT)
+        status, record, ver, kek = store.crypto_material(
+            args.key_id, args.tenant_id, opened.version
+        )
+        if status == store.CRYPTO_NOT_FOUND:
+            return _crypto_reject(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_DECRYPT, 404, "key not found",
+            )
+        if status == store.CRYPTO_REVOKED:
+            return _crypto_reject(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_DECRYPT, 409, "key is revoked",
+            )
+        if opened.algorithm != ver.algorithm:
+            return _crypto_reject(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_DECRYPT, 400,
+                "field envelope algorithm does not match the key version",
+            )
+        if opened.aad != aad:
+            return _crypto_reject(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_DECRYPT, 400,
+                "field aad does not match the envelope",
+            )
+        try:
+            plaintext = envelope.open_envelope(opened, kek)
+        except envelope.EnvelopeError as exc:
+            return _crypto_reject(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_DECRYPT, 400, str(exc),
+            )
+        if not _attempt(
+            store, args.tenant_id, args.key_id,
+            audit_mod.ACTION_DECRYPT, audit_mod.OUTCOME_SUCCESS,
+        ):
+            return 1
+        _print({"plaintext": envelope.b64_encode(plaintext)})
+        return 0
 
     if args.command == "backup":
         if not args.tenant_id or not args.passphrase:

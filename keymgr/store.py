@@ -962,6 +962,8 @@ class KeyStore:
                 audit_mod.ACTION_REVOKE,
                 audit_mod.ACTION_IMPORT,
                 audit_mod.ACTION_EXPORT,
+                audit_mod.ACTION_ENCRYPT,
+                audit_mod.ACTION_DECRYPT,
                 audit_mod.ACTION_AUDIT,
             )
         ):
@@ -2922,6 +2924,101 @@ class KeyStore:
         if ver is None:
             return None
         return record, ver
+
+    # -- envelope crypto material ------------------------------------------
+    # Outcomes of crypto_material: the version's KEK is ready, the key or
+    # version does not exist for this tenant, or the key is revoked.
+    CRYPTO_OK = "ok"
+    CRYPTO_NOT_FOUND = "not_found"
+    CRYPTO_REVOKED = "revoked"
+
+    @staticmethod
+    def _kek_for_version(ver: VersionRecord, raw_material: str):
+        """Turn exported raw material into an envelope KEK object.
+
+        AES256 yields the raw 32-byte key; RSA2048 yields the loaded private
+        key (envelope wrapping uses its public component). Corrupt stored
+        material is a backend inconsistency, surfaced as ProviderUnavailable
+        (503) -- never as a client-visible 400 and never leaking material.
+        """
+        if ver.algorithm == "AES256":
+            try:
+                raw = base64.b64decode(raw_material, validate=True)
+            except (ValueError, TypeError) as exc:
+                raise ProviderUnavailable(
+                    "stored AES256 material is not valid base64"
+                ) from exc
+            if len(raw) != 32:
+                raise ProviderUnavailable(
+                    "stored AES256 material does not decode to 32 bytes"
+                )
+            return raw
+        if ver.algorithm == "RSA2048":
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric import rsa
+
+            try:
+                private_key = serialization.load_pem_private_key(
+                    raw_material.encode("utf-8"), password=None
+                )
+            except (ValueError, TypeError) as exc:
+                raise ProviderUnavailable(
+                    "stored RSA2048 material is not a PEM private key"
+                ) from exc
+            if not isinstance(private_key, rsa.RSAPrivateKey) or (
+                private_key.key_size != 2048
+            ):
+                raise ProviderUnavailable(
+                    "stored RSA2048 material is not a 2048-bit RSA private key"
+                )
+            return private_key
+        raise ProviderUnavailable(
+            "unsupported algorithm for envelope crypto: %r" % ver.algorithm
+        )
+
+    def crypto_material(
+        self, key_id: str, tenant_id: str, version: Optional[int] = None
+    ) -> tuple:
+        """Resolve a version's key-encryption key for envelope crypto.
+
+        Returns ``(status, record, ver, kek)``: on CRYPTO_OK ``kek`` is the
+        raw 32-byte AES key or the loaded RSA private key; ``record``/``ver``
+        are the committed view. CRYPTO_NOT_FOUND covers an unknown key, a
+        foreign tenant and an unknown version alike (existence never leaks);
+        CRYPTO_REVOKED means the key is revoked (every version refuses
+        crypto). The read runs under the key locks over the committed
+        projection, adopts a raw legacy record exactly like export, and asks
+        the owning provider for the material -- a record owned by an inactive
+        provider raises ProviderUnavailable (503), never a silent fallback.
+        Nothing is persisted and no audit event is written here.
+        """
+        if not is_valid_key_id(key_id):
+            return self.CRYPTO_NOT_FOUND, None, None, None
+        path = self._path_for(key_id)
+        with self._key_lock(key_id), self._file_lock(key_id):
+            on_disk = self._read_record(path)
+            if on_disk is None or on_disk.tenant_id != tenant_id:
+                return self.CRYPTO_NOT_FOUND, None, None, None
+            # Never crypto against an uncommitted current: project only the
+            # durable state (the view, not the file, is trimmed).
+            record = self._committed_record(on_disk)
+            if record is None:
+                return self.CRYPTO_NOT_FOUND, None, None, None
+            # Adopt a raw legacy record now, under the key locks and only
+            # while the local provider is active (same rule as export).
+            self._take_over_legacy(record)
+            if record.status == "revoked":
+                return self.CRYPTO_REVOKED, record, None, None
+            if version is None:
+                ver = record.current
+            else:
+                ver = record.get_version(version)
+                if ver is None:
+                    return self.CRYPTO_NOT_FOUND, record, None, None
+            provider = self._provider_for(ver.provider_id)
+            exported = provider.export_material(ver.handle)
+            kek = self._kek_for_version(ver, exported.encrypted_material)
+            return self.CRYPTO_OK, record, ver, kek
 
     # -- export / import ---------------------------------------------------
     def _export_version(self, ver: VersionRecord) -> dict:

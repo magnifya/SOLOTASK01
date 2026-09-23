@@ -41,6 +41,8 @@ POLICY_ACTIONS = (
     "revoke",
     "import",
     "export",
+    "encrypt",
+    "decrypt",
     "audit",
 )
 EFFECTS = ("allow", "deny")

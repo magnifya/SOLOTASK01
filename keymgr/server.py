@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from . import audit as audit_mod
+from . import envelope
 from . import keybundle
 from . import operations as operations_mod
 from . import restore as restore_mod
@@ -34,6 +35,8 @@ _KEY_PATH_RE = re.compile(r"^/v1/keys/([^/]+)$")
 _ROTATE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/rotate$")
 _REVOKE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/revoke$")
 _EXPORT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/export$")
+_ENCRYPT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/encrypt$")
+_DECRYPT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/decrypt$")
 _STATUS_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/status$")
 _VERSION_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/versions/([^/]+)$")
 _CURRENT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/current$")
@@ -719,6 +722,16 @@ def make_handler(
                     self._export_key(export_match.group(1), parts, operator)
                     return
 
+                encrypt_match = _ENCRYPT_PATH_RE.match(path)
+                if encrypt_match is not None:
+                    self._encrypt_key(encrypt_match.group(1), parts, operator)
+                    return
+
+                decrypt_match = _DECRYPT_PATH_RE.match(path)
+                if decrypt_match is not None:
+                    self._decrypt_key(decrypt_match.group(1), parts, operator)
+                    return
+
                 if path == _IMPORT_PATH:
                     self._import_key(parts, operator)
                     return
@@ -1116,6 +1129,210 @@ def make_handler(
                 return
             self._send_json(
                 200, {"format": keybundle.FORMAT, "bundle": bundle}
+            )
+
+        def _reject_crypto(self, tenant_id, key_id, action, status,
+                           message) -> None:
+            """Audit a rejected encrypt/decrypt attempt, then answer."""
+            if not self._record_attempt(
+                tenant_id, key_id, action, audit_mod.OUTCOME_REJECTED
+            ):
+                return
+            self._send_json(status, {"error": message})
+
+        def _crypto_request_base(self, key_id, parts, action):
+            """Shared parse/validate prelude for encrypt and decrypt.
+
+            Returns ``(tenant_id, payload)`` or None after the response was
+            sent. Follows the export endpoint's rules: body/tenant failures
+            are invisible tenant_conflict events, and field errors after the
+            tenant is known are tenant-visible rejected attempts.
+            """
+            payload = self._read_json_object()
+            if payload is None:
+                return None
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                if not self._record_conflict():
+                    return None
+                self._bad_request("field tenant_id must be a non-empty string")
+                return None
+            tenant_id = self._tenant(parts, payload)
+            if tenant_id is None:
+                return None
+            if self._bad_key_id(key_id):
+                return None
+            return tenant_id, payload
+
+        def _request_aad(self, tenant_id, key_id, action, payload):
+            """Decode the optional aad field; None means 400 was sent."""
+            aad = payload.get("aad")
+            if aad is None:
+                return b""
+            try:
+                return envelope.b64_decode_field(aad, "aad")
+            except envelope.EnvelopeError as exc:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 400, str(exc)
+                )
+                return None
+
+        def _encrypt_key(self, key_id: str, parts, operator: str) -> None:
+            """POST /v1/keys/{key_id}/encrypt.
+
+            Body ``{tenant_id, version?, plaintext, aad?}``; plaintext and aad
+            are base64, version defaults to the current version. The answer
+            carries only the opaque envelope token -- never the data key, the
+            KEK or any backend material.
+            """
+            action = audit_mod.ACTION_ENCRYPT
+            base = self._crypto_request_base(key_id, parts, action)
+            if base is None:
+                return
+            tenant_id, payload = base
+            version = payload.get("version")
+            if version is not None and (
+                not isinstance(version, int)
+                or isinstance(version, bool)
+                or version < 1
+            ):
+                self._reject_crypto(
+                    tenant_id, key_id, action, 400,
+                    "field version must be a positive integer",
+                )
+                return
+            plaintext = payload.get("plaintext")
+            if not isinstance(plaintext, str):
+                self._reject_crypto(
+                    tenant_id, key_id, action, 400,
+                    "field plaintext must be a base64 string"
+                    if "plaintext" in payload
+                    else "missing required field: plaintext",
+                )
+                return
+            try:
+                raw_plaintext = envelope.b64_decode_field(
+                    plaintext, "plaintext"
+                )
+            except envelope.EnvelopeError as exc:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 400, str(exc)
+                )
+                return
+            aad = self._request_aad(tenant_id, key_id, action, payload)
+            if aad is None:
+                return
+            if not self._enforce(tenant_id, key_id, action, operator):
+                return
+            status, record, ver, kek = store.crypto_material(
+                key_id, tenant_id, version
+            )
+            if status == store.CRYPTO_NOT_FOUND:
+                # Unknown key, unknown version and cross-tenant access are
+                # indistinguishable, all 404.
+                self._reject_crypto(
+                    tenant_id, key_id, action, 404, "key not found"
+                )
+                return
+            if status == store.CRYPTO_REVOKED:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 409, "key is revoked"
+                )
+                return
+            token = envelope.encode_envelope(
+                key_id=key_id,
+                version=ver.version,
+                algorithm=ver.algorithm,
+                kek=kek,
+                plaintext=raw_plaintext,
+                aad=aad,
+            )
+            if not self._record_attempt(
+                tenant_id, key_id, action, audit_mod.OUTCOME_SUCCESS
+            ):
+                return
+            self._send_json(
+                200, {"format": envelope.FORMAT, "envelope": token}
+            )
+
+        def _decrypt_key(self, key_id: str, parts, operator: str) -> None:
+            """POST /v1/keys/{key_id}/decrypt.
+
+            Body ``{tenant_id, envelope, aad?}``. The envelope names its own
+            key_id and version; both must match the request, the AAD must
+            match the sealed one, and any tampering is a 400 naming the
+            field. The plaintext leaves only inside the response body.
+            """
+            action = audit_mod.ACTION_DECRYPT
+            base = self._crypto_request_base(key_id, parts, action)
+            if base is None:
+                return
+            tenant_id, payload = base
+            token = payload.get("envelope")
+            if not isinstance(token, str) or not token:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 400,
+                    "field envelope must be a non-empty string",
+                )
+                return
+            aad = self._request_aad(tenant_id, key_id, action, payload)
+            if aad is None:
+                return
+            # Structural validation is parameter validation: it runs before
+            # authorization, exactly like the other request fields.
+            try:
+                opened = envelope.decode_envelope(token)
+            except envelope.EnvelopeError as exc:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 400, str(exc)
+                )
+                return
+            if opened.key_id != key_id:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 400,
+                    "field envelope key_id does not match the request key_id",
+                )
+                return
+            if not self._enforce(tenant_id, key_id, action, operator):
+                return
+            status, record, ver, kek = store.crypto_material(
+                key_id, tenant_id, opened.version
+            )
+            if status == store.CRYPTO_NOT_FOUND:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 404, "key not found"
+                )
+                return
+            if status == store.CRYPTO_REVOKED:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 409, "key is revoked"
+                )
+                return
+            if opened.algorithm != ver.algorithm:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 400,
+                    "field envelope algorithm does not match the key version",
+                )
+                return
+            if opened.aad != aad:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 400,
+                    "field aad does not match the envelope",
+                )
+                return
+            try:
+                plaintext = envelope.open_envelope(opened, kek)
+            except envelope.EnvelopeError as exc:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 400, str(exc)
+                )
+                return
+            if not self._record_attempt(
+                tenant_id, key_id, action, audit_mod.OUTCOME_SUCCESS
+            ):
+                return
+            self._send_json(
+                200, {"plaintext": envelope.b64_encode(plaintext)}
             )
 
         def _import_key(self, parts, operator: str) -> None:
