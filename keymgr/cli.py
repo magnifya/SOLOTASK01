@@ -18,7 +18,7 @@ from .crypto import SUPPORTED_ALGORITHMS
 from .operations import OperationStore
 from .policy import PolicyError, PolicyStore, validate_rules
 from .provider import ProviderInvalidMaterial, ProviderUnavailable
-from .server import _resolve_committed_operation, serve
+from .server import _resolve_committed_operation, make_encrypt_executor, serve
 from .store import IMPORT_CONFLICT, KeyStore, LockTimeout, is_valid_key_id, validate_batch_items
 
 DEFAULT_DATA_DIR = os.environ.get("KEYMGR_DATA_DIR", "keymgr_data")
@@ -128,6 +128,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_encrypt.add_argument(
         "--aad", default=None, help="optional base64 additional authenticated data"
+    )
+    p_encrypt.add_argument(
+        "--idempotency-key", default=None,
+        help="optional 1-128 chars A-Za-z0-9._~- ; retries reuse the result",
     )
 
     p_decrypt = tenant_parser(
@@ -331,6 +335,8 @@ def _provider_terminal(
         action = audit_mod.ACTION_BATCH_ROTATE
     elif kind == "rotate":
         action = audit_mod.ACTION_ROTATE
+    elif kind == "encrypt":
+        action = audit_mod.ACTION_ENCRYPT
     else:
         action = audit_mod.ACTION_IMPORT
     audit_key_id = (
@@ -488,7 +494,8 @@ def _run_owned_attempt(op_store, store, artifact_store, executor, operation,
 
 
 def idempotent_run(op_store, store, path, tenant_id, operator, body, key,
-                   validator, executor, decoder=None, artifact_store=None):
+                   validator, executor, decoder=None, artifact_store=None,
+                   binding=None):
     """CLI counterpart of the HTTP idempotency guard.
 
     Returns a process exit code. ``validator()`` runs cheap side-effect-free
@@ -500,11 +507,13 @@ def idempotent_run(op_store, store, path, tenant_id, operator, body, key,
     wrong passphrase neither masks a replay nor consumes the key.
     ``executor(operation, mirror) -> (http_status, body)`` runs once for a new
     binding and may raise ProviderInvalidMaterial / ProviderUnavailable /
-    LedgerError / LockTimeout.
+    LedgerError / LockTimeout. ``binding`` overrides the recorded request
+    binding (the idempotent encrypt passes the SHA-256 of the canonical body
+    so the plaintext/AAD never reach disk).
     """
     if _idem_key_error(key):
         return 2
-    normalized = operations_mod.normalize_body(body)
+    normalized = binding or operations_mod.normalize_body(body)
 
     refusal = validator()
     if refusal is not None:
@@ -624,7 +633,9 @@ def _idempotent_run_body(op_store, store, artifact_store, executor, operation,
         return _emit_operation_result(500, body_err)
     resp = dict(resp)
     resp["operation_id"] = op_id
-    state = operations_mod.state_for_http_status(http_status)
+    state = operations_mod.state_for_http_status(
+        http_status, (operation.details or {}).get("kind")
+    )
     op_store.finish(operation, state, http_status, resp)
     if artifact_store is not None and mirror is not None:
         # Committed: verified ownership then dropped; uncommitted: dropped
@@ -1142,6 +1153,68 @@ def _run(argv: Optional[List[str]] = None) -> int:
         )
 
     if args.command == "encrypt":
+        if args.idempotency_key:
+            # Idempotent envelope encrypt: mirrors the HTTP endpoint. Field
+            # failures before the bind are plain exit-2 errors with no audit
+            # event and they never consume the key; the binding stores only
+            # the SHA-256 of the canonical body so plaintext/AAD never persist.
+            if _idem_key_error(args.idempotency_key):
+                return 2
+            if not args.tenant_id:
+                return _fail(
+                    "field tenant_id must be a non-empty string", 2
+                )
+            if not is_valid_key_id(args.key_id):
+                return _fail("field key_id must be a UUID4", 2)
+            try:
+                raw_plaintext = envelope.b64_decode_field(
+                    args.plaintext, "plaintext"
+                )
+            except envelope.EnvelopeError as exc:
+                return _fail(str(exc), 2)
+            aad = b""
+            if args.aad is not None:
+                try:
+                    aad = envelope.b64_decode_field(args.aad, "aad")
+                except envelope.EnvelopeError as exc:
+                    return _fail(str(exc), 2)
+
+            body = {"tenant_id": args.tenant_id,
+                    "plaintext": args.plaintext}
+            if args.aad is not None:
+                body["aad"] = args.aad
+            if args.version is not None:
+                body["version"] = args.version
+            path = "/v1/keys/%s/encrypt" % args.key_id
+
+            def reject(operation, http_status, message):
+                return _terminal_rejection(
+                    op_store, store, operation,
+                    args.tenant_id, args.key_id,
+                    audit_mod.ACTION_ENCRYPT, http_status, message,
+                )
+
+            execute = make_encrypt_executor(
+                store=store,
+                op_store=op_store,
+                tenant_id=args.tenant_id,
+                key_id=args.key_id,
+                version=args.version,
+                raw_plaintext=raw_plaintext,
+                aad=aad,
+                reject=reject,
+                is_allowed=lambda: policies.is_allowed(
+                    args.tenant_id, audit_mod.ACTION_ENCRYPT, args.operator
+                ),
+            )
+            return idempotent_run(
+                op_store, store, path, args.tenant_id, args.operator, body,
+                args.idempotency_key, lambda: None, execute,
+                artifact_store=artifact_store,
+                binding=operations_mod.binding_digest(body),
+            )
+
+        # Legacy non-idempotent encrypt: unchanged behavior/auditing.
         if not args.tenant_id:
             if not _conflict(store):
                 return 1

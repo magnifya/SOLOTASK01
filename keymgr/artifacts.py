@@ -67,6 +67,7 @@ _KIND_ACTIONS = {
     "batch_rotate": audit_mod.ACTION_BATCH_ROTATE,
     "import": audit_mod.ACTION_IMPORT,
     "restore": audit_mod.ACTION_IMPORT,
+    "encrypt": audit_mod.ACTION_ENCRYPT,
 }
 
 
@@ -208,7 +209,7 @@ class ArtifactMirror:
             seen.add(key_id)
             normalized.append(key_id)
         normalized.sort()
-        if kind in ("rotate", "import") and len(normalized) != 1:
+        if kind in ("rotate", "import", "encrypt") and len(normalized) != 1:
             raise ArtifactInconsistent(
                 "mirror kind %r requires exactly one write-set key, got %d"
                 % (kind, len(normalized))
@@ -280,6 +281,49 @@ class ArtifactMirror:
         with self._lock:
             self.descriptor["empty_marker"] = marker_path
             self._persist()
+
+    def note_encrypt(self, version: int, algorithm: str,
+                     provider_id: str) -> None:
+        """Durably record an encrypt attempt's no-redo boundary (durable).
+
+        Called under the key locks strictly AFTER the key version is locked
+        in and BEFORE the first provider call: the exact version, algorithm
+        and owning provider this attempt is bound to become part of the
+        crash evidence, and the mirror leaves the ``bound`` phase. A rewrite
+        failure raises :class:`ArtifactStrandUnavailable` (500) so the
+        executor aborts without ever calling the provider; a crash after
+        this point keeps the operation pending (never re-executed) until the
+        durable result or event lets a retry finish the attempt.
+        """
+        with self._lock:
+            if (
+                not isinstance(version, int)
+                or isinstance(version, bool)
+                or version < 1
+            ):
+                raise ArtifactInconsistent(
+                    "encrypt boundary version is not a positive integer: %r"
+                    % (version,)
+                )
+            if not isinstance(algorithm, str) or not algorithm:
+                raise ArtifactInconsistent(
+                    "encrypt boundary algorithm is not a non-empty string"
+                )
+            if not isinstance(provider_id, str) or not provider_id:
+                raise ArtifactInconsistent(
+                    "encrypt boundary provider_id is not a non-empty string"
+                )
+            self.descriptor["encrypt"] = {
+                "version": version,
+                "algorithm": algorithm,
+                "provider_id": provider_id,
+            }
+            if self.descriptor.get("phase") == PHASE_BOUND:
+                self.descriptor["phase"] = PHASE_PROVISIONING
+            try:
+                self._persist()
+            except OSError as exc:
+                raise ArtifactStrandUnavailable(str(exc), 500)
 
     def discard(self) -> bool:
         """Remove the mirror file. Returns True when it no longer exists."""
@@ -575,7 +619,42 @@ class ArtifactStore:
         journal or a handle existed) is finalized by the startup crash rule
         instead -- a request never re-executes it. The descriptor is reset to
         a fresh ``bound`` image as the executor re-describes the write set.
+
+        An idempotent envelope ``encrypt`` is the single exception: it mints
+        NO provider handles and its backend call is never repeatable, so a
+        retried encrypt never re-executes either. A mirror that crossed the
+        no-redo boundary (``encrypt`` boundary recorded) but whose event is
+        still absent is handed back AS-IS (no reset): the executor detects
+        the crossed boundary and finalizes the attempt without calling the
+        provider again -- it appends the single audit event only when the
+        durable result already exists, and otherwise stays pending and hides
+        the result.
         """
+        if descriptor.get("kind") == "encrypt" and descriptor.get("encrypt"):
+            # Crossed the no-redo boundary. It mints no handles and writes no
+            # key/policy files, so the only foreign-evidence risk is a durable
+            # event that is not this encrypt's own. A matching event (or no
+            # event yet) hands the strand back for no-redo finalization; the
+            # executor appends the idempotent event and/or replays the staged
+            # terminal without calling the provider again.
+            event = self._event_durable(operation.operation_id)
+            if event is False:
+                raise ArtifactStrandUnavailable(
+                    "ledger unreadable for an encrypt past its boundary"
+                )
+            if event is not None and (
+                event.tenant_id != operation.tenant_id
+                or event.action != audit_mod.ACTION_ENCRYPT
+            ):
+                raise ArtifactStrandUnavailable(
+                    "encrypt boundary shares an id with a foreign event"
+                )
+            if self._residual_evidence(descriptor):
+                raise ArtifactStrandUnavailable(
+                    "encrypt attempt crossed its boundary with surviving "
+                    "write artifacts"
+                )
+            return ArtifactMirror(self, operation, descriptor)
         phase = descriptor.get("phase")
         if phase != PHASE_BOUND or descriptor.get("handles"):
             raise ArtifactStrandUnavailable(
@@ -671,6 +750,12 @@ class ArtifactStore:
         # provisioning/staged after a terminal response: the store's abort
         # path either verified the rollback (journal/snapshot gone) or parked
         # the scene. Decide from the durable facts, never from the phase.
+        if getattr(mirror.operation, "status", None) == "pending":
+            # The response was a strand fault, not a terminal: the attempt is
+            # still in flight (e.g. an idempotent encrypt that crossed its
+            # no-redo boundary but lost its in-memory result). Keep the mirror
+            # as the pending attempt's cross-reference; never discard it.
+            return
         if not self._residual_evidence(descriptor):
             self.discard(mirror.operation_id)
 
@@ -732,6 +817,21 @@ class ArtifactStore:
                 continue
             if not getattr(record, "mirror_required", False):
                 # Legacy binding: no mirror was ever mandatory.
+                continue
+            # A missing mirror normally keeps the op pending (a clean strand
+            # a same-id request takes over, or a scene to preserve). The one
+            # exception is an attempt whose COMMIT EVENT is already durable
+            # and matches the operation: commit is proven by the ledger with
+            # or without a mirror (e.g. the process died inside finish() after
+            # the committed mirror was cleaned), so leave it for
+            # recover_pending to finalize verbatim instead of parking it
+            # forever. An unreadable ledger is treated conservatively (park).
+            try:
+                event = self.audit.get_event(operation_id)
+            except Exception:
+                self._parked.add(operation_id)
+                continue
+            if event is not None and _event_is_own(record, event):
                 continue
             self._parked.add(operation_id)
 
@@ -809,7 +909,15 @@ class ArtifactStore:
         # rolled back (provider failure / conflict / ledger failure) is the
         # legacy interruption: drop the mirror so the operation finalizes
         # failed(500) exactly as before.
-        if self._never_provisioned(descriptor):
+        if descriptor.get("kind") == "encrypt":
+            # An idempotent envelope encrypt is NEVER re-run by recovery and
+            # mints no handles: with its commit event absent the attempt may
+            # still be finished by a same-id retry (the durable result only
+            # needs its event appended) or must wait because the in-memory
+            # result was lost after the provider call. Either way keep the
+            # operation pending and the mirror as its cross-reference.
+            self._parked.add(operation_id)
+        elif self._never_provisioned(descriptor):
             self._parked.add(operation_id)
         else:
             self.discard(operation_id)
@@ -901,6 +1009,27 @@ class ArtifactStore:
         empty_marker = descriptor.get("empty_marker")
         if empty_marker is not None and not isinstance(empty_marker, str):
             return False
+        encrypt_boundary = descriptor.get("encrypt")
+        if encrypt_boundary is not None:
+            if kind != "encrypt":
+                return False
+            if not isinstance(encrypt_boundary, dict):
+                return False
+            boundary_version = encrypt_boundary.get("version")
+            if (
+                not isinstance(boundary_version, int)
+                or isinstance(boundary_version, bool)
+                or boundary_version < 1
+            ):
+                return False
+            if not isinstance(encrypt_boundary.get("algorithm"), str) or not (
+                encrypt_boundary.get("algorithm")
+            ):
+                return False
+            if not isinstance(
+                encrypt_boundary.get("provider_id"), str
+            ) or not encrypt_boundary.get("provider_id"):
+                return False
         if not isinstance(descriptor.get("policy"), bool):
             return False
         handles = descriptor.get("handles")
@@ -935,7 +1064,7 @@ class ArtifactStore:
             if not _is_key_id(key_id) or key_id in seen:
                 return False
             seen.add(key_id)
-        if kind in ("rotate", "import") and len(seen) != 1:
+        if kind in ("rotate", "import", "encrypt") and len(seen) != 1:
             return False
         if kind == "batch_rotate" and not seen:
             return False
@@ -957,8 +1086,22 @@ class ArtifactStore:
         if not isinstance(details, dict) or details.get("kind") != kind:
             return False
         write_set = descriptor.get("write_set") or []
-        if kind in ("rotate", "import"):
-            return details.get("key_id") == (write_set[0] if write_set else None)
+        if kind in ("rotate", "import", "encrypt"):
+            if details.get("key_id") != (write_set[0] if write_set else None):
+                return False
+            if kind != "encrypt":
+                return True
+            # The durable no-redo boundary is authoritative in the MIRROR;
+            # the operation record's copy is supporting evidence written just
+            # after the mirror, so it may be absent (a crash/fault in that
+            # exact window) but must never disagree.
+            boundary = descriptor.get("encrypt")
+            recorded = details.get("encrypt")
+            if boundary is None:
+                return recorded is None
+            if recorded is not None and recorded != boundary:
+                return False
+            return True
         if kind == "batch_rotate":
             items = details.get("items")
             if not isinstance(items, list):
@@ -1041,7 +1184,7 @@ class ArtifactStore:
             return False
         kind = descriptor.get("kind")
         write_set = descriptor.get("write_set") or []
-        if kind in ("rotate", "import"):
+        if kind in ("rotate", "import", "encrypt"):
             if event.key_id != (write_set[0] if write_set else None):
                 return False
         elif event.key_id is not None:
@@ -1101,6 +1244,31 @@ class ArtifactStore:
             if kind == "rotate":
                 version = response.get("version")
                 if not isinstance(version, int) or key.get_version(version) is None:
+                    return False
+        elif kind == "encrypt":
+            # A 200 encrypt body is {format, envelope, operation_id}. Verify
+            # it structurally (the token names the bound key/version/
+            # algorithm) WITHOUT any key material: the envelope is opaque and
+            # its plaintext/DEK are never re-derived here.
+            if response.get("format") != "keymgr-envelope-v1":
+                return False
+            token = response.get("envelope")
+            if not isinstance(token, str) or not token:
+                return False
+            try:
+                from . import envelope as envelope_mod
+
+                opened = envelope_mod.decode_envelope(token)
+            except Exception:
+                return False
+            key_id = write_set[0] if write_set else None
+            if opened.key_id != key_id:
+                return False
+            boundary = descriptor.get("encrypt")
+            if isinstance(boundary, dict):
+                if opened.version != boundary.get("version"):
+                    return False
+                if opened.algorithm != boundary.get("algorithm"):
                     return False
         elif kind == "batch_rotate":
             items = response.get("items")
@@ -1587,6 +1755,35 @@ def _is_uuid4(value: str) -> bool:
         return uuid.UUID(value).version == 4
     except (ValueError, AttributeError, TypeError):
         return False
+
+
+def _event_is_own(record, event) -> bool:
+    """Whether a durable event is the operation's own commit/rejection event.
+
+    Mirror-independent counterpart of the descriptor checks, used when a
+    mirror is missing: the tenant must always match, and when the operation
+    record staged an audit descriptor its action/outcome must match;
+    otherwise the event must be a success whose action fits the kind.
+    """
+    if event is None or event.tenant_id != record.tenant_id:
+        return False
+    details = getattr(record, "details", None)
+    desc = details.get("audit") if isinstance(details, dict) else None
+    if isinstance(desc, dict):
+        action = desc.get("action")
+        if isinstance(action, str) and action and event.action != action:
+            return False
+        outcome = desc.get("outcome")
+        if isinstance(outcome, str) and outcome and event.outcome != outcome:
+            return False
+        return True
+    if event.outcome != audit_mod.OUTCOME_SUCCESS:
+        return False
+    kind = details.get("kind") if isinstance(details, dict) else None
+    expected = _KIND_ACTIONS.get(kind)
+    if expected is not None and event.action != expected:
+        return False
+    return True
 
 
 def _is_key_id(value) -> bool:

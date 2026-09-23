@@ -2977,7 +2977,8 @@ class KeyStore:
         )
 
     def crypto_material(
-        self, key_id: str, tenant_id: str, version: Optional[int] = None
+        self, key_id: str, tenant_id: str, version: Optional[int] = None,
+        on_resolve=None,
     ) -> tuple:
         """Resolve a version's key-encryption key for envelope crypto.
 
@@ -2991,6 +2992,14 @@ class KeyStore:
         the owning provider for the material -- a record owned by an inactive
         provider raises ProviderUnavailable (503), never a silent fallback.
         Nothing is persisted and no audit event is written here.
+
+        ``on_resolve`` (optional) runs under the key locks with the resolved
+        ``ver`` strictly AFTER the version is locked in and BEFORE the first
+        provider call. The idempotent envelope encrypt uses it to fsync the
+        no-redo boundary (version/algorithm/provider_id) into its operation
+        record and artifact mirror: a callback exception (e.g. an OSError
+        from the fsync) aborts the call without touching the provider, so a
+        crashed attempt can never be re-run against the backend.
         """
         if not is_valid_key_id(key_id):
             return self.CRYPTO_NOT_FOUND, None, None, None
@@ -3015,6 +3024,11 @@ class KeyStore:
                 ver = record.get_version(version)
                 if ver is None:
                     return self.CRYPTO_NOT_FOUND, record, None, None
+            if on_resolve is not None:
+                # The no-redo boundary: the caller durably records exactly
+                # which version/provider this attempt is bound to before the
+                # backend is ever called.
+                on_resolve(ver)
             provider = self._provider_for(ver.provider_id)
             exported = provider.export_material(ver.handle)
             kek = self._kek_for_version(ver, exported.encrypted_material)

@@ -78,18 +78,21 @@ def is_valid_idempotency_key(value) -> bool:
     return True
 
 
-def state_for_http_status(http_status: int) -> str:
+def state_for_http_status(http_status: int, kind: Optional[str] = None) -> str:
     """Map a terminal response's HTTP status to its operation state.
 
-    201 is the only success; an explicit request conflict (409) is the
-    "conflict" state. Every other terminal refusal (400/403/404) or backend
-    failure (500/503) records as "failed". A crash-recovered operation whose
-    audit event is durable therefore lands in the same state the original
-    request would have, including a reconstructed rejection.
+    A 2xx response is the only success (201 for the write mutations, 200 for
+    the idempotent envelope encrypt); an explicit request conflict (409) is
+    the "conflict" state for the write mutations. Every other terminal
+    refusal (400/403/404) or backend failure (500/503) records as "failed";
+    an encrypt's revoked-key 409 is likewise a failed terminal. A
+    crash-recovered operation whose audit event is durable therefore lands in
+    the same state the original request would have, including a reconstructed
+    rejection.
     """
-    if http_status == 201:
+    if 200 <= http_status < 300:
         return STATUS_SUCCEEDED
-    if http_status == 409:
+    if http_status == 409 and kind != "encrypt":
         return STATUS_CONFLICT
     return STATUS_FAILED
 
@@ -100,6 +103,7 @@ _KIND_ACTIONS = {
     "batch_rotate": "batch_rotate",
     "import": "import",
     "restore": "import",
+    "encrypt": "encrypt",
 }
 
 
@@ -148,6 +152,21 @@ def normalize_body(body: Optional[dict]) -> str:
         separators=(",", ":"),
         ensure_ascii=False,
     )
+
+
+def binding_digest(body: Optional[dict]) -> str:
+    """Collision-free stand-in for a request body that must never persist.
+
+    The envelope-encrypt request carries the plaintext and AAD, neither of
+    which may be written to disk (operation record, artifact mirror or
+    anywhere else). The idempotent binding therefore records the SHA-256 of
+    the canonical body instead of the body itself: two requests bind the same
+    exactly when their canonical bodies hash the same, and a same-key request
+    with a different plaintext/AAD/version still conflicts and names the
+    original operation_id. The digest is stored verbatim as the operation's
+    ``request_body``.
+    """
+    return hashlib.sha256(normalize_body(body).encode("utf-8")).hexdigest()
 
 
 class BeginResult(NamedTuple):
@@ -673,7 +692,10 @@ class OperationStore:
                             }
                 self.finish(
                     record,
-                    state_for_http_status(http_status),
+                    state_for_http_status(
+                        http_status,
+                        (record.details or {}).get("kind"),
+                    ),
                     http_status,
                     response,
                 )

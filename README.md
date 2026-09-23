@@ -4,7 +4,8 @@
 密钥的生成、版本化轮换、吊销、加密导出/导入、租户级加密备份/恢复、按租户的
 操作者策略、只追加的审计账，以及可插拔的 KMS/HSM 提供者。轮换/导入/恢复是
 幂等变更：同一 `Idempotency-Key` 的重试只重放原结果，进程在任一步骤崩溃后
-重启都能据 `operation_id` 判定是否已耐久并一致收尾。私钥只保存在服务端，
+重启都能据 `operation_id` 判定是否已耐久并一致收尾；信封加密也可携带可选
+`Idempotency-Key` 获得同样的崩溃一致重试（不携带则保持非幂等旧行为）。私钥只保存在服务端，
 任何响应与审计投影都不含私钥、句柄或包装材料。
 
 ## 依赖与安装
@@ -85,11 +86,22 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   幂等键。
 - `POST /v1/keys/{key_id}/encrypt`，body
   `{tenant_id, version?, plaintext, aad?}`；`plaintext`、`aad` 为 base64，
-  `version` 缺省为 current。`200` →
-  `{format:"keymgr-envelope-v1", envelope}`，`envelope` 为 base64，内含
-  key_id、version、算法、nonce/tag、密文及**包装后的数据密钥**：每次生成新
-  的 256 位数据密钥，以 AES-256-GCM 加密明文；AES256 版本用 AES-GCM 包装数
-  据密钥，RSA2048 版本用 RSA-OAEP-SHA256 包装。
+  `version` 缺省为 current。`Idempotency-Key` 头**可选**：不携带时完全沿用
+  旧的非幂等行为（无 `operation_id`、无操作记录）；携带时成为幂等操作，
+  `200` → `{format:"keymgr-envelope-v1", envelope, operation_id}`，重试与
+  `GET /v1/operations/{operation_id}` 逐字节重放原响应。携带键时，body/
+  tenant_id/key_id/version/plaintext/aad/base64 等一切参数错误都发生在键
+  绑定**之前**：一律 `400`、零副作用（不写审计、操作记录、句柄，也不消费
+  该键）；绑定后策略拒绝 `403`、未知/跨租户 `404`、吊销版本 `409` 都是耐久
+  终态（错误体仅 `{error, operation_id}`，审计记对应 `encrypt/rejected`，
+  `event_id=operation_id`）；同键不同规范化请求 `409` 并返回原
+  `operation_id`；提供者不可用为固定文案 `503` 终态。`envelope` 为 base64，
+  内含 key_id、version、算法、nonce/tag、密文及**包装后的数据密钥**：每次
+  生成新的 256 位数据密钥，以 AES-256-GCM 加密明文；AES256 版本用 AES-GCM
+  包装数据密钥，RSA2048 版本用 RSA-OAEP-SHA256 包装。幂等绑定只保存规范化
+  请求体的 SHA-256（绝不保存明文/AAD），操作记录耐久保存 key_id、version、
+  algorithm、provider_id 与完整响应；version 缺省在调用提供者前锁定为
+  current。
 - `POST /v1/keys/{key_id}/decrypt`，body `{tenant_id, envelope, aad?}`，接
   受 `keymgr-envelope-v1`。`200` → `{plaintext}`（base64）。信封内 key_id
   必须与路径一致；缺字段、非法 base64、篡改、AAD 不符为 `400` 且错误指明
@@ -116,18 +128,25 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `Idempotency-Key` 头（CLI 必填 `--idempotency-key`），值为 1–128 个
   `[A-Za-z0-9._~-]` 字符。缺失、为空、重复、非法一律 `400`（CLI `2`），且该
   校验先于请求体读取与一切业务：不写审计、操作记录、密钥或提供者句柄。
+  **信封加密 encrypt 的 `Idempotency-Key`（CLI `--idempotency-key`）为可选**：
+  不携带时完全保留旧的非幂等行为；携带时与上述变更共用同一套绑定/重放/
+  查询机制（HTTP `200` 成功，CLI 退出 `0`）。encrypt 的请求体含明文/AAD，
+  因此绑定记录只保存规范化体（键排序紧凑 JSON）的 SHA-256 摘要，绝不保存
+  请求体本身。
 - 键全局唯一，绑定记录 `operation_id`(UUID4)、租户、操作者、路径、规范化体
-  （键排序紧凑 JSON）、状态、HTTP 状态与响应；存于 `operations/<id>.json`
-  (0600) 与 `operations/index.json`，进程内锁 + `operations.lock` 的 fcntl
-  排他锁串行化。
+  （encrypt 为其 SHA-256 摘要）、状态、HTTP 状态与响应；存于
+  `operations/<id>.json` (0600) 与 `operations/index.json`，进程内锁 +
+  `operations.lock` 的 fcntl 排他锁串行化。
 - 相同绑定重试：直接重放首次状态码、响应体与审计事件（同一
   `operation_id`，业务不执行第二次）。同键不同绑定：`409`（CLI `3`），错误
   体给出已有 `operation_id`。绑定前的导入/恢复解密无副作用：口令错误 `400`
-  不占用该键。
-- 状态：`pending`/`succeeded`/`failed`/`conflict`/`timed_out`。成功为 `201`
-  succeeded；同租户冲突为 `409` conflict；`403/404/400` 与提供者/账本失败为
-  failed（保留原状态码）。并发同键仅一个执行，其余等待；等待超 5 秒返回
-  `503` timed_out（CLI `1`），等待方不写任何东西。
+  不占用该键；携带键的 encrypt 在绑定前的全部参数错误同样 `400`/CLI `2`、
+  零副作用且不消费键。
+- 状态：`pending`/`succeeded`/`failed`/`conflict`/`timed_out`。写变更成功为
+  `201` succeeded，encrypt 成功为 `200` succeeded；同租户冲突为 `409`
+  conflict（encrypt 的吊销 `409` 是 failed 而非 conflict）；`403/404/400`
+  与提供者/账本失败为 failed（保留原状态码）。并发同键仅一个执行，其余等
+  待；等待超 5 秒返回 `503` timed_out（CLI `1`），等待方不写任何东西。
 - 多/单轮换互斥：批量轮换与单键 rotate 都按 `key_id` 排序获取 per-key
   进程内锁 + `<key_id>.lock` fcntl 排他锁（整批共享一个 5 秒截止时刻）。对同一
   key 的并发变更要么全在批量之前、要么全在之后；等待同一被占 key 超过 5 秒的
@@ -140,6 +159,19 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `404`/`409` 响应与审计投影并置终态（拒绝终态的状态码随事件持久化，严格
   重放）；事件未入帐则置 failed(`500`)，半成品文件、提供者句柄与标记由
   outbox/provision 恢复回滚。不重复记账（账本按 event_id 去重），不误判。
+- **幂等信封加密的不可重做边界**：encrypt 不铸句柄、不改密钥文件，但会调用
+  提供者的 `export_material` 读取 KEK，该后端调用同样不得重复。执行顺序为
+  绑定 → 0600 mirror(bound) → 授权 → **边界 fsync**（在密钥锁内选定版本
+  后、首次提供者调用前，把 version/algorithm/provider_id 耐久写入
+  operation 记录与 mirror，version 缺省在此锁定为 current）→ 提供者调用 →
+  信封（仅内存）→ 完整 200 响应 fsync → 审计事件（提交点）→ 终态。任一步
+  崩溃：**边界未耐久**（mirror 未越过 bound、无事件、无残留证据）的现场可
+  由同键 HTTP/CLI 重试在同一 `operation_id` 下重新开始；**边界已耐久而事
+  件未耐久**时绝不再调用提供者——结果已耐久则只幂等补记事件并返回原信封，
+  结果未落盘（内存信封随进程丢失）则 operation 保持 `pending`、隐藏结果、
+  返回可重试的临时故障，等待原 provider/现场；事件已耐久则只做收尾。启动
+  恢复对事件未落的 encrypt 一律保持 pending 并保留 mirror 作为交叉索引，
+  绝不按旧规则终结，也不重复调用提供者。
 - **operation 工件镜像**：rotate/import/restore/batch-rotate 在幂等键绑定
   记录耐久**之后**、首次调用提供者**之前**，原子创建
   `operation-artifacts/<operation_id>.json`（0600、temp 文件 fsync 后 rename；
@@ -159,6 +191,11 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   snapshot 与句柄），不猜测回滚也不暴露未提交 current：该 operation 保持
   `pending`，请求/重启返回 `500`/`503` 等待下次重试。无镜像的旧 journal 与旧
   restore 标记沿用原有恢复规则，镜像从不强制存在。
+  携带幂等键的 encrypt 同样在绑定后、首次提供者调用前创建该镜像（无键的
+  encrypt 不创建）；它不铸句柄、无 journal/snapshot/写集文件，镜像额外在越
+  过不可重做边界时耐久 `{version, algorithm, provider_id}`。encrypt 镜像的请
+  求体字段是规范化体的 SHA-256 摘要而非明文体；事件未落的 encrypt 镜像在
+  启动时一律保留并使 operation 保持 pending（见“不可重做边界”一节）。
 - `GET /v1/operations/{operation_id}`：需单一操作者与单一租户来源；操作须
   同时属于该租户与操作者，否则一律 `404`。`200` →
   `{operation_id, tenant_id, status, http_status, response}`，pending 时后两
@@ -227,9 +264,10 @@ python -m keymgr status   --tenant-id t --key-id <id> --operator alice
 # 导出/导入、备份/恢复
 python -m keymgr export   --tenant-id t --key-id <id> --passphrase pw --operator alice
 # 信封加密/解密（plaintext/aad 为 base64，version 缺省 current）
+# encrypt 的 --idempotency-key 可选：携带即幂等并返回 operation_id，省略则沿用旧行为
 python -m keymgr encrypt  --tenant-id t --key-id <id> \
                           --plaintext <base64> [--aad <base64>] [--version 1] \
-                          --operator alice
+                          --operator alice [--idempotency-key enc-0001]
 python -m keymgr decrypt  --tenant-id t --key-id <id> \
                           --envelope <keymgr-envelope-v1-base64> [--aad <base64>] \
                           --operator alice
@@ -291,3 +329,9 @@ python -m keymgr policy --operator admin set|show|delete --tenant-id t [--rules 
   阶段及新句柄；确认提交并核对句柄归属后随 journal/snapshot 一并清理，未提交
   时待全部新句柄删除、旧写集恢复后清理，任何证据缺失或不一致则整组保留（详见
   “幂等操作”一节）。
+- 携带幂等键的信封加密也在 `operations/<id>.json` 与
+  `operation-artifacts/<id>.json` 中留下耐久记录：`request_body` 只存规范化
+  请求体的 SHA-256，`details` 只存 key_id、version、algorithm、provider_id
+  与最终响应（信封本身是不透明 token，不含明文/数据密钥/AAD 明文）；不铸句
+  柄、无 provision journal、不改密钥文件。明文、AAD、口令、数据密钥与 KEK
+  绝不落盘、不进响应之外的任何投影或审计。
