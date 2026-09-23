@@ -462,8 +462,15 @@ def test_batch_uncommitted_with_provider_down_parks_then_settles(env):
     scene = _craft_batch_scene(env, keys)
     _, op_store, art = _setup_no_recovery(env)
     record = _pending_operation(op_store, scene.event_id, keys[0])
-    # Re-point the pending op's path to the batch endpoint for realism.
+    # Re-point the pending op at the batch endpoint, with the same batch kind
+    # and item set a real batch executor persists before describing the mirror.
     record.path = "/v1/keys/batch-rotate"
+    record.details = {
+        "kind": "batch_rotate",
+        "items": [
+            {"key_id": key_id, "algorithm": "AES256"} for key_id in keys
+        ],
+    }
     op_store._write_record(record)
     mirror = art.create(record).describe(
         {"kind": "batch_rotate", "write_set": keys}

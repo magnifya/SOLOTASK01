@@ -33,6 +33,7 @@ Records predating mirrors (legacy journal/restore markers) keep using the
 existing recovery rules unchanged.
 """
 
+import hashlib
 import json
 import os
 import tempfile
@@ -155,22 +156,33 @@ class ArtifactMirror:
         durable-rewrite failure here happens with NO journal, handle, key or
         event in existence, so it is a restartable strand fault (the operation
         stays pending for a same-id retry) rather than a failed(500) terminal.
+
+        The facts are validated strictly rather than filtered: the kind must
+        be one of the four mirrored mutations, the action must be the audit
+        action that kind commits with, and the write set must list unique
+        canonical key ids with the kind's exact shape (rotate/import a single
+        key_id; batch_rotate the full non-empty item set; restore the possibly
+        empty set of newly created keys). Anything else is an
+        :class:`ArtifactInconsistent` programming/corruption error instead of
+        being silently normalized away, so the mirror's cross-reference can
+        never disagree with the operation it mirrors.
         """
         with self._lock:
             kind = facts.get("kind")
             if kind not in _KIND_ACTIONS:
                 raise ArtifactInconsistent("unknown mirror kind: %r" % kind)
-            self.descriptor["kind"] = kind
-            self.descriptor["action"] = facts.get(
-                "action", _KIND_ACTIONS[kind]
-            )
-            write_set = facts.get("write_set")
-            if isinstance(write_set, list):
-                normalized = sorted(
-                    key_id for key_id in write_set
-                    if _is_key_id(key_id)
+            canonical_action = _KIND_ACTIONS[kind]
+            action = facts.get("action", canonical_action)
+            if action != canonical_action:
+                raise ArtifactInconsistent(
+                    "mirror action %r does not match kind %r (%r)"
+                    % (action, kind, canonical_action)
                 )
-                self.descriptor["write_set"] = normalized
+            write_set = facts.get("write_set")
+            normalized = self._validated_write_set(kind, write_set)
+            self.descriptor["kind"] = kind
+            self.descriptor["action"] = action
+            self.descriptor["write_set"] = normalized
             if facts.get("policy") is not None:
                 self.descriptor["policy"] = bool(facts["policy"])
             try:
@@ -179,9 +191,53 @@ class ArtifactMirror:
                 raise ArtifactStrandUnavailable(str(exc), 500)
         return self
 
+    @staticmethod
+    def _validated_write_set(kind: str, write_set) -> List[str]:
+        """The exact, sorted write set a kind may carry, else inconsistent."""
+        if not isinstance(write_set, list):
+            raise ArtifactInconsistent(
+                "mirror write_set must be a list, got %r" % type(write_set)
+            )
+        normalized: List[str] = []
+        seen = set()
+        for key_id in write_set:
+            if not _is_key_id(key_id) or key_id in seen:
+                raise ArtifactInconsistent(
+                    "mirror write_set entry is not a unique UUID4: %r" % (key_id,)
+                )
+            seen.add(key_id)
+            normalized.append(key_id)
+        normalized.sort()
+        if kind in ("rotate", "import") and len(normalized) != 1:
+            raise ArtifactInconsistent(
+                "mirror kind %r requires exactly one write-set key, got %d"
+                % (kind, len(normalized))
+            )
+        if kind == "batch_rotate" and not normalized:
+            raise ArtifactInconsistent(
+                "a batch_rotate mirror requires a non-empty write set"
+            )
+        return normalized
+
     def provision(self, journal_id: str, snapshot: Optional[str] = None) -> None:
-        """Tie the provision journal (and batch snapshot) to the mirror."""
+        """Tie the provision journal (and batch snapshot) to the mirror.
+
+        Both durable artifacts are named after the attempt's operation id, so
+        a reference naming any other id is an inconsistency rather than a
+        quietly stored cross-reference.
+        """
         with self._lock:
+            operation_id = self.operation_id
+            if journal_id != operation_id:
+                raise ArtifactInconsistent(
+                    "provision journal %r does not name operation %r"
+                    % (journal_id, operation_id)
+                )
+            if snapshot is not None and snapshot != operation_id:
+                raise ArtifactInconsistent(
+                    "batch snapshot %r does not name operation %r"
+                    % (snapshot, operation_id)
+                )
             self.descriptor["journal"] = journal_id
             if snapshot is not None:
                 self.descriptor["snapshot"] = snapshot
@@ -204,6 +260,14 @@ class ArtifactMirror:
         """
         with self._lock:
             handles = self.descriptor.setdefault("handles", [])
+            if not isinstance(provider_id, str) or not provider_id:
+                raise ArtifactInconsistent(
+                    "a mirrored handle requires a non-empty provider_id"
+                )
+            if not isinstance(handle, str) or not handle:
+                raise ArtifactInconsistent(
+                    "a mirrored handle requires a non-empty handle"
+                )
             pair = {"provider_id": provider_id, "handle": handle}
             if pair not in handles:
                 handles.append(pair)
@@ -699,11 +763,14 @@ class ArtifactStore:
 
         # Pending operation.
         if event is not None and self._event_confirms(descriptor, event):
-            # Durable success with matching action/tenant: keep the new
-            # versions, clean the mirror once post-commit ownership verifies.
-            # The event is the commit fact regardless of residual markers, so
-            # the operation is never parked on this branch.
-            if self._committed_state_verified(descriptor):
+            # Durable success with matching action/tenant. Keep the new
+            # versions and clean the mirror ONLY once the committed write set,
+            # every surviving reference and the staged 201 response all verify.
+            # The event is the commit fact regardless of residual markers, so a
+            # verification miss parks the evidence but never rolls it back.
+            if self._committed_state_verified(descriptor) and (
+                self._staged_success_response_backed(descriptor, record)
+            ):
                 self.discard(operation_id)
             return
         if event is not None and event.outcome == audit_mod.OUTCOME_SUCCESS:
@@ -711,17 +778,26 @@ class ArtifactStore:
             # an id collision. Neither commit nor rollback is provable.
             self._parked.add(operation_id)
             return
-        # Event absent, or a durable rejected terminal: the attempt never
-        # committed. The outbox recovery has either finished the rollback or
-        # deliberately parked the scene (provider down, corrupt basis).
+        if event is not None and not self._rejected_event_matches(
+            descriptor, record, event
+        ):
+            # A durable event with this id is not the mirror's own rejection
+            # (action/tenant/key/outcome or staged response mismatch): the id
+            # collides with a different terminal. Park rather than replaying.
+            self._parked.add(operation_id)
+            return
+        # Event absent, or a durable rejected terminal that matches: the
+        # attempt never committed its write set. The outbox recovery has
+        # either finished the rollback or deliberately parked the scene
+        # (provider down, corrupt/missing basis).
         if self._residual_evidence(descriptor):
             self._parked.add(operation_id)
             return
         if event is not None:
-            # A durable rejected terminal (403/404/409/503) with no residual
-            # file/journal: the rejection already committed and the operation
-            # store replays its staged result verbatim; the mirror is spent
-            # housekeeping. Never park a decided terminal for a retry.
+            # A durable, matching rejected terminal (403/404/409/503) with no
+            # residual file/journal: the rejection already committed and the
+            # operation store replays its staged result verbatim; the mirror
+            # is spent housekeeping. Never park a decided terminal for a retry.
             self.discard(operation_id)
             return
         # No event and no residual evidence. Decide from whether the provider
@@ -752,33 +828,172 @@ class ArtifactStore:
         """Discard a terminal operation's mirror only when its state verifies."""
         if record.status == "succeeded":
             if event is not None and self._event_confirms(descriptor, event):
-                if self._committed_state_verified(descriptor):
+                if self._committed_state_verified(
+                    descriptor
+                ) and self._staged_success_response_backed(descriptor, record):
                     self.discard(record.operation_id)
             return
-        # failed/conflict/timed_out: uncommitted terminal. The store/restore
-        # recovery removes its artifacts; a surviving journal/snapshot/marker
-        # means cleanup is still retrying and the mirror stays as its index.
+        # failed/conflict/timed_out: an uncommitted terminal. A durable
+        # rejection must still BE this mirror's rejection (action/tenant/
+        # outcome/response agree); the store/restore recovery removes the
+        # artifacts, so a surviving journal/snapshot/marker means cleanup is
+        # still retrying and the mirror stays as its index.
+        if event is not None and not self._rejected_event_matches(
+            descriptor, record, event
+        ):
+            return
         if not self._residual_evidence(descriptor):
             self.discard(record.operation_id)
 
     # -- verification primitives -------------------------------------------
     @staticmethod
-    def _binding_matches(descriptor: dict, record) -> bool:
-        """Whether the mirror is the SAME attempt as the operation record."""
+    def _descriptor_consistent(descriptor: dict, allow_undescribed: bool):
+        """Whether one on-disk mirror descriptor is internally well-formed.
+
+        A descriptor is the cross-index of an attempt, so every reference it
+        carries must already be self-consistent before it is compared against
+        anything else:
+
+        * ``kind`` (once described) is one of the four mirrored mutations and
+          ``action`` is exactly the audit action that kind commits with;
+        * ``write_set`` is a list of unique canonical key ids with the kind's
+          exact shape (rotate/import one key; batch a non-empty set; restore a
+          possibly empty set);
+        * ``handles`` is a duplicate-free list of non-empty
+          ``{provider_id, handle}`` pairs;
+        * the journal/snapshot references name the operation itself and a
+          snapshot only accompanies a batch rotation.
+
+        ``allow_undescribed`` admits a still-``bound`` mirror that crashed
+        before ``describe`` (kind/action unset, empty write set).
+        """
+        if not isinstance(descriptor, dict):
+            return False
+        operation_id = descriptor.get("operation_id")
+        if not _is_uuid4(operation_id):
+            return False
+        for field in ("tenant_id", "operator_id", "path", "request_body"):
+            value = descriptor.get(field)
+            if not isinstance(value, str):
+                return False
+        if not descriptor.get("tenant_id"):
+            return False
+        kind = descriptor.get("kind")
+        action = descriptor.get("action")
+        write_set = descriptor.get("write_set")
+        if kind is None:
+            if not allow_undescribed:
+                return False
+            if action is not None or write_set:
+                return False
+        else:
+            if kind not in _KIND_ACTIONS or action != _KIND_ACTIONS[kind]:
+                return False
+            if not ArtifactStore._valid_write_set_shape(kind, write_set):
+                return False
+        journal = descriptor.get("journal")
+        if journal is not None and journal != operation_id:
+            return False
+        snapshot = descriptor.get("snapshot")
+        if snapshot is not None:
+            if snapshot != operation_id or kind != "batch_rotate":
+                return False
+        empty_marker = descriptor.get("empty_marker")
+        if empty_marker is not None and not isinstance(empty_marker, str):
+            return False
+        if not isinstance(descriptor.get("policy"), bool):
+            return False
+        handles = descriptor.get("handles")
+        if not isinstance(handles, list):
+            return False
+        seen = set()
+        for entry in handles:
+            if not isinstance(entry, dict):
+                return False
+            provider_id = entry.get("provider_id")
+            handle = entry.get("handle")
+            if (
+                not isinstance(provider_id, str)
+                or not provider_id
+                or not isinstance(handle, str)
+                or not handle
+            ):
+                return False
+            pair = (provider_id, handle)
+            if pair in seen:
+                return False
+            seen.add(pair)
+        return True
+
+    @staticmethod
+    def _valid_write_set_shape(kind: str, write_set) -> bool:
+        """The kind's exact write-set shape (unique canonical UUID4s)."""
+        if not isinstance(write_set, list):
+            return False
+        seen = set()
+        for key_id in write_set:
+            if not _is_key_id(key_id) or key_id in seen:
+                return False
+            seen.add(key_id)
+        if kind in ("rotate", "import") and len(seen) != 1:
+            return False
+        if kind == "batch_rotate" and not seen:
+            return False
+        return True
+
+    @staticmethod
+    def _details_correspond(descriptor: dict, record) -> bool:
+        """Whether the operation record's durable details match the mirror.
+
+        The kind/action must correspond to the exact ``key_id`` (rotate/
+        import), ``items`` set (batch rotation) or ``key_ids`` plus policy
+        flag (restore) the executor persisted in ``operations/<id>.json``.
+        A mirror that was never described has nothing yet to correspond.
+        """
+        kind = descriptor.get("kind")
+        if kind is None:
+            return True
+        details = getattr(record, "details", None)
+        if not isinstance(details, dict) or details.get("kind") != kind:
+            return False
+        write_set = descriptor.get("write_set") or []
+        if kind in ("rotate", "import"):
+            return details.get("key_id") == (write_set[0] if write_set else None)
+        if kind == "batch_rotate":
+            items = details.get("items")
+            if not isinstance(items, list):
+                return False
+            item_keys = set()
+            for item in items:
+                if not isinstance(item, dict) or not _is_key_id(
+                    item.get("key_id")
+                ):
+                    return False
+                item_keys.add(item["key_id"])
+            return item_keys == set(write_set)
+        key_ids = details.get("key_ids")
+        if not isinstance(key_ids, list) or sorted(key_ids) != sorted(write_set):
+            return False
+        return bool(details.get("policy_restored")) == bool(
+            descriptor.get("policy")
+        )
+
+    def _binding_matches(self, descriptor: dict, record) -> bool:
+        """Whether the mirror is the SAME attempt as the operation record.
+
+        Compares the full binding (tenant/operator/path/canonical request),
+        requires an internally consistent descriptor, and -- once the mirror
+        is described -- requires the record's durable details to name the
+        exact same kind, key_id/items, write set and policy fact.
+        """
         if descriptor.get("operation_id") != record.operation_id:
             return False
         for field in ("tenant_id", "operator_id", "path", "request_body"):
             if descriptor.get(field) != getattr(record, field):
                 return False
-        kind = descriptor.get("kind")
-        if kind is not None and kind not in _KIND_ACTIONS:
+        if not self._descriptor_consistent(descriptor, allow_undescribed=True):
             return False
-        action = descriptor.get("action")
-        if action is not None and action not in (
-            audit_mod.ACTION_ROTATE,
-            audit_mod.ACTION_BATCH_ROTATE,
-            audit_mod.ACTION_IMPORT,
-        ):
+        if not self._details_correspond(descriptor, record):
             return False
         return True
 
@@ -805,17 +1020,141 @@ class ArtifactStore:
             return False
         return event.action == expected
 
-    def _committed_state_verified(self, descriptor: dict) -> bool:
-        """Verify the committed write set owns every mirror handle.
+    def _rejected_event_matches(self, descriptor: dict, record, event) -> bool:
+        """Whether a durable REJECTED terminal event belongs to this mirror.
 
-        Every write-set key file must exist, belong to the mirror's tenant
-        and carry no unresolved pending marker of another outcome; and every
-        (provider_id, handle) the mirror recorded must be owned by one of the
-        surviving committed versions. The provision journal and a batch
-        snapshot are post-commit housekeeping and must already be gone (a
-        surviving one keeps the mirror for the next open). Marker-clear
-        residue (event already durable) never hides the committed state.
+        A rejection commits no write set, but its event must still name the
+        operation and carry the mirror's action and tenant; rotate/import
+        rejections project the one write-set key while batch/restore events
+        project no key. When the record staged its audit descriptor / result
+        before the append, those durable facts must agree with the event and
+        the staged response must be a refusal (never a 201). Anything less
+        leaves the evidence parked.
         """
+        if event is None or event.outcome != audit_mod.OUTCOME_REJECTED:
+            return False
+        if descriptor.get("kind") is None:
+            return False
+        if event.action != descriptor.get("action"):
+            return False
+        if event.tenant_id != descriptor.get("tenant_id"):
+            return False
+        kind = descriptor.get("kind")
+        write_set = descriptor.get("write_set") or []
+        if kind in ("rotate", "import"):
+            if event.key_id != (write_set[0] if write_set else None):
+                return False
+        elif event.key_id is not None:
+            return False
+        details = getattr(record, "details", None)
+        if isinstance(details, dict):
+            audit_desc = details.get("audit")
+            if isinstance(audit_desc, dict):
+                if audit_desc.get("action") not in (None, event.action):
+                    return False
+                if audit_desc.get("outcome") not in (
+                    None, audit_mod.OUTCOME_REJECTED
+                ):
+                    return False
+                if audit_desc.get("tenant_id") not in (None, event.tenant_id):
+                    return False
+            result = details.get("result")
+            if isinstance(result, dict) and result.get("http_status") == 201:
+                # A staged 201 response cannot share an id with a rejection.
+                return False
+        return True
+
+    def _staged_success_response_backed(
+        self, descriptor: dict, record
+    ) -> bool:
+        """Whether a staged 201 response is backed by the committed write set.
+
+        Startup settlement uses this when the operation record persisted its
+        exact success response before the commit-point append: the on-disk
+        committed state must actually support that response (the named
+        versions exist; a restore's key set and policy flag match). Records
+        without a staged response (older bindings, crafted recovery scenes)
+        skip this and rely on the artifact checks alone.
+        """
+        details = getattr(record, "details", None)
+        if not isinstance(details, dict):
+            return True
+        result = details.get("result")
+        if not isinstance(result, dict):
+            return True
+        http_status = result.get("http_status")
+        response = result.get("response")
+        if http_status is None and response is None:
+            return True
+        if http_status != 201 or not isinstance(response, dict):
+            return False
+        kind = descriptor.get("kind")
+        tenant_id = descriptor.get("tenant_id")
+        write_set = descriptor.get("write_set") or []
+        if kind in ("rotate", "import"):
+            key_id = write_set[0] if write_set else None
+            if response.get("key_id") != key_id:
+                return False
+            key = self.key_store._read_record(self.key_store._path_for(key_id))
+            if key is None or key.tenant_id != tenant_id:
+                return False
+            if kind == "rotate":
+                version = response.get("version")
+                if not isinstance(version, int) or key.get_version(version) is None:
+                    return False
+        elif kind == "batch_rotate":
+            items = response.get("items")
+            if not isinstance(items, list):
+                return False
+            response_keys = set()
+            for item in items:
+                if not isinstance(item, dict):
+                    return False
+                key_id = item.get("key_id")
+                if not _is_key_id(key_id):
+                    return False
+                response_keys.add(key_id)
+                key = self.key_store._read_record(
+                    self.key_store._path_for(key_id)
+                )
+                if key is None or key.tenant_id != tenant_id:
+                    return False
+                version = item.get("version")
+                if not isinstance(version, int) or key.get_version(version) is None:
+                    return False
+            if response_keys != set(write_set):
+                return False
+        elif kind == "restore":
+            key_ids = response.get("key_ids")
+            if not isinstance(key_ids, list) or sorted(key_ids) != sorted(
+                write_set
+            ):
+                return False
+            if response.get("policy_restored") != bool(descriptor.get("policy")):
+                return False
+            for key_id in write_set:
+                key = self.key_store._read_record(
+                    self.key_store._path_for(key_id)
+                )
+                if key is None or key.tenant_id != tenant_id:
+                    return False
+        return True
+
+    def _committed_state_verified(self, descriptor: dict) -> bool:
+        """Verify the committed write set and every surviving reference.
+
+        Every write-set key file must exist, belong to the mirror's tenant,
+        carry no unresolved pending marker of this operation and own every
+        (provider_id, handle) the mirror recorded; a restore that carried a
+        policy leaves the tenant's committed policy document, and an empty
+        restore leaves its finalized (event-cleared) marker. The provision
+        journal and a batch snapshot are post-commit housekeeping and must
+        already be gone. Finally every surviving on-disk reference must be
+        cross-consistent with the mirror (a missing/corrupt/duplicate/extra
+        reference keeps the mirror for the next open).
+        """
+        if not self._descriptor_consistent(descriptor, allow_undescribed=False):
+            return False
         operation_id = descriptor["operation_id"]
         journal_id = descriptor.get("journal") or operation_id
         if os.path.exists(self.key_store._provision_path(journal_id)):
@@ -824,11 +1163,17 @@ class ArtifactStore:
             self.key_store._batch_snapshot_path(descriptor["snapshot"])
         ):
             return False
+        kind = descriptor.get("kind")
         tenant_id = descriptor.get("tenant_id")
         owned = set()
         for key_id in descriptor.get("write_set", []):
             record = self.key_store._read_record(self.key_store._path_for(key_id))
             if record is None or record.tenant_id != tenant_id:
+                return False
+            marker = getattr(record, "pending_event", None)
+            if isinstance(marker, dict) and self._marker_event_id(
+                marker
+            ) == operation_id:
                 return False
             for ver in record.versions:
                 owned.add((ver.provider_id, ver.handle))
@@ -837,15 +1182,371 @@ class ArtifactStore:
             for entry in descriptor.get("handles", [])
             if isinstance(entry, dict)
         }
-        return expected.issubset(owned)
+        if not expected.issubset(owned):
+            return False
+        if kind == "restore" and not self._committed_restore_extras_verified(
+            descriptor
+        ):
+            return False
+        if not self._surviving_artifacts_consistent(descriptor):
+            return False
+        return True
+
+    def _committed_restore_extras_verified(self, descriptor: dict) -> bool:
+        """Committed restore policy document and empty-restore marker checks."""
+        tenant_id = descriptor.get("tenant_id")
+        if descriptor.get("policy"):
+            doc = self._read_policy_doc(self._policy_doc_path(tenant_id))
+            if doc is None:
+                return False
+            owner, pending = doc
+            if owner != tenant_id:
+                return False
+            if isinstance(pending, dict) and self._marker_event_id(
+                pending
+            ) == descriptor.get("operation_id"):
+                return False
+        if not descriptor.get("write_set") and not descriptor.get("policy"):
+            # An empty restore commits only its persistent marker: it must
+            # survive, be finalized (event cleared) and name this tenant.
+            path = descriptor.get("empty_marker")
+            if not isinstance(path, str) or not os.path.exists(path):
+                return False
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    marker = json.load(fh)
+            except (OSError, ValueError):
+                return False
+            if not isinstance(marker, dict) or not marker.get("_empty"):
+                return False
+            if marker.get("tenant_id") != tenant_id or marker.get("event") is not None:
+                return False
+        return True
+
+    def _policy_doc_path(self, tenant_id: str) -> str:
+        # Mirror PolicyStore._path_for WITHOUT constructing a PolicyStore: its
+        # constructor runs outbox recovery, which a read-only verification must
+        # never trigger as a side effect.
+        digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()
+        return os.path.join(self.data_dir, "policies", digest + ".json")
+
+    def _read_policy_doc(self, path: str):
+        """Read (tenant_id, pending_event) from a policy file, side-effect free.
+
+        Rules are not validated here -- only the owning tenant and the pending
+        marker are cross-checked -- so this never instantiates PolicyStore (and
+        never runs its startup outbox recovery). Returns None when the file is
+        absent or unreadable.
+        """
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(doc, dict):
+            return None
+        return doc.get("tenant_id"), doc.get("pending_event")
+
+    # -- surviving-artifact cross-validation -------------------------------
+    def _surviving_artifacts_consistent(self, descriptor: dict) -> bool:
+        """Whether every surviving on-disk reference cross-agrees.
+
+        Returns False when a surviving reference is missing, corrupt,
+        duplicated or carries more/fewer facts than the mirror; the caller
+        then keeps the whole evidence set. Absence of an artifact the attempt
+        legitimately removed is fine.
+        """
+        try:
+            self._journal_verdict(descriptor)
+            kind = descriptor.get("kind")
+            if kind == "batch_rotate":
+                self._snapshot_verdict(descriptor)
+            elif descriptor.get("snapshot"):
+                return False
+            if kind == "restore":
+                self._restore_artifacts_verdict(descriptor)
+            elif isinstance(descriptor.get("empty_marker"), str):
+                return False
+        except ArtifactInconsistent:
+            return False
+        return True
+
+    def _journal_verdict(self, descriptor: dict) -> None:
+        """Cross-check a surviving provision journal against the mirror.
+
+        Compares the journal's operation header (operation_id/tenant/action)
+        and its exact provider_id/handle SET with the mirror: a corrupt,
+        duplicated or extra entry is an inconsistency. Legacy headerless
+        journals keep id-only resolution, but their handle set must still
+        equal the mirror's. Absence is fine. Raises ArtifactInconsistent.
+        """
+        operation_id = descriptor["operation_id"]
+        journal_id = descriptor.get("journal") or operation_id
+        path = self.key_store._provision_path(journal_id)
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                raw_lines = [
+                    line for line in fh.read().splitlines() if line.strip()
+                ]
+        except OSError as exc:
+            raise ArtifactInconsistent(str(exc))
+        entries = []
+        header = None
+        for index, raw in enumerate(raw_lines):
+            try:
+                line = json.loads(raw)
+            except ValueError:
+                raise ArtifactInconsistent("corrupt provision journal line")
+            if not isinstance(line, dict):
+                raise ArtifactInconsistent(
+                    "provision journal line is not an object"
+                )
+            if index == 0 and "operation_id" in line:
+                header = line
+                continue
+            provider_id = line.get("provider_id")
+            handle = line.get("handle")
+            if not (
+                isinstance(provider_id, str)
+                and provider_id
+                and isinstance(handle, str)
+                and handle
+            ):
+                raise ArtifactInconsistent("provision journal entry is malformed")
+            entries.append((provider_id, handle))
+        kind = descriptor.get("kind")
+        if header is not None:
+            if header.get("operation_id") != journal_id:
+                raise ArtifactInconsistent(
+                    "provision journal header names another operation"
+                )
+            if kind is not None:
+                if header.get("tenant_id") != descriptor.get("tenant_id"):
+                    raise ArtifactInconsistent(
+                        "provision journal tenant disagrees with the mirror"
+                    )
+                if header.get("action") != descriptor.get("action"):
+                    raise ArtifactInconsistent(
+                        "provision journal action disagrees with the mirror"
+                    )
+        pairs = set()
+        for pair in entries:
+            if pair in pairs:
+                raise ArtifactInconsistent(
+                    "duplicate handle entry in provision journal"
+                )
+            pairs.add(pair)
+        mirrored = {
+            (entry.get("provider_id"), entry.get("handle"))
+            for entry in descriptor.get("handles", [])
+            if isinstance(entry, dict)
+        }
+        if pairs != mirrored:
+            raise ArtifactInconsistent(
+                "provision journal handle set disagrees with the mirror"
+            )
+
+    @staticmethod
+    def _marker_event_id(marker) -> Optional[str]:
+        """The event id a (possibly nested) pending marker names."""
+        if not isinstance(marker, dict):
+            return None
+        nested = marker.get("event")
+        desc = nested if isinstance(nested, dict) else marker
+        event_id = desc.get("event_id") if isinstance(desc, dict) else None
+        return event_id if isinstance(event_id, str) else None
+
+    def _scan_pending_markers(self, operation_id: str) -> list:
+        """All surviving pending markers (key files, policy doc) naming an id."""
+        found = []
+        try:
+            names = os.listdir(self.data_dir)
+        except OSError:
+            return found
+        for name in names:
+            if not (name.endswith(".json") and _is_key_id(name[:-5])):
+                continue
+            record = self.key_store._read_record(os.path.join(self.data_dir, name))
+            marker = getattr(record, "pending_event", None)
+            if isinstance(marker, dict) and self._marker_event_id(
+                marker
+            ) == operation_id:
+                found.append(("key", record.key_id, marker))
+        policy_dir = os.path.join(self.data_dir, "policies")
+        try:
+            policy_names = os.listdir(policy_dir)
+        except OSError:
+            return found
+        for name in policy_names:
+            if not name.endswith(".json"):
+                continue
+            path = os.path.join(policy_dir, name)
+            doc = self._read_policy_doc(path)
+            owner = None
+            pending = None
+            if doc is None:
+                try:
+                    with open(path, "r", encoding="utf-8") as fh:
+                        raw = json.load(fh)
+                except (OSError, ValueError):
+                    continue
+                if isinstance(raw, dict):
+                    owner = raw.get("tenant_id")
+                    pending = raw.get("pending_event")
+            else:
+                owner, pending = doc
+            if isinstance(pending, dict) and self._marker_event_id(
+                pending
+            ) == operation_id:
+                found.append(("policy", owner, pending))
+        return found
+
+    def _snapshot_verdict(self, descriptor: dict) -> None:
+        """Cross-check a surviving batch snapshot against the mirror.
+
+        Filename/event id, tenant, the exact key_id set, and every
+        ``previous_b64`` image (strictly decoded into a tenant-matching,
+        version-contiguous KeyRecord with no pending marker) must agree with
+        the mirror and with every residual batch marker. A surviving snapshot
+        the mirror never named, or a referenced but corrupt/mismatched one,
+        is an inconsistency.
+        """
+        operation_id = descriptor["operation_id"]
+        tenant_id = descriptor.get("tenant_id")
+        referenced = descriptor.get("snapshot")
+        expected_id = referenced or operation_id
+        path = self.key_store._batch_snapshot_path(expected_id)
+        present = os.path.exists(path)
+        if referenced is None:
+            if present:
+                raise ArtifactInconsistent(
+                    "unnamed batch snapshot survives for the operation"
+                )
+            return
+        if not present:
+            # Referenced but gone: legitimate only after a verified rollback;
+            # the residual-marker scan decides whether files still need it.
+            return
+        raw = self.key_store._read_batch_snapshot(expected_id)
+        if not isinstance(raw, dict):
+            raise ArtifactInconsistent("batch snapshot is missing or corrupt")
+        if raw.get("event_id") != expected_id:
+            raise ArtifactInconsistent(
+                "batch snapshot event_id disagrees with its filename"
+            )
+        if raw.get("tenant_id") != tenant_id:
+            raise ArtifactInconsistent(
+                "batch snapshot tenant disagrees with the mirror"
+            )
+        snapshot_keys = set()
+        for entry in raw.get("keys", []):
+            if not isinstance(entry, dict) or not _is_key_id(entry.get("key_id")):
+                raise ArtifactInconsistent("batch snapshot key entry is malformed")
+            snapshot_keys.add(entry["key_id"])
+        if snapshot_keys != set(descriptor.get("write_set", [])):
+            raise ArtifactInconsistent(
+                "batch snapshot key set disagrees with the mirror write set"
+            )
+        markers = [
+            marker
+            for _where, _owner, marker in self._scan_pending_markers(
+                operation_id
+            )
+            if isinstance(marker, dict) and marker.get("_batch_rotate")
+        ]
+        if self.key_store._validated_batch_snapshot(
+            expected_id, raw, markers
+        ) is None:
+            raise ArtifactInconsistent(
+                "batch snapshot contents or residual markers are invalid"
+            )
+
+    def _restore_artifacts_verdict(self, descriptor: dict) -> None:
+        """Cross-check surviving restore markers (multi-file and empty)."""
+        operation_id = descriptor["operation_id"]
+        tenant_id = descriptor.get("tenant_id")
+        write_set = set(descriptor.get("write_set", []))
+        for where, owner, marker in self._scan_pending_markers(operation_id):
+            if not isinstance(marker, dict) or not marker.get("_restore"):
+                raise ArtifactInconsistent(
+                    "a pending marker naming the restore is not a restore marker"
+                )
+            if marker.get("_empty"):
+                continue
+            desc = marker.get("event")
+            if not isinstance(desc, dict):
+                raise ArtifactInconsistent("restore marker carries no event")
+            if desc.get("event_id") != operation_id:
+                raise ArtifactInconsistent("restore marker names another event")
+            if desc.get("action") != audit_mod.ACTION_IMPORT:
+                raise ArtifactInconsistent(
+                    "restore marker event action is not import"
+                )
+            if desc.get("tenant_id") != tenant_id or marker.get(
+                "tenant_id"
+            ) != tenant_id:
+                raise ArtifactInconsistent(
+                    "restore marker tenant disagrees with the mirror"
+                )
+            key_ids = marker.get("key_ids")
+            if not isinstance(key_ids, list) or set(key_ids) != write_set:
+                raise ArtifactInconsistent(
+                    "restore marker write set disagrees with the mirror"
+                )
+            if bool(marker.get("policy")) != bool(descriptor.get("policy")):
+                raise ArtifactInconsistent(
+                    "restore marker policy flag disagrees with the mirror"
+                )
+            journal = marker.get("journal")
+            if journal is not None and journal != operation_id:
+                raise ArtifactInconsistent(
+                    "restore marker journal does not name the operation"
+                )
+            if where == "policy" and owner != tenant_id:
+                raise ArtifactInconsistent(
+                    "restored policy document names another tenant"
+                )
+        empty_path = descriptor.get("empty_marker")
+        if isinstance(empty_path, str) and os.path.exists(empty_path):
+            try:
+                with open(empty_path, "r", encoding="utf-8") as fh:
+                    marker = json.load(fh)
+            except (OSError, ValueError):
+                raise ArtifactInconsistent("empty restore marker is corrupt")
+            if not isinstance(marker, dict) or not marker.get("_empty"):
+                raise ArtifactInconsistent("empty restore marker is malformed")
+            if marker.get("tenant_id") != tenant_id:
+                raise ArtifactInconsistent(
+                    "empty restore marker tenant disagrees with the mirror"
+                )
+            event = marker.get("event")
+            if event is None:
+                return
+            if not isinstance(event, dict):
+                raise ArtifactInconsistent(
+                    "empty restore marker event is malformed"
+                )
+            if event.get("event_id") != operation_id:
+                raise ArtifactInconsistent(
+                    "empty restore marker names another event"
+                )
+            if (
+                event.get("action") != audit_mod.ACTION_IMPORT
+                or event.get("tenant_id") != tenant_id
+            ):
+                raise ArtifactInconsistent(
+                    "empty restore marker event disagrees with the mirror"
+                )
 
     def _residual_evidence(self, descriptor: dict) -> bool:
         """Whether uncommitted-attempt artifacts still survive on disk.
 
         Scans the provision journal, the batch snapshot, the restore empty
-        marker and every key file carrying a pending marker named after this
-        operation. The outbox recovery leaves these in place exactly while it
-        is parking the scene (unreadable ledger, unreachable provider,
+        marker and every key/policy file carrying a pending marker named after
+        this operation. The outbox recovery leaves these in place exactly while
+        it is parking the scene (unreadable ledger, unreachable provider,
         corrupt/missing basis, id collision); while any survives the mirror
         cannot be dropped.
         """
@@ -862,7 +1563,7 @@ class ArtifactStore:
             empty_marker, operation_id
         ):
             return True
-        return self._marker_names_event(operation_id)
+        return bool(self._scan_pending_markers(operation_id))
 
     def _pending_empty_marker(self, path: str, operation_id: str) -> bool:
         """An empty-restore marker still carrying THIS pending event."""
@@ -878,52 +1579,6 @@ class ArtifactStore:
         event = marker.get("event")
         if isinstance(event, dict):
             return event.get("event_id") == operation_id
-        return False
-
-    def _marker_names_event(self, operation_id: str) -> bool:
-        """Whether any key file still carries a pending marker for this id."""
-        directory = self.data_dir
-        try:
-            names = os.listdir(directory)
-        except OSError:
-            # Cannot scan: assume evidence may survive and retain the mirror.
-            return True
-        for name in names:
-            if not (name.endswith(".json") and _is_key_id(name[:-5])):
-                continue
-            record = self.key_store._read_record(os.path.join(directory, name))
-            marker = getattr(record, "pending_event", None)
-            if not isinstance(marker, dict):
-                continue
-            nested = marker.get("event")
-            desc = nested if isinstance(nested, dict) else marker
-            if isinstance(desc, dict) and desc.get("event_id") == operation_id:
-                return True
-        # Policy files can carry the shared restore marker too.
-        policy_dir = os.path.join(self.data_dir, "policies")
-        try:
-            policy_names = os.listdir(policy_dir)
-        except OSError:
-            return False
-        for name in policy_names:
-            if not name.endswith(".json"):
-                continue
-            try:
-                with open(
-                    os.path.join(policy_dir, name), "r", encoding="utf-8"
-                ) as fh:
-                    doc = json.load(fh)
-            except (OSError, ValueError):
-                continue
-            if not isinstance(doc, dict):
-                continue
-            pending = doc.get("pending_event")
-            if not isinstance(pending, dict):
-                continue
-            nested = pending.get("event")
-            desc = nested if isinstance(nested, dict) else pending
-            if isinstance(desc, dict) and desc.get("event_id") == operation_id:
-                return True
         return False
 
 
