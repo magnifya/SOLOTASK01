@@ -60,6 +60,9 @@ PHASE_ROLLED_BACK = "rolled_back"  # new handles deleted / old set restored
 
 _DIR_NAME = "operation-artifacts"
 
+# An empty restore persists its idempotency marker under this data-dir prefix.
+_EMPTY_MARKER_PREFIX = "restore-empty-"
+
 # Kinds and the audit action each commits with.
 _KIND_ACTIONS = {
     "rotate": audit_mod.ACTION_ROTATE,
@@ -67,6 +70,61 @@ _KIND_ACTIONS = {
     "import": audit_mod.ACTION_IMPORT,
     "restore": audit_mod.ACTION_IMPORT,
 }
+
+
+def _operation_kind(record) -> Optional[str]:
+    """The mutation kind an operation record's details declare, else None."""
+    details = getattr(record, "details", None)
+    if not isinstance(details, dict):
+        return None
+    kind = details.get("kind")
+    return kind if kind in _KIND_ACTIONS else None
+
+
+def _operation_write_set(record) -> Optional[List[str]]:
+    """The exact key_id write set the operation details declare, else None.
+
+    Returns None when the operation recorded no kind facts yet (a crash
+    between the bind and the executor's facts landing), or a list (possibly
+    empty) once they are durable. Rotate/import own one key; batch-rotate
+    owns the full request item set; restore owns every key in the bundle.
+    Only canonical lowercase UUID4 values are accepted, so a corrupt
+    details value never agrees with a mirror by accident.
+    """
+    kind = _operation_kind(record)
+    if kind is None:
+        return None
+    details = record.details
+    if kind in ("rotate", "import"):
+        raw = [details.get("key_id")]
+    elif kind == "batch_rotate":
+        items = details.get("items")
+        if not isinstance(items, list):
+            return []
+        raw = []
+        for item in items:
+            if not isinstance(item, dict):
+                return None
+            raw.append(item.get("key_id"))
+    else:  # restore
+        raw = details.get("key_ids")
+        if not isinstance(raw, list):
+            return []
+    write_set = []
+    for key_id in raw:
+        if not _is_key_id(key_id):
+            return None
+        write_set.append(key_id)
+    return sorted(write_set)
+
+
+def _operation_policy_flag(record) -> Optional[bool]:
+    """Whether a restore's details record a policy write; None if unstated."""
+    if _operation_kind(record) != "restore":
+        return None
+    details = record.details or {}
+    flag = details.get("policy_restored")
+    return bool(flag) if isinstance(flag, bool) else None
 
 
 class ArtifactInconsistent(Exception):
@@ -713,7 +771,15 @@ class ArtifactStore:
             return
         # Event absent, or a durable rejected terminal: the attempt never
         # committed. The outbox recovery has either finished the rollback or
-        # deliberately parked the scene (provider down, corrupt basis).
+        # deliberately parked the scene (provider down, corrupt basis). Before
+        # trusting either outcome, cross-check every surviving referenced
+        # artifact (journal / batch snapshot / restore marker) against the
+        # mirror: a missing fact, corruption, a duplicate/extra/different
+        # handle or a mismatched write set means the durable records do not
+        # prove one attempt and the ENTIRE evidence set is retained.
+        if not self._references_consistent(descriptor):
+            self._parked.add(operation_id)
+            return
         if self._residual_evidence(descriptor):
             self._parked.add(operation_id)
             return
@@ -721,7 +787,16 @@ class ArtifactStore:
             # A durable rejected terminal (403/404/409/503) with no residual
             # file/journal: the rejection already committed and the operation
             # store replays its staged result verbatim; the mirror is spent
-            # housekeeping. Never park a decided terminal for a retry.
+            # housekeeping. Never park a decided terminal for a retry. But the
+            # rejected event must still name THIS operation (id), tenant,
+            # action and outcome and the staged response must be present; a
+            # durable rejected event of a different action/tenant is an id
+            # collision and parks the evidence rather than being adopted.
+            if not self._rejected_event_consistent(
+                descriptor, record, event
+            ):
+                self._parked.add(operation_id)
+                return
             self.discard(operation_id)
             return
         # No event and no residual evidence. Decide from whether the provider
@@ -758,13 +833,208 @@ class ArtifactStore:
         # failed/conflict/timed_out: uncommitted terminal. The store/restore
         # recovery removes its artifacts; a surviving journal/snapshot/marker
         # means cleanup is still retrying and the mirror stays as its index.
+        # A durable rejected event that does not actually match this attempt
+        # (an id collision) is likewise retained as evidence -- the recorded
+        # terminal is never rewritten, but the mirror is not discarded over a
+        # fact the ledger does not support.
+        if (
+            event is not None
+            and event.outcome == audit_mod.OUTCOME_REJECTED
+            and not self._rejected_event_consistent(descriptor, record, event)
+        ):
+            return
         if not self._residual_evidence(descriptor):
             self.discard(record.operation_id)
 
+    def _references_consistent(self, descriptor: dict) -> bool:
+        """Cross-check every surviving referenced artifact against the mirror.
+
+        Used on the uncommitted settlement path. A referenced artifact that
+        has already been removed (a rolled-back journal/snapshot/marker) is
+        consistent with a finished rollback; one that SURVIVES must agree
+        exactly with the mirror (operation/tenant/action, handle and write
+        sets). A corrupt or mismatched artifact returns False so the caller
+        parks the whole evidence set instead of guessing.
+        """
+        # The provision journal, when it survives, must name this operation,
+        # tenant and action and list exactly the mirror's new handles.
+        if self._journal_consistent(descriptor) is False:
+            return False
+        # A surviving batch snapshot must name this event/tenant, list exactly
+        # the mirror's write set, and decode every previous_b64 into a
+        # tenant-matching, version-contiguous KeyRecord with no pending marker.
+        if self._snapshot_consistent(descriptor) is False:
+            return False
+        # Every surviving outbox marker (single-key, restore, batch or empty)
+        # must agree with the mirror on event/tenant/action, references, the
+        # write set and the policy flag.
+        if not self._markers_consistent(descriptor):
+            return False
+        return True
+
+    def _snapshot_candidate(self, descriptor: dict) -> Optional[str]:
+        """The batch-snapshot id a mirror could reference, if applicable."""
+        snapshot_id = descriptor.get("snapshot")
+        if isinstance(snapshot_id, str) and snapshot_id:
+            return snapshot_id
+        if descriptor.get("kind") == "batch_rotate":
+            # The snapshot is always named after the event/operation id; a
+            # surviving file is evidence even if the descriptor field is
+            # missing (a torn mirror rewrite).
+            return descriptor["operation_id"]
+        return None
+
+    def _snapshot_consistent(self, descriptor: dict) -> Optional[bool]:
+        """Cross-check a surviving batch snapshot against the mirror.
+
+        None when no snapshot survives, True when present and fully valid
+        (filename/payload event id, tenant, the mirror's exact unique key_id
+        set, and every ``previous_b64`` strictly decoded into a tenant-matching
+        version-contiguous pending-free KeyRecord), False on any corruption or
+        mismatch.
+        """
+        if self.key_store is None:
+            return False
+        snapshot_id = self._snapshot_candidate(descriptor)
+        if snapshot_id is None:
+            return None
+        path = self.key_store._batch_snapshot_path(snapshot_id)
+        if not os.path.exists(path):
+            return None
+        # Presence of a corrupt file still counts: _read_batch_snapshot
+        # returns None for an unreadable/torn payload.
+        raw = self.key_store._read_batch_snapshot(snapshot_id)
+        if raw is None:
+            return False
+        if raw.get("event_id") != snapshot_id:
+            return False
+        if raw.get("tenant_id") != descriptor.get("tenant_id"):
+            return False
+        # Strictly validate the payload: id shape, unique keys, and each
+        # previous_b64 decoded into a trusted pre-batch KeyRecord. An empty
+        # marker set still enforces all payload/previous_b64 rules.
+        entries = self.key_store._validated_batch_snapshot(
+            snapshot_id, raw, []
+        )
+        if entries is None:
+            return False
+        snapshot_keys = {key_id for key_id, _bytes, _rec in entries}
+        mirror_keys = set(descriptor.get("write_set", []))
+        return snapshot_keys == mirror_keys
+
     # -- verification primitives -------------------------------------------
+    def _read_journal(self, journal_id: str):
+        """Parse a provision journal into ``(header, entries)``.
+
+        ``header`` is the first-line operation header dict (or None for a
+        legacy headerless journal); ``entries`` is the ordered list of
+        ``(provider_id, handle)`` pairs. Returns None when the journal file
+        is unreadable or carries a torn/unknown line -- the caller treats
+        that as corrupt evidence and parks rather than guessing.
+        """
+        path = self.key_store._provision_path(journal_id)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                lines = fh.readlines()
+        except OSError:
+            return None
+        header = None
+        entries = []
+        for index, raw_line in enumerate(lines):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                return None
+            if not isinstance(obj, dict):
+                return None
+            if "operation_id" in obj:
+                # The operation header is only valid as the FIRST object.
+                if index != 0 or entries:
+                    return None
+                header = obj
+                continue
+            provider_id = obj.get("provider_id")
+            handle = obj.get("handle")
+            if not (
+                isinstance(provider_id, str) and provider_id
+                and isinstance(handle, str) and handle
+            ):
+                return None
+            entries.append((provider_id, handle))
+        return header, entries
+
+    def _journal_consistent(self, descriptor: dict) -> Optional[bool]:
+        """Cross-check a surviving provision journal against the mirror.
+
+        Returns None when no journal survives, True when it is present and
+        fully consistent, False when present but missing facts, corrupt,
+        duplicated, or carrying a different operation/tenant/action or a
+        handle set that is not EXACTLY the mirror's ordered unique new-handle
+        set (a missing handle orphans a backend object; an extra or repeated
+        one proves the two durable records describe different attempts).
+        """
+        if self.key_store is None:
+            return False
+        operation_id = descriptor["operation_id"]
+        journal_id = descriptor.get("journal") or operation_id
+        path = self.key_store._provision_path(journal_id)
+        if not os.path.exists(path):
+            return None
+        parsed = self._read_journal(journal_id)
+        if parsed is None:
+            return False
+        header, entries = parsed
+        if header is not None:
+            if header.get("operation_id") != journal_id:
+                return False
+            tenant = header.get("tenant_id")
+            if isinstance(tenant, str) and tenant and tenant != descriptor.get(
+                "tenant_id"
+            ):
+                return False
+            action = header.get("action")
+            if isinstance(action, str) and action:
+                expected = descriptor.get("action") or _KIND_ACTIONS.get(
+                    descriptor.get("kind")
+                )
+                if expected is not None and action != expected:
+                    return False
+        # The journal must list each new handle exactly once, and no others.
+        if len(set(entries)) != len(entries):
+            return False
+        journal_handles = set(entries)
+        mirror_handles = set()
+        for entry in descriptor.get("handles", []):
+            if not isinstance(entry, dict):
+                return False
+            provider_id = entry.get("provider_id")
+            handle = entry.get("handle")
+            if not (
+                isinstance(provider_id, str) and provider_id
+                and isinstance(handle, str) and handle
+            ):
+                return False
+            mirror_handles.add((provider_id, handle))
+        if len(descriptor.get("handles", [])) != len(mirror_handles):
+            return False
+        return journal_handles == mirror_handles
+
     @staticmethod
     def _binding_matches(descriptor: dict, record) -> bool:
-        """Whether the mirror is the SAME attempt as the operation record."""
+        """Whether the mirror is the SAME attempt as the operation record.
+
+        The identity facts (operation id, tenant, operator, path, canonical
+        request) must be identical, and -- once the mirror has been described
+        with the attempt's kind -- the kind/action pair and the exact write
+        set must agree with the operation's durable details: a rotate/import
+        mirror names the operation's single key_id, a batch mirror names its
+        full item set, and a restore mirror names the bundle keys and its
+        policy flag. Any disagreement means the two durable records prove
+        different attempts and nothing can be guessed.
+        """
         if descriptor.get("operation_id") != record.operation_id:
             return False
         for field in ("tenant_id", "operator_id", "path", "request_body"):
@@ -780,7 +1050,78 @@ class ArtifactStore:
             audit_mod.ACTION_IMPORT,
         ):
             return False
+        if kind is not None:
+            # kind/action must correspond; a described mirror always carries
+            # the action its kind commits with.
+            if action != _KIND_ACTIONS[kind]:
+                return False
+            # The mirror's kind must be the operation's durable kind: a rotate
+            # mirror cannot describe an import operation even if both happen to
+            # write one key.
+            op_kind = _operation_kind(record)
+            if op_kind is not None and op_kind != kind:
+                return False
+            # The write set must equal the operation's durable key facts.
+            op_write_set = _operation_write_set(record)
+            if op_write_set is not None:
+                mirror_write_set = descriptor.get("write_set")
+                if not isinstance(mirror_write_set, list):
+                    return False
+                if sorted(mirror_write_set) != op_write_set:
+                    return False
+            if kind == "restore":
+                op_policy = _operation_policy_flag(record)
+                if op_policy is not None and bool(
+                    descriptor.get("policy")
+                ) != op_policy:
+                    return False
         return True
+
+    def _rejected_event_consistent(self, descriptor, record, event) -> bool:
+        """Whether a durable rejected event is exactly this attempt's terminal.
+
+        The event must carry the operation id (by lookup), the rejected
+        outcome, the mirror's tenant and action, and agree with the terminal
+        audit descriptor staged in the operation record; a staged result
+        (http status + response) must also be durable so the rejection can be
+        replayed verbatim. A mismatch is an id collision and parks the scene.
+        """
+        if event is None or event.outcome != audit_mod.OUTCOME_REJECTED:
+            return False
+        tenant = descriptor.get("tenant_id")
+        if tenant is not None and event.tenant_id != tenant:
+            return False
+        kind = descriptor.get("kind")
+        expected = descriptor.get("action") or _KIND_ACTIONS.get(kind)
+        if expected is not None and event.action != expected:
+            return False
+        details = getattr(record, "details", None)
+        if not isinstance(details, dict):
+            return False
+        audit_desc = details.get("audit")
+        if isinstance(audit_desc, dict):
+            action = audit_desc.get("action")
+            if isinstance(action, str) and action and event.action != action:
+                return False
+            outcome = audit_desc.get("outcome")
+            if isinstance(outcome, str) and outcome and (
+                outcome != audit_mod.OUTCOME_REJECTED
+            ):
+                return False
+            audited_tenant = audit_desc.get("tenant_id")
+            if (
+                isinstance(audited_tenant, str)
+                and audited_tenant
+                and audited_tenant != event.tenant_id
+            ):
+                return False
+        # The exact rejection response must be staged for verbatim replay.
+        result = details.get("result")
+        if not isinstance(result, dict):
+            return False
+        return isinstance(result.get("http_status"), int) and isinstance(
+            result.get("response"), dict
+        )
 
     @staticmethod
     def _event_confirms(descriptor: dict, event) -> bool:
@@ -820,8 +1161,9 @@ class ArtifactStore:
         journal_id = descriptor.get("journal") or operation_id
         if os.path.exists(self.key_store._provision_path(journal_id)):
             return False
-        if descriptor.get("snapshot") and os.path.exists(
-            self.key_store._batch_snapshot_path(descriptor["snapshot"])
+        snapshot_id = self._snapshot_candidate(descriptor)
+        if snapshot_id is not None and os.path.exists(
+            self.key_store._batch_snapshot_path(snapshot_id)
         ):
             return False
         tenant_id = descriptor.get("tenant_id")
@@ -853,8 +1195,9 @@ class ArtifactStore:
         journal_id = descriptor.get("journal") or operation_id
         if os.path.exists(self.key_store._provision_path(journal_id)):
             return True
-        if descriptor.get("snapshot") and os.path.exists(
-            self.key_store._batch_snapshot_path(descriptor["snapshot"])
+        snapshot_id = self._snapshot_candidate(descriptor)
+        if snapshot_id is not None and os.path.exists(
+            self.key_store._batch_snapshot_path(snapshot_id)
         ):
             return True
         empty_marker = descriptor.get("empty_marker")
@@ -879,6 +1222,224 @@ class ArtifactStore:
         if isinstance(event, dict):
             return event.get("event_id") == operation_id
         return False
+
+    def _scan_operation_markers(
+        self, operation_id: str, pinned_path: Optional[str] = None
+    ) -> dict:
+        """Collect every surviving outbox marker naming this operation.
+
+        Returns ``{"key": [marker, ...], "policy": [marker, ...],
+        "empty": [marker, ...], "corrupt": bool}``. Key/policy markers come
+        from the pending_event of the write-set files and the policy document;
+        empty markers from the ``restore-empty-*`` idempotency files. A file
+        that exists at a referenced marker path (including the path the mirror
+        pins) but cannot be parsed sets ``corrupt`` so the caller parks rather
+        than trusting a partial scan.
+        """
+        found = {"key": [], "policy": [], "empty": [], "corrupt": False}
+        directory = self.data_dir
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            found["corrupt"] = True
+            return found
+        for name in names:
+            if name.endswith(".json") and _is_key_id(name[:-5]):
+                record = self.key_store._read_record(os.path.join(directory, name))
+                marker = getattr(record, "pending_event", None)
+                if self._marker_names(marker, operation_id):
+                    found["key"].append(marker)
+            elif name.startswith(_EMPTY_MARKER_PREFIX) and name.endswith(".json"):
+                path = os.path.join(directory, name)
+                try:
+                    with open(path, "r", encoding="utf-8") as fh:
+                        marker = json.load(fh)
+                except (OSError, ValueError):
+                    if os.path.exists(path):
+                        found["corrupt"] = True
+                    continue
+                if self._marker_names(marker, operation_id):
+                    found["empty"].append(marker)
+        # The mirror may pin the empty-marker path even when the directory
+        # scan misses the file (e.g. an unexpected name layout).
+        pinned = self._read_pinned_empty_marker(operation_id, pinned_path)
+        if pinned is False:
+            found["corrupt"] = True
+        elif isinstance(pinned, dict) and pinned not in found["empty"]:
+            found["empty"].append(pinned)
+        policy_dir = os.path.join(self.data_dir, "policies")
+        try:
+            policy_names = os.listdir(policy_dir)
+        except OSError:
+            policy_names = []
+        for name in policy_names:
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(
+                    os.path.join(policy_dir, name), "r", encoding="utf-8"
+                ) as fh:
+                    doc = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(doc, dict):
+                continue
+            marker = doc.get("pending_event")
+            if self._marker_names(marker, operation_id):
+                found["policy"].append(marker)
+        return found
+
+    def _read_pinned_empty_marker(
+        self, operation_id: str, path: Optional[str]
+    ):
+        """Read the empty-restore marker the mirror pins, if it survives.
+
+        Returns the marker dict, None when absent/unrelated, or False when the
+        referenced path exists but is unreadable.
+        """
+        if not isinstance(path, str) or not path:
+            return None
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                marker = json.load(fh)
+        except (OSError, ValueError):
+            return False
+        if not isinstance(marker, dict):
+            return False
+        return marker if self._marker_names(marker, operation_id) else None
+
+    @staticmethod
+    def _marker_event_desc(marker) -> Optional[dict]:
+        """The event descriptor of an outbox marker.
+
+        Restore/batch/empty markers nest it under ``event``; a bare
+        single-key rotate/import marker IS the event dict itself (with an
+        optional sibling ``journal``).
+        """
+        if not isinstance(marker, dict):
+            return None
+        nested = marker.get("event")
+        return nested if isinstance(nested, dict) else marker
+
+    @classmethod
+    def _marker_names(cls, marker, operation_id: str) -> bool:
+        """Whether a parsed pending marker carries the given event id."""
+        desc = cls._marker_event_desc(marker)
+        return bool(desc) and desc.get("event_id") == operation_id
+
+    def _markers_consistent(self, descriptor: dict) -> bool:
+        """Cross-check every surviving outbox marker against the mirror.
+
+        Restore markers (on key files and optionally the policy document),
+        batch-rotation markers and restore-empty markers must all agree with
+        the mirror: event id/tenant/action, the journal/snapshot references,
+        the exact write set and the policy flag. A corrupt or mismatched
+        marker returns False so the whole evidence set is retained.
+        """
+        if self.key_store is None:
+            return False
+        operation_id = descriptor["operation_id"]
+        tenant_id = descriptor.get("tenant_id")
+        journal_id = descriptor.get("journal") or operation_id
+        mirror_keys = set(descriptor.get("write_set", []))
+        markers = self._scan_operation_markers(
+            operation_id, descriptor.get("empty_marker")
+        )
+        if markers["corrupt"]:
+            return False
+        for marker in markers["key"] + markers["policy"]:
+            if not self._one_marker_consistent(
+                marker, descriptor, operation_id, tenant_id,
+                journal_id, mirror_keys,
+            ):
+                return False
+        for marker in markers["empty"]:
+            if not self._empty_marker_consistent(
+                marker, operation_id, tenant_id
+            ):
+                return False
+        return True
+
+    def _one_marker_consistent(
+        self, marker, descriptor, operation_id, tenant_id, journal_id,
+        mirror_keys,
+    ) -> bool:
+        event_desc = self._marker_event_desc(marker)
+        if not isinstance(event_desc, dict):
+            return False
+        if event_desc.get("event_id") != operation_id:
+            return False
+        if event_desc.get("tenant_id") != tenant_id:
+            return False
+        kind = descriptor.get("kind")
+        action = descriptor.get("action") or _KIND_ACTIONS.get(kind)
+        if action is None or event_desc.get("action") != action:
+            return False
+        # A bare single-key marker carries the tenant only on the event.
+        if marker.get("_batch_rotate") or marker.get("_restore"):
+            if marker.get("tenant_id") != tenant_id:
+                return False
+        key_ids = marker.get("key_ids")
+        if marker.get("_batch_rotate") or marker.get("_restore"):
+            if not isinstance(key_ids, list):
+                return False
+            marked = set()
+            for value in key_ids:
+                if not _is_key_id(value) or value in marked:
+                    return False
+                marked.add(value)
+            if marked != mirror_keys:
+                return False
+        if marker.get("_batch_rotate"):
+            if kind != "batch_rotate":
+                return False
+            if marker.get("journal") != journal_id:
+                return False
+            if marker.get("snapshot") != (
+                descriptor.get("snapshot") or operation_id
+            ):
+                return False
+        elif marker.get("_restore"):
+            if kind != "restore":
+                return False
+            if "journal" in marker and marker.get("journal") != journal_id:
+                return False
+            if bool(marker.get("policy")) != bool(descriptor.get("policy")):
+                return False
+        else:
+            # A bare single-key rotate/import pending marker: the event dict
+            # plus an optional journal reference. It owns exactly the one key
+            # the event projects, which must be the mirror's sole write set.
+            if kind not in ("rotate", "import"):
+                return False
+            if mirror_keys != {event_desc.get("key_id")} or not _is_key_id(
+                event_desc.get("key_id")
+            ):
+                return False
+            if "journal" in marker and marker.get("journal") != journal_id:
+                return False
+        return True
+
+    @staticmethod
+    def _empty_marker_consistent(marker, operation_id, tenant_id) -> bool:
+        event_desc = marker.get("event")
+        if not isinstance(event_desc, dict):
+            return False
+        if not marker.get("_restore") or not marker.get("_empty"):
+            return False
+        if event_desc.get("event_id") != operation_id:
+            return False
+        if event_desc.get("action") != audit_mod.ACTION_IMPORT:
+            return False
+        if event_desc.get("tenant_id") != tenant_id:
+            return False
+        if marker.get("tenant_id") != tenant_id:
+            return False
+        if marker.get("key_ids") != [] or bool(marker.get("policy")):
+            return False
+        return True
 
     def _marker_names_event(self, operation_id: str) -> bool:
         """Whether any key file still carries a pending marker for this id."""
