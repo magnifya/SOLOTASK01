@@ -331,6 +331,8 @@ def _provider_terminal(
         action = audit_mod.ACTION_BATCH_ROTATE
     elif kind == "rotate":
         action = audit_mod.ACTION_ROTATE
+    elif kind == "encrypt":
+        action = audit_mod.ACTION_ENCRYPT
     else:
         action = audit_mod.ACTION_IMPORT
     audit_key_id = (

@@ -67,7 +67,16 @@ _KIND_ACTIONS = {
     "batch_rotate": audit_mod.ACTION_BATCH_ROTATE,
     "import": audit_mod.ACTION_IMPORT,
     "restore": audit_mod.ACTION_IMPORT,
+    # Envelope encryption is idempotent but mutates no key: its write set is
+    # always empty. It carries a non-persisted target key_id purely so its one
+    # audit event can project the key the envelope was sealed under.
+    "encrypt": audit_mod.ACTION_ENCRYPT,
 }
+
+# Kinds that never mutate key/policy files and therefore always have an empty
+# write set. Their mirrors are cross-references only (binding + the metadata
+# key_id), with no journal, snapshot, marker or handle of their own.
+_NO_WRITE_SET_KINDS = frozenset(("encrypt",))
 
 
 class ArtifactInconsistent(Exception):
@@ -183,6 +192,14 @@ class ArtifactMirror:
             self.descriptor["kind"] = kind
             self.descriptor["action"] = action
             self.descriptor["write_set"] = normalized
+            if kind in _NO_WRITE_SET_KINDS:
+                # A write-free operation still names the key its event projects.
+                target = facts.get("key_id")
+                if not _is_key_id(target):
+                    raise ArtifactInconsistent(
+                        "mirror kind %r requires a UUID4 key_id" % kind
+                    )
+                self.descriptor["key_id"] = target
             if facts.get("policy") is not None:
                 self.descriptor["policy"] = bool(facts["policy"])
             try:
@@ -617,6 +634,9 @@ class ArtifactStore:
             "action": None,
             "phase": PHASE_BOUND,
             "write_set": [],
+            # Metadata-only target key for write-free kinds (encrypt); null
+            # until describe() records it.
+            "key_id": None,
             "handles": [],
             "journal": None,
             "snapshot": None,
@@ -891,6 +911,13 @@ class ArtifactStore:
                 return False
             if not ArtifactStore._valid_write_set_shape(kind, write_set):
                 return False
+            if kind in _NO_WRITE_SET_KINDS:
+                # A write-free operation owns no files: the write set must be
+                # empty and the metadata key_id it projects must be a UUID4.
+                if write_set:
+                    return False
+                if not _is_key_id(descriptor.get("key_id")):
+                    return False
         journal = descriptor.get("journal")
         if journal is not None and journal != operation_id:
             return False
@@ -959,6 +986,12 @@ class ArtifactStore:
         write_set = descriptor.get("write_set") or []
         if kind in ("rotate", "import"):
             return details.get("key_id") == (write_set[0] if write_set else None)
+        if kind in _NO_WRITE_SET_KINDS:
+            # No files are written; the metadata key_id must still agree.
+            return (
+                details.get("key_id") == descriptor.get("key_id")
+                and not write_set
+            )
         if kind == "batch_rotate":
             items = details.get("items")
             if not isinstance(items, list):
@@ -1044,6 +1077,10 @@ class ArtifactStore:
         if kind in ("rotate", "import"):
             if event.key_id != (write_set[0] if write_set else None):
                 return False
+        elif kind in _NO_WRITE_SET_KINDS:
+            # No write set, but the event projects the metadata target key.
+            if event.key_id != descriptor.get("key_id"):
+                return False
         elif event.key_id is not None:
             return False
         details = getattr(record, "details", None)
@@ -1086,9 +1123,14 @@ class ArtifactStore:
         response = result.get("response")
         if http_status is None and response is None:
             return True
+        kind = descriptor.get("kind")
+        if kind in _NO_WRITE_SET_KINDS:
+            # A write-free operation (encrypt) succeeds with 200; its opaque
+            # response is backed by the durable event alone -- never decode the
+            # envelope or re-run crypto to verify it.
+            return http_status == 200 and isinstance(response, dict)
         if http_status != 201 or not isinstance(response, dict):
             return False
-        kind = descriptor.get("kind")
         tenant_id = descriptor.get("tenant_id")
         write_set = descriptor.get("write_set") or []
         if kind in ("rotate", "import"):

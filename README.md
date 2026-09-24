@@ -85,11 +85,18 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   幂等键。
 - `POST /v1/keys/{key_id}/encrypt`，body
   `{tenant_id, version?, plaintext, aad?}`；`plaintext`、`aad` 为 base64，
-  `version` 缺省为 current。`200` →
-  `{format:"keymgr-envelope-v1", envelope}`，`envelope` 为 base64，内含
-  key_id、version、算法、nonce/tag、密文及**包装后的数据密钥**：每次生成新
-  的 256 位数据密钥，以 AES-256-GCM 加密明文；AES256 版本用 AES-GCM 包装数
-  据密钥，RSA2048 版本用 RSA-OAEP-SHA256 包装。
+  `version` 缺省为 current。**HTTP 端点需单一 `Idempotency-Key` 头（CLI
+  `encrypt` 命令不变、不携带幂等键）**。`200` →
+  `{format:"keymgr-envelope-v1", envelope, operation_id}`（字段序 format、
+  envelope、operation_id），`envelope` 为 base64，内含 key_id、version、
+  算法、nonce/tag、密文及**包装后的数据密钥**：每次生成新的 256 位数据密钥，
+  以 AES-256-GCM 加密明文；AES256 版本用 AES-GCM 包装数据密钥，RSA2048 版本
+  用 RSA-OAEP-SHA256 包装。相同幂等键+相同请求重放同一信封（不重新铸随机
+  DEK）；同键异请求 `409` 并回原 `operation_id`；参数/解析/base64 错误在幂等
+  键绑定**之前**为零副作用 `400`（普通错误体，不占键）；策略拒绝 `403`、未知/
+  跨租/未知版本 `404`、吊销 `409`、提供者 `503`、等锁超 5 秒 `503`
+  timed_out、账本失败 `500`，错误体仅 `{error, operation_id}`。明文与 aad
+  只以 SHA-256 摘要进入绑定，绝不落操作记录、镜像、审计或响应。
 - `POST /v1/keys/{key_id}/decrypt`，body `{tenant_id, envelope, aad?}`，接
   受 `keymgr-envelope-v1`。`200` → `{plaintext}`（base64）。信封内 key_id
   必须与路径一致；缺字段、非法 base64、篡改、AAD 不符为 `400` 且错误指明
@@ -112,22 +119,32 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 ## 幂等操作
 
 - rotate/import/restore/batch-rotate（CLI：
-  `rotate`/`import`/`restore`/`batch-rotate`）必须携带**单一**
-  `Idempotency-Key` 头（CLI 必填 `--idempotency-key`），值为 1–128 个
-  `[A-Za-z0-9._~-]` 字符。缺失、为空、重复、非法一律 `400`（CLI `2`），且该
-  校验先于请求体读取与一切业务：不写审计、操作记录、密钥或提供者句柄。
+  `rotate`/`import`/`restore`/`batch-rotate`）以及 **HTTP 的
+  `POST .../encrypt`**（CLI `encrypt` 命令**不变**、不携带幂等键）必须携带
+  **单一** `Idempotency-Key` 头（CLI 除 encrypt HTTP 外的上述命令必填
+  `--idempotency-key`），值为 1–128 个 `[A-Za-z0-9._~-]` 字符。缺失、为空、
+  重复、非法一律 `400`（CLI `2`），且该校验先于请求体读取与一切业务：不写
+  审计、操作记录、密钥或提供者句柄。
 - 键全局唯一，绑定记录 `operation_id`(UUID4)、租户、操作者、路径、规范化体
   （键排序紧凑 JSON）、状态、HTTP 状态与响应；存于 `operations/<id>.json`
   (0600) 与 `operations/index.json`，进程内锁 + `operations.lock` 的 fcntl
-  排他锁串行化。
+  排他锁串行化。**encrypt 绑定的机密字段（`plaintext`/`aad`）在规范化前
+  替换为 `sha256:` 摘要**：同请求仍判等可重放，但明文/aad 绝不进入绑定、
+  镜像、操作记录或其它持久化（响应仅回不透明 envelope，审计只有元数据）。
 - 相同绑定重试：直接重放首次状态码、响应体与审计事件（同一
-  `operation_id`，业务不执行第二次）。同键不同绑定：`409`（CLI `3`），错误
-  体给出已有 `operation_id`。绑定前的导入/恢复解密无副作用：口令错误 `400`
-  不占用该键。
-- 状态：`pending`/`succeeded`/`failed`/`conflict`/`timed_out`。成功为 `201`
-  succeeded；同租户冲突为 `409` conflict；`403/404/400` 与提供者/账本失败为
-  failed（保留原状态码）。并发同键仅一个执行，其余等待；等待超 5 秒返回
-  `503` timed_out（CLI `1`），等待方不写任何东西。
+  `operation_id`，业务不执行第二次；encrypt 重放同一信封，不重新铸随机
+  DEK）。同键不同绑定：`409`（CLI `3`），错误体给出已有 `operation_id`。
+  绑定前的导入/恢复解密无副作用：口令错误 `400` 不占用该键；encrypt 绑定前
+  的参数/解析/base64 错误同为零副作用 `400`。
+- 状态：`pending`/`succeeded`/`failed`/`conflict`/`timed_out`。成功为
+  rotate 等的 `201` 或 encrypt 的 `200` succeeded；同租户冲突为 `409`
+  conflict；`403/404/400` 与提供者/账本失败为 failed（保留原状态码）。并发
+  同键仅一个执行，其余等待；等待超 5 秒返回 `503` timed_out（CLI `1`），
+  等待方不写任何东西。
+- encrypt 的幂等执行在 per-key 进程内锁 + `<key_id>.lock` fcntl 锁（5 秒
+  截止）下解析版本材料：等待被占 key 超 5 秒返回 `503` timed_out 且不写审计
+  或句柄。encrypt 不写密钥文件、不铸句柄：其镜像写集恒空，仅作绑定与投影
+  key_id 的交叉索引（无 journal/snapshot/marker/handle）。
 - 多/单轮换互斥：批量轮换与单键 rotate 都按 `key_id` 排序获取 per-key
   进程内锁 + `<key_id>.lock` fcntl 排他锁（整批共享一个 5 秒截止时刻）。对同一
   key 的并发变更要么全在批量之前、要么全在之后；等待同一被占 key 超过 5 秒的
@@ -136,11 +153,15 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   HTTP 与 CLI 共用同一套记录，可跨入口用相同键重放或按 id 查询。
 - **崩溃一致性**：进程可在绑定、outbox 落盘、账本追加或清理任一步骤崩溃。
   重启（或任一 CLI 入口）在 key/restore outbox 恢复之后，按同一
-  `operation_id` 判定：事件已入帐即已提交，据耐久事实重建原 `201`/`403`/
-  `404`/`409` 响应与审计投影并置终态（拒绝终态的状态码随事件持久化，严格
-  重放）；事件未入帐则置 failed(`500`)，半成品文件、提供者句柄与标记由
+  `operation_id` 判定：事件已入帐即已提交，据耐久事实重建原 `201`/`200`/
+  `403`/`404`/`409` 响应与审计投影并置终态（拒绝终态的状态码随事件持久化，
+  严格重放）；事件未入帐则置 failed(`500`)，半成品文件、提供者句柄与标记由
   outbox/provision 恢复回滚。不重复记账（账本按 event_id 去重），不误判。
-- **operation 工件镜像**：rotate/import/restore/batch-rotate 在幂等键绑定
+  encrypt 的 `200` envelope 在单条成功事件追加**之前**先随操作耐久：事件未
+  入帐时该操作保持 `pending` 且 `http_status`/`response`（含 envelope）为
+  null（GET 与持久化均不暴露），事件耐久后才置终态并原样重放。
+- **operation 工件镜像**：rotate/import/restore/batch-rotate 及 HTTP
+  encrypt 在幂等键绑定
   记录耐久**之后**、首次调用提供者**之前**，原子创建
   `operation-artifacts/<operation_id>.json`（0600、temp 文件 fsync 后 rename；
   非幂等入口与未绑定请求不创建该目录）。镜像是一次尝试全部耐久工件的交叉

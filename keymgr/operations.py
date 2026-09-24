@@ -81,13 +81,15 @@ def is_valid_idempotency_key(value) -> bool:
 def state_for_http_status(http_status: int) -> str:
     """Map a terminal response's HTTP status to its operation state.
 
-    201 is the only success; an explicit request conflict (409) is the
-    "conflict" state. Every other terminal refusal (400/403/404) or backend
-    failure (500/503) records as "failed". A crash-recovered operation whose
-    audit event is durable therefore lands in the same state the original
-    request would have, including a reconstructed rejection.
+    201 is the success state of a mutating endpoint (rotate/import/restore/
+    batch-rotate); 200 is the success state of an idempotent envelope
+    encryption. An explicit request conflict (409) is the "conflict" state.
+    Every other terminal refusal (400/403/404) or backend failure
+    (500/503) records as "failed". A crash-recovered operation whose audit
+    event is durable therefore lands in the same state the original request
+    would have, including a reconstructed rejection.
     """
-    if http_status == 201:
+    if http_status in (200, 201):
         return STATUS_SUCCEEDED
     if http_status == 409:
         return STATUS_CONFLICT
@@ -100,7 +102,44 @@ _KIND_ACTIONS = {
     "batch_rotate": "batch_rotate",
     "import": "import",
     "restore": "import",
+    "encrypt": "encrypt",
 }
+
+# Request fields that must never be persisted inside an idempotent operation
+# binding (they carry secrets). Such a field is replaced by a non-reversible
+# SHA-256 digest before the normalized body is stored or mirrored, so two
+# identical requests still bind/replay as equal while the plaintext, aad or a
+# passphrase can never be recovered from an operation record or its mirror.
+_SECRET_FIELDS = ("plaintext", "aad", "passphrase")
+
+
+def binding_body(payload: Optional[dict], path: Optional[str] = None) -> dict:
+    """Return a secret-free copy of a request body for binding/persistence.
+
+    Secret fields are hashed (never stored verbatim); everything else is kept
+    so a same-key/different-*request* still answers 409. The digest is of the
+    field's canonical JSON encoding (``sort_keys``, ``ensure_ascii=False``) so
+    a value that is not a string (rejected later as a 400) still hashes
+    deterministically. This never mutates ``payload``.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    redacted = dict(payload)
+    for name in _SECRET_FIELDS:
+        if name in redacted:
+            canonical = json.dumps(
+                redacted[name],
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+            redacted[name] = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    return redacted
+
+
+def normalize_binding(payload: Optional[dict]) -> str:
+    """Canonical, secret-redacted JSON used as an operation binding."""
+    return normalize_body(binding_body(payload))
 
 
 def _event_matches_operation(record: "OperationRecord", event) -> bool:

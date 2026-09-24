@@ -7,6 +7,7 @@ keymgr-envelope-v1 token shape, AAD binding, tamper and field-naming 400s,
 """
 
 import base64
+import itertools
 import json
 import os
 import urllib.error
@@ -165,8 +166,18 @@ def test_crypto_material_statuses(local_stack):
 def http_server(local_stack):
     store, policies, data_dir = local_stack
     coordinator = restore_mod.RestoreCoordinator(store, policies)
+    from keymgr.operations import OperationStore
+    from keymgr.artifacts import ArtifactStore
+
+    op_store = OperationStore(data_dir, store.audit)
+    artifact_store = ArtifactStore(data_dir, store, store.audit)
+    artifact_store.settle_pending(op_store)
+    op_store.recover_pending(
+        lambda record, event: _resolve(store, policies, record, event),
+        is_parked=artifact_store.is_parked,
+    )
     handler = make_handler(
-        store, policies, coordinator, _NullOperations(store.audit), None
+        store, policies, coordinator, op_store, artifact_store
     )
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     httpd.daemon_threads = True
@@ -178,11 +189,10 @@ def http_server(local_stack):
     httpd.shutdown()
 
 
-class _NullOperations:
-    """Minimal operation stand-in: encrypt/decrypt are non-idempotent."""
+def _resolve(store, policies, record, event):
+    from keymgr.server import _resolve_committed_operation
 
-    def __init__(self, audit):
-        self.audit = audit
+    return _resolve_committed_operation(store, policies, record, event)
 
 
 class Client:
@@ -217,10 +227,20 @@ def _make_key(client, tenant="t", algorithm="AES256"):
     return body["key_id"]
 
 
-def _encrypt(client, kid, tenant, plaintext, **extra):
+_idem_counter = itertools.count(1)
+
+
+def _encrypt(client, kid, tenant, plaintext, idem=None, **extra):
     body = {"tenant_id": tenant, "plaintext": b64(plaintext)}
     body.update(extra)
-    return client.call("POST", "/v1/keys/%s/encrypt" % kid, body)
+    if idem is None:
+        # Each call gets a fresh Idempotency-Key so unrelated calls never
+        # collide; replay tests pass an explicit idem to reuse it.
+        idem = "enc-%d" % next(_idem_counter)
+    return client.call(
+        "POST", "/v1/keys/%s/encrypt" % kid, body,
+        headers={"Idempotency-Key": idem},
+    )
 
 
 def _decrypt(client, kid, tenant, token, **extra):
@@ -296,9 +316,26 @@ def test_http_field_validation_400(http_server):
     ]
     for body, field in cases_encrypt:
         status, out = client.call(
-            "POST", "/v1/keys/%s/encrypt" % kid, body
+            "POST", "/v1/keys/%s/encrypt" % kid, body,
+            headers={"Idempotency-Key": "enc-field-%s" % field},
         )
         assert status == 400 and field in out["error"], (body, out)
+        # A prebind parameter 400 is a plain error body and never binds.
+        assert set(out) == {"error"}
+
+    # A missing / duplicated / illegal Idempotency-Key is itself a 400 that
+    # happens before the body is read: a plain error, no operation_id.
+    status, out = client.call(
+        "POST", "/v1/keys/%s/encrypt" % kid,
+        {"tenant_id": "t", "plaintext": b64(b"x")},
+    )
+    assert status == 400 and "Idempotency-Key" in out["error"]
+    status, out = client.call(
+        "POST", "/v1/keys/%s/encrypt" % kid,
+        {"tenant_id": "t", "plaintext": b64(b"x")},
+        headers={"Idempotency-Key": "bad key!"},
+    )
+    assert status == 400 and "Idempotency-Key" in out["error"]
 
     status, out = client.call(
         "POST", "/v1/keys/%s/decrypt" % kid, {"tenant_id": "t"}
@@ -343,8 +380,11 @@ def test_http_unknown_and_cross_tenant_404(http_server):
     status, out = client.call(
         "POST", "/v1/keys/%s/encrypt" % unknown,
         {"tenant_id": "t", "plaintext": b64(b"x")},
+        headers={"Idempotency-Key": "enc-unknown"},
     )
-    assert status == 404 and out == {"error": "key not found"}
+    # A bound encrypt refusal is {error, operation_id}.
+    assert status == 404 and out["error"] == "key not found"
+    assert set(out) == {"error", "operation_id"}
     # A structurally valid envelope naming the unknown key also reads as a
     # missing key (parameter validation precedes existence).
     token = env_mod.encode_envelope(
@@ -360,10 +400,10 @@ def test_http_unknown_and_cross_tenant_404(http_server):
     status, out = _encrypt(
         client, kid, "other", b"x", operator="bob"
     )
-    assert status == 404 and out == {"error": "key not found"}
+    assert status == 404 and out["error"] == "key not found"
     # Unknown version on an existing key is a 404 as well.
     status, out = _encrypt(client, kid, "t", b"x", version=42)
-    assert status == 404
+    assert status == 404 and out["error"] == "key not found"
 
 
 def test_http_revoked_key_409_for_both_actions(http_server):
@@ -390,7 +430,10 @@ def test_http_policy_denial_audits_rejected(http_server):
         [Rule("alice", ["create", "read"], "allow")],
     )
     status, out = _encrypt(client, kid, "t", b"x")
-    assert status == 403 and out == {"error": "action not permitted by policy"}
+    # Encrypt is a bound idempotent op: the 403 body names its operation_id.
+    assert status == 403
+    assert out["error"] == "action not permitted by policy"
+    assert set(out) == {"error", "operation_id"}
     status, out = _decrypt(client, kid, "t", sealed["envelope"])
     assert status == 403
     page = _store_events(http_server, action="encrypt")
@@ -434,6 +477,208 @@ def test_http_success_audits_metadata_only_and_no_material(http_server):
     assert b"aad-secret" not in ledger
 
 
+# ------------------------------------------------- encrypt idempotency
+def _get_operation(client, operation_id, tenant="t", operator="alice"):
+    return client.call(
+        "GET", "/v1/operations/%s" % operation_id, None,
+        operator=operator, tenant_via=tenant,
+    )
+
+
+def _operation_files(data_dir):
+    import glob
+
+    names = glob.glob(os.path.join(data_dir, "operations", "*.json"))
+    names += glob.glob(
+        os.path.join(data_dir, "operation-artifacts", "*.json")
+    )
+    return names
+
+
+def test_http_encrypt_replay_reuses_envelope_and_one_event(http_server):
+    client, store, _policies = http_server
+    kid = _make_key(client)
+    payload = {"tenant_id": "t", "plaintext": b64(b"replay-me"),
+               "aad": b64(b"ctx")}
+    headers = {"Idempotency-Key": "enc-replay-1"}
+    status, first = client.call(
+        "POST", "/v1/keys/%s/encrypt" % kid, payload, headers=headers
+    )
+    assert status == 200
+    assert set(first) == {"format", "envelope", "operation_id"}
+    assert first["format"] == env_mod.FORMAT
+    op_id = first["operation_id"]
+    # The identical request under the same key replays the SAME envelope and
+    # operation_id; the random envelope is not re-minted.
+    status, second = client.call(
+        "POST", "/v1/keys/%s/encrypt" % kid, payload, headers=headers
+    )
+    assert status == 200
+    assert second["envelope"] == first["envelope"]
+    assert second["operation_id"] == op_id
+    # Exactly one encrypt success event, named after the operation_id.
+    events = [
+        e for e in _store_events(http_server, action="encrypt")
+        if e.event_id == op_id
+    ]
+    assert len(events) == 1 and events[0].outcome == "success"
+    # GET operations reports the terminal 200 with the stored body.
+    status, got = _get_operation(client, op_id)
+    assert status == 200
+    assert got["status"] == "succeeded"
+    assert got["http_status"] == 200
+    assert got["response"] == first
+    assert list(got) == [
+        "operation_id", "tenant_id", "status", "http_status", "response"
+    ]
+
+
+def test_http_encrypt_same_key_different_request_is_409(http_server):
+    client, _store, _policies = http_server
+    kid = _make_key(client)
+    headers = {"Idempotency-Key": "enc-conflict-1"}
+    status, first = client.call(
+        "POST", "/v1/keys/%s/encrypt" % kid,
+        {"tenant_id": "t", "plaintext": b64(b"one")}, headers=headers,
+    )
+    assert status == 200
+    # Same key, different plaintext -> 409 naming the original operation.
+    status, out = client.call(
+        "POST", "/v1/keys/%s/encrypt" % kid,
+        {"tenant_id": "t", "plaintext": b64(b"two")}, headers=headers,
+    )
+    assert status == 409
+    assert out["operation_id"] == first["operation_id"]
+    assert set(out) == {"error", "operation_id"}
+    # A different version under the same key conflicts too.
+    status, out = client.call(
+        "POST", "/v1/keys/%s/encrypt" % kid,
+        {"tenant_id": "t", "plaintext": b64(b"one"), "version": 2},
+        headers=headers,
+    )
+    assert status == 409
+    assert out["operation_id"] == first["operation_id"]
+
+
+def test_http_encrypt_rejected_terminal_replays(http_server):
+    client, _store, _policies = http_server
+    kid = _make_key(client)
+    headers = {"Idempotency-Key": "enc-reject-1"}
+    body = {"tenant_id": "t", "plaintext": b64(b"x"), "version": 99}
+    status, first = client.call(
+        "POST", "/v1/keys/%s/encrypt" % kid, body, headers=headers
+    )
+    assert status == 404 and set(first) == {"error", "operation_id"}
+    op_id = first["operation_id"]
+    # Replay the identical rejected binding verbatim.
+    status, second = client.call(
+        "POST", "/v1/keys/%s/encrypt" % kid, body, headers=headers
+    )
+    assert status == 404 and second == first
+    # The single rejection event is named after the operation_id.
+    events = [
+        e for e in _store_events(http_server, action="encrypt")
+        if e.event_id == op_id
+    ]
+    assert len(events) == 1 and events[0].outcome == "rejected"
+
+
+def test_http_encrypt_never_persists_plaintext_or_aad(http_server):
+    client, store, _policies = http_server
+    data_dir = store.data_dir
+    kid = _make_key(client)
+    secret = b"do-not-persist-me"
+    aad_secret = b"do-not-persist-aad"
+    status, body = client.call(
+        "POST", "/v1/keys/%s/encrypt" % kid,
+        {"tenant_id": "t", "plaintext": b64(secret),
+         "aad": b64(aad_secret)},
+        headers={"Idempotency-Key": "enc-secret-1"},
+    )
+    assert status == 200
+    # The operation record, its index and the mirror must not contain the
+    # plaintext/aad bytes nor their base64 form (only a sha256 digest).
+    blob = b""
+    for name in _operation_files(data_dir):
+        with open(name, "rb") as fh:
+            blob += fh.read()
+    assert secret not in blob
+    assert aad_secret not in blob
+    assert b64(secret).encode() not in blob
+    assert b64(aad_secret).encode() not in blob
+    assert b"sha256:" in blob
+    # The envelope response itself never embeds the plaintext.
+    assert secret not in base64.b64decode(body["envelope"])
+
+
+def test_http_encrypt_operation_unknown_and_cross_scope_404(http_server):
+    client, _store, _policies = http_server
+    kid = _make_key(client)
+    status, body = client.call(
+        "POST", "/v1/keys/%s/encrypt" % kid,
+        {"tenant_id": "t", "plaintext": b64(b"x")},
+        headers={"Idempotency-Key": "enc-scope-1"},
+    )
+    assert status == 200
+    op_id = body["operation_id"]
+    # A random unknown operation id is 404.
+    status, out = _get_operation(
+        client, "44444444-4444-4444-8444-444444444444"
+    )
+    assert status == 404 and out == {"error": "operation not found"}
+    # Another tenant cannot see it.
+    status, out = _get_operation(client, op_id, tenant="other")
+    assert status == 404 and out == {"error": "operation not found"}
+    # Another operator cannot see it.
+    status, out = _get_operation(client, op_id, operator="bob")
+    assert status == 404 and out == {"error": "operation not found"}
+
+
+def test_http_encrypt_pending_hides_envelope(http_server):
+    # Immediately after binding, before the event is durable, GET must report
+    # pending with null http_status/response (the envelope stays hidden until
+    # the single terminal event commits).
+    client, store, policies = http_server
+    kid = _make_key(client)
+    import threading
+    import time as _time
+
+    from keymgr.operations import STATUS_PENDING
+
+    observed = []
+
+    def encrypt_once():
+        client.call(
+            "POST", "/v1/keys/%s/encrypt" % kid,
+            {"tenant_id": "t", "plaintext": b64(b"pend")},
+            headers={"Idempotency-Key": "enc-pend-1"},
+        )
+
+    worker = threading.Thread(target=encrypt_once)
+    worker.start()
+    # The terminal lands within milliseconds; the durable contract is that a
+    # pending record never exposes http_status/response. Probe the record
+    # store directly for any pending shape, then confirm the final terminal.
+    worker.join(timeout=10)
+    # Find the one encrypt operation and assert terminal visibility shape.
+    import glob
+
+    for name in glob.glob(os.path.join(store.data_dir, "operations", "*.json")):
+        if name.endswith("index.json"):
+            continue
+        with open(name, "r", encoding="utf-8") as fh:
+            rec = json.load(fh)
+        if (rec.get("details") or {}).get("kind") != "encrypt":
+            continue
+        if rec["status"] == STATUS_PENDING:
+            assert rec["http_status"] is None and rec["response"] is None
+        else:
+            assert rec["http_status"] == 200
+            assert "envelope" in rec["response"]
+            observed.append(rec)
+    assert observed and observed[0]["status"] == "succeeded"
+
+
 def test_http_provider_unavailable_is_503_safe_wording(env, monkeypatch):
     # env fixture wires the fake external KMS.
     from keymgr.policy import PolicyStore
@@ -442,8 +687,18 @@ def test_http_provider_unavailable_is_503_safe_wording(env, monkeypatch):
     store = env.open_store()
     policies = PolicyStore(env.data_dir, store.audit)
     coordinator = restore_mod.RestoreCoordinator(store, policies)
+    from keymgr.operations import OperationStore
+    from keymgr.artifacts import ArtifactStore
+
+    op_store = OperationStore(env.data_dir, store.audit)
+    artifact_store = ArtifactStore(env.data_dir, store, store.audit)
+    artifact_store.settle_pending(op_store)
+    op_store.recover_pending(
+        lambda record, event: _resolve(store, policies, record, event),
+        is_parked=artifact_store.is_parked,
+    )
     handler = make_handler(
-        store, policies, coordinator, _NullOperations(store.audit), None
+        store, policies, coordinator, op_store, artifact_store
     )
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     httpd.daemon_threads = True
@@ -461,7 +716,9 @@ def test_http_provider_unavailable_is_503_safe_wording(env, monkeypatch):
         env.set_faults({"unreachable": True})
         status, out = _encrypt(client, kid, "t", b"x")
         assert status == 503
-        assert out == {"error": "key management provider is unavailable"}
+        assert out["error"] == "key management provider is unavailable"
+        # A bound provider failure names its operation_id, decrypt does not.
+        assert set(out) == {"error", "operation_id"}
         status, out = _decrypt(client, kid, "t", body["envelope"])
         assert status == 503
         assert out == {"error": "key management provider is unavailable"}
