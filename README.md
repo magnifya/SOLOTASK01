@@ -85,11 +85,12 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   幂等键。
 - `POST /v1/keys/{key_id}/encrypt`，body
   `{tenant_id, version?, plaintext, aad?}`；`plaintext`、`aad` 为 base64，
-  `version` 缺省为 current。`200` →
-  `{format:"keymgr-envelope-v1", envelope}`，`envelope` 为 base64，内含
-  key_id、version、算法、nonce/tag、密文及**包装后的数据密钥**：每次生成新
-  的 256 位数据密钥，以 AES-256-GCM 加密明文；AES256 版本用 AES-GCM 包装数
-  据密钥，RSA2048 版本用 RSA-OAEP-SHA256 包装。
+  `version` 缺省为 current。HTTP 需单一 `Idempotency-Key`（CLI `encrypt`
+  子命令保持不变、不带该头）。`200` →
+  `{format:"keymgr-envelope-v1", envelope, operation_id}`，`envelope` 为
+  base64，内含 key_id、version、算法、nonce/tag、密文及**包装后的数据密钥**：
+  每次生成新的 256 位数据密钥，以 AES-256-GCM 加密明文；AES256 版本用
+  AES-GCM 包装数据密钥，RSA2048 版本用 RSA-OAEP-SHA256 包装。
 - `POST /v1/keys/{key_id}/decrypt`，body `{tenant_id, envelope, aad?}`，接
   受 `keymgr-envelope-v1`。`200` → `{plaintext}`（base64）。信封内 key_id
   必须与路径一致；缺字段、非法 base64、篡改、AAD 不符为 `400` 且错误指明
@@ -112,22 +113,28 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 ## 幂等操作
 
 - rotate/import/restore/batch-rotate（CLI：
-  `rotate`/`import`/`restore`/`batch-rotate`）必须携带**单一**
-  `Idempotency-Key` 头（CLI 必填 `--idempotency-key`），值为 1–128 个
+  `rotate`/`import`/`restore`/`batch-rotate`）以及 HTTP 的 encrypt（CLI
+  `encrypt` 子命令不强制该头、行为不变）必须携带**单一**
+  `Idempotency-Key` 头（变更类 CLI 必填 `--idempotency-key`），值为 1–128 个
   `[A-Za-z0-9._~-]` 字符。缺失、为空、重复、非法一律 `400`（CLI `2`），且该
   校验先于请求体读取与一切业务：不写审计、操作记录、密钥或提供者句柄。
 - 键全局唯一，绑定记录 `operation_id`(UUID4)、租户、操作者、路径、规范化体
   （键排序紧凑 JSON）、状态、HTTP 状态与响应；存于 `operations/<id>.json`
   (0600) 与 `operations/index.json`，进程内锁 + `operations.lock` 的 fcntl
-  排他锁串行化。
+  排他锁串行化。encrypt 的明文/aad 是秘密：其规范化体只保存二者的 SHA-256
+  摘要（不同明文仍判为不同绑定→`409`，相同则重放），原文绝不落盘；信封
+  envelope 是密文，随成功响应持久化以便逐字节重放。
 - 相同绑定重试：直接重放首次状态码、响应体与审计事件（同一
   `operation_id`，业务不执行第二次）。同键不同绑定：`409`（CLI `3`），错误
   体给出已有 `operation_id`。绑定前的导入/恢复解密无副作用：口令错误 `400`
   不占用该键。
 - 状态：`pending`/`succeeded`/`failed`/`conflict`/`timed_out`。成功为 `201`
-  succeeded；同租户冲突为 `409` conflict；`403/404/400` 与提供者/账本失败为
-  failed（保留原状态码）。并发同键仅一个执行，其余等待；等待超 5 秒返回
-  `503` timed_out（CLI `1`），等待方不写任何东西。
+  succeeded（encrypt 为 `200` succeeded）；同键不同绑定与 encrypt 的吊销键为
+  `409` conflict；参数错误 `400`、策略拒绝 `403`、未知/跨租户对象 `404` 与
+  提供者/账本失败 `503/500` 为 failed（保留原状态码；encrypt 的参数 `400`
+  发生在绑定之前、不留记录）。并发同键仅一个执行，其余等待；等待超 5 秒返回
+  `503` timed_out（CLI `1`），等待方不写任何东西。encrypt 的终态错误体只含
+  `error` 与 `operation_id`。
 - 多/单轮换互斥：批量轮换与单键 rotate 都按 `key_id` 排序获取 per-key
   进程内锁 + `<key_id>.lock` fcntl 排他锁（整批共享一个 5 秒截止时刻）。对同一
   key 的并发变更要么全在批量之前、要么全在之后；等待同一被占 key 超过 5 秒的
@@ -140,22 +147,25 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `404`/`409` 响应与审计投影并置终态（拒绝终态的状态码随事件持久化，严格
   重放）；事件未入帐则置 failed(`500`)，半成品文件、提供者句柄与标记由
   outbox/provision 恢复回滚。不重复记账（账本按 event_id 去重），不误判。
-- **operation 工件镜像**：rotate/import/restore/batch-rotate 在幂等键绑定
-  记录耐久**之后**、首次调用提供者**之前**，原子创建
+- **operation 工件镜像**：rotate/import/restore/batch-rotate 与 HTTP encrypt
+  在幂等键绑定记录耐久**之后**、首次调用提供者**之前**，原子创建
   `operation-artifacts/<operation_id>.json`（0600、temp 文件 fsync 后 rename；
   非幂等入口与未绑定请求不创建该目录）。镜像是一次尝试全部耐久工件的交叉
   索引，记录租户、操作者、路径、规范化请求体、`kind`/审计动作、完整写集
-  （rotate/import 为该 key_id，batch 为全部 key_id，restore 为全部新建
-  key_id 及是否含策略）、阶段（`bound`→`provisioning`→`staged`→
+  （rotate/import/encrypt 为该 key_id，batch 为全部 key_id，restore 为全部
+  新建 key_id 及是否含策略）。encrypt 为只读操作，镜像恒停留 `bound` 阶段，
+  不铸句柄、无 journal/snapshot/标记；其余四类阶段为
+  （`bound`→`provisioning`→`staged`→
   `committed`/`rolled_back`）、`provisions/<id>.json` 引用（batch 另引用
   `batch-rotations/<id>.json`，空 restore 另记录其 `restore-empty-*`
   标记）以及每铸一个句柄即登记的新句柄 `provider_id`/`handle`；镜像与 journal
   条目同步落盘，二者永不矛盾。请求到达终态后：事件确认且 action/tenant/
   operation 一致、写集文件拥有全部新句柄且 journal/snapshot 已清，才删镜像
-  并保留新版本；事件未入账时，先由 outbox 恢复幂等删除全部新句柄并恢复可信
-  旧写集，证据清零才删镜像。账本不可读、提交不确定（同 id 事件 action/tenant
-  不符）、镜像缺失/损坏、镜像与 `operations/<id>.json` 绑定不一致、引用缺失/
-  不一致或 batch snapshot 损坏时，**保留整组证据**（镜像、标记、journal、
+  并保留新版本（encrypt 仅校验其引用 key 仍属本租户）；事件未入账时，先由
+  outbox 恢复幂等删除全部新句柄并恢复可信旧写集，证据清零才删镜像。账本不
+  可读、提交不确定（同 id 事件 action/tenant 不符）、镜像缺失/损坏、镜像与
+  `operations/<id>.json` 绑定不一致、引用缺失/不一致或 batch snapshot 损坏时，
+  **保留整组证据**（镜像、标记、journal、
   snapshot 与句柄），不猜测回滚也不暴露未提交 current：该 operation 保持
   `pending`，请求/重启返回 `500`/`503` 等待下次重试。无镜像的旧 journal 与旧
   restore 标记沿用原有恢复规则，镜像从不强制存在。

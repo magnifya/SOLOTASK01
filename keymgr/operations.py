@@ -81,13 +81,14 @@ def is_valid_idempotency_key(value) -> bool:
 def state_for_http_status(http_status: int) -> str:
     """Map a terminal response's HTTP status to its operation state.
 
-    201 is the only success; an explicit request conflict (409) is the
-    "conflict" state. Every other terminal refusal (400/403/404) or backend
-    failure (500/503) records as "failed". A crash-recovered operation whose
-    audit event is durable therefore lands in the same state the original
-    request would have, including a reconstructed rejection.
+    A success (201 for the mutating endpoints, 200 for an envelope encrypt) is
+    "succeeded"; an explicit request conflict (409) is the "conflict" state.
+    Every other terminal refusal (400/403/404) or backend failure (500/503)
+    records as "failed". A crash-recovered operation whose audit event is
+    durable therefore lands in the same state the original request would have,
+    including a reconstructed rejection.
     """
-    if http_status == 201:
+    if http_status in (200, 201):
         return STATUS_SUCCEEDED
     if http_status == 409:
         return STATUS_CONFLICT
@@ -100,6 +101,7 @@ _KIND_ACTIONS = {
     "batch_rotate": "batch_rotate",
     "import": "import",
     "restore": "import",
+    "encrypt": "encrypt",
 }
 
 

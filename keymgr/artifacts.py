@@ -49,6 +49,7 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 
 from . import audit as audit_mod
 from .audit import LedgerError
+from .envelope import FORMAT as ENVELOPE_FORMAT
 
 # Phases of one mirrored attempt, in order. The mirror is always rewritten
 # atomically (temp file, fsync, 0600 rename), so a crash lands on either the
@@ -67,6 +68,10 @@ _KIND_ACTIONS = {
     "batch_rotate": audit_mod.ACTION_BATCH_ROTATE,
     "import": audit_mod.ACTION_IMPORT,
     "restore": audit_mod.ACTION_IMPORT,
+    # Encrypt mints no handles and writes no key file, but it is still an
+    # idempotent operation whose single terminal audit event is named after
+    # its operation_id; its mirror cross-references the one key it used.
+    "encrypt": audit_mod.ACTION_ENCRYPT,
 }
 
 
@@ -208,7 +213,7 @@ class ArtifactMirror:
             seen.add(key_id)
             normalized.append(key_id)
         normalized.sort()
-        if kind in ("rotate", "import") and len(normalized) != 1:
+        if kind in ("rotate", "import", "encrypt") and len(normalized) != 1:
             raise ArtifactInconsistent(
                 "mirror kind %r requires exactly one write-set key, got %d"
                 % (kind, len(normalized))
@@ -935,7 +940,7 @@ class ArtifactStore:
             if not _is_key_id(key_id) or key_id in seen:
                 return False
             seen.add(key_id)
-        if kind in ("rotate", "import") and len(seen) != 1:
+        if kind in ("rotate", "import", "encrypt") and len(seen) != 1:
             return False
         if kind == "batch_rotate" and not seen:
             return False
@@ -957,7 +962,7 @@ class ArtifactStore:
         if not isinstance(details, dict) or details.get("kind") != kind:
             return False
         write_set = descriptor.get("write_set") or []
-        if kind in ("rotate", "import"):
+        if kind in ("rotate", "import", "encrypt"):
             return details.get("key_id") == (write_set[0] if write_set else None)
         if kind == "batch_rotate":
             items = details.get("items")
@@ -1041,7 +1046,7 @@ class ArtifactStore:
             return False
         kind = descriptor.get("kind")
         write_set = descriptor.get("write_set") or []
-        if kind in ("rotate", "import"):
+        if kind in ("rotate", "import", "encrypt"):
             if event.key_id != (write_set[0] if write_set else None):
                 return False
         elif event.key_id is not None:
@@ -1086,11 +1091,29 @@ class ArtifactStore:
         response = result.get("response")
         if http_status is None and response is None:
             return True
-        if http_status != 201 or not isinstance(response, dict):
-            return False
         kind = descriptor.get("kind")
+        # A mutating endpoint stages a 201; an envelope encrypt is read-only
+        # and stages a 200 carrying its opaque envelope.
+        success_status = 200 if kind == "encrypt" else 201
+        if http_status != success_status or not isinstance(response, dict):
+            return False
         tenant_id = descriptor.get("tenant_id")
         write_set = descriptor.get("write_set") or []
+        if kind == "encrypt":
+            # Encrypt writes no version and mints no handle; the staged body
+            # must be the exact 200 shape (format/envelope/operation_id) and
+            # the referenced key must still belong to the tenant.
+            key_id = write_set[0] if write_set else None
+            key = self.key_store._read_record(self.key_store._path_for(key_id))
+            if key is None or key.tenant_id != tenant_id:
+                return False
+            return (
+                response.get("format") == ENVELOPE_FORMAT
+                and isinstance(response.get("envelope"), str)
+                and bool(response["envelope"])
+                and response.get("operation_id")
+                == descriptor.get("operation_id")
+            )
         if kind in ("rotate", "import"):
             key_id = write_set[0] if write_set else None
             if response.get("key_id") != key_id:
