@@ -81,13 +81,13 @@ def is_valid_idempotency_key(value) -> bool:
 def state_for_http_status(http_status: int) -> str:
     """Map a terminal response's HTTP status to its operation state.
 
-    201 is the only success; an explicit request conflict (409) is the
+    200 and 201 are successes; an explicit request conflict (409) is the
     "conflict" state. Every other terminal refusal (400/403/404) or backend
     failure (500/503) records as "failed". A crash-recovered operation whose
     audit event is durable therefore lands in the same state the original
     request would have, including a reconstructed rejection.
     """
-    if http_status == 201:
+    if http_status in (200, 201):
         return STATUS_SUCCEEDED
     if http_status == 409:
         return STATUS_CONFLICT
@@ -100,6 +100,7 @@ _KIND_ACTIONS = {
     "batch_rotate": "batch_rotate",
     "import": "import",
     "restore": "import",
+    "encrypt": "encrypt",
 }
 
 
@@ -421,6 +422,7 @@ class OperationStore:
         path: str,
         request_body: str,
         idempotency_key: str,
+        mirror_required: bool = True,
     ) -> BeginResult:
         """Bind the key and create/return the operation for one request.
 
@@ -430,6 +432,12 @@ class OperationStore:
         is returned as ``replay`` for an identical binding or ``conflict`` for
         a different one. Exactly one concurrent same-key request can win
         ``new``; the others observe the pending binding.
+
+        ``mirror_required`` marks the binding as of the artifact-mirror
+        generation. The mirrored mutations (rotate/import/restore/batch and
+        the read-only idempotent encrypt) pass True; legacy/test wiring that
+        runs without an ArtifactStore passes False and keeps the pre-mirror
+        crash rules.
         """
         scope = self._scope(tenant_id, operator_id, idempotency_key)
         fd = self._locked()
@@ -466,7 +474,7 @@ class OperationStore:
                 status=STATUS_PENDING,
                 created_at=now,
                 updated_at=now,
-                mirror_required=True,
+                mirror_required=mirror_required,
             )
             self._write_record(record)
             index["bindings"][scope] = operation_id
@@ -566,6 +574,39 @@ class OperationStore:
         finally:
             self._unlocked(fd)
 
+    def finalize_durable(
+        self,
+        record: OperationRecord,
+        http_status: int,
+        response: dict,
+        audit: Optional[dict] = None,
+    ) -> None:
+        """Stage a terminal result, then make the audit event the commit point.
+
+        Used by the read-only idempotent encrypt, which has no key-file
+        outbox: the exact terminal status/response (and the audit descriptor
+        naming the operation's event) are fsynced to the operation record
+        first, then the single ledger event named after the operation_id is
+        appended durably. The append's event_id dedupe makes a retry
+        idempotent. Only once the append returns does the caller finish the
+        operation and release the envelope; a crash before the append leaves
+        the operation pending with neither event nor envelope answer, so a
+        restart/retry re-runs the encryption exactly once and never answers
+        from an uncommitted stage. Raises ``LedgerError`` if the commit point
+        itself cannot be reached (the response is then withheld).
+        """
+        self.stage_terminal(record, http_status, response, audit=audit)
+        desc = audit or {}
+        self.audit.append(
+            self.audit.new_event(
+                record.tenant_id,
+                desc.get("action"),
+                desc.get("key_id"),
+                desc.get("outcome"),
+                event_id=record.operation_id,
+            )
+        )
+
     def get(
         self, operation_id: str, tenant_id: str, operator_id: str
     ) -> Optional[OperationRecord]:
@@ -657,6 +698,15 @@ class OperationStore:
                     http_status = int(staged["http_status"])
                     response = staged["response"]
                 else:
+                    details_now = record.details or {}
+                    if details_now.get("kind") == "encrypt":
+                        # The event is durable but the exact 200 envelope was
+                        # not staged (a scene the encrypt flow never produces):
+                        # the envelope cannot be reconstructed without the
+                        # request, so never fabricate one. Keep the op pending
+                        # for an identical retry, which dedupes on the durable
+                        # event and re-seals under the same operation_id.
+                        continue
                     # Backwards-compatible recovery for records that
                     # committed before the result was staged.
                     http_status, response = 201, {
@@ -678,6 +728,17 @@ class OperationStore:
                     response,
                 )
             else:
+                details = record.details or {}
+                if details.get("kind") == "encrypt":
+                    # A read-only idempotent encrypt crashed before its event
+                    # became durable: no key/handle/outbox exists, and the
+                    # sealed envelope cannot be rebuilt at startup (the
+                    # request plaintext/aad are deliberately not stored). Keep
+                    # the operation PENDING with the envelope hidden; an
+                    # identical HTTP/CLI retry runs it once under the same
+                    # operation_id, then either commits the event or re-answers
+                    # from durable facts. Never guess a failed(500) terminal.
+                    continue
                 self.finish(
                     record,
                     STATUS_FAILED,

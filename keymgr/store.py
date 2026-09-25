@@ -2977,7 +2977,11 @@ class KeyStore:
         )
 
     def crypto_material(
-        self, key_id: str, tenant_id: str, version: Optional[int] = None
+        self,
+        key_id: str,
+        tenant_id: str,
+        version: Optional[int] = None,
+        lock_timeout: Optional[float] = None,
     ) -> tuple:
         """Resolve a version's key-encryption key for envelope crypto.
 
@@ -2991,11 +2995,16 @@ class KeyStore:
         the owning provider for the material -- a record owned by an inactive
         provider raises ProviderUnavailable (503), never a silent fallback.
         Nothing is persisted and no audit event is written here.
+
+        With a finite ``lock_timeout`` the per-key in-process and fcntl locks
+        share one deadline and a wait beyond it raises :class:`LockTimeout`
+        before the provider is touched. The idempotent encrypt uses it so a
+        contended key answers 503/timed_out with zero side effects.
         """
         if not is_valid_key_id(key_id):
             return self.CRYPTO_NOT_FOUND, None, None, None
         path = self._path_for(key_id)
-        with self._key_lock(key_id), self._file_lock(key_id):
+        with self.key_locks(key_id, timeout=lock_timeout):
             on_disk = self._read_record(path)
             if on_disk is None or on_disk.tenant_id != tenant_id:
                 return self.CRYPTO_NOT_FOUND, None, None, None

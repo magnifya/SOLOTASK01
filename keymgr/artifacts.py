@@ -67,7 +67,15 @@ _KIND_ACTIONS = {
     "batch_rotate": audit_mod.ACTION_BATCH_ROTATE,
     "import": audit_mod.ACTION_IMPORT,
     "restore": audit_mod.ACTION_IMPORT,
+    # Envelope encryption is a read-only idempotent operation: it mints no
+    # provider handle and writes no key file, but its one audit event is still
+    # named after the operation_id, so its mirror commits by the ledger event.
+    "encrypt": audit_mod.ACTION_ENCRYPT,
 }
+
+# Kinds that only ever READ the key set and can never record a freshly minted
+# provider handle, a provision journal, a batch snapshot or a restore marker.
+_READ_ONLY_KINDS = frozenset(("encrypt",))
 
 
 class ArtifactInconsistent(Exception):
@@ -208,7 +216,7 @@ class ArtifactMirror:
             seen.add(key_id)
             normalized.append(key_id)
         normalized.sort()
-        if kind in ("rotate", "import") and len(normalized) != 1:
+        if kind in ("rotate", "import", "encrypt") and len(normalized) != 1:
             raise ArtifactInconsistent(
                 "mirror kind %r requires exactly one write-set key, got %d"
                 % (kind, len(normalized))
@@ -891,6 +899,20 @@ class ArtifactStore:
                 return False
             if not ArtifactStore._valid_write_set_shape(kind, write_set):
                 return False
+        # A read-only kind (encrypt) mints nothing: any handle, provision
+        # journal, batch snapshot, restore marker or policy fact on its mirror
+        # is by construction an inconsistency.
+        if kind in _READ_ONLY_KINDS:
+            if descriptor.get("handles"):
+                return False
+            if descriptor.get("journal") is not None:
+                return False
+            if descriptor.get("snapshot") is not None:
+                return False
+            if descriptor.get("empty_marker") is not None:
+                return False
+            if descriptor.get("policy"):
+                return False
         journal = descriptor.get("journal")
         if journal is not None and journal != operation_id:
             return False
@@ -935,7 +957,7 @@ class ArtifactStore:
             if not _is_key_id(key_id) or key_id in seen:
                 return False
             seen.add(key_id)
-        if kind in ("rotate", "import") and len(seen) != 1:
+        if kind in ("rotate", "import", "encrypt") and len(seen) != 1:
             return False
         if kind == "batch_rotate" and not seen:
             return False
@@ -957,7 +979,7 @@ class ArtifactStore:
         if not isinstance(details, dict) or details.get("kind") != kind:
             return False
         write_set = descriptor.get("write_set") or []
-        if kind in ("rotate", "import"):
+        if kind in ("rotate", "import", "encrypt"):
             return details.get("key_id") == (write_set[0] if write_set else None)
         if kind == "batch_rotate":
             items = details.get("items")
@@ -1041,7 +1063,7 @@ class ArtifactStore:
             return False
         kind = descriptor.get("kind")
         write_set = descriptor.get("write_set") or []
-        if kind in ("rotate", "import"):
+        if kind in ("rotate", "import", "encrypt"):
             if event.key_id != (write_set[0] if write_set else None):
                 return False
         elif event.key_id is not None:
@@ -1086,11 +1108,15 @@ class ArtifactStore:
         response = result.get("response")
         if http_status is None and response is None:
             return True
-        if http_status != 201 or not isinstance(response, dict):
+        if not isinstance(response, dict):
             return False
         kind = descriptor.get("kind")
         tenant_id = descriptor.get("tenant_id")
         write_set = descriptor.get("write_set") or []
+        # Mutating operations stage a 201; the read-only encrypt stages a 200.
+        allowed_status = 200 if kind in _READ_ONLY_KINDS else 201
+        if http_status != allowed_status:
+            return False
         if kind in ("rotate", "import"):
             key_id = write_set[0] if write_set else None
             if response.get("key_id") != key_id:
@@ -1123,6 +1149,32 @@ class ArtifactStore:
                 if not isinstance(version, int) or key.get_version(version) is None:
                     return False
             if response_keys != set(write_set):
+                return False
+        elif kind == "encrypt":
+            # The read-only encrypt creates nothing: the key must still exist
+            # for the mirror's tenant and the staged envelope must name that
+            # same key and one of its existing versions. The envelope bytes
+            # themselves are opaque -- only structural metadata is checked.
+            from . import envelope as envelope_mod
+
+            key_id = write_set[0] if write_set else None
+            if response.get("format") != envelope_mod.FORMAT:
+                return False
+            if response.get("operation_id") != descriptor.get("operation_id"):
+                return False
+            token = response.get("envelope")
+            if not isinstance(token, str) or not token:
+                return False
+            try:
+                opened = envelope_mod.decode_envelope(token)
+            except Exception:
+                return False
+            if opened.key_id != key_id:
+                return False
+            key = self.key_store._read_record(self.key_store._path_for(key_id))
+            if key is None or key.tenant_id != tenant_id:
+                return False
+            if key.get_version(opened.version) is None:
                 return False
         elif kind == "restore":
             key_ids = response.get("key_ids")

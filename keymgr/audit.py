@@ -328,6 +328,22 @@ class AuditLog:
                 return event
         return None
 
+    def commitment(self, message: str) -> str:
+        """Keyed, opaque digest of request material that must never be stored.
+
+        The idempotent encrypt binds on the exact (normalized) request, but its
+        plaintext and AAD are secret. The operation/mirror records therefore
+        carry only this HMAC-SHA256 commitment (keyed by the 0600
+        ``audit.secret``) of the secret fields: equal inputs replay, differing
+        inputs conflict, and the material itself can neither be recovered from
+        disk nor forged without the secret.
+        """
+        return hmac.new(
+            self._signing_secret(),
+            message.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
     # -- cursors -----------------------------------------------------------
     def _encode_cursor(self, payload: dict) -> str:
         raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
