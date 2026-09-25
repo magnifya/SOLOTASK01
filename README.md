@@ -123,6 +123,20 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   租户策略，见下。
 - `GET /v1/audit`：本租户审计查询，见下。
 - `GET /v1/operations/{operation_id}`：查询幂等操作，见下。
+- `GET /v1/provider/status`：KMS/HSM 健康状态。只需单一操作者头，**不接受**
+  tenant_id（头、参数、体均不可携带）。惰性按当前配置建厂并探测可选
+  `health()`。`200` 键序固定 `{"provider_id","status"}`，`status` 仅
+  `ready`/`unavailable`；加载失败时 `provider_id` 为 `null`。
+- `POST /v1/provider/reconnect`：无中断重连。操作者头同上、正文必须恰为
+  `{}`（坏 JSON、非对象或任何多余字段一律 `400`，零副作用）。按当前
+  `KEYMGR_PROVIDER` 配置**重新建厂、校验契约并检查健康**，任一失败 `503`
+  且**保留旧实例**，错误体固定
+  `{"error":"key management provider is unavailable"}`；成功 `200` 返回与
+  status 同序同形的结构。重连与提供者调用**共用五秒门限**：在途调用始终由
+  旧实例完成，新调用等待新实例；门限超时 `503` 且零副作用（不调用错后端、
+  不写审计/句柄）。已绑定的 pending 操作仍绑定其原 `provider_id`：活动提供者
+  id 不匹配时保持 `pending` 并 `503`，重连回**同一 id** 后同键重试在同一
+  `operation_id` 下继续，`event_id` 绝不重复。
 
 ## 幂等操作
 
@@ -268,7 +282,15 @@ python -m keymgr restore  --tenant-id t --passphrase pw --bundle <b> \
 python -m keymgr audit    --tenant-id t --action rotate --limit 100 --operator alice
 python -m keymgr operation --tenant-id t --operator alice --operation-id <id>
 python -m keymgr policy --operator admin set|show|delete --tenant-id t [--rules '<json>']
+# KMS/HSM 健康检查 / 无中断重连（不按租户隔离，只需 --operator）
+python -m keymgr provider status    --operator admin
+python -m keymgr provider reconnect --operator admin
 ```
+
+`provider status|reconnect` 成功输出同序单行 JSON
+`{"provider_id":...,"status":"ready|unavailable"}`（加载失败时
+`provider_id` 为 null）；重连的参数/坏 JSON 错误退出 `2`，后端
+（加载/契约/健康/五秒门限）失败退出 `1` 且 stderr 仅固定文案。
 
 ## KMS/HSM 提供者
 
@@ -277,7 +299,9 @@ python -m keymgr policy --operator admin set|show|delete --tenant-id t [--rules 
   generate/rotate/import_material/export_material/delete）及这五个方法。
   generate/rotate/import_material → `{handle, public_key, encrypted_material}`；
   export_material(handle) → `{public_key, encrypted_material}`；delete(handle)
-  幂等。模块缺失/工厂失败/契约不符/后端异常一律 `503`（CLI `1`），固定文案
+  幂等。可再实现无参 `health()` → 纯 `bool`：**缺少该方法视为健康**；返回
+  非布尔值或抛出异常视为不可用，且探测文本绝不外泄。模块缺失/工厂失败/契约
+  不符/后端异常/健康不可用一律 `503`（CLI `1`），固定文案
   "key management provider is unavailable"，绝不回退；导入材料不符算法（AES
   非 32 字节、RSA 公私钥不匹配等）为 `400`，错误只指名字段。
 - 本地提供者用 `local.dek`(0600) 以 AES-256-GCM 包装材料，句柄与包装材料登

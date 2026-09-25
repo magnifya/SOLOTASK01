@@ -8,7 +8,10 @@ Fault injection is driven by a JSON file named by ``FAKE_KMS_FAULTS``:
     {
       "unreachable": true,          # every call fails as a backend outage
       "fail": {"delete": true, ...} # per-operation failures
-      "sleep": {"rotate": 5.0}      # per-operation pre-call delay (seconds)
+      "sleep": {"rotate": 5.0},     # per-operation pre-call delay (seconds)
+      "health": false,              # health() reports unavailable
+      "health_raises": true,        # health() raises (=> unavailable)
+      "health_nonbool": true        # health() returns a non-bool (=> unavailable)
     }
 
 Materials are stored base64-wrapped with a static prefix so nothing here ever
@@ -118,6 +121,19 @@ class FakeKmsProvider:
 
     def configure(self, data_dir):
         _check_fault("configure")
+
+    def health(self):
+        # Optional health contract for the provider tests. The safe adapter
+        # treats a non-bool result or a raised exception as unavailable and
+        # never surfaces the underlying text.
+        faults = _faults()
+        if faults.get("health_raises"):
+            raise RuntimeError("health probe exploded with secret detail")
+        if faults.get("health_nonbool"):
+            return "yes"
+        if "health" in faults:
+            return bool(faults.get("health"))
+        return True
 
     def _mint(self, algorithm, public_key, material):
         _check_fault("mint")

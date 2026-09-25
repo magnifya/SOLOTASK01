@@ -32,11 +32,12 @@ from contextlib import contextmanager
 from typing import Dict, Iterator, List, NamedTuple, Optional
 
 from . import audit as audit_mod
+from . import provider as provider_mod
 from . import tenantbundle
 from .artifacts import PHASE_COMMITTED, PHASE_ROLLED_BACK, PHASE_STAGED
 from .audit import AuditEvent, LedgerError
 from .policy import Rule
-from .provider import ProviderUnavailable
+from .provider import LOCAL_PROVIDER_ID, ProviderUnavailable
 
 try:  # fcntl is POSIX-only; restores still work without cross-process locks.
     import fcntl
@@ -142,9 +143,31 @@ class RestoreCoordinator:
 
     def backup_bundle(self, tenant_id: str, passphrase: str) -> str:
         """Seal the tenant's full state into an opaque backup bundle."""
-        return tenantbundle.encode_bundle(
-            self.backup_payload(tenant_id), passphrase
-        )
+        # One pin for the whole snapshot: the legacy adoption and every
+        # version's provider export share the same pinned instance and drain
+        # token, so a reconnect cannot land between versions of one bundle.
+        # Inside an idempotent gate this simply reuses that gate's pin.
+        with provider_mod.operation_pin():
+            return tenantbundle.encode_bundle(
+                self.backup_payload(tenant_id), passphrase
+            )
+
+    @staticmethod
+    def _restore_provider_ids(payload: dict):
+        """Every distinct provider id a restore's versions adopt through.
+
+        A version without a provenance block is legacy local material; any
+        other version names the provider whose block it carries.
+        """
+        ids = []
+        for entry in payload.get("keys", []):
+            for ver in entry.get("versions", []):
+                block = ver.get("provider")
+                ids.append(
+                    LOCAL_PROVIDER_ID if block is None
+                    else block.get("provider_id")
+                )
+        return ids
 
     # -- restore -----------------------------------------------------------
     @contextmanager
@@ -291,6 +314,14 @@ class RestoreCoordinator:
         # Take every lock BEFORE minting the event/journal/handles, so a
         # lock-wait timeout leaves no key, audit event or handle behind.
         with self._restore_locks(tenant_id, key_ids, lock_timeout):
+            # Bind/check the owning provider id of every bundled version
+            # BEFORE the event/journal exists: a version without a provenance
+            # block is local-only, every other version names its provider. An
+            # attempt that would span providers, or one whose bound (pending)
+            # provider is inactive, fails here as a clean 503 with no journal
+            # or handle, and the operation stays PENDING for a same-id retry
+            # after a same-provider reconnect.
+            provider_mod.preflight(self._restore_provider_ids(payload))
             # Mint the committing event up front so the provision journal is
             # named after its event_id, letting startup recovery decide
             # committed-vs-not purely from the ledger.

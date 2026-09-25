@@ -34,6 +34,7 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from typing import Callable, NamedTuple, Optional
 
 try:  # fcntl is POSIX-only; idempotency still works without cross-process locks.

@@ -11,13 +11,19 @@ from . import audit as audit_mod
 from . import envelope
 from . import keybundle
 from . import operations as operations_mod
+from . import provider as provider_mod
 from . import restore as restore_mod
 from . import tenantbundle
 from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
 from .operations import OperationStore
 from .policy import PolicyError, PolicyStore, validate_rules
-from .provider import ProviderInvalidMaterial, ProviderUnavailable
+from .provider import (
+    ProviderInvalidMaterial,
+    ProviderMismatch,
+    ProviderSwitchTimeout,
+    ProviderUnavailable,
+)
 from .server import _resolve_committed_operation, serve
 from .store import IMPORT_CONFLICT, KeyStore, LockTimeout, is_valid_key_id, validate_batch_items
 
@@ -196,6 +202,28 @@ def build_parser() -> argparse.ArgumentParser:
         "delete", help="delete a tenant's policy"
     )
     p_policy_delete.add_argument("--tenant-id", required=True)
+
+    p_provider = sub.add_parser(
+        "provider", help="inspect or reconnect the KMS/HSM provider"
+    )
+    provider_sub = p_provider.add_subparsers(
+        dest="provider_command", required=True
+    )
+    p_provider_status = provider_sub.add_parser(
+        "status", help="show provider_id and ready/unavailable status"
+    )
+    p_provider_status.add_argument(
+        "--operator", required=True,
+        help="non-empty X-Operator-Id of the caller",
+    )
+    p_provider_reconnect = provider_sub.add_parser(
+        "reconnect",
+        help="rebuild the provider from current config and swap it in",
+    )
+    p_provider_reconnect.add_argument(
+        "--operator", required=True,
+        help="non-empty X-Operator-Id of the caller",
+    )
 
     p_serve = sub.add_parser("serve", help="run the HTTP server")
     p_serve.add_argument("--host", default="127.0.0.1")
@@ -557,7 +585,21 @@ def _idempotent_run_body(op_store, store, artifact_store, executor, operation,
     from .artifacts import ArtifactStrandUnavailable
 
     try:
-        http_status, resp = executor(operation, mirror)
+        # Provider gate: durably bind the pending op to its provider id and
+        # pin one instance across the whole attempt (see the HTTP handler).
+        with provider_mod.operation_gate(operation, op_store):
+            http_status, resp = executor(operation, mirror)
+    except (ProviderMismatch, ProviderSwitchTimeout):
+        # Bound provider inactive, or the 5 s reconnect gate expired: keep
+        # the operation PENDING, write no event, and answer the fixed 503
+        # (exit 1). A same-id retry after a same-id reconnect continues.
+        return _emit_operation_result(
+            503,
+            {
+                "error": "key management provider is unavailable",
+                "operation_id": op_id,
+            },
+        )
     except ArtifactStrandUnavailable as exc:
         # The mirror could not be described/tied in before the first provider
         # call: nothing committed, keep the operation pending for a same-id
@@ -679,6 +721,9 @@ def _run(argv: Optional[List[str]] = None) -> int:
         return _fail(
             "field operator must be a non-empty string", 2
         )
+
+    if args.command == "provider":
+        return _provider_command(args)
 
     def allowed(action, key_id=None) -> bool:
         """Policy gate; on denial the response/audit was already handled."""
@@ -1486,6 +1531,31 @@ def _run(argv: Optional[List[str]] = None) -> int:
         return _policy_command(args, policies)
 
     return 2  # pragma: no cover - argparse enforces choices
+
+
+def _provider_status_json() -> dict:
+    # Same fixed key order as GET /v1/provider/status.
+    provider_id, ready = provider_mod.provider_status()
+    return {
+        "provider_id": provider_id,
+        "status": "ready" if ready else "unavailable",
+    }
+
+
+def _provider_command(args) -> int:
+    """Handle `provider status|reconnect`; not tenant scoped.
+
+    Success prints one single-line JSON object in key order
+    ``provider_id,status``; a backend load/contract/health/drain failure
+    exits 1 with the fixed generic message (CLI 503).
+    """
+    if args.provider_command == "reconnect":
+        try:
+            provider_mod.reconnect()
+        except ProviderUnavailable:
+            return _fail("key management provider is unavailable", 1)
+    _print(_provider_status_json())
+    return 0
 
 
 def _policy_command(args, policies: PolicyStore) -> int:

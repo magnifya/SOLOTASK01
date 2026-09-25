@@ -344,7 +344,16 @@ class KeyStore:
     # -- provider helpers --------------------------------------------------
     @staticmethod
     def _provider():
-        """The active KMS/HSM provider (imported lazily on first use)."""
+        """The active KMS/HSM provider for a request's generation calls.
+
+        Inside a provider gate/pin this resolves through the thread-local
+        session (lazily pinning the installed instance for the whole request
+        so a concurrent reconnect cannot swap it mid-operation); startup
+        recovery and other unwired callers get the lazily-loaded global.
+        """
+        session = provider_mod.current_session()
+        if session is not None:
+            return session.resolve_active()
         return provider_mod.get_provider()
 
     # -- provision journal -------------------------------------------------
@@ -1267,11 +1276,23 @@ class KeyStore:
         providers.
         """
         if provider_id == LOCAL_PROVIDER_ID:
-            if provider_mod.active_is_local():
-                return provider_mod.get_local_provider()
-            raise ProviderUnavailable(
-                "record is owned by the local provider, which is not active"
-            )
+            if not provider_mod.active_is_local():
+                raise ProviderUnavailable(
+                    "record is owned by the local provider, which is not active"
+                )
+            session = provider_mod.current_session()
+            if session is not None:
+                # Route the local singleton through the gate/pin too, so a
+                # pending attempt owned by "local" records the same durable
+                # provider_id binding as an external-provider attempt.
+                return session.resolve(LOCAL_PROVIDER_ID)
+            return provider_mod.get_local_provider()
+        session = provider_mod.current_session()
+        if session is not None:
+            # Inside a request gate/pin: pin once and keep using that
+            # instance (the gate's drain token covers the whole request),
+            # including a bound pending op's provider-id check.
+            return session.resolve(provider_id)
         active = provider_mod.get_provider()
         if active.provider_id != provider_id:
             raise ProviderUnavailable(
@@ -1289,38 +1310,43 @@ class KeyStore:
         handle and raises LedgerError, so the change and its event never land
         separately.
         """
-        provider = self._provider()
-        triple = provider.generate(algorithm)
-        key_id = str(uuid.uuid4())
-        created_at = datetime.now(timezone.utc).isoformat()
-        record = KeyRecord(
-            key_id=key_id,
-            tenant_id=tenant_id,
-            label=label,
-            versions=[
-                VersionRecord(
-                    version=1,
-                    created_at=created_at,
-                    algorithm=algorithm,
-                    public_key=triple.public_key,
-                    provider_id=provider.provider_id,
-                    handle=triple.handle,
-                    encrypted_material=triple.encrypted_material,
-                )
-            ],
-            current_version=1,
-        )
-        event = self.audit.new_event(
-            tenant_id, audit_mod.ACTION_CREATE, key_id,
-            audit_mod.OUTCOME_SUCCESS, timestamp=created_at,
-        )
-        # The key_id is fresh, but take the same locks as rotation so a
-        # concurrent rotate cannot observe a half-written create.
-        with self._key_lock(key_id), self._file_lock(key_id):
-            self._commit_mutation(
-                self._path_for(key_id), record, event, None,
-                provider=provider, new_handles=(triple.handle,),
+        # Pin one provider instance for the whole mint -> commit (and any
+        # rollback delete) so a concurrent reconnect cannot swap the backend
+        # underneath this request. Inside an idempotent gate this is a no-op
+        # reuse of the operation's own pinned instance.
+        with provider_mod.operation_pin():
+            provider = self._provider()
+            triple = provider.generate(algorithm)
+            key_id = str(uuid.uuid4())
+            created_at = datetime.now(timezone.utc).isoformat()
+            record = KeyRecord(
+                key_id=key_id,
+                tenant_id=tenant_id,
+                label=label,
+                versions=[
+                    VersionRecord(
+                        version=1,
+                        created_at=created_at,
+                        algorithm=algorithm,
+                        public_key=triple.public_key,
+                        provider_id=provider.provider_id,
+                        handle=triple.handle,
+                        encrypted_material=triple.encrypted_material,
+                    )
+                ],
+                current_version=1,
             )
+            event = self.audit.new_event(
+                tenant_id, audit_mod.ACTION_CREATE, key_id,
+                audit_mod.OUTCOME_SUCCESS, timestamp=created_at,
+            )
+            # The key_id is fresh, but take the same locks as rotation so a
+            # concurrent rotate cannot observe a half-written create.
+            with self._key_lock(key_id), self._file_lock(key_id):
+                self._commit_mutation(
+                    self._path_for(key_id), record, event, None,
+                    provider=provider, new_handles=(triple.handle,),
+                )
         return record
 
     def _marker_event_durable(self, marker) -> bool:
@@ -1719,7 +1745,10 @@ class KeyStore:
             self._ensure_settled(record)
             # A version is rotated on the provider that owns the record;
             # switching providers mid-key is refused (503), never silently
-            # migrated.
+            # migrated. Resolve (and, inside an idempotent gate, durably bind
+            # the pending operation to) the provider BEFORE any journal or
+            # handle exists, so a provider-mismatch/reconnect-gate failure is
+            # a clean 503 with zero artifacts and the op stays retryable.
             provider = self._provider_for(record.current.provider_id)
             previous = record.to_json()
             # Mint the committing event and its provision journal *before*
@@ -3004,30 +3033,34 @@ class KeyStore:
         if not is_valid_key_id(key_id):
             return self.CRYPTO_NOT_FOUND, None, None, None
         path = self._path_for(key_id)
-        with self.key_locks(key_id, timeout=lock_timeout):
-            on_disk = self._read_record(path)
-            if on_disk is None or on_disk.tenant_id != tenant_id:
-                return self.CRYPTO_NOT_FOUND, None, None, None
-            # Never crypto against an uncommitted current: project only the
-            # durable state (the view, not the file, is trimmed).
-            record = self._committed_record(on_disk)
-            if record is None:
-                return self.CRYPTO_NOT_FOUND, None, None, None
-            # Adopt a raw legacy record now, under the key locks and only
-            # while the local provider is active (same rule as export).
-            self._take_over_legacy(record)
-            if record.status == "revoked":
-                return self.CRYPTO_REVOKED, record, None, None
-            if version is None:
-                ver = record.current
-            else:
-                ver = record.get_version(version)
-                if ver is None:
-                    return self.CRYPTO_NOT_FOUND, record, None, None
-            provider = self._provider_for(ver.provider_id)
-            exported = provider.export_material(ver.handle)
-            kek = self._kek_for_version(ver, exported.encrypted_material)
-            return self.CRYPTO_OK, record, ver, kek
+        # Pin the owning provider for the export call; the reserve is lazy so
+        # the token is only taken when _provider_for actually loads/selects a
+        # backend, and an idempotent encrypt gate reuses its own pin.
+        with provider_mod.operation_pin():
+            with self.key_locks(key_id, timeout=lock_timeout):
+                on_disk = self._read_record(path)
+                if on_disk is None or on_disk.tenant_id != tenant_id:
+                    return self.CRYPTO_NOT_FOUND, None, None, None
+                # Never crypto against an uncommitted current: project only the
+                # durable state (the view, not the file, is trimmed).
+                record = self._committed_record(on_disk)
+                if record is None:
+                    return self.CRYPTO_NOT_FOUND, None, None, None
+                # Adopt a raw legacy record now, under the key locks and only
+                # while the local provider is active (same rule as export).
+                self._take_over_legacy(record)
+                if record.status == "revoked":
+                    return self.CRYPTO_REVOKED, record, None, None
+                if version is None:
+                    ver = record.current
+                else:
+                    ver = record.get_version(version)
+                    if ver is None:
+                        return self.CRYPTO_NOT_FOUND, record, None, None
+                provider = self._provider_for(ver.provider_id)
+                exported = provider.export_material(ver.handle)
+                kek = self._kek_for_version(ver, exported.encrypted_material)
+                return self.CRYPTO_OK, record, ver, kek
 
     # -- export / import ---------------------------------------------------
     def _export_version(self, ver: VersionRecord) -> dict:
@@ -3083,23 +3116,26 @@ class KeyStore:
         if not is_valid_key_id(key_id):
             return None
         path = self._path_for(key_id)
-        with self._key_lock(key_id), self._file_lock(key_id):
-            on_disk = self._read_record(path)
-            if on_disk is None or on_disk.tenant_id != tenant_id:
-                return None
-            # Never seal an uncommitted current: project only the durable
-            # state (the view, not the file, is trimmed).
-            record = self._committed_record(on_disk)
-            if record is None:
-                return None
-            # Adopt a raw legacy record now, under the key locks and only
-            # while the local provider is active. When a module:factory
-            # provider is active this is a no-op and _export_version fails
-            # the local-owned version as 503, without rewriting anything.
-            self._take_over_legacy(record)
-            return keybundle.encode_bundle(
-                self.export_payload(record), passphrase
-            )
+        # One pin for the legacy adoption and every per-version provider
+        # export, so a reconnect cannot land between versions of one bundle.
+        with provider_mod.operation_pin():
+            with self._key_lock(key_id), self._file_lock(key_id):
+                on_disk = self._read_record(path)
+                if on_disk is None or on_disk.tenant_id != tenant_id:
+                    return None
+                # Never seal an uncommitted current: project only the durable
+                # state (the view, not the file, is trimmed).
+                record = self._committed_record(on_disk)
+                if record is None:
+                    return None
+                # Adopt a raw legacy record now, under the key locks and only
+                # while the local provider is active. When a module:factory
+                # provider is active this is a no-op and _export_version fails
+                # the local-owned version as 503, without rewriting anything.
+                self._take_over_legacy(record)
+                return keybundle.encode_bundle(
+                    self.export_payload(record), passphrase
+                )
 
     def prepare_backup_record(self, record: KeyRecord) -> KeyRecord:
         """Lazily adopt a record's legacy versions for a tenant backup.
@@ -3234,6 +3270,17 @@ class KeyStore:
         # Acquire the key lock first: a lock-wait timeout must surface before
         # a journal, handle or event exists.
         with self.key_locks(key_id, timeout=lock_timeout):
+            # Bind/check the owning provider id BEFORE the journal exists: a
+            # bundle without a provenance block is local-only; every block
+            # names the provider the versions must be adopted through. Under
+            # an idempotent gate this durably binds the pending op (a retried
+            # op whose provider is inactive stays pending 503) and starts the
+            # reconnect drain timer; nothing is minted here.
+            provider_mod.preflight(
+                LOCAL_PROVIDER_ID if ver.get("provider") is None
+                else ver["provider"].get("provider_id")
+                for ver in payload["versions"]
+            )
             # Mint the committing event up front so the provision journal is
             # named after its event_id: a leftover journal resolves at any
             # startup by asking the ledger whether the event committed.
