@@ -163,14 +163,19 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   提供者”规则终态 `503`。曾激活的 provider_id 记在
   `provider-ids.json`(0600)，跨进程可识别。
 - **主备故障转移（`KEYMGR_PROVIDER_CHAIN`）**：链配置后，首次健康激活
-  选链中首个健康项。每次提供者调用都会探测活动实例；活动实例不健康时，
-  复用同一 5 秒跨进程意图/排水门切到首个健康备项（排除当前活动 id）：
-  在途旧调用由其进入时捕获的实例完成，切换提交后到达的调用只用新代，
-  并发触发仅一次建厂/提交（其余等待者直接采用已提交的代）。切换失败
-  （无健康备项、门限超时、提交失败）不改旧代，固定 `503`（CLI `1`），
-  不铸句柄、不写审计、不外泄后端文本。主项恢复健康后**不自动回切**；
-  只有 reconnect 按链序重选首个健康项。pending 幂等操作仍绑定原
-  `provider_id`，绝不在备端重放；重连回同 id 提供者后，同
+  选链中首个健康项。**每次普通 provider 调用都先探活活动实例**：探活恰好
+  返回 `True` 即把连续失败数清零并继续；返回 `False`、非 `bool`、抛异常或
+  探活超过共用 5 秒门限，都把活动项的连续失败数加一（持久化、最多 3）并
+  固定 `503`。前两次失败**不切换**；第三次失败在现有 5 秒跨进程意图/排水
+  门内**再验一次**活动实例——恢复则清零并继续本次调用，否则只切一次到链
+  中首个健康备项（排除当前活动 id）并令 `generation` 加 1。在途旧调用由
+  其进入时捕获的实例完成，切换提交后到达的调用只用新代，并发的第三次失
+  败仅一次建厂/提交（其余等待者直接采用已提交的代；失败计数本身由独立的
+  `provider-health.lock` 短排他锁跨进程串行化，前两次失败不排水、不阻
+  断在途调用）。切换失败（无健康备项、门限超时、提交失败）不改旧代，固
+  定 `503`（CLI `1`），不铸句柄、不写审计、不外泄后端文本。主项恢复健康
+  后**不自动回切**；只有 reconnect 按链序重选首个健康项。pending 幂等操
+  作仍绑定原 `provider_id`，绝不在备端重放；重连回同 id 提供者后，同
   `Idempotency-Key` 的请求在同一 `operation_id`/`event_id` 下继续恰好
   一次。
 - **定向切换（`POST /v1/provider/switchover`）**：只需单一非空
@@ -203,7 +208,22 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   文件。仅健康候选能在跨进程排他锁（`provider-state.lock`，与进程内门
   共用 5 秒门限）下互斥递增 generation；失败或提交前崩溃保留旧代。提交
   后各进程下次调用重建当前配置，所得 `provider_id` 不符或不健康则
-  `503`（链配置时改为触发故障转移）且零副作用。
+  `503`（链配置时改为按下面的持久化故障门限处理）且零副作用。
+- **持久化故障门限 `provider-health.json`(0600)**：记录活动项的连续失败
+  数，使“三次失败才切换”的门限跨重启生效、跨进程共享。紧凑 UTF-8 JSON、
+  非 ASCII 原样、无末尾换行，temp 文件 fsync 后原子 rename，顶层键序固定
+  `schema_version,provider_id,generation,status,consecutive_failures`（依次
+  为固定整数 1、非空字符串、正整数、`ready`/`unavailable`、0–3 整数）。它
+  是 **ready** `provider-state.json` 的卫星文件，须与其同 ID 同代：文件缺失
+  或代落后于已提交代时，据后者重建为该代 `ready`/0；文件损坏、代超前、或
+  同代但 `provider_id` 不符，普通 provider 调用一律固定 `503` 且**绝不改
+  写**该文件（reconnect/switchover/failover 的提交也会在落笔前被这种毒文件
+  挡住、两个文件都保持原样；status 同样报 `unavailable`）。切换/重连/首次
+  激活**先提交 `provider-state.json`，再写新代的 `ready`/0**（两步之间崩溃
+  时，旧 health 因代落后于新 state 而在下次读取时重建为 `ready`/0）。重启
+  按上述规则收敛；探活 `True` 清零，`False`/非 bool/异常加一，并发失败的
+  计数由 `provider-health.lock` 短排他锁串行（前两次失败不排水、不阻断在途
+  调用），只有第三次失败才触发那一次切换。
 - CLI：`provider status --operator O`、
   `provider reconnect --operator O` 与
   `provider switchover --operator O --provider-id P`，成功输出同序单行

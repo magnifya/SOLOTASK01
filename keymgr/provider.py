@@ -13,11 +13,22 @@ Primary/standby failover
 ``module:factory`` entries (entries and their built ``provider_id`` values
 must be unique; an unset variable falls back to ``KEYMGR_PROVIDER``, while a
 set-but-empty, empty-item or malformed chain is unusable). The first healthy
-entry is activated; when the active instance later probes unhealthy, the
-service fails over to the first healthy standby under the same five-second
-cross-process intent/drain gate a reconnect uses -- old calls finish on the
+entry is activated. Every ORDINARY provider call then probes the active
+instance first: a probe returning exactly ``True`` clears the persisted
+failure count and proceeds; ``False``, a non-bool, a raised or an expired
+probe increments the active entry's persisted failure count (capped at three)
+and pins the call to the fixed 503. The first two failures never switch; the
+third re-verifies the active entry under the same five-second cross-process
+intent/drain gate a reconnect uses -- recovery clears the count and serves the
+call, otherwise the active generation fails over exactly once to the first
+healthy standby and increments the generation. Old calls finish on the
 instance they captured, later calls land on the new generation, and
-concurrent triggers build/commit exactly once. A recovered primary is never
+concurrent third strikes build/commit exactly once. With no healthy standby
+(or on a gate timeout) the old generation is retained. The threshold lives in
+``provider-health.json`` (a 0600 satellite of a READY ``provider-state.json``
+with the same id and generation), so it survives restarts and is shared
+across processes; a corrupt, ahead or same-generation-wrong-id health record
+is a fixed 503 that is never rewritten. A recovered primary is never
 re-selected automatically; only ``reconnect`` re-selects the first healthy
 entry, while ``switchover`` moves the active provider to one NAMED chain
 entry under the same gate (``switching`` then ``ready`` commits, reason
@@ -969,6 +980,35 @@ def _parse_committed_state(data) -> Optional[_CommittedState]:
     )
 
 
+def _assert_health_allows_commit(
+    provider_id: str, generation: int
+) -> None:
+    """Refuse a provider-state commit that would overwrite a poison satellite.
+
+    Called immediately before every ``provider-state.json`` commit. The
+    existing health file may be superseded only when it is absent, lags the
+    record being committed, or already tracks that same id/generation. A
+    corrupt file, one ahead of the committed generation, or one at the same
+    generation with a different provider_id is poison: raise the fixed 503 and
+    leave BOTH files byte-for-byte untouched. This makes the corruption
+    contract hold for reconnect/switchover/failover commits too, not just
+    ordinary calls.
+    """
+    if _configured_dir is None:
+        return
+    health = _read_health()
+    if health is None:
+        return
+    if health.generation < generation:
+        return
+    if health.generation == generation and health.provider_id == provider_id:
+        return
+    raise ProviderUnavailable(
+        "provider health record is corrupt, ahead of the committed provider "
+        "state, or tracks a different provider id"
+    )
+
+
 def _write_committed_state(
     provider_id: str,
     generation: int,
@@ -981,10 +1021,13 @@ def _write_committed_state(
     The payload is compact UTF-8 JSON with the fixed key order
     ``schema_version,provider_id,target_provider_id,generation,reason,phase``,
     non-ASCII written as-is and no trailing newline. The rename is the commit
-    point: a crash before it keeps the previous record.
+    point: a crash before it keeps the previous record. A poison
+    ``provider-health.json`` (corrupt/ahead/same-generation-wrong-id) blocks
+    the commit before anything is written.
     """
     if _configured_dir is None:
         return
+    _assert_health_allows_commit(provider_id, generation)
     payload = json.dumps(
         {
             "schema_version": _STATE_SCHEMA_VERSION,
@@ -1024,6 +1067,218 @@ def _write_committed_state(
         except OSError:
             pass
         raise
+    if phase == _PHASE_READY:
+        # A switch/activation commits provider-state FIRST and only then the
+        # new generation's health satellite as ready/0 (explicit commit: this
+        # also supersedes a stale, lagging, ahead or corrupt health file,
+        # unlike read-time convergence which must never rewrite one). A crash
+        # in between simply rebuilds ready/0 at the next read because the old
+        # health now lags the committed generation.
+        _write_health(
+            provider_id, generation, _HEALTH_STATUS_READY, 0
+        )
+
+
+# -- persisted active-provider failure threshold -----------------------------
+# ``provider-health.json`` (0600) records the active provider's persistent
+# failure threshold so the three-strike failover policy survives a restart and
+# is shared across processes. It is written atomically (temp file, fsync,
+# rename) as compact UTF-8 JSON with the fixed key order
+# ``schema_version,provider_id,generation,status,consecutive_failures``, no
+# ASCII escaping and no trailing newline: schema_version is the fixed integer
+# 1, provider_id the non-empty id of the READY committed provider it belongs
+# to, generation the positive committed generation it tracks, status one of
+# ``ready``/``unavailable`` and consecutive_failures an integer 0..3. The file
+# is a *satellite* of a ``ready`` ``provider-state.json``: it must carry the
+# same (provider_id, generation). A missing file, or one lagging behind the
+# committed generation, is rebuilt as ready/0. A corrupt file, one ahead of the
+# committed generation, or one at the same generation with a different
+# provider_id poisons provider calls (the fixed 503) and is never rewritten.
+# A switch commits ``provider-state.json`` FIRST and only then the new
+# generation's ready/0 health record, so a crash between them simply rebuilds
+# ready/0 at the next read rather than ever trusting a stale failure count.
+_HEALTH_NAME = "provider-health.json"
+_HEALTH_SCHEMA_VERSION = 1
+_HEALTH_STATUS_READY = "ready"
+_HEALTH_STATUS_UNAVAILABLE = "unavailable"
+_HEALTH_FAILURE_LIMIT = 3
+
+
+class _HealthState(NamedTuple):
+    """A parsed ``provider-health.json`` record."""
+
+    provider_id: str
+    generation: int
+    status: str
+    consecutive_failures: int
+
+
+def _health_path() -> Optional[str]:
+    if _configured_dir is None:
+        return None
+    return os.path.join(_configured_dir, _HEALTH_NAME)
+
+
+def _parse_health(data) -> Optional[_HealthState]:
+    """Validate a decoded health object; None when any field is invalid."""
+    if not isinstance(data, dict):
+        return None
+    if set(data) != {
+        "schema_version",
+        "provider_id",
+        "generation",
+        "status",
+        "consecutive_failures",
+    }:
+        return None
+    version = data["schema_version"]
+    provider_id = data["provider_id"]
+    generation = data["generation"]
+    status = data["status"]
+    failures = data["consecutive_failures"]
+    if not (
+        type(version) is int
+        and version == _HEALTH_SCHEMA_VERSION
+        and isinstance(provider_id, str)
+        and bool(provider_id)
+        and type(generation) is int
+        and generation >= 1
+        and status in (_HEALTH_STATUS_READY, _HEALTH_STATUS_UNAVAILABLE)
+        and type(failures) is int
+        and 0 <= failures <= _HEALTH_FAILURE_LIMIT
+    ):
+        return None
+    return _HealthState(
+        provider_id=provider_id,
+        generation=generation,
+        status=status,
+        consecutive_failures=failures,
+    )
+
+
+def _read_health() -> Optional[_HealthState]:
+    """Return the persisted health record, or None if the file is absent.
+
+    A missing/unreadable-as-absent file returns None. A present but corrupt or
+    field-invalid file raises :class:`ProviderUnavailable` so the caller
+    answers the fixed 503 and leaves the file byte-for-byte untouched.
+    """
+    path = _health_path()
+    if path is None:
+        return None
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ProviderUnavailable(
+            "cannot read provider health: %s" % exc
+        ) from exc
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ProviderUnavailable("provider health file is corrupt") from exc
+    health = _parse_health(data)
+    if health is None:
+        raise ProviderUnavailable("provider health file is corrupt")
+    return health
+
+
+def _write_health(
+    provider_id: str,
+    generation: int,
+    status: str,
+    consecutive_failures: int,
+) -> None:
+    """Atomically commit ``provider-health.json`` (0600, fsync + rename).
+
+    Compact UTF-8 JSON, fixed key order
+    ``schema_version,provider_id,generation,status,consecutive_failures``,
+    non-ASCII written as-is, no trailing newline. The rename is the commit
+    point. Raises :class:`ProviderUnavailable` on a write failure.
+    """
+    if _configured_dir is None:
+        return
+    payload = json.dumps(
+        {
+            "schema_version": _HEALTH_SCHEMA_VERSION,
+            "provider_id": provider_id,
+            "generation": generation,
+            "status": status,
+            "consecutive_failures": consecutive_failures,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=_configured_dir, suffix=".tmp")
+    except OSError as exc:
+        raise ProviderUnavailable(
+            "cannot write provider health: %s" % exc
+        ) from exc
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, os.path.join(_configured_dir, _HEALTH_NAME))
+    except OSError as exc:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise ProviderUnavailable(
+            "cannot write provider health: %s" % exc
+        ) from exc
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _reconcile_health(state: _CommittedState) -> _HealthState:
+    """Resolve the persisted health record against a READY committed state.
+
+    ``state`` must be a ready committed record. Convergence rules:
+
+    * the health file is absent, or belongs to an older generation (an
+      id-bearing older generation counts as lagging): rebuild and persist it
+      as ready/0 for the current committed id/generation;
+    * the file is corrupt or field-invalid, is ahead of the committed
+      generation, or sits at the same generation with a different
+      provider_id: raise :class:`ProviderUnavailable` (the fixed 503) without
+      rewriting anything.
+
+    Returns the resolved health record for the current committed generation.
+    """
+    health = _read_health()
+    if health is None or health.generation < state.generation:
+        health = _HealthState(
+            provider_id=state.provider_id,
+            generation=state.generation,
+            status=_HEALTH_STATUS_READY,
+            consecutive_failures=0,
+        )
+        _write_health(
+            health.provider_id,
+            health.generation,
+            health.status,
+            health.consecutive_failures,
+        )
+        return health
+    if health.generation > state.generation:
+        raise ProviderUnavailable(
+            "provider health record is ahead of the committed provider state"
+        )
+    if health.provider_id != state.provider_id:
+        raise ProviderUnavailable(
+            "provider health record does not match the committed provider id"
+        )
+    return health
 
 
 class _FileLease:
@@ -1179,8 +1434,156 @@ def _healthy_within(provider, deadline) -> bool:
     return _health_with_deadline(provider, deadline)
 
 
-class _FailoverNeeded(Exception):
-    """Internal signal: the committed active provider must be failed over."""
+# Serializes per-process failure-counter updates; the matching cross-process
+# serialization is the short exclusive flock on ``provider-health.lock`` taken
+# in :func:`_health_counter_gate`. That fence is deliberately separate from the
+# reconnect intent/drain gate: strikes one and two only bump a counter, so they
+# must never drain in-flight calls or block on a switch. The actual single
+# switch on a third strike still commits under the exclusive state lease inside
+# :func:`_failover` (concurrent third strikes commit exactly once).
+_health_lock = threading.Lock()
+_HEALTH_LOCK_NAME = "provider-health.lock"
+
+
+@contextmanager
+def _health_counter_gate(budget: "_Budget"):
+    """Hold the in-process lock AND a short exclusive cross-process counter
+    flock around one failure-counter read-modify-write.
+
+    Independent of the reconnect intent/drain gate, so ordinary failed probes
+    never drain or block in-flight calls. The held shared provider-state lease
+    of the calling :func:`provider_call` pins the committed generation for the
+    duration; this fence only orders the counter writes of concurrent calls.
+    """
+    with _health_lock:
+        lease = _FileLease(_HEALTH_LOCK_NAME)
+        lease.acquire(True, budget.deadline)
+        try:
+            yield
+        finally:
+            lease.release()
+
+
+def _reconcile_health_with_committed() -> Optional[_HealthState]:
+    """Reconcile the health satellite with the ready committed state.
+
+    Re-reads the committed ``provider-state.json`` (already reconciled and
+    cached by this attempt's :func:`_sync_committed_state`) and resolves the
+    health file for its current generation. Only a ready state has a health
+    satellite; a ``switching`` state is completed/handled before this runs.
+    Returns None when no data directory is bound (nothing to persist).
+    """
+    if _configured_dir is None:
+        return None
+    state = _read_committed_state()
+    if state is None or state.phase != _PHASE_READY:
+        # Should be unreachable on the admission path; refuse rather than
+        # attach a failure count to a non-ready generation.
+        raise ProviderUnavailable("provider state is not ready")
+    return _reconcile_health(state)
+
+
+def _active_probe_ready(budget: "_Budget", provider) -> str:
+    """Probe the active instance and apply the persistent failure threshold.
+
+    Runs on every ordinary provider call in chain mode, after the committed
+    state and its health satellite are reconciled. Returns a directive:
+
+    * ``"admit"``: the call may proceed on ``provider``;
+    * ``"reject"``: the active entry is unhealthy but fewer than three
+      consecutive failures are recorded -- the call is pinned to the fixed
+      503 and NO switch happens;
+    * ``"switch"``: the third consecutive failure -- the caller re-verifies /
+      fails over under the five-second intent/drain gate.
+
+    A probe that returns the exact bool ``True`` clears the persisted count to
+    ready/0 and admits. A ``False``, a non-bool or a raised/expired probe is
+    one failure: the persisted count is incremented (capped at three). On the
+    third failure the active entry is probed once more; recovery clears the
+    count and admits, otherwise the caller performs the single failover.
+    """
+    state = _read_committed_state()
+    if state is None or state.phase != _PHASE_READY:
+        raise ProviderUnavailable("provider state is not ready")
+    if _healthy_within(provider, budget):
+        _record_health(state, ready=True, budget=budget)
+        return "admit"
+    with _health_counter_gate(budget):
+        # Re-read under the cross-process counter fence so two processes
+        # failing the active entry concurrently cannot lose an increment.
+        state = _read_committed_state()
+        if state is None or state.phase != _PHASE_READY:
+            raise ProviderUnavailable("provider state is not ready")
+        health = _reconcile_health(state)
+        failures = min(
+            _HEALTH_FAILURE_LIMIT, health.consecutive_failures + 1
+        )
+        if failures < _HEALTH_FAILURE_LIMIT:
+            # Strikes one and two: persist the failure and pin the call to
+            # 503 without touching the active generation.
+            _write_health(
+                state.provider_id,
+                state.generation,
+                _HEALTH_STATUS_UNAVAILABLE,
+                failures,
+            )
+            return "reject"
+        # Third strike: re-verify the active entry once more inside the
+        # failure gate. A recovered active clears the count and serves this
+        # very call; a still-unhealthy one triggers the single failover.
+        if _healthy_within(provider, budget):
+            _write_health(
+                state.provider_id,
+                state.generation,
+                _HEALTH_STATUS_READY,
+                0,
+            )
+            return "admit"
+        _write_health(
+            state.provider_id,
+            state.generation,
+            _HEALTH_STATUS_UNAVAILABLE,
+            _HEALTH_FAILURE_LIMIT,
+        )
+        return "switch"
+
+
+def _record_health(
+    state: "_CommittedState", ready: bool, budget: Optional["_Budget"] = None
+) -> None:
+    """Persist a probe outcome, coalescing redundant ready/0 writes.
+
+    The steady-state healthy path (the file already tracks this generation as
+    ready/0) takes NO cross-process lock; the short counter flock is acquired
+    only when a write may actually be needed, and the record is re-read under
+    it so concurrent resets still converge.
+    """
+    if budget is None:
+        budget = _Budget()
+    if ready:
+        peek = _read_health()
+        if (
+            peek is not None
+            and peek.generation == state.generation
+            and peek.provider_id == state.provider_id
+            and peek.status == _HEALTH_STATUS_READY
+            and peek.consecutive_failures == 0
+        ):
+            return
+    with _health_counter_gate(budget):
+        health = _reconcile_health(state)
+        if ready:
+            if (
+                health.status == _HEALTH_STATUS_READY
+                and health.consecutive_failures == 0
+            ):
+                return
+            _write_health(
+                state.provider_id,
+                state.generation,
+                _HEALTH_STATUS_READY,
+                0,
+            )
 
 
 def _first_healthy(candidates, deadline, exclude_id: Optional[str] = None):
@@ -1246,10 +1649,12 @@ def _complete_switch(state: _CommittedState, deadline) -> _CommittedState:
 def _adopt_committed(state: _CommittedState, deadline) -> None:
     """Install the configured instance matching a committed ready state.
 
-    Chain mode maps the committed ``provider_id`` back to a chain entry; a
-    committed id no entry builds is a fixed 503, and a matching entry that
-    probes unhealthy raises :class:`_FailoverNeeded` so the caller switches
-    to the first healthy standby instead of failing the call.
+    Chain mode maps the committed ``provider_id`` back to a chain entry and
+    installs it WHETHER OR NOT it currently probes healthy: a committed id no
+    entry builds is a fixed 503, while an unhealthy-but-committed active entry
+    is installed so the caller's persistent failure threshold -- not the mere
+    fact of one bad probe -- decides when to fail over. Single-spec mode keeps
+    the old rule (an unhealthy rebuild is a fixed 503, no standby exists).
     """
     global _provider, _active_state
     if _chain_configured():
@@ -1263,8 +1668,6 @@ def _adopt_committed(state: _CommittedState, deadline) -> None:
                 "configured provider does not match the committed provider "
                 "state"
             )
-        if not _healthy_within(chosen, deadline):
-            raise _FailoverNeeded()
     else:
         chosen = _build_current_provider()
         if chosen.provider_id != state.provider_id:
@@ -1359,8 +1762,10 @@ def _sync_committed_state(budget: "_Budget", lease: "_FileLease") -> None:
     entry builds, corrupt state, or (single-spec mode) an unhealthy rebuild
     fails the call with :class:`ProviderUnavailable` before any provider
     operation, handle, audit event or state write happens. In chain mode an
-    unhealthy committed active raises :class:`_FailoverNeeded` instead, so
-    the caller switches to the first healthy standby under the gate.
+    unhealthy committed active is nevertheless INSTALLED (not switched here):
+    the caller's persistent three-strike threshold
+    (:func:`_active_probe_ready`) owns the decision to fail over, so a single
+    bad probe never moves the generation.
     """
     global _provider, _active_state
     deadline = budget.deadline
@@ -1520,9 +1925,14 @@ def provider_call(timeout: Optional[float] = None):
        forces a rebuild; corrupt state, id mismatch or an unhealthy rebuild
        fail the call with zero side effects), then capture the instance;
     6. with ``KEYMGR_PROVIDER_CHAIN`` configured, probe the captured active
-       instance: an unhealthy active fails over to the first healthy standby
-       under the same intent/drain gate (see :func:`_failover`), after which
-       this attempt re-enters admission against the new generation.
+       instance on EVERY call and apply the persistent three-strike threshold
+       backed by ``provider-health.json`` (see :func:`_active_probe_ready`):
+       a healthy probe clears the failure count and admits the call; the
+       first two unhealthy probes pin the call to a fixed 503 without
+       switching; the third re-verifies under the same five-second
+       intent/drain gate and either clears on recovery or fails over exactly
+       once to the first healthy standby (generation + 1), after which this
+       attempt re-enters admission against the new generation.
 
     Calls admitted before intent existed are not kept out: they hold their
     shared lease, run on the instance they captured and are simply drained by
@@ -1564,7 +1974,6 @@ def provider_call(timeout: Optional[float] = None):
                 # state lease is dropped at once and the call goes back to
                 # waiting, so it never extends the reconnect's drain.
                 intent_hit = False
-                failover = False
                 with _state_sync_lock:
                     lease = _FileLease()
                     lease.acquire(False, budget.deadline)
@@ -1574,41 +1983,59 @@ def provider_call(timeout: Optional[float] = None):
                         intent_hit = True
                     else:
                         # (5) Reconcile with the committed generation.
-                        try:
-                            _sync_committed_state(budget, lease)
-                        except _FailoverNeeded:
-                            failover = True
+                        _sync_committed_state(budget, lease)
                 if intent_hit:
                     _gate.release_lease()
                     gate_held = False
                     _intent_wait_clear(budget)
                     continue
-                if failover:
-                    # The committed active provider is unhealthy: switch to
-                    # the first healthy standby under the gate, then re-enter
-                    # admission against the new generation. A failed failover
-                    # keeps the old generation and raises the fixed 503.
-                    lease.release()
-                    lease = None
-                    _gate.release_lease()
-                    gate_held = False
-                    _failover(budget)
-                    continue
                 # Capture the current instance AFTER admission; a lazy first
                 # import happens here, outside the gate/sync locks.
                 provider = get_provider()
-                # (6) Chain mode: an active instance that probes unhealthy is
-                # failed over to the first healthy standby; there is no
-                # automatic failback while the active entry stays healthy.
-                if _chain_configured() and not _healthy_within(
-                    provider, budget
-                ):
+                # (6) Reconcile the health satellite against the ready
+                # committed state for every configuration; chain mode then
+                # runs the per-call active probe / three-strike failover. In
+                # single-spec mode an unhealthy active stays a plain fixed
+                # 503 (no standby exists); the satellite is still kept
+                # convergent for status/restart.
+                _reconcile_health_with_committed()
+                if _chain_configured():
+                    directive = _active_probe_ready(budget, provider)
+                else:
+                    directive = "admit"
+                if directive == "switch":
+                    # Third strike: re-verify/fail over under the gate. Old
+                    # leases must be released first -- _failover takes the
+                    # exclusive lease and drains exactly the calls admitted
+                    # before it -- then re-enter admission.
                     lease.release()
                     lease = None
                     _gate.release_lease()
                     gate_held = False
-                    _failover(budget)
+                    try:
+                        _failover(budget)
+                    except ProviderReconnectPending:
+                        raise
+                    except ProviderUnavailable:
+                        # No healthy standby / commit failure: the old
+                        # generation is retained and the business provider
+                        # was never effectively called -- keep a bound
+                        # idempotent operation pending (fixed 503).
+                        raise ProviderReconnectPending(
+                            "active provider is unhealthy and no healthy "
+                            "standby is available"
+                        )
                     continue
+                if directive == "reject":
+                    # Strikes one and two: pin the call to the fixed 503
+                    # without switching. Only health() was probed -- the
+                    # business provider method was never called and no
+                    # handle/event was produced, so a bound idempotent
+                    # operation stays pending for a retry (recovery clears
+                    # the count, the third strike fails over).
+                    raise ProviderReconnectPending(
+                        "active provider failed its health probe"
+                    )
                 admitted = True
                 break
             except BaseException:
@@ -1919,7 +2346,22 @@ def provider_status() -> dict:
     """
     if _configured_dir is not None:
         try:
-            _read_committed_state()
+            state = _read_committed_state()
+            # A poison health satellite (corrupt, ahead of the ready
+            # committed generation, or same generation/wrong id) makes the
+            # data plane unavailable, exactly like a corrupt provider-state.
+            # A missing/lagging satellite is harmless here (it is rebuilt on
+            # the next ordinary call); status performs no rewrite itself.
+            health = _read_health()
+            if state is not None and state.phase == _PHASE_READY:
+                if health is not None and (
+                    health.generation > state.generation
+                    or (
+                        health.generation == state.generation
+                        and health.provider_id != state.provider_id
+                    )
+                ):
+                    return {"provider_id": None, "status": "unavailable"}
         except ProviderUnavailable:
             return {"provider_id": None, "status": "unavailable"}
     provider = None
