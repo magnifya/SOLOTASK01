@@ -25,6 +25,7 @@ from .policy import PolicyError, PolicyStore, validate_rules
 from .provider import (
     ProviderInvalidMaterial,
     ProviderReconnectPending,
+    ProviderSwitchTargetInvalid,
     ProviderUnavailable,
 )
 from .store import IMPORT_CONFLICT, KeyStore, LockTimeout, is_valid_key_id, validate_batch_items
@@ -33,6 +34,7 @@ _AUDIT_PATH = "/v1/audit"
 _POLICY_PATH = "/v1/policy"
 _PROVIDER_STATUS_PATH = "/v1/provider/status"
 _PROVIDER_RECONNECT_PATH = "/v1/provider/reconnect"
+_PROVIDER_SWITCHOVER_PATH = "/v1/provider/switchover"
 _OPERATIONS_PATH_RE = re.compile(r"^/v1/operations/([^/]+)$")
 _IMPORT_PATH = "/v1/keys/import"
 _BATCH_ROTATE_PATH = "/v1/keys/batch-rotate"
@@ -785,6 +787,10 @@ def make_handler(
 
                 if path == _PROVIDER_RECONNECT_PATH:
                     self._provider_reconnect()
+                    return
+
+                if path == _PROVIDER_SWITCHOVER_PATH:
+                    self._provider_switchover()
                     return
             except ProviderInvalidMaterial as exc:
                 self._provider_invalid_material(exc)
@@ -1875,6 +1881,78 @@ def make_handler(
                 },
             )
 
+        def _provider_switchover(self) -> None:
+            """POST /v1/provider/switchover.
+
+            The body must be exactly ``{"provider_id": P}`` with P a
+            non-empty string: bad JSON, a non-object, any extra field or a
+            tenant_id (header, query or body) is a side-effect-free 400
+            naming the field. An unset provider chain or a P no chain entry
+            builds is also a zero-side-effect 400. A successful switch
+            reuses the cross-process drain gate and commits ``switching``
+            then ``ready`` (generation+1, reason ``reconnect``); 200 returns
+            the ``provider_id,status`` body naming P and ``ready``. A target
+            build/contract/health failure or an exhausted five-second budget
+            keeps the old state and answers the fixed 503 whose body never
+            carries backend detail.
+            """
+            parts = urlsplit(self.path)
+            if not self._no_tenant(parts):
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                self._bad_request("invalid Content-Length")
+                return
+            raw = self.rfile.read(length) if length > 0 else b""
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                self._bad_request("request body must be valid JSON")
+                return
+            # Exactly {"provider_id": P}: any deviation is a 400 that happens
+            # before the chain is touched (zero side effects, no audit
+            # event). A tenant_id field is named directly.
+            if isinstance(payload, dict) and "tenant_id" in payload:
+                self._bad_request(
+                    "field tenant_id is not accepted by this endpoint"
+                )
+                return
+            if not isinstance(payload, dict):
+                self._bad_request("request body must be a JSON object")
+                return
+            extra = sorted(set(payload) - {"provider_id"})
+            if extra:
+                self._bad_request(
+                    "field %s is not accepted by this endpoint" % extra[0]
+                )
+                return
+            target = payload.get("provider_id")
+            if not isinstance(target, str) or not target:
+                self._bad_request(
+                    "field provider_id must be a non-empty string"
+                    if "provider_id" in payload
+                    else "missing required field: provider_id"
+                )
+                return
+            try:
+                body = provider_mod.switchover(target)
+            except ProviderSwitchTargetInvalid as exc:
+                self._bad_request(str(exc))
+                return
+            except ProviderUnavailable:
+                self._send_json(
+                    503,
+                    {"error": "key management provider is unavailable"},
+                )
+                return
+            self._send_json(
+                200,
+                {
+                    "provider_id": body["provider_id"],
+                    "status": body["status"],
+                },
+            )
         # -- GET ----------------------------------------------------------
         def do_GET(self) -> None:
             parts = urlsplit(self.path)

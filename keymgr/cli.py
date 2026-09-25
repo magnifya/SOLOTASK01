@@ -20,6 +20,7 @@ from .policy import PolicyError, PolicyStore, validate_rules
 from .provider import (
     ProviderInvalidMaterial,
     ProviderReconnectPending,
+    ProviderSwitchTargetInvalid,
     ProviderUnavailable,
 )
 from .server import _resolve_committed_operation, serve
@@ -221,6 +222,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_provider_reconnect.add_argument(
         "--operator", required=True,
         help="non-empty X-Operator-Id of the caller",
+    )
+    p_provider_switchover = provider_sub.add_parser(
+        "switchover",
+        help="switch the active provider to a named chain entry",
+    )
+    p_provider_switchover.add_argument(
+        "--operator", required=True,
+        help="non-empty X-Operator-Id of the caller",
+    )
+    p_provider_switchover.add_argument(
+        "--provider-id", required=True,
+        help="provider_id of the configured chain entry to switch to",
     )
 
     p_serve = sub.add_parser("serve", help="run the HTTP server")
@@ -713,9 +726,25 @@ def _run(argv: Optional[List[str]] = None) -> int:
             return _fail("field operator must be a non-empty string", 2)
         if args.provider_command == "status":
             body = provider_mod.provider_status()
-        else:
+        elif args.provider_command == "reconnect":
             try:
                 body = provider_mod.reconnect()
+            except ProviderUnavailable:
+                return _fail(
+                    "key management provider is unavailable", 1
+                )
+        else:
+            # switchover: a missing chain or an unknown provider_id is a
+            # parameter error (exit 2); a target build/health failure or a
+            # gate timeout is the fixed provider 503 (exit 1).
+            if not getattr(args, "provider_id", None):
+                return _fail(
+                    "field provider_id must be a non-empty string", 2
+                )
+            try:
+                body = provider_mod.switchover(args.provider_id)
+            except ProviderSwitchTargetInvalid as exc:
+                return _fail(str(exc), 2)
             except ProviderUnavailable:
                 return _fail(
                     "key management provider is unavailable", 1

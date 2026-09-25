@@ -19,8 +19,11 @@ cross-process intent/drain gate a reconnect uses -- old calls finish on the
 instance they captured, later calls land on the new generation, and
 concurrent triggers build/commit exactly once. A recovered primary is never
 re-selected automatically; only ``reconnect`` re-selects the first healthy
-entry. Pending idempotent operations stay bound to their original
-``provider_id`` and are never replayed on a standby.
+entry. ``switchover`` is the directed counterpart: it switches the active
+entry to a named chain ``provider_id`` under the same gate, committing
+``switching`` then ``ready`` with reason ``reconnect``. Pending idempotent
+operations stay bound to their original ``provider_id`` and are never
+replayed on a standby.
 
 Provider contract
 -----------------
@@ -112,6 +115,17 @@ class ProviderInvalidMaterial(ProviderError):
 
     Surfaced as HTTP ``400`` / CLI exit code ``2``; the message names the
     offending field but never embeds the material itself.
+    """
+
+
+class ProviderSwitchTargetInvalid(ProviderError):
+    """The directed switchover target is not usable.
+
+    Raised when no provider chain is configured or the requested
+    ``provider_id`` is not built by any configured chain entry. Surfaced as
+    HTTP ``400`` / CLI exit code ``2`` with a message naming the
+    ``provider_id`` field; the check happens before any gate, probe or state
+    write, so the rejection has zero side effects.
     """
 
 
@@ -2181,6 +2195,156 @@ def reconnect(timeout: float = CALL_GATE_SECONDS) -> dict:
 
     current = get_provider()
     return _status_for(current)
+
+
+def switchover(
+    target_provider_id: str, timeout: float = CALL_GATE_SECONDS
+) -> dict:
+    """Switch the active provider to the chain entry carrying ``target_provider_id``.
+
+    A directed operator action (``POST /v1/provider/switchover`` /
+    ``provider switchover``), unlike a failover it names its target. The
+    target must come from a configured ``KEYMGR_PROVIDER_CHAIN``: an unset
+    chain or a ``provider_id`` no chain entry builds is
+    :class:`ProviderSwitchTargetInvalid` (HTTP 400 / CLI exit 2) before any
+    gate, probe or write -- zero side effects.
+
+    A successful switch reuses the reconnect drain gate: calls admitted
+    earlier finish on the instance they captured, every later call waits
+    from the moment intent is established, and ``provider-state.json`` is
+    committed ``switching`` (old id, target id, the ORIGINAL generation,
+    reason ``reconnect``) then ``ready`` (target id, null, generation+1).
+    Concurrent switchovers to the same target commit exactly once: a later
+    one adopts the committed generation. A target that is already the
+    committed active entry commits nothing: healthy answers the status body
+    with the generation unchanged, unhealthy is the fixed 503 with zero
+    side effects. A target build/contract/health failure or an exhausted
+    five-second budget keeps the old state byte-for-byte and raises
+    :class:`ProviderUnavailable`. A crash between the two commits is
+    completed only for a healthy target, else the ``switching`` record is
+    kept and the answer is the fixed 503.
+    """
+    if not isinstance(target_provider_id, str) or not target_provider_id:
+        raise ProviderSwitchTargetInvalid(
+            "field provider_id must be a non-empty string"
+        )
+    if not _chain_configured():
+        raise ProviderSwitchTargetInvalid(
+            "field provider_id requires a configured provider chain"
+        )
+    # Resolve the target chain entry before any gate or write. ``local`` is
+    # matched on its well-known id without building; a module:factory entry
+    # only reveals its provider_id once built, and a build/contract failure
+    # is the fixed 503 (still zero side effects).
+    target = None
+    for spec in _chain_specs():
+        if spec == LOCAL_PROVIDER_ID:
+            if target_provider_id == LOCAL_PROVIDER_ID:
+                target = _build_spec(spec)
+            continue
+        candidate = _build_spec(spec)
+        if candidate.provider_id == target_provider_id:
+            target = candidate
+            break
+    if target is None:
+        raise ProviderSwitchTargetInvalid(
+            "field provider_id is not in the configured provider chain"
+        )
+
+    budget = _Budget(timeout)
+    _gate.acquire_serialized(budget)
+    intent = _intent_lease()
+    state_lease = _FileLease()
+    draining = False
+    global _active_state
+    try:
+        intent.acquire(True, budget.deadline)
+        _gate.begin_draining()
+        draining = True
+        _gate.wait_drained(budget)
+        if budget.expired():
+            raise ProviderReconnectPending(
+                "switchover exceeded the shared five-second budget"
+            )
+        # Lock order: _state_sync_lock -> state lock file.
+        with _state_sync_lock:
+            state_lease.acquire(True, budget.deadline)
+            if budget.expired():
+                raise ProviderReconnectPending(
+                    "switchover exceeded the shared five-second budget"
+                )
+            state = _read_committed_state()
+            if state is not None and state.phase == _PHASE_SWITCHING:
+                # A crash interrupted a switch. Complete it only for a
+                # healthy recorded target; anything else keeps the
+                # ``switching`` record byte-for-byte and fails 503.
+                if state.target_provider_id == target.provider_id:
+                    if not _healthy_within(target, budget.deadline):
+                        raise ProviderUnavailable(
+                            "provider switch target is unavailable"
+                        )
+                    generation = state.generation + 1
+                    _write_committed_state(
+                        target.provider_id, generation, state.reason
+                    )
+                    _install_provider(target)
+                    _active_state = (target.provider_id, generation)
+                    return _switchover_body(target)
+                state = _complete_switch(state, budget.deadline)
+            if state is None:
+                # No committed generation yet: the switchover is the first
+                # activation of the target entry.
+                if not _healthy_within(target, budget.deadline):
+                    raise ProviderUnavailable("provider reported unhealthy")
+                _write_committed_state(
+                    target.provider_id, 1, _REASON_INITIAL
+                )
+                _install_provider(target)
+                _active_state = (target.provider_id, 1)
+                return _switchover_body(target)
+            if state.provider_id == target.provider_id:
+                # Already the committed active entry (or a concurrent
+                # switchover to the same target committed while this one
+                # waited): commit nothing and keep the generation. Health
+                # still decides 200 vs the zero-side-effect 503.
+                if not _healthy_within(target, budget.deadline):
+                    raise ProviderUnavailable("provider reported unhealthy")
+                _install_provider(target)
+                _active_state = (target.provider_id, state.generation)
+                return _switchover_body(target)
+            # The directed switch: the target must build (above), pass the
+            # contract and probe healthy BEFORE anything is written.
+            if not _healthy_within(target, budget.deadline):
+                raise ProviderUnavailable(
+                    "provider switch target is unavailable"
+                )
+            generation = state.generation
+            _write_committed_state(
+                state.provider_id,
+                generation,
+                _REASON_RECONNECT,
+                target_provider_id=target.provider_id,
+                phase=_PHASE_SWITCHING,
+            )
+            _write_committed_state(
+                target.provider_id, generation + 1, _REASON_RECONNECT
+            )
+            _install_provider(target)
+            _active_state = (target.provider_id, generation + 1)
+            return _switchover_body(target)
+    finally:
+        # Always release in reverse order; failure or timeout leaves the
+        # previously active instance and committed state untouched.
+        state_lease.release()
+        if draining:
+            _gate.end_draining()
+        intent.release()
+        _gate.release_serialized()
+
+
+def _switchover_body(target) -> dict:
+    """The fixed 200 body of a successful switchover (key order matters)."""
+    return {"provider_id": target.provider_id, "status": "ready"}
 
 
 def _health_with_deadline(provider, deadline: float) -> bool:
