@@ -214,6 +214,78 @@ def test_third_strike_reverify_recovery_clears_without_switch(
     assert json.loads(_read_health_raw(env))["consecutive_failures"] == 0
 
 
+# -- per-probe one-second cap and the non-resettable five-second budget ------
+def test_slow_health_probe_capped_at_one_second_counts_one(bound):
+    env = bound
+    # health() blocks far past both the 1 s per-probe cap and the 5 s shared
+    # budget; the ordinary call waits only ~1 s, the late True is void and the
+    # probe counts as exactly one failure.
+    env.set_faults({"health_sleep": 6.0})
+    import time
+
+    t0 = time.monotonic()
+    result, detail = _call()
+    elapsed = time.monotonic() - t0
+    assert result == "err" and detail == "ProviderReconnectPending"
+    assert 0.9 < elapsed < 2.0, elapsed
+    health = json.loads(_read_health_raw(env))
+    assert health["status"] == "unavailable"
+    assert health["consecutive_failures"] == 1
+    # The business method was never reached: no backend handle minted.
+    assert env.kms_handles() == set()
+
+
+def test_budget_exhausted_before_standby_keeps_old_generation_caps_three(
+    bound, monkeypatch
+):
+    env = bound
+    import time
+
+    # A 1.5 s per-call budget: the third strike spends 1 s on its initial
+    # probe and the remaining 0.5 s on the active re-verification, so no
+    # standby is reachable -- even a healthy standby must not be switched to
+    # (here the standby is slow too, so a reached probe would fail anyway).
+    monkeypatch.setattr(provider_mod, "CALL_GATE_SECONDS", 1.5)
+    monkeypatch.setattr(
+        provider_mod.get_local_provider(),
+        "health",
+        lambda: time.sleep(6.0) or True,
+    )
+    env.set_faults({"health_sleep": 6.0})
+    timings = []
+    for n in (1, 2, 3):
+        t0 = time.monotonic()
+        result, detail = _call()
+        timings.append(time.monotonic() - t0)
+        assert result == "err" and detail == "ProviderReconnectPending"
+        assert json.loads(_read_health_raw(env))["consecutive_failures"] == n
+    # The third call used the whole 1.5 s on the two active probes, not a
+    # fresh 5 s budget and not a six-second blocking health().
+    assert 1.3 < timings[2] < 2.2, timings
+    state = _read_state(env)
+    assert state["generation"] == 1 and state["provider_id"] == "fakekms"
+    # Further calls keep the count capped at three and the old generation.
+    _call()
+    assert json.loads(_read_health_raw(env))["consecutive_failures"] == 3
+    assert _read_state(env)["generation"] == 1
+
+
+def test_bounded_probe_helper_voids_a_late_true():
+    import time
+
+    class Slow:
+        provider_id = "slow"
+
+        def health(self):
+            time.sleep(0.3)
+            return True
+
+    # A result landing after the wait is void: the helper reports unhealthy
+    # rather than ever trusting the late True.
+    assert provider_mod._health_with_limit(Slow(), 0.05) is False
+    assert provider_mod._health_with_limit(Slow(), 1.0) is True
+
+
 # -- third strike: exactly one failover to the first healthy standby ----------
 def test_third_strike_fails_over_once_and_serves_standby(bound):
     env = bound
