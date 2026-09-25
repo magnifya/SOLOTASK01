@@ -622,9 +622,34 @@ def test_first_healthy_activation_writes_state_file(env):
     raw = _read_state_raw(env)
     # Compact UTF-8 JSON, fixed key order, no trailing newline, mode 0600.
     assert raw == (
-        b'{"schema_version":1,"provider_id":"fakekms","generation":1}'
+        b'{"schema_version":2,"provider_id":"fakekms",'
+        b'"target_provider_id":null,"generation":1,'
+        b'"reason":"initial","phase":"ready"}'
     )
     assert os.stat(_state_path(env)).st_mode & 0o777 == 0o600
+
+
+def test_legacy_v1_state_file_is_treated_as_ready(env):
+    # A v1 record written by an older version is adopted as a ready state
+    # (never rewritten, never a 503); the next commit upgrades it to v2.
+    provider_mod.bind_data_dir(env.data_dir)
+    with open(_state_path(env), "wb") as fh:
+        fh.write(b'{"schema_version":1,"provider_id":"fakekms","generation":3}')
+    with provider_mod.provider_call() as provider:
+        assert provider.provider_id == "fakekms"
+    assert provider_mod._active_state == ("fakekms", 3)
+    assert _read_state_raw(env) == (
+        b'{"schema_version":1,"provider_id":"fakekms","generation":3}'
+    )
+    provider_mod.reconnect()
+    assert json.loads(_read_state_raw(env)) == {
+        "schema_version": 2,
+        "provider_id": "fakekms",
+        "target_provider_id": None,
+        "generation": 4,
+        "reason": "reconnect",
+        "phase": "ready",
+    }
 
 
 def test_successful_reconnect_increments_generation(env):
@@ -632,9 +657,12 @@ def test_successful_reconnect_increments_generation(env):
     provider_mod.get_provider()
     provider_mod.reconnect()
     assert json.loads(_read_state_raw(env)) == {
-        "schema_version": 1,
+        "schema_version": 2,
         "provider_id": "fakekms",
+        "target_provider_id": None,
         "generation": 2,
+        "reason": "reconnect",
+        "phase": "ready",
     }
     provider_mod.reconnect()
     assert json.loads(_read_state_raw(env))["generation"] == 3
@@ -655,7 +683,9 @@ def test_non_ascii_provider_id_written_unescaped(env, monkeypatch):
     monkeypatch.setenv("FAKE_KMS_PROVIDER_ID", "fakekms-ü")
     provider_mod.reconnect()
     assert _read_state_raw(env) == (
-        '{"schema_version":1,"provider_id":"fakekms-ü","generation":1}'
+        '{"schema_version":2,"provider_id":"fakekms-ü",'
+        '"target_provider_id":null,"generation":1,'
+        '"reason":"reconnect","phase":"ready"}'
     ).encode("utf-8")
 
 
@@ -686,6 +716,14 @@ def test_corrupt_state_file_is_503_and_never_rewritten(env):
         b'{"schema_version":1,"provider_id":"fakekms","generation":true}',
         b'{"schema_version":1,"provider_id":"fakekms"}',
         b'{"schema_version":1,"provider_id":"fakekms","generation":1,"x":0}',
+        b'{"schema_version":2,"provider_id":"fakekms","target_provider_id":null,'
+        b'"generation":1,"reason":"bogus","phase":"ready"}',
+        b'{"schema_version":2,"provider_id":"fakekms","target_provider_id":null,'
+        b'"generation":1,"reason":"initial","phase":"switching"}',
+        b'{"schema_version":2,"provider_id":"fakekms","target_provider_id":"b",'
+        b'"generation":1,"reason":"initial","phase":"ready"}',
+        b'{"schema_version":2,"provider_id":"fakekms","target_provider_id":"b",'
+        b'"generation":1,"reason":"failover","phase":"switching","x":0}',
         b'[1,2,3]',
     ],
 )

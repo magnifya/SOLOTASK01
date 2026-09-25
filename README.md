@@ -24,7 +24,10 @@ python -m keymgr --data-dir ./keymgr_data serve --host 127.0.0.1 --port 8080
 
 数据目录也可用环境变量 `KEYMGR_DATA_DIR` 指定（CLI 默认 `keymgr_data`）。
 提供者由 `KEYMGR_PROVIDER` 选择（缺省或 `local` 为内置本地提供者，其它值为
-`module:factory`，首次使用时才惰性加载，绝不回退本地）。
+`module:factory`，首次使用时才惰性加载，绝不回退本地）。设置了
+`KEYMGR_PROVIDER_CHAIN` 时改为使用主备链（逗号分隔的
+`local`/`module:factory` 列表，见下"主备故障转移"），此时
+`KEYMGR_PROVIDER` 被忽略。
 
 ## 基础测试
 
@@ -152,19 +155,41 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   操作保持 `pending` 并返回固定 `503`（不终态化、不写拒绝事件、镜像复位为
   干净的 `bound` 待续线索）；重连同 `provider_id` 的提供者后，同
   `Idempotency-Key` 的请求在**同一** `operation_id`/`event_id` 下继续恰好
-  一次，事件绝不重复。从未在本数据目录激活过的 provider_id 仍按原“未激活
+  一次，事件绝不重复。故障转移切到备提供者后同样适用：pending 操作绝不
+  在备端重放，只有重连回同 id 的提供者才以原 `operation_id` 继续。从未在
+  本数据目录激活过的 provider_id 仍按原“未激活
   提供者”规则终态 `503`。曾激活的 provider_id 记在
   `provider-ids.json`(0600)，跨进程可识别。
-- **跨进程激活状态 `provider-state.json`(0600)**：首次健康激活与每次成功
-  重连都原子提交（temp 文件 fsync 后 rename）该文件：紧凑 UTF-8 JSON、
-  非 ASCII 原样、无末尾换行，键序固定
-  `schema_version,provider_id,generation`（依次为固定整数 1、非空字符串、
-  从 1 递增的正整数）。启动与每次提供者调用时读取：文件缺失由首次健康激
-  活创建（generation 1）；损坏或字段非法时，提供者调用与重连一律按固定
-  文案 `503` 且绝不改写该文件。仅健康候选能在跨进程排他锁
-  （`provider-state.lock`，与进程内门共用 5 秒门限）下互斥递增
-  generation；失败或提交前崩溃保留旧代。提交后各进程下次调用重建当前配
-  置，所得 `provider_id` 不符或不健康则 `503` 且零副作用。
+- **跨进程激活状态 `provider-state.json`(0600)**：首次健康激活、每次成功
+  重连与每次成功故障转移都原子提交（temp 文件 fsync 后 rename）该文件：
+  紧凑 UTF-8 JSON、非 ASCII 原样、无末尾换行，键序固定
+  `schema_version,provider_id,target_provider_id,generation,reason,phase`，
+  值依次为固定整数 2、非空字符串、null 或非空字符串、从 1 递增的正整数、
+  `initial`/`reconnect`/`failover`、`ready`/`switching`；旧版 v1 记录
+  （仅 `schema_version,provider_id,generation` 三键）一律视作 ready。
+  启动与每次提供者调用时读取：文件缺失由首次健康激活创建（generation
+  1）；损坏或字段非法时，提供者调用与重连一律按固定文案 `503` 且绝不改
+  写该文件。仅健康候选能在跨进程排他锁（`provider-state.lock`，与进程
+  内门共用 5 秒门限）下互斥递增 generation；失败或提交前崩溃保留旧代。
+  提交后各进程下次调用重建当前配置，所得 `provider_id` 不符或不健康则
+  `503` 且零副作用。
+- **主备故障转移（`KEYMGR_PROVIDER_CHAIN`）**：设置后取代
+  `KEYMGR_PROVIDER`，值为逗号分隔的 `local`/`module:factory` 列表；项本
+  身及各项建厂所得 `provider_id` 必须唯一，空设、空项、格式错误或重复
+  均使整个配置不可用（一切提供者使用固定 `503`，绝不回退）。首次激活
+  选链中首个健康项。活动实例健康检查失败时，复用跨进程意图/排水的共用
+  5 秒门进行一次故障转移：在途旧调用仍由其进入时捕获的实例完成，门后
+  到调用只用新代，并发尝试串行化为恰好一次建厂/提交。选中首个健康备项
+  后先原子写 `switching` 记录（`provider_id` 为旧 id、
+  `target_provider_id` 为目标 id、原 generation），再写 `ready` 记录
+  （目标 id、null 目标、generation+1、reason=`failover`）。找不到健康
+  备项时旧代不变，调用方得固定 `503`（CLI `1`），不产生句柄、审计事件
+  或后端文本（幂等操作保持 pending，绝不终态化）。主项恢复健康后不自
+  动切回；只有 `reconnect` 按链序重新选择首个健康项。
+- **崩溃于切换中段**：重启（或任一进程读取）遇到 `switching` 记录时重
+  新建厂并健康检查其 `target_provider_id`：健康即按原 reason 补写
+  `ready`（目标 id、null 目标、generation+1）完成切换；否则保留该记录
+  不变并 `503`。
 - CLI：`provider status --operator O` 与
   `provider reconnect --operator O`，成功输出同序单行 JSON；`400→2`、
   `503→1`，成功 `0`。status 在提供者不可用时仍以退出 `0` 返回
@@ -321,6 +346,11 @@ python -m keymgr provider reconnect --operator alice
 
 ## KMS/HSM 提供者
 
+- 设置 `KEYMGR_PROVIDER_CHAIN` 时以该链取代 `KEYMGR_PROVIDER`：逗号分隔
+  的 `local`/`module:factory` 列表，项与各项建厂所得 `provider_id` 必须
+  唯一；空设、空项、格式错误或重复均使整个配置不可用。首次激活选首个
+  健康项，活动实例不健康时按"主备故障转移"一节规则切到首个健康备项，
+  主项恢复后不自动切回，`reconnect` 才按链序重选首个健康项。
 - 工厂返回对象须有非空 `provider_id`、`capabilities`
   （algorithms 含 AES256/RSA2048；operations 含
   generate/rotate/import_material/export_material/delete）及这五个方法。
