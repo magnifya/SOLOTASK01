@@ -800,3 +800,234 @@ def test_cli_provider_requires_operator_exit_2(env):
     assert result.returncode == 2
     result = run_cli(env, "provider", "reconnect")
     assert result.returncode == 2
+
+
+# -- cross-process reconnect-intent fence ------------------------------------
+# The exclusive flock a reconnect queues on provider-state.lock is NOT a
+# barrier on Linux: new shared-lock requests leapfrog a waiting exclusive
+# locker. A separate reconnect-intent fence (provider-reconnect.lock) is held
+# exclusively for the whole drain/build/commit/swap window; ordinary calls
+# only instant-probe it and wait, so every call that arrives AFTER intent was
+# established is held until the new generation is committed -- in every
+# process -- while calls admitted earlier finish on the instance they
+# captured.
+INTENT_LOCK = "provider-reconnect.lock"
+
+
+def _hold_intent_exclusive(env):
+    """Hold the reconnect-intent fence like a reconnect mid-drain."""
+    import fcntl
+
+    fd = os.open(
+        os.path.join(env.data_dir, INTENT_LOCK),
+        os.O_RDWR | os.O_CREAT,
+        0o600,
+    )
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def _release_intent(fd) -> None:
+    import fcntl
+
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+
+
+def test_later_call_waits_on_held_intent_then_503_zero_side_effects(
+    http, monkeypatch
+):
+    env, srv = http
+    _create_key(srv)  # load provider, commit generation 1
+    fd = _hold_intent_exclusive(env)
+    try:
+        # Shrink the shared budget so the wait fails fast: the later call
+        # must answer the fixed 503 having built/probed/called nothing.
+        monkeypatch.setattr(provider_mod, "CALL_GATE_SECONDS", 0.4)
+        before_files = set(os.listdir(env.data_dir))
+        before_handles = env.kms_handles()
+        t0 = time.monotonic()
+        status, body = srv.request(
+            "POST", "/v1/keys",
+            {"tenant_id": "tx", "algorithm": "AES256", "label": "k"},
+            OPERATOR,
+        )
+        waited = time.monotonic() - t0
+        assert status == 503
+        assert body == {"error": "key management provider is unavailable"}
+        assert waited >= 0.35
+        # Zero side effects: no backend handle, no key file, no audit event.
+        assert env.kms_handles() == before_handles
+        assert set(os.listdir(env.data_dir)) == before_files
+        assert all(
+            e.tenant_id != "tx" for e in env.audit_events()
+        )
+    finally:
+        _release_intent(fd)
+    # Once the intent clears, ordinary service resumes on the old generation.
+    assert _create_key(srv, tenant="tx")
+    assert json.loads(_read_state_raw(env))["generation"] == 1
+
+
+def test_concurrent_reconnects_serialize_without_skipped_generation(env):
+    provider_mod.bind_data_dir(env.data_dir)
+    provider_mod.get_provider()
+    errors = []
+
+    def loop():
+        try:
+            for _ in range(2):
+                provider_mod.reconnect()
+        except Exception as exc:  # pragma: no cover - failure reporting
+            errors.append(exc)
+
+    threads = [threading.Thread(target=loop) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(15.0)
+        assert not t.is_alive()
+    assert not errors
+    # Six serialized successes -> exactly six increments, none skipped.
+    assert json.loads(_read_state_raw(env))["generation"] == 7
+
+
+def test_reconnect_releases_intent_fence_file(env):
+    provider_mod.bind_data_dir(env.data_dir)
+    provider_mod.reconnect()
+    path = os.path.join(env.data_dir, INTENT_LOCK)
+    assert os.path.exists(path)
+    assert os.stat(path).st_mode & 0o777 == 0o600
+    # The fence is released after the swap: an instant shared probe is clear.
+    assert provider_mod._intent_probe_clear()
+
+
+def test_later_call_waits_out_real_cross_process_reconnect_then_uses_new_gen(
+    http
+):
+    """End-to-end across processes.
+
+    A call admitted before the reconnect holds the shared state lease and
+    keeps running on its captured (old) instance; a CLI reconnect in another
+    process establishes intent first and waits for that lease; an HTTP call
+    arriving AFTER intent waits (it cannot leapfrog) and, once the reconnect
+    commits generation 2, rebuilds and succeeds against the new generation.
+    """
+    import fcntl
+
+    from test_recovery_cli import run_cli
+
+    env, srv = http
+    _create_key(srv)  # generation 1, provider cached in the server process
+    entered = threading.Event()
+    release_old = threading.Event()
+    pinned = {}
+
+    def old_in_flight():
+        with provider_mod.provider_call() as provider:
+            pinned["old"] = provider
+            entered.set()
+            # Still inside the lease well after the later call and the CLI
+            # reconnect have lined up behind it.
+            release_old.wait(10.0)
+            # TLS pinning: even after the other process committed and this
+            # server rebuilt, this thread sees the instance it captured.
+            pinned["still"] = provider_mod.get_provider()
+
+    worker = threading.Thread(target=old_in_flight)
+    worker.start()
+    assert entered.wait(2.0)
+    assert pinned["old"].provider_id == "fakekms"
+
+    # CLI reconnect: intent first, then blocked draining the old call's SH.
+    reconn_done = threading.Event()
+    reconn_rc = {}
+
+    def run_reconnect():
+        result = run_cli(
+            env, "provider", "reconnect", "--operator", "alice", timeout=20
+        )
+        reconn_rc["code"] = result.returncode
+        reconn_rc["out"] = result.stdout + result.stderr
+        reconn_done.set()
+
+    reconn = threading.Thread(target=run_reconnect)
+    reconn.start()
+    # The reconnect must be parked behind the old call's shared lease (it has
+    # established intent but cannot yet take the exclusive state lease).
+    time.sleep(1.0)
+    assert not reconn_done.is_set()
+
+    # A LATER call arrives after intent: it waits instead of leaping past.
+    later_done = threading.Event()
+    later_result = {}
+
+    def later_call():
+        later_result["status"], later_result["body"] = srv.request(
+            "POST", "/v1/keys",
+            {"tenant_id": "t2", "algorithm": "AES256", "label": "k"},
+            OPERATOR,
+        )
+        later_done.set()
+
+    later = threading.Thread(target=later_call)
+    later.start()
+    time.sleep(0.5)
+    # Still blocked: the old call has not released and the fence is up.
+    assert not later_done.is_set()
+    assert json.loads(_read_state_raw(env))["generation"] == 1
+
+    # Finish the old call on its captured instance; reconnect then commits.
+    release_old.set()
+    assert reconn_done.wait(10.0)
+    assert reconn_rc["code"] == 0, reconn_rc["out"]
+    assert json.loads(_read_state_raw(env))["generation"] == 2
+
+    # The waiting later call unblocks, rebuilds and succeeds on generation 2
+    # well within its own five-second budget.
+    assert later_done.wait(8.0)
+    assert later_result["status"] == 201, later_result
+    worker.join(5.0)
+    reconn.join(5.0)
+    later.join(5.0)
+    assert pinned["still"] is pinned["old"]
+    # The server process rebuilt onto the committed generation.
+    assert provider_mod._active_state == ("fakekms", 2)
+
+
+def test_cross_process_reconnect_failure_keeps_old_generation_and_unblocks(
+    http, monkeypatch
+):
+    """A reconnect that times out draining a long in-flight call releases its
+    intent, answers 503, keeps the old generation and lets the waiting call
+    proceed (no fence leak, no deadlock across processes)."""
+    from test_recovery_cli import run_cli
+
+    env, srv = http
+    _create_key(srv)
+    entered = threading.Event()
+    release_old = threading.Event()
+
+    def long_call():
+        with provider_mod.provider_call():
+            entered.set()
+            release_old.wait(15.0)
+
+    worker = threading.Thread(target=long_call)
+    worker.start()
+    assert entered.wait(2.0)
+
+    # The CLI reconnect cannot drain within its five-second budget.
+    result = run_cli(
+        env, "provider", "reconnect", "--operator", "alice", timeout=15
+    )
+    assert result.returncode == 1
+    assert json.loads(result.stderr.strip()) == {
+        "error": "key management provider is unavailable",
+    }
+    # Old generation retained, intent released (a later call is admitted).
+    assert json.loads(_read_state_raw(env))["generation"] == 1
+    assert provider_mod._intent_probe_clear()
+    release_old.set()
+    worker.join(5.0)
+    assert _create_key(srv, tenant="t3")

@@ -702,14 +702,56 @@ def _remember(provider_id: str) -> None:
 
 
 # -- non-disruptive reconnect gate -----------------------------------------
-# Reconnect and ordinary provider calls share ONE five-second budget. While a
-# reconnect is draining or installing a freshly built provider, every NEW
-# provider operation waits at the gate; operations already in flight keep
-# using the provider instance they started on, so they complete without
-# interruption. A call that cannot be admitted within the budget fails with
-# ProviderUnavailable (surfaced as 503) having made zero provider calls and
-# therefore zero side effects.
+# Reconnect and ordinary provider calls share ONE five-second budget, measured
+# from the attempt's FIRST wait. The ordering the gate enforces is:
+#
+#   1. a reconnect first establishes a cross-process *intent* (an exclusive
+#      flock on ``provider-reconnect.lock``), THEN drains the calls admitted
+#      before it;
+#   2. every LATER call waits -- in every process -- from the instant intent
+#      is visible until the candidate is built, contract-validated, health
+#      probed, ``provider-state.json`` is committed and the swap finished;
+#   3. calls admitted before the intent was established keep running on the
+#      OLD provider instance they captured and are simply drained.
+#
+# The extra intent file is required because a blocking exclusive flock alone
+# is NOT a barrier on Linux: new shared-lock requests leapfrog a queued
+# exclusive waiter (verified on the host kernel), so later calls would slip
+# past a reconnect that had only *queued* for ``provider-state.lock`` and a
+# steady call stream could starve it. Ordinary calls therefore never hold the
+# intent lock for their duration; they only probe it with an instant
+# non-blocking shared trylock, once before and once after taking their shared
+# state lease, and fall back to waiting when the probe catches a reconnect.
 CALL_GATE_SECONDS = 5.0
+_POLL_SECONDS = 0.02
+
+
+class _Budget:
+    """The shared five-second budget for one call or reconnect attempt.
+
+    The deadline starts lazily at the first blocking wait (``start`` is
+    idempotent), so an attempt admitted without contention spends no budget on
+    the gate; every later wait, poll and bounded probe shares one deadline.
+    """
+
+    def __init__(self, seconds: Optional[float] = None) -> None:
+        self.seconds = CALL_GATE_SECONDS if seconds is None else seconds
+        self._deadline: Optional[float] = None
+
+    def start(self) -> float:
+        if self._deadline is None:
+            self._deadline = time.monotonic() + self.seconds
+        return self._deadline
+
+    @property
+    def deadline(self) -> float:
+        return self.start()
+
+    def remaining(self) -> float:
+        return max(0.0, self.deadline - time.monotonic())
+
+    def expired(self) -> bool:
+        return self.remaining() <= 0
 
 
 class ProviderReconnectPending(ProviderUnavailable):
@@ -745,6 +787,12 @@ class ProviderIdentityMismatch(ProviderReconnectPending):
 # provider calls and reconnect (fixed 503) and is never rewritten.
 _STATE_NAME = "provider-state.json"
 _STATE_LOCK_NAME = "provider-state.lock"
+# The reconnect-intent fence: a reconnect holds this lock exclusively for its
+# whole drain/build/commit/swap window, while ordinary calls only ever touch
+# it with an instant non-blocking shared trylock (never hold it across their
+# work). A granted intent therefore becomes immediately visible to every later
+# call in every process, regardless of flock's unfair read-leapfrog.
+_INTENT_LOCK_NAME = "provider-reconnect.lock"
 _STATE_SCHEMA_VERSION = 1
 
 # The (provider_id, generation) this process's cached ``_provider`` instance
@@ -859,7 +907,7 @@ def _write_committed_state(provider_id: str, generation: int) -> None:
 
 
 class _FileLease:
-    """A held shared/exclusive ``flock`` on ``provider-state.lock``.
+    """A held shared/exclusive ``flock`` on a gate lock file.
 
     This is the cross-process half of the reconnect gate: provider calls
     hold a shared lease for their whole duration (in-flight calls in every
@@ -871,7 +919,8 @@ class _FileLease:
     no-op and the in-process gate alone applies.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, lock_name: str = _STATE_LOCK_NAME) -> None:
+        self._lock_name = lock_name
         self._fd: Optional[int] = None
 
     def acquire(self, exclusive: bool, deadline: float) -> None:
@@ -881,7 +930,7 @@ class _FileLease:
         try:
             os.makedirs(_configured_dir, exist_ok=True)
             fd = os.open(
-                os.path.join(_configured_dir, _STATE_LOCK_NAME),
+                os.path.join(_configured_dir, self._lock_name),
                 os.O_RDWR | os.O_CREAT,
                 0o600,
             )
@@ -927,6 +976,71 @@ class _FileLease:
         os.close(fd)
 
 
+def _intent_probe_clear() -> bool:
+    """Return whether no reconnect intent is currently held.
+
+    The check is instantaneous and never BLOCKS on the lock and never retains
+    the descriptor: an unheld exclusive lock always grants a shared trylock
+    even while waiters are queued, so only a *held* reconnect intent reads as
+    blocked. Ordinary calls use this to notice reconnect intent established
+    after they began arriving; the descriptor (and its shared lock) is closed
+    again immediately, so probing calls never queue behind -- and never
+    leapfrog -- a reconnect waiting on the state lease.
+    """
+    if _configured_dir is None or fcntl is None:
+        return True
+    try:
+        os.makedirs(_configured_dir, exist_ok=True)
+        fd = os.open(
+            os.path.join(_configured_dir, _INTENT_LOCK_NAME),
+            os.O_RDWR | os.O_CREAT,
+            0o600,
+        )
+    except OSError as exc:
+        raise ProviderUnavailable(
+            "cannot open provider reconnect lock: %s" % exc
+        ) from exc
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                return True
+            except InterruptedError:
+                continue
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                    return False
+                raise
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def _intent_wait_clear(budget: "_Budget") -> None:
+    """Wait until no reconnect intent is held, bounded by ``budget``.
+
+    Polls with the instant shared trylock rather than queueing a blocking
+    shared flock: a waiting call must not hold a queue entry that an
+    exclusive requester has to drain, otherwise a stream of waiting calls
+    could starve reconnects (flock grants new shared locks ahead of a queued
+    exclusive waiter on Linux).
+    """
+    while not _intent_probe_clear():
+        if budget.expired():
+            raise ProviderReconnectPending(
+                "timed out waiting for provider reconnect to settle"
+            )
+        time.sleep(min(_POLL_SECONDS, budget.remaining()))
+
+
+def _intent_lease() -> "_FileLease":
+    """A lease on the reconnect-intent fence (caller acquires/releases)."""
+    return _FileLease(_INTENT_LOCK_NAME)
+
+
 @contextmanager
 def _exclusive_state_lease(deadline: float):
     """Hold the exclusive cross-process state lease for one commit."""
@@ -938,12 +1052,14 @@ def _exclusive_state_lease(deadline: float):
         lease.release()
 
 
-def _healthy_within(provider, deadline: float) -> bool:
+def _healthy_within(provider, deadline) -> bool:
     """Bounded health probe; False (never raises) when unhealthy/too slow."""
+    if isinstance(deadline, _Budget):
+        deadline = deadline.deadline
     return _health_with_deadline(provider, deadline)
 
 
-def _activate_or_adopt(provider, deadline: float) -> None:
+def _activate_or_adopt(provider, deadline) -> None:
     """Reconcile a freshly built ``provider`` with the committed state.
 
     Called with ``_state_sync_lock`` held. A missing state file is created
@@ -955,6 +1071,8 @@ def _activate_or_adopt(provider, deadline: float) -> None:
     and is never rewritten.
     """
     global _active_state
+    if isinstance(deadline, _Budget):
+        deadline = deadline.deadline
     if _configured_dir is None:
         return
     state = _read_committed_state()
@@ -986,7 +1104,7 @@ def _current_consistent(state: Tuple[str, int]) -> bool:
     )
 
 
-def _sync_committed_state(deadline: float, lease: "_FileLease") -> None:
+def _sync_committed_state(budget: "_Budget", lease: "_FileLease") -> None:
     """Bring this process's cached provider in line with the committed state.
 
     Called from :func:`provider_call` with ``_state_sync_lock`` and the
@@ -999,6 +1117,7 @@ def _sync_committed_state(deadline: float, lease: "_FileLease") -> None:
     audit event or state write happens.
     """
     global _provider, _active_state
+    deadline = budget.deadline
     if _configured_dir is None:
         return
     while True:
@@ -1048,13 +1167,14 @@ def _sync_committed_state(deadline: float, lease: "_FileLease") -> None:
 class _ReconnectGate:
     """Serialize non-disruptive provider replacement against provider calls.
 
-    Reconnect marks the gate as *draining* and waits for every lease handed
-    out before it began to be returned (calls in flight finish on the OLD
-    instance), then builds/configures/health-checks the candidate and swaps it
-    in. Provider operations take a shared lease: while draining they block and
-    are admitted against the (new) current instance once reconnect completes.
-    A wait beyond :data:`CALL_GATE_SECONDS` raises ProviderReconnectPending
-    without invoking any provider.
+    The in-process half of the reconnect ordering. A reconnect first marks
+    the gate as *draining* (only AFTER the cross-process intent fence is held)
+    and waits for every lease handed out before it began to be returned:
+    calls admitted earlier finish on the OLD instance they captured, and no
+    new local lease is admitted while draining. Later calls wait on the
+    condition and are admitted against the freshly installed instance once
+    the swap finishes. A wait past the attempt's shared five-second budget
+    raises ProviderReconnectPending without invoking any provider.
     """
 
     def __init__(self) -> None:
@@ -1063,62 +1183,57 @@ class _ReconnectGate:
         self._draining = False
         self._leases = 0
 
-    def _acquire_lease(self, deadline: float) -> None:
+    def acquire_serialized(self, budget: "_Budget") -> None:
+        """Become the single in-flight reconnect, bounded by ``budget``.
+
+        Polled (never an unbounded blocking acquire) so a storm of concurrent
+        reconnects serializes without a thread waiting past the shared
+        five-second budget: a waiter that cannot get its turn answers 503 and
+        leaves the old instance untouched instead of blocking indefinitely.
+        """
+        while not self._serialize.acquire(timeout=min(0.05, budget.remaining())):
+            if budget.expired():
+                raise ProviderReconnectPending(
+                    "timed out waiting for an earlier reconnect to finish"
+                )
+
+    def release_serialized(self) -> None:
+        self._serialize.release()
+
+    def begin_draining(self) -> None:
+        with self._cond:
+            self._draining = True
+
+    def wait_drained(self, budget: "_Budget") -> None:
+        """Wait for all leases admitted before draining began to be returned."""
+        with self._cond:
+            while self._leases > 0:
+                if budget.expired():
+                    raise ProviderReconnectPending(
+                        "timed out draining provider calls before reconnect"
+                    )
+                self._cond.wait(timeout=min(0.05, budget.remaining()))
+
+    def end_draining(self) -> None:
+        with self._cond:
+            self._draining = False
+            self._cond.notify_all()
+
+    def acquire_lease(self, budget: "_Budget") -> None:
         with self._cond:
             while self._draining:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                if budget.expired():
                     raise ProviderReconnectPending(
                         "timed out waiting for provider reconnect to settle"
                     )
-                self._cond.wait(timeout=min(0.05, remaining))
+                self._cond.wait(timeout=min(0.05, budget.remaining()))
             self._leases += 1
 
-    def _release_lease(self) -> None:
+    def release_lease(self) -> None:
         with self._cond:
             self._leases -= 1
             if self._draining and self._leases == 0:
                 self._cond.notify_all()
-
-    @contextmanager
-    def swapping(self, builder, timeout: Optional[float] = None):
-        """Drain in-flight calls, run ``builder`` and let it swap the instance.
-
-        Only one reconnect runs at a time. The shared budget (default
-        :data:`CALL_GATE_SECONDS`, read at call time) bounds both the wait for
-        in-flight leases and the overall settle (a builder that returns after
-        the budget is refused). On any failure the previously active instance
-        is retained untouched.
-        """
-        if timeout is None:
-            timeout = CALL_GATE_SECONDS
-        with self._serialize:
-            deadline = time.monotonic() + timeout
-            with self._cond:
-                self._draining = True
-                try:
-                    while self._leases > 0:
-                        remaining = deadline - time.monotonic()
-                        if remaining <= 0:
-                            raise ProviderReconnectPending(
-                                "timed out draining provider calls before "
-                                "reconnect"
-                            )
-                        self._cond.wait(timeout=min(0.05, remaining))
-                except BaseException:
-                    self._draining = False
-                    self._cond.notify_all()
-                    raise
-            # The condition lock is released here (draining stays true, so no
-            # new lease can be admitted, and the lease count cannot rise above
-            # zero); the slow factory/configure/health work and the swap run
-            # without holding it.
-            try:
-                builder(deadline)
-            finally:
-                with self._cond:
-                    self._draining = False
-                    self._cond.notify_all()
 
 
 _gate = _ReconnectGate()
@@ -1135,22 +1250,34 @@ _tls = threading.local()
 def provider_call(timeout: Optional[float] = None):
     """Bind one logical operation to one provider instance for its duration.
 
-    Yields the provider instance captured at admission. Blocks behind an
-    in-progress reconnect up to ``timeout`` (defaulting to
-    :data:`CALL_GATE_SECONDS`, read at call time); on timeout raises
-    :class:`ProviderReconnectPending` with zero provider side effects. Nested
-    use on the same thread reuses the outer lease/instance.
+    Yields the provider instance captured at admission. One shared five-second
+    budget (``timeout``) covers EVERY wait of the attempt, starting at the
+    first one: waiting behind a draining reconnect in this process, waiting
+    for a reconnect INTENT held in another process, and taking the shared
+    cross-process state lease. On timeout raises
+    :class:`ProviderReconnectPending` before any provider is built, probed or
+    called -- hence before any handle, audit event or state write. Nested use
+    on the same thread reuses the outer lease/instance.
 
-    Admission also takes the shared cross-process state lease (so a
-    reconnect in ANY process drains this call before committing) and
-    reconciles the cached provider with the committed
-    ``provider-state.json``: a commit by another process forces a rebuild
-    here, and a corrupt state, an id mismatch or an unhealthy rebuild fails
-    the call before any provider operation, handle, audit event or state
-    write happens.
+    Admission order, and the double intent check that closes the flock
+    read-leapfrog race:
+
+    1. take the in-process gate lease (wait while a local reconnect drains);
+    2. probe the cross-process reconnect intent -- if held, release the gate
+       lease and wait for the intent to clear;
+    3. take the shared ``provider-state.lock`` lease;
+    4. probe the intent AGAIN: a reconnect may have established it between
+       the two probes (its exclusive intent is instant, while this call's
+       shared state lease can be granted ahead of the reconnect's queued
+       exclusive one). On a hit release both leases and go back to waiting;
+    5. reconcile with the committed ``provider-state.json`` (a foreign commit
+       forces a rebuild; corrupt state, id mismatch or an unhealthy rebuild
+       fail the call with zero side effects), then capture the instance.
+
+    Calls admitted before intent existed are not kept out: they hold their
+    shared lease, run on the instance they captured and are simply drained by
+    the reconnect (which waits for that lease).
     """
-    if timeout is None:
-        timeout = CALL_GATE_SECONDS
     depth = getattr(_tls, "depth", 0)
     if depth:
         _tls.depth = depth + 1
@@ -1160,42 +1287,78 @@ def provider_call(timeout: Optional[float] = None):
             _tls.depth -= 1
         return
 
-    deadline = time.monotonic() + timeout
-    _gate._acquire_lease(deadline)
-    lease = _FileLease()
+    budget = _Budget(timeout)
+    lease = None
+    gate_held = False
+    admitted = False
     try:
-        # Lock order: _state_sync_lock -> state lock file. The shared file
-        # lease is only ever acquired under _state_sync_lock, so a thread
-        # waiting for the exclusive lease (its own shared lease released)
-        # can never be blocked by a holder that also needs the sync lock.
-        with _state_sync_lock:
-            lease.acquire(False, deadline)
+        while True:
+            # (1) In-process gate: wait out a locally draining reconnect.
+            _gate.acquire_lease(budget)
+            gate_held = True
             try:
-                _sync_committed_state(deadline, lease)
+                # (2) Intent BEFORE the shared state lease. A hit drops the
+                # gate lease (this attempt is not yet admitted anywhere) and
+                # waits for the intent to clear, all on the same budget.
+                if not _intent_probe_clear():
+                    _gate.release_lease()
+                    gate_held = False
+                    _intent_wait_clear(budget)
+                    continue
+                # (3)+(4) take the shared state lease strictly UNDER the
+                # sync lock (lock order: _state_sync_lock -> state lock
+                # file), then probe intent AGAIN: a reconnect may have
+                # established intent between the two probes -- its exclusive
+                # intent is instant while this call's shared state lease can
+                # be granted ahead of its queued exclusive one. On a hit the
+                # state lease is dropped at once and the call goes back to
+                # waiting, so it never extends the reconnect's drain.
+                intent_hit = False
+                with _state_sync_lock:
+                    lease = _FileLease()
+                    lease.acquire(False, budget.deadline)
+                    if not _intent_probe_clear():
+                        lease.release()
+                        lease = None
+                        intent_hit = True
+                    else:
+                        # (5) Reconcile with the committed generation.
+                        _sync_committed_state(budget, lease)
+                if intent_hit:
+                    _gate.release_lease()
+                    gate_held = False
+                    _intent_wait_clear(budget)
+                    continue
+                # Capture the current instance AFTER admission; a lazy first
+                # import happens here, outside the gate/sync locks.
+                provider = get_provider()
+                admitted = True
+                break
             except BaseException:
-                lease.release()
+                if lease is not None:
+                    lease.release()
+                    lease = None
+                if gate_held:
+                    _gate.release_lease()
+                    gate_held = False
                 raise
-        # Capture the current instance AFTER admission, without holding the
-        # gate condition: a lazy first import stays out of the condition
-        # lock. If loading fails, the lease is released and nothing was
-        # called.
+        _tls.depth = 1
+        _tls.bound_provider = provider
         try:
-            provider = get_provider()
-        except BaseException:
+            yield provider
+        finally:
+            _tls.depth = 0
+            _tls.bound_provider = None
             lease.release()
-            raise
-    except BaseException:
-        _gate._release_lease()
-        raise
-    _tls.depth = 1
-    _tls.bound_provider = provider
-    try:
-        yield provider
+            _gate.release_lease()
     finally:
-        _tls.depth = 0
-        _tls.bound_provider = None
-        lease.release()
-        _gate._release_lease()
+        # Defensive: an unexpected escape between admission and binding must
+        # not leak a lease.
+        if not admitted:
+            if lease is not None:
+                lease.release()
+            if gate_held:
+                _gate.release_lease()
 
 
 def _spec() -> str:
@@ -1427,61 +1590,88 @@ def reconnect(timeout: float = CALL_GATE_SECONDS) -> dict:
     """Rebuild the provider from the current configuration without dropping
     in-flight calls.
 
-    A fresh instance is built from the factory named by ``KEYMGR_PROVIDER``,
-    contract-validated, configured against the bound data directory and health
-    checked; only a healthy instance is swapped in, and the swap happens while
-    the gate is still draining so every call admitted afterwards uses the new
-    instance. In-flight calls finish on the OLD instance while new calls wait
-    behind the shared five-second gate. On any failure (drain/build/configure/
-    health timeout) the previously active instance is retained untouched and
-    :class:`ProviderUnavailable` is raised. Returns the new status body.
+    Ordering (within one data directory):
 
-    A successful reconnect atomically commits ``provider-state.json`` with
-    the next generation under the exclusive cross-process state lease, so
-    only a healthy candidate can increment the generation and a failure or
-    crash before the commit keeps the old generation. Every other process
-    observes the commit on its next provider call and rebuilds.
+    1. serialize against concurrent reconnects in this process;
+    2. establish the cross-process reconnect INTENT (exclusive
+       ``provider-reconnect.lock``) -- only after this does any draining
+       happen, and every LATER call in every process waits from now on;
+    3. drain calls admitted earlier in this process (they finish on the
+       instance they captured), then take the exclusive
+       ``provider-state.lock`` which drains earlier calls in other processes;
+    4. build, contract-validate, configure and health-probe the candidate,
+       atomically commit ``provider-state.json`` with the next generation and
+       only then swap the cached instance;
+    5. release the drain/intent: later calls resume on the NEW generation.
+
+    Every wait shares one five-second budget started at the first one. On any
+    failure (serialization, intent/drain wait, build, configure, health,
+    commit) the previously active instance and the old state are retained
+    byte-for-byte and :class:`ProviderUnavailable` is raised. One successful
+    reconnect increments ``generation`` by exactly one.
     """
-
-    def builder(deadline: float) -> None:
-        if deadline - time.monotonic() <= 0:
+    budget = _Budget(timeout)
+    # (1) Single reconnect per process at a time, bounded by the budget.
+    _gate.acquire_serialized(budget)
+    intent = _intent_lease()
+    state_lease = _FileLease()
+    draining = False
+    try:
+        # (2) Cross-process intent FIRST. Held to the end of the swap, so a
+        # call arriving after this point can never slip in via flock's
+        # read-leapfrog: its intent probe blocks and it waits.
+        intent.acquire(True, budget.deadline)
+        # (3) Mark the local drain, wait out earlier in-process calls, then
+        # take the exclusive state lease (which drains earlier cross-process
+        # calls still holding their shared lease).
+        _gate.begin_draining()
+        draining = True
+        _gate.wait_drained(budget)
+        if budget.expired():
             raise ProviderReconnectPending(
                 "reconnect exceeded the shared five-second budget"
             )
-        global _active_state
-        # The generation increment is mutually exclusive across processes:
-        # the exclusive state lease is held from the committed-state read
-        # through the atomic commit. A corrupt state file fails the
-        # reconnect here and is never rewritten.
+        # Lock order: _state_sync_lock -> state lock file.
         with _state_sync_lock:
-            with _exclusive_state_lease(deadline):
-                state = _read_committed_state()
-                # Build + contract validation + configure (factory work
-                # happens while new calls are held at the gate but no gate
-                # condition lock is held).
-                candidate = _build_current_provider()
-                # The health check shares the same five-second budget: a
-                # slow/blocked probe is a failed reconnect; its text is
-                # never surfaced.
-                try:
-                    ready = _health_with_deadline(candidate, deadline)
-                except Exception:
-                    raise ProviderUnavailable("provider health check failed")
-                if not ready:
-                    raise ProviderUnavailable("provider reported unhealthy")
-                generation = 1 if state is None else state[1] + 1
-                # The atomic rename is the commit point: a crash before it
-                # keeps the old generation; afterwards every process's next
-                # call rebuilds and adopts this generation.
-                _write_committed_state(candidate.provider_id, generation)
-                # Swap while still draining: leases are zero and no new
-                # lease can be admitted, so the old instance is retained
-                # only by calls already in flight (which captured it) and
-                # every later call lands on candidate.
-                _install_provider(candidate)
-                _active_state = (candidate.provider_id, generation)
-
-    _gate.swapping(builder, timeout=timeout)
+            state_lease.acquire(True, budget.deadline)
+            if budget.expired():
+                raise ProviderReconnectPending(
+                    "reconnect exceeded the shared five-second budget"
+                )
+            # A corrupt state file fails the reconnect and is never
+            # rewritten; a missing file means generation 1.
+            state = _read_committed_state()
+            # (4) Build + contract validation + configure while every later
+            # call is held behind intent/draining.
+            candidate = _build_current_provider()
+            # The health probe shares the same deadline: a slow/blocked
+            # probe is a failed reconnect; its text never surfaces.
+            try:
+                ready = _health_with_deadline(candidate, budget.deadline)
+            except Exception:
+                raise ProviderUnavailable("provider health check failed")
+            if not ready:
+                raise ProviderUnavailable("provider reported unhealthy")
+            generation = 1 if state is None else state[1] + 1
+            # The atomic rename is the commit point: a crash before it keeps
+            # the old generation/instance; afterwards every process's next
+            # call rebuilds and adopts this generation.
+            _write_committed_state(candidate.provider_id, generation)
+            # Swap while still draining and holding intent: no call can be
+            # admitted, so the old instance is retained only by calls
+            # already in flight (which captured it) and every later call
+            # lands on candidate.
+            global _active_state
+            _install_provider(candidate)
+            _active_state = (candidate.provider_id, generation)
+    finally:
+        # (5) Always release in reverse order; failure or timeout leaves the
+        # previously active instance and committed state untouched.
+        state_lease.release()
+        if draining:
+            _gate.end_draining()
+        intent.release()
+        _gate.release_serialized()
 
     current = get_provider()
     return _status_for(current)
