@@ -1781,16 +1781,39 @@ def make_handler(
                 return False
             return True
 
+        def _no_tenant_body(self) -> bool:
+            """Reject a non-empty request body carrying tenant_id with a 400.
+
+            Read before any factory build or health probe: a body that
+            mentions tenant_id is a parameter error naming the field.
+            """
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                self._bad_request("invalid Content-Length")
+                return False
+            raw = self.rfile.read(length) if length > 0 else b""
+            if raw and "tenant_id" in raw.decode("utf-8", "replace"):
+                self._bad_request(
+                    "field tenant_id is not accepted by this endpoint"
+                )
+                return False
+            return True
+
         def _provider_status(self) -> None:
             """GET /v1/provider/status.
 
             200 with keys in order ``provider_id,status``; status is only
             ``ready`` or ``unavailable``. A provider that cannot be loaded
             reports ``provider_id`` null (the probe builds it lazily). The
-            readiness text/exception never leaves the process.
+            readiness text/exception never leaves the process. A tenant_id
+            in a header, the query or a non-empty body is a 400 before any
+            factory build or health probe.
             """
             parts = urlsplit(self.path)
             if not self._no_tenant(parts):
+                return
+            if not self._no_tenant_body():
                 return
             body = provider_mod.provider_status()
             self._send_json(
@@ -1827,7 +1850,12 @@ def make_handler(
                 return
             # Exactly the empty object: a non-object or any extra field is a
             # 400 that happens before the factory is touched (zero side
-            # effects, no audit event).
+            # effects, no audit event). A tenant_id field is named directly.
+            if isinstance(payload, dict) and "tenant_id" in payload:
+                self._bad_request(
+                    "field tenant_id is not accepted by this endpoint"
+                )
+                return
             if not isinstance(payload, dict) or payload:
                 self._bad_request("request body must be exactly {}")
                 return

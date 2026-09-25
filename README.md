@@ -155,6 +155,16 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   一次，事件绝不重复。从未在本数据目录激活过的 provider_id 仍按原“未激活
   提供者”规则终态 `503`。曾激活的 provider_id 记在
   `provider-ids.json`(0600)，跨进程可识别。
+- **跨进程激活状态 `provider-state.json`(0600)**：首次健康激活与每次成功
+  重连都原子提交（temp 文件 fsync 后 rename）该文件：紧凑 UTF-8 JSON、
+  非 ASCII 原样、无末尾换行，键序固定
+  `schema_version,provider_id,generation`（依次为固定整数 1、非空字符串、
+  从 1 递增的正整数）。启动与每次提供者调用时读取：文件缺失由首次健康激
+  活创建（generation 1）；损坏或字段非法时，提供者调用与重连一律按固定
+  文案 `503` 且绝不改写该文件。仅健康候选能在跨进程排他锁
+  （`provider-state.lock`，与进程内门共用 5 秒门限）下互斥递增
+  generation；失败或提交前崩溃保留旧代。提交后各进程下次调用重建当前配
+  置，所得 `provider_id` 不符或不健康则 `503` 且零副作用。
 - CLI：`provider status --operator O` 与
   `provider reconnect --operator O`，成功输出同序单行 JSON；`400→2`、
   `503→1`，成功 `0`。status 在提供者不可用时仍以退出 `0` 返回

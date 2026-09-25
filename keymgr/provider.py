@@ -32,6 +32,7 @@ never falls back to the local provider.
 """
 
 import base64
+import errno
 import importlib
 import json
 import os
@@ -40,7 +41,12 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Tuple
+
+try:  # fcntl is POSIX-only; the cross-process gate degrades to in-process.
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    fcntl = None
 
 from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import serialization
@@ -728,6 +734,317 @@ class ProviderIdentityMismatch(ProviderReconnectPending):
     """
 
 
+# -- committed cross-process provider state ---------------------------------
+# ``provider-state.json`` (0600) is the single cross-process record of which
+# provider is active in a data directory and which generation of it was last
+# committed. It is written atomically (temp file, fsync, rename) by the first
+# healthy activation and by every successful reconnect, as compact UTF-8 JSON
+# with the fixed key order ``schema_version,provider_id,generation``, no
+# ASCII escaping and no trailing newline. A missing file is created by the
+# first healthy activation (generation 1); a corrupt or invalid file poisons
+# provider calls and reconnect (fixed 503) and is never rewritten.
+_STATE_NAME = "provider-state.json"
+_STATE_LOCK_NAME = "provider-state.lock"
+_STATE_SCHEMA_VERSION = 1
+
+# The (provider_id, generation) this process's cached ``_provider`` instance
+# was activated/adopted/committed with. Only ever set together with
+# ``_provider``; a commit observed on disk that does not match this tuple
+# forces a rebuild on the next provider call.
+_active_state: Optional[Tuple[str, int]] = None
+# Serializes state sync/activation/adoption within this process. Lock order:
+# ``_state_sync_lock`` -> state lock file -> ``_provider_lock`` (never the
+# reverse), so a thread upgrading to the exclusive file lease can never
+# deadlock against one holding the provider lock.
+_state_sync_lock = threading.Lock()
+
+
+def _state_path() -> Optional[str]:
+    if _configured_dir is None:
+        return None
+    return os.path.join(_configured_dir, _STATE_NAME)
+
+
+def _read_committed_state() -> Optional[Tuple[str, int]]:
+    """Return the committed ``(provider_id, generation)``, or None if absent.
+
+    A corrupt or field-invalid ``provider-state.json`` raises
+    :class:`ProviderUnavailable`: provider calls and reconnect then answer
+    the fixed 503 text and the file is left byte-for-byte untouched.
+    """
+    path = _state_path()
+    if path is None:
+        return None
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ProviderUnavailable(
+            "cannot read provider state: %s" % exc
+        ) from exc
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ProviderUnavailable("provider state file is corrupt") from exc
+    valid = isinstance(data, dict) and set(data) == {
+        "schema_version",
+        "provider_id",
+        "generation",
+    }
+    if valid:
+        version = data["schema_version"]
+        provider_id = data["provider_id"]
+        generation = data["generation"]
+        valid = (
+            type(version) is int
+            and version == _STATE_SCHEMA_VERSION
+            and isinstance(provider_id, str)
+            and bool(provider_id)
+            and type(generation) is int
+            and generation >= 1
+        )
+    if not valid:
+        raise ProviderUnavailable("provider state file is corrupt")
+    return (data["provider_id"], data["generation"])
+
+
+def _write_committed_state(provider_id: str, generation: int) -> None:
+    """Atomically commit ``provider-state.json`` (0600, fsync + rename).
+
+    The payload is compact UTF-8 JSON with the fixed key order
+    ``schema_version,provider_id,generation``, non-ASCII written as-is and
+    no trailing newline. The rename is the commit point: a crash before it
+    keeps the previous generation.
+    """
+    if _configured_dir is None:
+        return
+    payload = json.dumps(
+        {
+            "schema_version": _STATE_SCHEMA_VERSION,
+            "provider_id": provider_id,
+            "generation": generation,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=_configured_dir, suffix=".tmp")
+    except OSError as exc:
+        raise ProviderUnavailable(
+            "cannot write provider state: %s" % exc
+        ) from exc
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, os.path.join(_configured_dir, _STATE_NAME))
+    except OSError as exc:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise ProviderUnavailable(
+            "cannot write provider state: %s" % exc
+        ) from exc
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+class _FileLease:
+    """A held shared/exclusive ``flock`` on ``provider-state.lock``.
+
+    This is the cross-process half of the reconnect gate: provider calls
+    hold a shared lease for their whole duration (in-flight calls in every
+    process finish before a reconnect commits), while a reconnect commit or
+    a first activation takes the exclusive lease. Acquisition polls with a
+    non-blocking flock against the shared five-second deadline; a wait past
+    it raises :class:`ProviderReconnectPending` with zero side effects. When
+    no data directory is bound (or fcntl is unavailable) the lease is a
+    no-op and the in-process gate alone applies.
+    """
+
+    def __init__(self) -> None:
+        self._fd: Optional[int] = None
+
+    def acquire(self, exclusive: bool, deadline: float) -> None:
+        self.release()
+        if _configured_dir is None or fcntl is None:
+            return
+        try:
+            os.makedirs(_configured_dir, exist_ok=True)
+            fd = os.open(
+                os.path.join(_configured_dir, _STATE_LOCK_NAME),
+                os.O_RDWR | os.O_CREAT,
+                0o600,
+            )
+        except OSError as exc:
+            raise ProviderUnavailable(
+                "cannot open provider state lock: %s" % exc
+            ) from exc
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, operation | fcntl.LOCK_NB)
+                    break
+                except InterruptedError:
+                    continue
+                except OSError as exc:
+                    if exc.errno not in (
+                        errno.EACCES,
+                        errno.EAGAIN,
+                        errno.EWOULDBLOCK,
+                    ):
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ProviderReconnectPending(
+                            "timed out waiting for the cross-process "
+                            "provider gate"
+                        )
+                    time.sleep(min(0.05, remaining))
+        except BaseException:
+            os.close(fd)
+            raise
+        self._fd = fd
+
+    def release(self) -> None:
+        fd, self._fd = self._fd, None
+        if fd is None:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+@contextmanager
+def _exclusive_state_lease(deadline: float):
+    """Hold the exclusive cross-process state lease for one commit."""
+    lease = _FileLease()
+    lease.acquire(True, deadline)
+    try:
+        yield
+    finally:
+        lease.release()
+
+
+def _healthy_within(provider, deadline: float) -> bool:
+    """Bounded health probe; False (never raises) when unhealthy/too slow."""
+    return _health_with_deadline(provider, deadline)
+
+
+def _activate_or_adopt(provider, deadline: float) -> None:
+    """Reconcile a freshly built ``provider`` with the committed state.
+
+    Called with ``_state_sync_lock`` held. A missing state file is created
+    by this first healthy activation (generation 1, mutually exclusive with
+    reconnect commits in every process). An existing committed state is
+    adopted: the built provider must carry the committed ``provider_id``
+    and be healthy, otherwise :class:`ProviderUnavailable` (503) is raised
+    with zero side effects. A corrupt state file propagates the same error
+    and is never rewritten.
+    """
+    global _active_state
+    if _configured_dir is None:
+        return
+    state = _read_committed_state()
+    if state is None:
+        with _exclusive_state_lease(deadline):
+            state = _read_committed_state()
+            if state is None:
+                if not _healthy_within(provider, deadline):
+                    raise ProviderUnavailable("provider reported unhealthy")
+                _write_committed_state(provider.provider_id, 1)
+                _active_state = (provider.provider_id, 1)
+                return
+    if provider.provider_id != state[0]:
+        raise ProviderUnavailable(
+            "configured provider does not match the committed provider "
+            "state"
+        )
+    if not _healthy_within(provider, deadline):
+        raise ProviderUnavailable("provider reported unhealthy")
+    _active_state = state
+
+
+def _current_consistent(state: Tuple[str, int]) -> bool:
+    """Whether the cached provider already matches the committed state."""
+    return (
+        _provider is not None
+        and _active_state == state
+        and _provider.provider_id == state[0]
+    )
+
+
+def _sync_committed_state(deadline: float, lease: "_FileLease") -> None:
+    """Bring this process's cached provider in line with the committed state.
+
+    Called from :func:`provider_call` with ``_state_sync_lock`` and the
+    shared file lease held (the lease is released/re-acquired internally if
+    a first activation needs the exclusive lease). After a commit by any
+    process, the next call rebuilds the provider from the current
+    configuration; a rebuilt instance whose ``provider_id`` disagrees with
+    the committed state, or one that is not healthy, fails the call with
+    :class:`ProviderUnavailable` before any provider operation, handle,
+    audit event or state write happens.
+    """
+    global _provider, _active_state
+    if _configured_dir is None:
+        return
+    while True:
+        state = _read_committed_state()
+        if state is None:
+            # First activation is mutually exclusive with reconnect
+            # commits in every process: drop the shared lease, take the
+            # exclusive one and re-check under it.
+            lease.release()
+            try:
+                with _exclusive_state_lease(deadline):
+                    state = _read_committed_state()
+                    if state is None:
+                        provider = _provider
+                        if provider is None:
+                            provider = _build_current_provider()
+                        if not _healthy_within(provider, deadline):
+                            raise ProviderUnavailable(
+                                "provider reported unhealthy"
+                            )
+                        _write_committed_state(provider.provider_id, 1)
+                        with _provider_lock:
+                            _provider = provider
+                        _remember(provider.provider_id)
+                        _active_state = (provider.provider_id, 1)
+                        return
+            finally:
+                lease.acquire(False, deadline)
+            # Another process activated meanwhile; adopt its commit.
+            continue
+        if _current_consistent(state):
+            return
+        candidate = _build_current_provider()
+        if candidate.provider_id != state[0]:
+            raise ProviderUnavailable(
+                "configured provider does not match the committed "
+                "provider state"
+            )
+        if not _healthy_within(candidate, deadline):
+            raise ProviderUnavailable("provider reported unhealthy")
+        with _provider_lock:
+            _provider = candidate
+        _remember(candidate.provider_id)
+        _active_state = state
+
+
 class _ReconnectGate:
     """Serialize non-disruptive provider replacement against provider calls.
 
@@ -823,6 +1140,14 @@ def provider_call(timeout: Optional[float] = None):
     :data:`CALL_GATE_SECONDS`, read at call time); on timeout raises
     :class:`ProviderReconnectPending` with zero provider side effects. Nested
     use on the same thread reuses the outer lease/instance.
+
+    Admission also takes the shared cross-process state lease (so a
+    reconnect in ANY process drains this call before committing) and
+    reconciles the cached provider with the committed
+    ``provider-state.json``: a commit by another process forces a rebuild
+    here, and a corrupt state, an id mismatch or an unhealthy rebuild fails
+    the call before any provider operation, handle, audit event or state
+    write happens.
     """
     if timeout is None:
         timeout = CALL_GATE_SECONDS
@@ -837,11 +1162,28 @@ def provider_call(timeout: Optional[float] = None):
 
     deadline = time.monotonic() + timeout
     _gate._acquire_lease(deadline)
+    lease = _FileLease()
     try:
+        # Lock order: _state_sync_lock -> state lock file. The shared file
+        # lease is only ever acquired under _state_sync_lock, so a thread
+        # waiting for the exclusive lease (its own shared lease released)
+        # can never be blocked by a holder that also needs the sync lock.
+        with _state_sync_lock:
+            lease.acquire(False, deadline)
+            try:
+                _sync_committed_state(deadline, lease)
+            except BaseException:
+                lease.release()
+                raise
         # Capture the current instance AFTER admission, without holding the
-        # gate condition: a lazy first import stays out of the condition lock.
-        # If loading fails, the lease is released and nothing was called.
-        provider = get_provider()
+        # gate condition: a lazy first import stays out of the condition
+        # lock. If loading fails, the lease is released and nothing was
+        # called.
+        try:
+            provider = get_provider()
+        except BaseException:
+            lease.release()
+            raise
     except BaseException:
         _gate._release_lease()
         raise
@@ -852,6 +1194,7 @@ def provider_call(timeout: Optional[float] = None):
     finally:
         _tls.depth = 0
         _tls.bound_provider = None
+        lease.release()
         _gate._release_lease()
 
 
@@ -915,6 +1258,12 @@ def get_provider():
     mid-way. Every other caller gets the current cached provider, importing
     it lazily on first use. Raises ProviderUnavailable (never falls back)
     when the configured provider cannot be loaded or fails the contract.
+
+    The first build in a process is reconciled with the committed
+    ``provider-state.json``: a missing file is created by this first
+    healthy activation, an existing one is adopted only if the built
+    provider carries the committed ``provider_id`` and is healthy, and a
+    corrupt file fails the call (503) without being rewritten.
     """
     global _provider
     bound = getattr(_tls, "bound_provider", None)
@@ -922,16 +1271,15 @@ def get_provider():
         return bound
     if _provider is not None:
         return _provider
-    with _provider_lock:
-        bound = getattr(_tls, "bound_provider", None)
-        if bound is not None and getattr(_tls, "depth", 0) > 0:
-            return bound
-        if _provider is not None:
-            return _provider
+    with _state_sync_lock:
         if _provider is not None:
             return _provider
         provider = _build_current_provider()
-        _provider = provider
+        _activate_or_adopt(
+            provider, time.monotonic() + CALL_GATE_SECONDS
+        )
+        with _provider_lock:
+            _provider = provider
         _remember(provider.provider_id)
         return _provider
 
@@ -1011,10 +1359,11 @@ def get_local_provider() -> "LocalProvider":
 
 def reset_for_tests() -> None:
     """Forget the cached provider (tests only)."""
-    global _provider, _configured_dir
+    global _provider, _configured_dir, _active_state
     with _provider_lock:
         _provider = None
         _configured_dir = None
+        _active_state = None
         _active_history.clear()
         _LOCAL_SINGLETON._configured = False
 
@@ -1026,8 +1375,15 @@ def provider_status() -> dict:
     ``{"provider_id": <id>, "status": "ready"|"unavailable"}``. A provider
     that has never loaded is built here (lazy) purely to answer the probe; a
     load/contract/configuration failure reports ``provider_id`` null and
-    status unavailable. The probe's own exception text is never returned.
+    status unavailable. A corrupt ``provider-state.json`` poisons every
+    provider call, so it reports unavailable as well (the file is left
+    untouched). The probe's own exception text is never returned.
     """
+    if _configured_dir is not None:
+        try:
+            _read_committed_state()
+        except ProviderUnavailable:
+            return {"provider_id": None, "status": "unavailable"}
     provider = None
     if _provider is not None:
         provider = _provider
@@ -1079,6 +1435,12 @@ def reconnect(timeout: float = CALL_GATE_SECONDS) -> dict:
     behind the shared five-second gate. On any failure (drain/build/configure/
     health timeout) the previously active instance is retained untouched and
     :class:`ProviderUnavailable` is raised. Returns the new status body.
+
+    A successful reconnect atomically commits ``provider-state.json`` with
+    the next generation under the exclusive cross-process state lease, so
+    only a healthy candidate can increment the generation and a failure or
+    crash before the commit keeps the old generation. Every other process
+    observes the commit on its next provider call and rebuilds.
     """
 
     def builder(deadline: float) -> None:
@@ -1086,21 +1448,38 @@ def reconnect(timeout: float = CALL_GATE_SECONDS) -> dict:
             raise ProviderReconnectPending(
                 "reconnect exceeded the shared five-second budget"
             )
-        # Build + contract validation + configure (factory work happens while
-        # new calls are held at the gate but no gate condition lock is held).
-        candidate = _build_current_provider()
-        # The health check shares the same five-second budget: a slow/blocked
-        # probe is a failed reconnect; its text is never surfaced.
-        try:
-            ready = _health_with_deadline(candidate, deadline)
-        except Exception:
-            raise ProviderUnavailable("provider health check failed")
-        if not ready:
-            raise ProviderUnavailable("provider reported unhealthy")
-        # Swap while still draining: leases are zero and no new lease can be
-        # admitted, so the old instance is retained only by calls already in
-        # flight (which captured it) and every later call lands on candidate.
-        _install_provider(candidate)
+        global _active_state
+        # The generation increment is mutually exclusive across processes:
+        # the exclusive state lease is held from the committed-state read
+        # through the atomic commit. A corrupt state file fails the
+        # reconnect here and is never rewritten.
+        with _state_sync_lock:
+            with _exclusive_state_lease(deadline):
+                state = _read_committed_state()
+                # Build + contract validation + configure (factory work
+                # happens while new calls are held at the gate but no gate
+                # condition lock is held).
+                candidate = _build_current_provider()
+                # The health check shares the same five-second budget: a
+                # slow/blocked probe is a failed reconnect; its text is
+                # never surfaced.
+                try:
+                    ready = _health_with_deadline(candidate, deadline)
+                except Exception:
+                    raise ProviderUnavailable("provider health check failed")
+                if not ready:
+                    raise ProviderUnavailable("provider reported unhealthy")
+                generation = 1 if state is None else state[1] + 1
+                # The atomic rename is the commit point: a crash before it
+                # keeps the old generation; afterwards every process's next
+                # call rebuilds and adopts this generation.
+                _write_committed_state(candidate.provider_id, generation)
+                # Swap while still draining: leases are zero and no new
+                # lease can be admitted, so the old instance is retained
+                # only by calls already in flight (which captured it) and
+                # every later call lands on candidate.
+                _install_provider(candidate)
+                _active_state = (candidate.provider_id, generation)
 
     _gate.swapping(builder, timeout=timeout)
 

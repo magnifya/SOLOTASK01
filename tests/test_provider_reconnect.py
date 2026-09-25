@@ -606,6 +606,159 @@ def test_active_provider_history_persists_across_processes(env):
     assert provider_mod.provider_was_active("fakekms")
 
 
+# -- committed cross-process provider state (provider-state.json) ------------
+def _state_path(env):
+    return os.path.join(env.data_dir, "provider-state.json")
+
+
+def _read_state_raw(env):
+    with open(_state_path(env), "rb") as fh:
+        return fh.read()
+
+
+def test_first_healthy_activation_writes_state_file(env):
+    provider_mod.bind_data_dir(env.data_dir)
+    provider_mod.get_provider()
+    raw = _read_state_raw(env)
+    # Compact UTF-8 JSON, fixed key order, no trailing newline, mode 0600.
+    assert raw == (
+        b'{"schema_version":1,"provider_id":"fakekms","generation":1}'
+    )
+    assert os.stat(_state_path(env)).st_mode & 0o777 == 0o600
+
+
+def test_successful_reconnect_increments_generation(env):
+    provider_mod.bind_data_dir(env.data_dir)
+    provider_mod.get_provider()
+    provider_mod.reconnect()
+    assert json.loads(_read_state_raw(env)) == {
+        "schema_version": 1,
+        "provider_id": "fakekms",
+        "generation": 2,
+    }
+    provider_mod.reconnect()
+    assert json.loads(_read_state_raw(env))["generation"] == 3
+
+
+def test_failed_reconnect_keeps_old_generation(env):
+    provider_mod.bind_data_dir(env.data_dir)
+    provider_mod.get_provider()
+    before = _read_state_raw(env)
+    env.set_faults({"health": False})
+    with pytest.raises(provider_mod.ProviderUnavailable):
+        provider_mod.reconnect()
+    assert _read_state_raw(env) == before
+
+
+def test_non_ascii_provider_id_written_unescaped(env, monkeypatch):
+    provider_mod.bind_data_dir(env.data_dir)
+    monkeypatch.setenv("FAKE_KMS_PROVIDER_ID", "fakekms-ü")
+    provider_mod.reconnect()
+    assert _read_state_raw(env) == (
+        '{"schema_version":1,"provider_id":"fakekms-ü","generation":1}'
+    ).encode("utf-8")
+
+
+def test_corrupt_state_file_is_503_and_never_rewritten(env):
+    provider_mod.bind_data_dir(env.data_dir)
+    provider_mod.get_provider()
+    with open(_state_path(env), "wb") as fh:
+        fh.write(b'{"schema_version":1,"provider_id":')
+    before = _read_state_raw(env)
+    with pytest.raises(provider_mod.ProviderUnavailable):
+        with provider_mod.provider_call():
+            pass
+    with pytest.raises(provider_mod.ProviderUnavailable):
+        provider_mod.reconnect()
+    assert provider_mod.provider_status() == {
+        "provider_id": None,
+        "status": "unavailable",
+    }
+    assert _read_state_raw(env) == before
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        b'{"schema_version":2,"provider_id":"fakekms","generation":1}',
+        b'{"schema_version":1,"provider_id":"","generation":1}',
+        b'{"schema_version":1,"provider_id":"fakekms","generation":0}',
+        b'{"schema_version":1,"provider_id":"fakekms","generation":true}',
+        b'{"schema_version":1,"provider_id":"fakekms"}',
+        b'{"schema_version":1,"provider_id":"fakekms","generation":1,"x":0}',
+        b'[1,2,3]',
+    ],
+)
+def test_invalid_state_fields_are_503_and_untouched(env, bad):
+    provider_mod.bind_data_dir(env.data_dir)
+    with open(_state_path(env), "wb") as fh:
+        fh.write(bad)
+    with pytest.raises(provider_mod.ProviderUnavailable):
+        with provider_mod.provider_call():
+            pass
+    with pytest.raises(provider_mod.ProviderUnavailable):
+        provider_mod.reconnect()
+    assert _read_state_raw(env) == bad
+
+
+def test_call_after_foreign_commit_rebuilds_and_adopts(env):
+    # A CLI process commits a new generation; this process's next provider
+    # call rebuilds from the current configuration and adopts it.
+    provider_mod.bind_data_dir(env.data_dir)
+    provider_mod.get_provider()
+    assert json.loads(_read_state_raw(env))["generation"] == 1
+    result = run_cli(env, "provider", "reconnect", "--operator", "alice")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(_read_state_raw(env))["generation"] == 2
+    with provider_mod.provider_call() as provider:
+        assert provider.provider_id == "fakekms"
+    assert provider_mod._active_state == ("fakekms", 2)
+
+
+def test_call_with_mismatched_committed_id_is_zero_side_effect_503(env):
+    # The committed state names a provider_id this process's configuration
+    # cannot build: the next call fails 503 before any backend object.
+    provider_mod.bind_data_dir(env.data_dir)
+    with open(_state_path(env), "wb") as fh:
+        fh.write(b'{"schema_version":1,"provider_id":"otherkms","generation":4}')
+    before = env.kms_handles()
+    with pytest.raises(provider_mod.ProviderUnavailable):
+        with provider_mod.provider_call():
+            pass
+    assert env.kms_handles() == before
+    assert _read_state_raw(env).endswith(b'"generation":4}')
+
+
+def test_status_rejects_tenant_id_in_body_before_probe(http):
+    env, srv = http
+    # Even with the factory failing (the probe could not build anything), a
+    # tenant_id in a non-empty body is a 400 naming the field, before any
+    # factory build or health probe.
+    env.set_faults({"factory_fails": True})
+    status, body = srv.raw(
+        "GET", "/v1/provider/status", b'{"tenant_id": "t1"}',
+        {"Content-Type": "application/json", **OPERATOR},
+    )
+    assert status == 400
+    assert "tenant_id" in body
+    # A body without tenant_id does not trip the check.
+    status, body = srv.raw(
+        "GET", "/v1/provider/status", b'{"other": 1}',
+        {"Content-Type": "application/json", **OPERATOR},
+    )
+    assert status == 200
+    env.clear_faults()
+
+
+def test_reconnect_body_tenant_id_names_field(http):
+    env, srv = http
+    status, body = srv.request(
+        "POST", "/v1/provider/reconnect", {"tenant_id": "t1"}, OPERATOR
+    )
+    assert status == 400
+    assert "tenant_id" in body["error"]
+
+
 # -- CLI ---------------------------------------------------------------------
 def test_cli_provider_status_and_reconnect(env):
     result = run_cli(env, "provider", "status", "--operator", "alice")
