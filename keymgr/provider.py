@@ -7,6 +7,21 @@ key material when a provider is in use: it only persists the opaque
 ``provider_id`` / ``handle`` / ``encrypted_material`` triple a provider
 returns, and asks the provider to turn a handle back into exportable material.
 
+Primary/standby failover
+------------------------
+``KEYMGR_PROVIDER_CHAIN`` may name a comma-separated list of ``local`` /
+``module:factory`` entries (entries and their built ``provider_id`` values
+must be unique; an unset variable falls back to ``KEYMGR_PROVIDER``, while a
+set-but-empty, empty-item or malformed chain is unusable). The first healthy
+entry is activated; when the active instance later probes unhealthy, the
+service fails over to the first healthy standby under the same five-second
+cross-process intent/drain gate a reconnect uses -- old calls finish on the
+instance they captured, later calls land on the new generation, and
+concurrent triggers build/commit exactly once. A recovered primary is never
+re-selected automatically; only ``reconnect`` re-selects the first healthy
+entry. Pending idempotent operations stay bound to their original
+``provider_id`` and are never replayed on a standby.
+
 Provider contract
 -----------------
 A provider instance exposes:
@@ -41,7 +56,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from typing import NamedTuple, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 try:  # fcntl is POSIX-only; the cross-process gate degrades to in-process.
     import fcntl
@@ -780,11 +795,23 @@ class ProviderIdentityMismatch(ProviderReconnectPending):
 # ``provider-state.json`` (0600) is the single cross-process record of which
 # provider is active in a data directory and which generation of it was last
 # committed. It is written atomically (temp file, fsync, rename) by the first
-# healthy activation and by every successful reconnect, as compact UTF-8 JSON
-# with the fixed key order ``schema_version,provider_id,generation``, no
-# ASCII escaping and no trailing newline. A missing file is created by the
-# first healthy activation (generation 1); a corrupt or invalid file poisons
-# provider calls and reconnect (fixed 503) and is never rewritten.
+# healthy activation, by every successful reconnect and by the two commits of
+# every provider switch, as compact UTF-8 JSON with the fixed key order
+# ``schema_version,provider_id,target_provider_id,generation,reason,phase``,
+# no ASCII escaping and no trailing newline: schema_version is the fixed
+# integer 2, provider_id a non-empty string, target_provider_id null or a
+# non-empty string, generation a positive integer, reason one of
+# ``initial``/``reconnect``/``failover`` and phase ``ready``/``switching``. A
+# switch (a failover, or a reconnect that changes provider_id) first commits
+# ``switching`` (old id, target id, the ORIGINAL generation) and only then
+# ``ready`` (target id, null, generation+1), so a crash between the two
+# commits never moves the generation. A process that reads ``switching``
+# re-verifies the target: a healthy target completes the switch, anything
+# else keeps the file byte-for-byte and answers the fixed 503. A legacy
+# schema_version 1 file (no target/reason/phase) reads as ``ready``. A
+# missing file is created by the first healthy activation (generation 1); a
+# corrupt or invalid file poisons provider calls and reconnect (fixed 503)
+# and is never rewritten.
 _STATE_NAME = "provider-state.json"
 _STATE_LOCK_NAME = "provider-state.lock"
 # The reconnect-intent fence: a reconnect holds this lock exclusively for its
@@ -793,7 +820,28 @@ _STATE_LOCK_NAME = "provider-state.lock"
 # work). A granted intent therefore becomes immediately visible to every later
 # call in every process, regardless of flock's unfair read-leapfrog.
 _INTENT_LOCK_NAME = "provider-reconnect.lock"
-_STATE_SCHEMA_VERSION = 1
+_STATE_SCHEMA_VERSION = 2
+_STATE_LEGACY_SCHEMA_VERSION = 1
+_REASON_INITIAL = "initial"
+_REASON_RECONNECT = "reconnect"
+_REASON_FAILOVER = "failover"
+_REASONS = (_REASON_INITIAL, _REASON_RECONNECT, _REASON_FAILOVER)
+_PHASE_READY = "ready"
+_PHASE_SWITCHING = "switching"
+
+
+class _CommittedState(NamedTuple):
+    """A parsed ``provider-state.json`` record.
+
+    ``reason`` is None only for a legacy schema_version 1 file (which has no
+    target/reason/phase fields and is treated as ``ready``).
+    """
+
+    provider_id: str
+    target_provider_id: Optional[str]
+    generation: int
+    reason: Optional[str]
+    phase: str
 
 # The (provider_id, generation) this process's cached ``_provider`` instance
 # was activated/adopted/committed with. Only ever set together with
@@ -813,8 +861,8 @@ def _state_path() -> Optional[str]:
     return os.path.join(_configured_dir, _STATE_NAME)
 
 
-def _read_committed_state() -> Optional[Tuple[str, int]]:
-    """Return the committed ``(provider_id, generation)``, or None if absent.
+def _read_committed_state() -> Optional[_CommittedState]:
+    """Return the committed state, or None if the state file is absent.
 
     A corrupt or field-invalid ``provider-state.json`` raises
     :class:`ProviderUnavailable`: provider calls and reconnect then answer
@@ -836,35 +884,92 @@ def _read_committed_state() -> Optional[Tuple[str, int]]:
         data = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as exc:
         raise ProviderUnavailable("provider state file is corrupt") from exc
-    valid = isinstance(data, dict) and set(data) == {
-        "schema_version",
-        "provider_id",
-        "generation",
-    }
-    if valid:
+    state = _parse_committed_state(data)
+    if state is None:
+        raise ProviderUnavailable("provider state file is corrupt")
+    return state
+
+
+def _parse_committed_state(data) -> Optional[_CommittedState]:
+    """Validate a decoded state object; None when any field is invalid."""
+    if not isinstance(data, dict):
+        return None
+    keys = set(data)
+    if keys == {"schema_version", "provider_id", "generation"}:
+        # Legacy schema_version 1: no target/reason/phase; treated as ready.
         version = data["schema_version"]
         provider_id = data["provider_id"]
         generation = data["generation"]
-        valid = (
+        if (
             type(version) is int
-            and version == _STATE_SCHEMA_VERSION
+            and version == _STATE_LEGACY_SCHEMA_VERSION
             and isinstance(provider_id, str)
             and bool(provider_id)
             and type(generation) is int
             and generation >= 1
-        )
-    if not valid:
-        raise ProviderUnavailable("provider state file is corrupt")
-    return (data["provider_id"], data["generation"])
+        ):
+            return _CommittedState(
+                provider_id=provider_id,
+                target_provider_id=None,
+                generation=generation,
+                reason=None,
+                phase=_PHASE_READY,
+            )
+        return None
+    if keys != {
+        "schema_version",
+        "provider_id",
+        "target_provider_id",
+        "generation",
+        "reason",
+        "phase",
+    }:
+        return None
+    version = data["schema_version"]
+    provider_id = data["provider_id"]
+    target = data["target_provider_id"]
+    generation = data["generation"]
+    reason = data["reason"]
+    phase = data["phase"]
+    if not (
+        type(version) is int
+        and version == _STATE_SCHEMA_VERSION
+        and isinstance(provider_id, str)
+        and bool(provider_id)
+        and (target is None or (isinstance(target, str) and bool(target)))
+        and type(generation) is int
+        and generation >= 1
+        and reason in _REASONS
+        and phase in (_PHASE_READY, _PHASE_SWITCHING)
+    ):
+        return None
+    # ready carries no target; switching always names its target.
+    if phase == _PHASE_READY and target is not None:
+        return None
+    if phase == _PHASE_SWITCHING and not target:
+        return None
+    return _CommittedState(
+        provider_id=provider_id,
+        target_provider_id=target,
+        generation=generation,
+        reason=reason,
+        phase=phase,
+    )
 
 
-def _write_committed_state(provider_id: str, generation: int) -> None:
+def _write_committed_state(
+    provider_id: str,
+    generation: int,
+    reason: str,
+    target_provider_id: Optional[str] = None,
+    phase: str = _PHASE_READY,
+) -> None:
     """Atomically commit ``provider-state.json`` (0600, fsync + rename).
 
     The payload is compact UTF-8 JSON with the fixed key order
-    ``schema_version,provider_id,generation``, non-ASCII written as-is and
-    no trailing newline. The rename is the commit point: a crash before it
-    keeps the previous generation.
+    ``schema_version,provider_id,target_provider_id,generation,reason,phase``,
+    non-ASCII written as-is and no trailing newline. The rename is the commit
+    point: a crash before it keeps the previous record.
     """
     if _configured_dir is None:
         return
@@ -872,7 +977,10 @@ def _write_committed_state(provider_id: str, generation: int) -> None:
         {
             "schema_version": _STATE_SCHEMA_VERSION,
             "provider_id": provider_id,
+            "target_provider_id": target_provider_id,
             "generation": generation,
+            "reason": reason,
+            "phase": phase,
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -1059,48 +1167,172 @@ def _healthy_within(provider, deadline) -> bool:
     return _health_with_deadline(provider, deadline)
 
 
-def _activate_or_adopt(provider, deadline) -> None:
-    """Reconcile a freshly built ``provider`` with the committed state.
+class _FailoverNeeded(Exception):
+    """Internal signal: the committed active provider must be failed over."""
+
+
+def _first_healthy(candidates, deadline, exclude_id: Optional[str] = None):
+    """The first candidate (in chain order) probing healthy, or None."""
+    for candidate in candidates:
+        if exclude_id is not None and candidate.provider_id == exclude_id:
+            continue
+        if _healthy_within(candidate, deadline):
+            return candidate
+    return None
+
+
+def _select_initial(deadline):
+    """Choose the provider for a first activation (generation 1).
+
+    Chain mode picks the first healthy configured entry; single-spec mode
+    builds the one configured provider. No healthy candidate is
+    :class:`ProviderUnavailable` (the fixed 503) with zero side effects.
+    """
+    if _chain_configured():
+        chosen = _first_healthy(_build_candidates(_specs()), deadline)
+        if chosen is None:
+            raise ProviderUnavailable(
+                "no healthy provider in the configured provider chain"
+            )
+        return chosen
+    provider = _provider if _provider is not None else _build_current_provider()
+    if not _healthy_within(provider, deadline):
+        raise ProviderUnavailable("provider reported unhealthy")
+    return provider
+
+
+def _complete_switch(state: _CommittedState, deadline) -> _CommittedState:
+    """Finish an interrupted switch after re-verifying its target.
+
+    Called with the exclusive state lease held. The target entry is rebuilt
+    and health-probed; only a healthy target commits the ``ready`` record
+    (target id, null target, generation+1, the original reason). Any other
+    outcome keeps the ``switching`` file byte-for-byte and raises
+    :class:`ProviderUnavailable` (the fixed 503).
+    """
+    if isinstance(deadline, _Budget):
+        deadline = deadline.deadline
+    target = None
+    for candidate in _build_candidates(_specs()):
+        if candidate.provider_id == state.target_provider_id:
+            target = candidate
+            break
+    if target is None or not _healthy_within(target, deadline):
+        raise ProviderUnavailable("provider switch target is unavailable")
+    _write_committed_state(
+        target.provider_id, state.generation + 1, state.reason
+    )
+    return _CommittedState(
+        provider_id=target.provider_id,
+        target_provider_id=None,
+        generation=state.generation + 1,
+        reason=state.reason,
+        phase=_PHASE_READY,
+    )
+
+
+def _adopt_committed(state: _CommittedState, deadline) -> None:
+    """Install the configured instance matching a committed ready state.
+
+    Chain mode maps the committed ``provider_id`` back to a chain entry; a
+    committed id no entry builds is a fixed 503, and a matching entry that
+    probes unhealthy raises :class:`_FailoverNeeded` so the caller switches
+    to the first healthy standby instead of failing the call.
+    """
+    global _provider, _active_state
+    if _chain_configured():
+        chosen = None
+        for candidate in _build_candidates(_specs()):
+            if candidate.provider_id == state.provider_id:
+                chosen = candidate
+                break
+        if chosen is None:
+            raise ProviderUnavailable(
+                "configured provider does not match the committed provider "
+                "state"
+            )
+        if not _healthy_within(chosen, deadline):
+            raise _FailoverNeeded()
+    else:
+        chosen = _build_current_provider()
+        if chosen.provider_id != state.provider_id:
+            raise ProviderUnavailable(
+                "configured provider does not match the committed provider "
+                "state"
+            )
+        if not _healthy_within(chosen, deadline):
+            raise ProviderUnavailable("provider reported unhealthy")
+    with _provider_lock:
+        _provider = chosen
+    _remember(chosen.provider_id)
+    _active_state = (chosen.provider_id, state.generation)
+
+
+def _activate_or_adopt(deadline):
+    """Reconcile a lazy first load with the committed state; return it.
 
     Called with ``_state_sync_lock`` held. A missing state file is created
     by this first healthy activation (generation 1, mutually exclusive with
-    reconnect commits in every process). An existing committed state is
-    adopted: the built provider must carry the committed ``provider_id``
-    and be healthy, otherwise :class:`ProviderUnavailable` (503) is raised
-    with zero side effects. A corrupt state file propagates the same error
-    and is never rewritten.
+    reconnect/failover commits in every process). An interrupted ``switching``
+    record is completed only for a healthy target. An existing ready state is
+    adopted: a configured entry must carry the committed ``provider_id`` and
+    be healthy, otherwise :class:`ProviderUnavailable` (503) is raised with
+    zero side effects. A corrupt state file propagates the same error and is
+    never rewritten.
     """
     global _active_state
     if isinstance(deadline, _Budget):
         deadline = deadline.deadline
     if _configured_dir is None:
-        return
+        return _select_initial(deadline)
     state = _read_committed_state()
     if state is None:
         with _exclusive_state_lease(deadline):
             state = _read_committed_state()
             if state is None:
-                if not _healthy_within(provider, deadline):
-                    raise ProviderUnavailable("provider reported unhealthy")
-                _write_committed_state(provider.provider_id, 1)
-                _active_state = (provider.provider_id, 1)
-                return
-    if provider.provider_id != state[0]:
-        raise ProviderUnavailable(
-            "configured provider does not match the committed provider "
-            "state"
-        )
-    if not _healthy_within(provider, deadline):
-        raise ProviderUnavailable("provider reported unhealthy")
-    _active_state = state
+                chosen = _select_initial(deadline)
+                _write_committed_state(
+                    chosen.provider_id, 1, _REASON_INITIAL
+                )
+                _active_state = (chosen.provider_id, 1)
+                return chosen
+    if state.phase == _PHASE_SWITCHING:
+        with _exclusive_state_lease(deadline):
+            state = _read_committed_state()
+            if state.phase == _PHASE_SWITCHING:
+                state = _complete_switch(state, deadline)
+    if _chain_configured():
+        chosen = None
+        for candidate in _build_candidates(_specs()):
+            if candidate.provider_id == state.provider_id:
+                chosen = candidate
+                break
+        if chosen is None:
+            raise ProviderUnavailable(
+                "configured provider does not match the committed provider "
+                "state"
+            )
+        if not _healthy_within(chosen, deadline):
+            raise ProviderUnavailable("provider reported unhealthy")
+    else:
+        chosen = _build_current_provider()
+        if chosen.provider_id != state.provider_id:
+            raise ProviderUnavailable(
+                "configured provider does not match the committed provider "
+                "state"
+            )
+        if not _healthy_within(chosen, deadline):
+            raise ProviderUnavailable("provider reported unhealthy")
+    _active_state = (chosen.provider_id, state.generation)
+    return chosen
 
 
-def _current_consistent(state: Tuple[str, int]) -> bool:
+def _current_consistent(state: _CommittedState) -> bool:
     """Whether the cached provider already matches the committed state."""
     return (
         _provider is not None
-        and _active_state == state
-        and _provider.provider_id == state[0]
+        and _active_state == (state.provider_id, state.generation)
+        and _provider.provider_id == state.provider_id
     )
 
 
@@ -1109,12 +1341,14 @@ def _sync_committed_state(budget: "_Budget", lease: "_FileLease") -> None:
 
     Called from :func:`provider_call` with ``_state_sync_lock`` and the
     shared file lease held (the lease is released/re-acquired internally if
-    a first activation needs the exclusive lease). After a commit by any
-    process, the next call rebuilds the provider from the current
-    configuration; a rebuilt instance whose ``provider_id`` disagrees with
-    the committed state, or one that is not healthy, fails the call with
-    :class:`ProviderUnavailable` before any provider operation, handle,
-    audit event or state write happens.
+    a first activation or a switch completion needs the exclusive lease).
+    After a commit by any process, the next call rebuilds the provider from
+    the current configuration; a committed ``provider_id`` no configured
+    entry builds, corrupt state, or (single-spec mode) an unhealthy rebuild
+    fails the call with :class:`ProviderUnavailable` before any provider
+    operation, handle, audit event or state write happens. In chain mode an
+    unhealthy committed active raises :class:`_FailoverNeeded` instead, so
+    the caller switches to the first healthy standby under the gate.
     """
     global _provider, _active_state
     deadline = budget.deadline
@@ -1122,8 +1356,22 @@ def _sync_committed_state(budget: "_Budget", lease: "_FileLease") -> None:
         return
     while True:
         state = _read_committed_state()
+        if state is not None and state.phase == _PHASE_SWITCHING:
+            # A crash interrupted a provider switch: re-verify the target
+            # under the exclusive lease. A healthy target completes the
+            # switch; anything else keeps the file byte-for-byte and fails
+            # the call with the fixed 503.
+            lease.release()
+            try:
+                with _exclusive_state_lease(deadline):
+                    state = _read_committed_state()
+                    if state is not None and state.phase == _PHASE_SWITCHING:
+                        _complete_switch(state, deadline)
+            finally:
+                lease.acquire(False, deadline)
+            continue
         if state is None:
-            # First activation is mutually exclusive with reconnect
+            # First activation is mutually exclusive with reconnect/failover
             # commits in every process: drop the shared lease, take the
             # exclusive one and re-check under it.
             lease.release()
@@ -1131,18 +1379,14 @@ def _sync_committed_state(budget: "_Budget", lease: "_FileLease") -> None:
                 with _exclusive_state_lease(deadline):
                     state = _read_committed_state()
                     if state is None:
-                        provider = _provider
-                        if provider is None:
-                            provider = _build_current_provider()
-                        if not _healthy_within(provider, deadline):
-                            raise ProviderUnavailable(
-                                "provider reported unhealthy"
-                            )
-                        _write_committed_state(provider.provider_id, 1)
+                        chosen = _select_initial(deadline)
+                        _write_committed_state(
+                            chosen.provider_id, 1, _REASON_INITIAL
+                        )
                         with _provider_lock:
-                            _provider = provider
-                        _remember(provider.provider_id)
-                        _active_state = (provider.provider_id, 1)
+                            _provider = chosen
+                        _remember(chosen.provider_id)
+                        _active_state = (chosen.provider_id, 1)
                         return
             finally:
                 lease.acquire(False, deadline)
@@ -1150,18 +1394,8 @@ def _sync_committed_state(budget: "_Budget", lease: "_FileLease") -> None:
             continue
         if _current_consistent(state):
             return
-        candidate = _build_current_provider()
-        if candidate.provider_id != state[0]:
-            raise ProviderUnavailable(
-                "configured provider does not match the committed "
-                "provider state"
-            )
-        if not _healthy_within(candidate, deadline):
-            raise ProviderUnavailable("provider reported unhealthy")
-        with _provider_lock:
-            _provider = candidate
-        _remember(candidate.provider_id)
-        _active_state = state
+        _adopt_committed(state, deadline)
+        return
 
 
 class _ReconnectGate:
@@ -1272,7 +1506,11 @@ def provider_call(timeout: Optional[float] = None):
        exclusive one). On a hit release both leases and go back to waiting;
     5. reconcile with the committed ``provider-state.json`` (a foreign commit
        forces a rebuild; corrupt state, id mismatch or an unhealthy rebuild
-       fail the call with zero side effects), then capture the instance.
+       fail the call with zero side effects), then capture the instance;
+    6. with ``KEYMGR_PROVIDER_CHAIN`` configured, probe the captured active
+       instance: an unhealthy active fails over to the first healthy standby
+       under the same intent/drain gate (see :func:`_failover`), after which
+       this attempt re-enters admission against the new generation.
 
     Calls admitted before intent existed are not kept out: they hold their
     shared lease, run on the instance they captured and are simply drained by
@@ -1314,6 +1552,7 @@ def provider_call(timeout: Optional[float] = None):
                 # state lease is dropped at once and the call goes back to
                 # waiting, so it never extends the reconnect's drain.
                 intent_hit = False
+                failover = False
                 with _state_sync_lock:
                     lease = _FileLease()
                     lease.acquire(False, budget.deadline)
@@ -1323,15 +1562,41 @@ def provider_call(timeout: Optional[float] = None):
                         intent_hit = True
                     else:
                         # (5) Reconcile with the committed generation.
-                        _sync_committed_state(budget, lease)
+                        try:
+                            _sync_committed_state(budget, lease)
+                        except _FailoverNeeded:
+                            failover = True
                 if intent_hit:
                     _gate.release_lease()
                     gate_held = False
                     _intent_wait_clear(budget)
                     continue
+                if failover:
+                    # The committed active provider is unhealthy: switch to
+                    # the first healthy standby under the gate, then re-enter
+                    # admission against the new generation. A failed failover
+                    # keeps the old generation and raises the fixed 503.
+                    lease.release()
+                    lease = None
+                    _gate.release_lease()
+                    gate_held = False
+                    _failover(budget)
+                    continue
                 # Capture the current instance AFTER admission; a lazy first
                 # import happens here, outside the gate/sync locks.
                 provider = get_provider()
+                # (6) Chain mode: an active instance that probes unhealthy is
+                # failed over to the first healthy standby; there is no
+                # automatic failback while the active entry stays healthy.
+                if _chain_configured() and not _healthy_within(
+                    provider, budget
+                ):
+                    lease.release()
+                    lease = None
+                    _gate.release_lease()
+                    gate_held = False
+                    _failover(budget)
+                    continue
                 admitted = True
                 break
             except BaseException:
@@ -1365,16 +1630,75 @@ def _spec() -> str:
     return os.environ.get("KEYMGR_PROVIDER", "") or LOCAL_PROVIDER_ID
 
 
+def _chain_configured() -> bool:
+    """Whether ``KEYMGR_PROVIDER_CHAIN`` is set (even to an invalid value)."""
+    return os.environ.get("KEYMGR_PROVIDER_CHAIN") is not None
+
+
+def _chain_specs() -> Optional[List[str]]:
+    """Parse ``KEYMGR_PROVIDER_CHAIN`` into an ordered list of specs.
+
+    Returns ``None`` when the variable is unset (the single
+    ``KEYMGR_PROVIDER`` spec applies). A set value must be a comma-separated
+    list of ``local`` / ``module:factory`` items with no empty and no
+    duplicate items; any violation raises :class:`ProviderUnavailable`, so a
+    set-but-empty, empty-item or malformed chain is unusable (fixed 503) at
+    every provider operation.
+    """
+    raw = os.environ.get("KEYMGR_PROVIDER_CHAIN")
+    if raw is None:
+        return None
+    items = [item.strip() for item in raw.split(",")]
+    seen = set()
+    for item in items:
+        if not item:
+            raise ProviderUnavailable(
+                "KEYMGR_PROVIDER_CHAIN must not contain empty items"
+            )
+        if item in seen:
+            raise ProviderUnavailable(
+                "KEYMGR_PROVIDER_CHAIN items must be unique"
+            )
+        seen.add(item)
+        if item == LOCAL_PROVIDER_ID:
+            continue
+        module_name, sep, factory_name = item.partition(":")
+        if not sep or not module_name or not factory_name:
+            raise ProviderUnavailable(
+                "KEYMGR_PROVIDER_CHAIN items must be 'local' or "
+                "'module:factory', got %r" % item
+            )
+    return items
+
+
+def _specs() -> List[str]:
+    """The ordered provider specs to select from (chain or single spec)."""
+    chain = _chain_specs()
+    if chain is not None:
+        return chain
+    return [_spec()]
+
+
 def active_is_local() -> bool:
     """Whether the configured active provider is the built-in local one.
 
-    Reads the ``KEYMGR_PROVIDER`` spec without importing anything: the local
-    provider is active only for an empty value or an explicit ``local``. This
-    is used for the provider-selection gates (legacy-record adoption, legacy
-    bundle import) that must never trigger an import of a module:factory
-    provider from a plain read.
+    Without a chain this reads the ``KEYMGR_PROVIDER`` spec without importing
+    anything: the local provider is active only for an empty value or an
+    explicit ``local``. With ``KEYMGR_PROVIDER_CHAIN`` set, the active entry
+    is whichever healthy entry was committed, so this consults the committed
+    ``provider-state.json`` (still importing nothing): local is active only
+    when the committed ``provider_id`` is ``local``. This is used for the
+    provider-selection gates (legacy-record adoption, legacy bundle import)
+    that must never trigger an import of a module:factory provider from a
+    plain read.
     """
-    return _spec() == LOCAL_PROVIDER_ID
+    if not _chain_configured():
+        return _spec() == LOCAL_PROVIDER_ID
+    try:
+        state = _read_committed_state()
+    except ProviderUnavailable:
+        return False
+    return state is not None and state.provider_id == LOCAL_PROVIDER_ID
 
 
 def _load_external(spec: str):
@@ -1424,9 +1748,11 @@ def get_provider():
 
     The first build in a process is reconciled with the committed
     ``provider-state.json``: a missing file is created by this first
-    healthy activation, an existing one is adopted only if the built
-    provider carries the committed ``provider_id`` and is healthy, and a
-    corrupt file fails the call (503) without being rewritten.
+    healthy activation (chain mode selects the first healthy entry), an
+    interrupted ``switching`` record is completed only for a healthy
+    target, an existing ready state is adopted only if a configured entry
+    carries the committed ``provider_id`` and is healthy, and a corrupt
+    file fails the call (503) without being rewritten.
     """
     global _provider
     bound = getattr(_tls, "bound_provider", None)
@@ -1437,9 +1763,8 @@ def get_provider():
     with _state_sync_lock:
         if _provider is not None:
             return _provider
-        provider = _build_current_provider()
-        _activate_or_adopt(
-            provider, time.monotonic() + CALL_GATE_SECONDS
+        provider = _activate_or_adopt(
+            time.monotonic() + CALL_GATE_SECONDS
         )
         with _provider_lock:
             _provider = provider
@@ -1447,9 +1772,8 @@ def get_provider():
         return _provider
 
 
-def _build_current_provider():
-    """Load (and configure) the provider named by the current configuration."""
-    spec = _spec()
+def _build_spec(spec: str):
+    """Load (and configure) the provider named by one spec."""
     if spec == LOCAL_PROVIDER_ID:
         provider = _LOCAL_SINGLETON
     else:
@@ -1457,6 +1781,22 @@ def _build_current_provider():
     if _configured_dir is not None:
         provider.configure(_configured_dir)
     return provider
+
+
+def _build_candidates(specs) -> list:
+    """Build every configured entry; the built provider_ids must be unique."""
+    providers = [_build_spec(spec) for spec in specs]
+    ids = [p.provider_id for p in providers]
+    if len(set(ids)) != len(ids):
+        raise ProviderUnavailable(
+            "provider chain entries must build unique provider_id values"
+        )
+    return providers
+
+
+def _build_current_provider():
+    """Load (and configure) the provider named by the single-spec config."""
+    return _build_spec(_spec())
 
 
 def configure(data_dir: str) -> KeyProvider:
@@ -1586,6 +1926,130 @@ def _install_provider(candidate) -> None:
         _remember(candidate.provider_id)
 
 
+def _failover(budget: "_Budget") -> None:
+    """Switch the active provider to the first healthy standby chain entry.
+
+    Uses the same cross-process intent/drain gate as :func:`reconnect`:
+    calls admitted earlier finish on the instance they captured, every later
+    call waits from the moment intent is established, and the switch commits
+    ``switching`` (old id, target id, the ORIGINAL generation) then ``ready``
+    (target id, null, generation+1) atomically. Concurrent triggers serialize
+    on the gate: only the first builds and commits, later ones adopt the
+    committed generation. Any failure (no healthy standby, budget exceeded,
+    commit failure) keeps the old generation byte-for-byte and raises
+    :class:`ProviderUnavailable` -- the fixed 503 with no handle, audit event
+    or backend text. There is no automatic failback: a recovered primary is
+    never re-selected here, only by :func:`reconnect`.
+    """
+    global _active_state
+    _gate.acquire_serialized(budget)
+    intent = _intent_lease()
+    state_lease = _FileLease()
+    draining = False
+    try:
+        intent.acquire(True, budget.deadline)
+        _gate.begin_draining()
+        draining = True
+        _gate.wait_drained(budget)
+        if budget.expired():
+            raise ProviderReconnectPending(
+                "failover exceeded the shared five-second budget"
+            )
+        # Lock order: _state_sync_lock -> state lock file.
+        with _state_sync_lock:
+            state_lease.acquire(True, budget.deadline)
+            if budget.expired():
+                raise ProviderReconnectPending(
+                    "failover exceeded the shared five-second budget"
+                )
+            state = _read_committed_state()
+            if state is not None and state.phase == _PHASE_SWITCHING:
+                # An interrupted switch is completed for a healthy target or
+                # kept byte-for-byte (fixed 503); failover never overrides it.
+                state = _complete_switch(state, budget.deadline)
+            if state is None:
+                # No committed generation (never activated, or no data
+                # directory bound): pick the first healthy entry other than
+                # the instance that just failed, if there is one.
+                exclude = (
+                    _provider.provider_id if _provider is not None else None
+                )
+                chosen = _first_healthy(
+                    _build_candidates(_specs()),
+                    budget.deadline,
+                    exclude_id=exclude,
+                )
+                if chosen is None:
+                    raise ProviderUnavailable(
+                        "no healthy standby provider in the configured "
+                        "provider chain"
+                    )
+                if _configured_dir is not None:
+                    _write_committed_state(
+                        chosen.provider_id, 1, _REASON_INITIAL
+                    )
+                _install_provider(chosen)
+                _active_state = (chosen.provider_id, 1)
+                return
+            if _current_consistent(state) and _healthy_within(
+                _provider, budget.deadline
+            ):
+                # A concurrent reconnect/failover already restored a healthy
+                # active instance while this one waited: nothing to commit.
+                return
+            candidates = _build_candidates(_specs())
+            committed = None
+            for candidate in candidates:
+                if candidate.provider_id == state.provider_id:
+                    committed = candidate
+                    break
+            if committed is None:
+                raise ProviderUnavailable(
+                    "configured provider does not match the committed "
+                    "provider state"
+                )
+            if _healthy_within(committed, budget.deadline):
+                # The committed active is healthy (a foreign reconnect or
+                # failover committed while this one waited): adopt it
+                # instead of committing a second generation.
+                _install_provider(committed)
+                _active_state = (committed.provider_id, state.generation)
+                return
+            target = _first_healthy(
+                candidates, budget.deadline, exclude_id=state.provider_id
+            )
+            if target is None:
+                raise ProviderUnavailable(
+                    "no healthy standby provider in the configured "
+                    "provider chain"
+                )
+            generation = state.generation
+            # Two atomic commits: switching(old id, target id, the original
+            # generation), then ready(target id, null, generation+1). A
+            # crash between them keeps the old generation and is completed
+            # (healthy target) or kept (fixed 503) at the next read.
+            _write_committed_state(
+                state.provider_id,
+                generation,
+                _REASON_FAILOVER,
+                target_provider_id=target.provider_id,
+                phase=_PHASE_SWITCHING,
+            )
+            _write_committed_state(
+                target.provider_id, generation + 1, _REASON_FAILOVER
+            )
+            _install_provider(target)
+            _active_state = (target.provider_id, generation + 1)
+    finally:
+        # Always release in reverse order; failure or timeout leaves the
+        # previously active instance and committed state untouched.
+        state_lease.release()
+        if draining:
+            _gate.end_draining()
+        intent.release()
+        _gate.release_serialized()
+
+
 def reconnect(timeout: float = CALL_GATE_SECONDS) -> dict:
     """Rebuild the provider from the current configuration without dropping
     in-flight calls.
@@ -1599,9 +2063,15 @@ def reconnect(timeout: float = CALL_GATE_SECONDS) -> dict:
     3. drain calls admitted earlier in this process (they finish on the
        instance they captured), then take the exclusive
        ``provider-state.lock`` which drains earlier calls in other processes;
-    4. build, contract-validate, configure and health-probe the candidate,
+    4. build, contract-validate, configure and health-probe the candidate --
+       with ``KEYMGR_PROVIDER_CHAIN`` set this re-selects the FIRST healthy
+       chain entry (the only operation that may move the active provider
+       back to a recovered primary) --
        atomically commit ``provider-state.json`` with the next generation and
-       only then swap the cached instance;
+       only then swap the cached instance. A commit that changes
+       ``provider_id`` first writes ``switching`` (old id, target id, the
+       original generation) and then ``ready`` (target id, null,
+       generation+1);
     5. release the drain/intent: later calls resume on the NEW generation.
 
     Every wait shares one five-second budget started at the first one. On any
@@ -1642,28 +2112,64 @@ def reconnect(timeout: float = CALL_GATE_SECONDS) -> dict:
             # rewritten; a missing file means generation 1.
             state = _read_committed_state()
             # (4) Build + contract validation + configure while every later
-            # call is held behind intent/draining.
-            candidate = _build_current_provider()
-            # The health probe shares the same deadline: a slow/blocked
-            # probe is a failed reconnect; its text never surfaces.
-            try:
-                ready = _health_with_deadline(candidate, budget.deadline)
-            except Exception:
-                raise ProviderUnavailable("provider health check failed")
-            if not ready:
-                raise ProviderUnavailable("provider reported unhealthy")
-            generation = 1 if state is None else state[1] + 1
-            # The atomic rename is the commit point: a crash before it keeps
-            # the old generation/instance; afterwards every process's next
-            # call rebuilds and adopts this generation.
-            _write_committed_state(candidate.provider_id, generation)
+            # call is held behind intent/draining. Chain mode re-selects the
+            # first healthy entry in chain order; single-spec mode rebuilds
+            # the one configured provider. The health probe shares the same
+            # deadline: a slow/blocked probe is a failed reconnect; its text
+            # never surfaces.
+            if _chain_configured():
+                selected = _first_healthy(
+                    _build_candidates(_specs()), budget.deadline
+                )
+                if selected is None:
+                    raise ProviderUnavailable(
+                        "no healthy provider in the configured provider chain"
+                    )
+            else:
+                selected = _build_current_provider()
+                if not _healthy_within(selected, budget.deadline):
+                    raise ProviderUnavailable("provider reported unhealthy")
+            if state is None:
+                generation = 1
+                _write_committed_state(
+                    selected.provider_id, generation, _REASON_INITIAL
+                )
+            elif state.phase == _PHASE_SWITCHING and (
+                selected.provider_id == state.target_provider_id
+            ):
+                # Finishing an interrupted switch with its original target:
+                # complete it under the original reason.
+                generation = state.generation + 1
+                _write_committed_state(
+                    selected.provider_id, generation, state.reason
+                )
+            else:
+                generation = state.generation + 1
+                if selected.provider_id == state.provider_id:
+                    _write_committed_state(
+                        selected.provider_id, generation, _REASON_RECONNECT
+                    )
+                else:
+                    # A provider switch: switching(old id, target id, the
+                    # original generation), then ready(target id, null,
+                    # generation+1).
+                    _write_committed_state(
+                        state.provider_id,
+                        state.generation,
+                        _REASON_RECONNECT,
+                        target_provider_id=selected.provider_id,
+                        phase=_PHASE_SWITCHING,
+                    )
+                    _write_committed_state(
+                        selected.provider_id, generation, _REASON_RECONNECT
+                    )
             # Swap while still draining and holding intent: no call can be
             # admitted, so the old instance is retained only by calls
             # already in flight (which captured it) and every later call
-            # lands on candidate.
+            # lands on selected.
             global _active_state
-            _install_provider(candidate)
-            _active_state = (candidate.provider_id, generation)
+            _install_provider(selected)
+            _active_state = (selected.provider_id, generation)
     finally:
         # (5) Always release in reverse order; failure or timeout leaves the
         # previously active instance and committed state untouched.
