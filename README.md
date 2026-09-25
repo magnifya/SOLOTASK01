@@ -123,6 +123,42 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   租户策略，见下。
 - `GET /v1/audit`：本租户审计查询，见下。
 - `GET /v1/operations/{operation_id}`：查询幂等操作，见下。
+- `GET /v1/provider/status` 与 `POST /v1/provider/reconnect`：KMS/HSM
+  健康检查与无中断重连，见下（全局、非租户作用域，不带也不接受
+  `tenant_id`，不记审计）。
+
+## KMS/HSM 健康检查与无中断重连
+
+- `GET /v1/provider/status`：只需单一非空 `X-Operator-Id`，不收
+  `tenant_id`（头/查询/体均不接受，违者 `400`），也不记审计。返回 `200`，
+  键序固定 `{"provider_id","status"}`；`status` 仅 `ready`/`unavailable`。
+  提供者尚未加载时该探测会惰性建厂；加载/契约/配置失败时
+  `provider_id` 为 `null`、`status` 为 `unavailable`，后端异常文本绝不外泄。
+- 提供者可选实现 `health()`：无参数、返回 `bool`。缺少该方法视为健康；
+  返回非 `bool`（即使为真值）或抛异常均视为不可用，文本不外泄。
+- `POST /v1/provider/reconnect`：同样只需单一非空操作者头、不收
+  `tenant_id`。请求体必须恰为 `{}`：坏 JSON、非对象或任何多余字段一律
+  无副作用 `400`。按当前 `KEYMGR_PROVIDER` 配置重新建厂、校验契约、用
+  已绑定的数据目录配置并做健康检查，成功才替换实例并 `200` 返回与
+  status 同序结构；任一失败（排水/建厂/配置/健康超过共用 5 秒门限）都
+  `503` 且保留旧实例，错误体固定
+  `{"error":"key management provider is unavailable"}`。
+- **共用 5 秒门限、无中断**：重连与提供者调用共用 5 秒门限。重连先排水：
+  在途调用由其进入时捕获的旧实例完成，绝不中途换实例；新调用在门内等待，
+  等待超 5 秒返回固定 `503` 且零副作用（未调用任何提供者、未铸句柄、未写
+  审计）。重连成功后新调用一律落到新实例。
+- **pending 操作绑定原 provider_id**：幂等操作记录其提供者 `provider_id`。
+  重连装入的提供者 `provider_id` 不同而某 pending 操作仍绑定旧 id 时，该
+  操作保持 `pending` 并返回固定 `503`（不终态化、不写拒绝事件、镜像复位为
+  干净的 `bound` 待续线索）；重连同 `provider_id` 的提供者后，同
+  `Idempotency-Key` 的请求在**同一** `operation_id`/`event_id` 下继续恰好
+  一次，事件绝不重复。从未在本数据目录激活过的 provider_id 仍按原“未激活
+  提供者”规则终态 `503`。曾激活的 provider_id 记在
+  `provider-ids.json`(0600)，跨进程可识别。
+- CLI：`provider status --operator O` 与
+  `provider reconnect --operator O`，成功输出同序单行 JSON；`400→2`、
+  `503→1`，成功 `0`。status 在提供者不可用时仍以退出 `0` 返回
+  `{"provider_id":null,"status":"unavailable"}`。
 
 ## 幂等操作
 
@@ -268,6 +304,9 @@ python -m keymgr restore  --tenant-id t --passphrase pw --bundle <b> \
 python -m keymgr audit    --tenant-id t --action rotate --limit 100 --operator alice
 python -m keymgr operation --tenant-id t --operator alice --operation-id <id>
 python -m keymgr policy --operator admin set|show|delete --tenant-id t [--rules '<json>']
+# KMS/HSM 健康检查与无中断重连（全局，无 --tenant-id）
+python -m keymgr provider status    --operator alice
+python -m keymgr provider reconnect --operator alice
 ```
 
 ## KMS/HSM 提供者
@@ -277,7 +316,9 @@ python -m keymgr policy --operator admin set|show|delete --tenant-id t [--rules 
   generate/rotate/import_material/export_material/delete）及这五个方法。
   generate/rotate/import_material → `{handle, public_key, encrypted_material}`；
   export_material(handle) → `{public_key, encrypted_material}`；delete(handle)
-  幂等。模块缺失/工厂失败/契约不符/后端异常一律 `503`（CLI `1`），固定文案
+  幂等。另可实现可选 `health()`（无参、返回 `bool`）：缺少视为健康，非
+  `bool`/抛异常视为不可用。模块缺失/工厂失败/契约不符/后端异常一律 `503`
+  （CLI `1`），固定文案
   "key management provider is unavailable"，绝不回退；导入材料不符算法（AES
   非 32 字节、RSA 公私钥不匹配等）为 `400`，错误只指名字段。
 - 本地提供者用 `local.dek`(0600) 以 AES-256-GCM 包装材料，句柄与包装材料登

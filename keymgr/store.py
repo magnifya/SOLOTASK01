@@ -1,9 +1,11 @@
 """Persistent, tenant-isolated, versioned key storage."""
 
 import base64
+import functools
 import json
 import os
 import re
+import sys
 import tempfile
 import threading
 import time
@@ -20,6 +22,8 @@ from .artifacts import PHASE_COMMITTED, PHASE_ROLLED_BACK, PHASE_STAGED
 from .audit import AuditEvent, AuditLog, LedgerError
 from .provider import (
     LOCAL_PROVIDER_ID,
+    ProviderIdentityMismatch,
+    ProviderReconnectPending,
     ProviderUnavailable,
 )
 
@@ -304,6 +308,24 @@ class KeyRecord:
             "created_at": self.created_at,
             "public_key": self.current.public_key,
         }
+
+
+def _provider_session(func):
+    """Pin one logical provider operation to a single provider instance.
+
+    The wrapped KeyStore operation runs inside one reconnect gate lease: the
+    whole operation (including its crash-safety rollback deletes) uses the
+    provider instance captured at admission, so a reconnect drains it rather
+    than swapping underneath it, and a wait past the five-second budget fails
+    with zero provider side effects.
+    """
+
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        with provider_mod.provider_call():
+            return func(self, *args, **kwargs)
+
+    return wrapper
 
 
 class KeyStore:
@@ -1274,11 +1296,24 @@ class KeyStore:
             )
         active = provider_mod.get_provider()
         if active.provider_id != provider_id:
+            # The active provider carries a different id. If the record's id
+            # WAS active earlier in this data directory, the record belongs to
+            # an instance displaced by a reconnect: a PENDING idempotent
+            # operation must stay pending until a provider with the same id is
+            # reconnected, rather than being frozen as a terminal failure. A
+            # provider id never active here is the classic inactive-provider
+            # refusal (503), never a silent switch.
+            if provider_mod.provider_was_active(provider_id):
+                raise ProviderIdentityMismatch(
+                    "record provider %r was displaced by a reconnect to %r"
+                    % (provider_id, active.provider_id)
+                )
             raise ProviderUnavailable(
                 "record provider %r is not the active provider" % provider_id
             )
         return active
 
+    @_provider_session
     def create(self, tenant_id: str, algorithm: str, label: str) -> KeyRecord:
         """Generate, persist and return a new key record (version 1).
 
@@ -1684,6 +1719,7 @@ class KeyStore:
                 return None
             return self._committed_record(record)
 
+    @_provider_session
     def rotate(
         self,
         key_id: str,
@@ -1795,6 +1831,20 @@ class KeyStore:
                     # mirror.provision failed before any provider call with
                     # only an empty journal, already dropped: keep the bound
                     # op pending for a same-id retry (no rollback evidence).
+                    raise
+                if isinstance(exc, ProviderReconnectPending):
+                    # No provider call was effectively made (the gate wait
+                    # timed out, or the owning provider_id was displaced): no
+                    # handle was minted. Drop the empty journal, return the
+                    # mirror to a clean bound strand and re-raise the pending
+                    # signal so the operation stays PENDING for a same-id
+                    # continuation (the guard answers the safe 503).
+                    self.drop_provision_journal(journal_id)
+                    if mirror is not None:
+                        try:
+                            mirror.reset_for_pending_retry()
+                        except OSError:
+                            pass
                     raise
                 cleaned = True
                 if minted_handle is not None:
@@ -1925,6 +1975,7 @@ class KeyStore:
             # snapshot on purpose, so a removal failure is never fatal here.
             pass
 
+    @_provider_session
     def batch_rotate(
         self,
         tenant_id: str,
@@ -2098,6 +2149,32 @@ class KeyStore:
                         "confirmed as the expected batch_rotate success event"
                     )
             except BaseException as exc:
+                if isinstance(exc, ProviderReconnectPending):
+                    # The session never effectively rotated anything: the gate
+                    # wait timed out at entry (before the snapshot/journal), or
+                    # the in-loop provider-id match found the owning id
+                    # displaced before the first rotate (snapshot + empty
+                    # journal exist, no handle minted, no event appended).
+                    # Scrub the empty artifacts and re-raise so the guard
+                    # resets the mirror to a clean bound strand and keeps the
+                    # op PENDING for a same-id continuation once the right
+                    # provider is back.
+                    self.drop_provision_journal(journal_id)
+                    snapshot_path = self._batch_snapshot_path(event.event_id)
+                    try:
+                        os.unlink(snapshot_path)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        # A retained snapshot parks the scene safely; the op
+                        # stays pending regardless.
+                        pass
+                    if mirror is not None:
+                        try:
+                            mirror.reset_for_pending_retry()
+                        except OSError:
+                            pass
+                    raise
                 if commit_unverifiable:
                     # The append returned but the durable fact is missing or
                     # belongs to a different action/tenant: neither commit nor
@@ -2976,6 +3053,7 @@ class KeyStore:
             "unsupported algorithm for envelope crypto: %r" % ver.algorithm
         )
 
+    @_provider_session
     def crypto_material(
         self,
         key_id: str,
@@ -3069,6 +3147,7 @@ class KeyStore:
             "versions": [self._export_version(v) for v in record.versions],
         }
 
+    @_provider_session
     def export_bundle(
         self, key_id: str, tenant_id: str, passphrase: str
     ) -> Optional[str]:
@@ -3202,6 +3281,7 @@ class KeyStore:
                 cleaned = False
         return cleaned
 
+    @_provider_session
     def import_bundle(
         self,
         tenant_id: str,
@@ -3307,6 +3387,26 @@ class KeyStore:
                     # handles this frame no longer knows about. A failed
                     # delete keeps the journal for startup and turns the
                     # answer into 503 instead of hiding the orphan.
+                    pending = isinstance(
+                        sys.exc_info()[1], ProviderReconnectPending
+                    )
+                    if pending:
+                        # Reconnect-pending interruption (gate timeout /
+                        # displaced provider_id): reconcile any minted handles,
+                        # but a cleanup failure merely retains the journal and
+                        # parks the scene; re-raise the ORIGINAL pending signal
+                        # so the guard keeps the op PENDING (never a terminal
+                        # 503) for a same-id continuation.
+                        try:
+                            self._abort_provision(journal_id, adopted)
+                        except ProviderUnavailable:
+                            pass
+                        if mirror is not None:
+                            try:
+                                mirror.reset_for_pending_retry()
+                            except OSError:
+                                pass
+                        raise
                     self._abort_provision(journal_id, adopted)
 
     # -- tenant backup / restore ------------------------------------------

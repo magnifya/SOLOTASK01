@@ -8,7 +8,12 @@ Fault injection is driven by a JSON file named by ``FAKE_KMS_FAULTS``:
     {
       "unreachable": true,          # every call fails as a backend outage
       "fail": {"delete": true, ...} # per-operation failures
-      "sleep": {"rotate": 5.0}      # per-operation pre-call delay (seconds)
+      "sleep": {"rotate": 5.0},     # per-operation pre-call delay (seconds)
+      "health": false,              # health() returns False (unavailable)
+      "health_raises": true,        # health() raises (treated as unavailable)
+      "health_nonbool": "yes",      # health() returns a non-bool (unavailable)
+      "health_sleep": 6.0,          # health() blocks past the reconnect budget
+      "provider_id": "fakekms-alt"  # override the factory's provider_id
     }
 
 Materials are stored base64-wrapped with a static prefix so nothing here ever
@@ -104,7 +109,6 @@ def _unwrap(blob):
 
 
 class FakeKmsProvider:
-    provider_id = PROVIDER_ID
     capabilities = {
         "algorithms": ["AES256", "RSA2048"],
         "operations": [
@@ -116,8 +120,28 @@ class FakeKmsProvider:
         ],
     }
 
+    def __init__(self):
+        # The id can be overridden per process (FAKE_KMS_PROVIDER_ID) so a
+        # reconnect can install a provider carrying a different provider_id,
+        # exercising the pending-operation displacement rule.
+        self.provider_id = os.environ.get("FAKE_KMS_PROVIDER_ID", PROVIDER_ID)
+
     def configure(self, data_dir):
         _check_fault("configure")
+
+    def health(self):
+        """Optional readiness probe driven by the faults file."""
+        faults = _faults()
+        if faults.get("health_raises"):
+            raise RuntimeError("health endpoint is failing")
+        if "health_nonbool" in faults:
+            return faults.get("health_nonbool")
+        if "health_sleep" in faults:
+            time.sleep(float(faults["health_sleep"]))
+        if "health" in faults:
+            return bool(faults.get("health"))
+        # Default: healthy unless the backend is globally unreachable.
+        return not faults.get("unreachable")
 
     def _mint(self, algorithm, public_key, material):
         _check_fault("mint")
@@ -177,4 +201,9 @@ class FakeKmsProvider:
 
 
 def make_provider():
+    faults = _faults()
+    if faults.get("factory_fails"):
+        raise RuntimeError("fake factory is failing")
+    if faults.get("factory_sleep"):
+        time.sleep(float(faults["factory_sleep"]))
     return FakeKmsProvider()

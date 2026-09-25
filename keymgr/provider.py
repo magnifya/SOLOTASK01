@@ -19,7 +19,10 @@ A provider instance exposes:
   ``{"handle", "public_key", "encrypted_material"}``;
 * ``import_material(algorithm, public_key, material)`` -> the same triple;
 * ``export_material(handle)`` -> ``{"public_key", "encrypted_material"}``;
-* ``delete(handle)`` -> ``None``, idempotent.
+* ``delete(handle)`` -> ``None``, idempotent;
+* ``health()`` -> ``bool``, *optional*. A missing method is treated as ready;
+  a method that raises or returns anything but a real bool reports unavailable.
+  The probe's own text never leaves the process.
 
 The factory named by ``KEYMGR_PROVIDER=module:factory`` is imported lazily on
 first use and called with no arguments. A missing module/factory, a factory
@@ -34,7 +37,9 @@ import json
 import os
 import tempfile
 import threading
+import time
 import uuid
+from contextlib import contextmanager
 from typing import NamedTuple, Optional
 
 from cryptography.exceptions import UnsupportedAlgorithm
@@ -168,6 +173,15 @@ class KeyProvider:
     def delete(self, handle: str) -> None:
         raise NotImplementedError
 
+    def health(self) -> bool:
+        """Optional KMS/HSM readiness probe.
+
+        Built-in providers are always ready. An external provider may omit
+        this method (a missing probe means healthy); :class:`_SafeProvider`
+        enforces the bool/exception contract on objects that supply one.
+        """
+        return True
+
     def supports(self, algorithm: str, operation: str) -> bool:
         caps = getattr(self, "capabilities", {}) or {}
         return (
@@ -219,6 +233,13 @@ def _validate_external(obj) -> None:
     if configure is not None and not callable(configure):
         raise ProviderUnavailable(
             "provider %r has a non-callable configure attribute" % provider_id
+        )
+    # health() is optional: no attribute means always healthy. A present but
+    # non-callable health is a contract failure like any other method.
+    health = getattr(obj, "health", None)
+    if health is not None and not callable(health):
+        raise ProviderUnavailable(
+            "provider %r has a non-callable health attribute" % provider_id
         )
 
 
@@ -294,6 +315,26 @@ class _SafeProvider:
         # Idempotent by contract; even so, a backend fault on delete is a 503
         # (the caller may retry, and delete must remain idempotent).
         self._call("delete", handle)
+
+    def health(self) -> bool:
+        """Optional readiness probe normalized to a bool.
+
+        A provider without a ``health`` method is treated as ready. A method
+        that raises, returns a non-bool, or returns ``False`` reports
+        unavailable; any backend text is swallowed here and never reaches a
+        client.
+        """
+        method = getattr(self._inner, "health", None)
+        if method is None:
+            # Missing health() means healthy by contract.
+            return True
+        try:
+            result = method()
+        except Exception:
+            return False
+        # Only the exact bool True is healthy; a bool False, a truthy
+        # non-bool (1, "yes", ...) and any other object mean unavailable.
+        return result is True
 
 
 class LocalProvider(KeyProvider):
@@ -598,6 +639,220 @@ _provider_lock = threading.Lock()
 _provider: Optional[KeyProvider] = None
 _configured_dir: Optional[str] = None
 _LOCAL_SINGLETON = LocalProvider()
+# Every provider_id that has been the active instance (in this process, and
+# historically in the data directory) is remembered. Lets a pending operation
+# distinguish a reconnect that swapped in a different provider_id (keep the op
+# pending) from a record owned by a provider that was never active here (the
+# classic inactive-provider terminal 503).
+_active_history: set = set()
+_HISTORY_NAME = "provider-ids.json"
+
+
+def _history_path() -> Optional[str]:
+    if _configured_dir is None:
+        return None
+    return os.path.join(_configured_dir, _HISTORY_NAME)
+
+
+def _load_history() -> None:
+    path = _history_path()
+    if path is None:
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError):
+        return
+    ids = data.get("ids") if isinstance(data, dict) else None
+    if isinstance(ids, list):
+        _active_history.update(i for i in ids if isinstance(i, str) and i)
+
+
+def _remember(provider_id: str) -> None:
+    if not provider_id or provider_id in _active_history:
+        return
+    _active_history.add(provider_id)
+    path = _history_path()
+    if path is None:
+        return
+    ids = sorted(_active_history)
+    fd, tmp_path = tempfile.mkstemp(dir=_configured_dir, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"ids": ids}, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        # A history write failure never blocks provider selection; the set is
+        # a best-effort hint, not an authority.
+
+
+# -- non-disruptive reconnect gate -----------------------------------------
+# Reconnect and ordinary provider calls share ONE five-second budget. While a
+# reconnect is draining or installing a freshly built provider, every NEW
+# provider operation waits at the gate; operations already in flight keep
+# using the provider instance they started on, so they complete without
+# interruption. A call that cannot be admitted within the budget fails with
+# ProviderUnavailable (surfaced as 503) having made zero provider calls and
+# therefore zero side effects.
+CALL_GATE_SECONDS = 5.0
+
+
+class ProviderReconnectPending(ProviderUnavailable):
+    """A provider call blocked on the reconnect gate past the 5 s budget.
+
+    Like every provider failure it answers 503 with the fixed generic body,
+    but an idempotent operation bound when this is raised has made NO provider
+    call: the guard leaves it PENDING (mirror and binding intact, no audit
+    event), so a retry once reconnect settles continues under the same
+    operation_id/event_id rather than being frozen as a terminal failure.
+    """
+
+
+class ProviderIdentityMismatch(ProviderReconnectPending):
+    """A record/pending attempt is bound to a provider_id that is not active.
+
+    Raised while a reconnect has installed a provider with a *different*
+    ``provider_id`` and an idempotent operation still owed to the old id is
+    being continued. The idempotent guard leaves the operation PENDING (never
+    terminal) and answers 503, so that reconnecting a provider with the same
+    id lets the same request/event continue exactly once.
+    """
+
+
+class _ReconnectGate:
+    """Serialize non-disruptive provider replacement against provider calls.
+
+    Reconnect marks the gate as *draining* and waits for every lease handed
+    out before it began to be returned (calls in flight finish on the OLD
+    instance), then builds/configures/health-checks the candidate and swaps it
+    in. Provider operations take a shared lease: while draining they block and
+    are admitted against the (new) current instance once reconnect completes.
+    A wait beyond :data:`CALL_GATE_SECONDS` raises ProviderReconnectPending
+    without invoking any provider.
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._serialize = threading.Lock()
+        self._draining = False
+        self._leases = 0
+
+    def _acquire_lease(self, deadline: float) -> None:
+        with self._cond:
+            while self._draining:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ProviderReconnectPending(
+                        "timed out waiting for provider reconnect to settle"
+                    )
+                self._cond.wait(timeout=min(0.05, remaining))
+            self._leases += 1
+
+    def _release_lease(self) -> None:
+        with self._cond:
+            self._leases -= 1
+            if self._draining and self._leases == 0:
+                self._cond.notify_all()
+
+    @contextmanager
+    def swapping(self, builder, timeout: Optional[float] = None):
+        """Drain in-flight calls, run ``builder`` and let it swap the instance.
+
+        Only one reconnect runs at a time. The shared budget (default
+        :data:`CALL_GATE_SECONDS`, read at call time) bounds both the wait for
+        in-flight leases and the overall settle (a builder that returns after
+        the budget is refused). On any failure the previously active instance
+        is retained untouched.
+        """
+        if timeout is None:
+            timeout = CALL_GATE_SECONDS
+        with self._serialize:
+            deadline = time.monotonic() + timeout
+            with self._cond:
+                self._draining = True
+                try:
+                    while self._leases > 0:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise ProviderReconnectPending(
+                                "timed out draining provider calls before "
+                                "reconnect"
+                            )
+                        self._cond.wait(timeout=min(0.05, remaining))
+                except BaseException:
+                    self._draining = False
+                    self._cond.notify_all()
+                    raise
+            # The condition lock is released here (draining stays true, so no
+            # new lease can be admitted, and the lease count cannot rise above
+            # zero); the slow factory/configure/health work and the swap run
+            # without holding it.
+            try:
+                builder(deadline)
+            finally:
+                with self._cond:
+                    self._draining = False
+                    self._cond.notify_all()
+
+
+_gate = _ReconnectGate()
+
+# A thread holding an active call lease is bound to the exact provider
+# instance captured at admission: every nested get_provider() in that thread
+# resolves to it, so one logical operation can never straddle a swap. Leases
+# are reentrant per thread (an outer store operation may call helpers that
+# take the gate too); only the outermost level acquires and releases.
+_tls = threading.local()
+
+
+@contextmanager
+def provider_call(timeout: Optional[float] = None):
+    """Bind one logical operation to one provider instance for its duration.
+
+    Yields the provider instance captured at admission. Blocks behind an
+    in-progress reconnect up to ``timeout`` (defaulting to
+    :data:`CALL_GATE_SECONDS`, read at call time); on timeout raises
+    :class:`ProviderReconnectPending` with zero provider side effects. Nested
+    use on the same thread reuses the outer lease/instance.
+    """
+    if timeout is None:
+        timeout = CALL_GATE_SECONDS
+    depth = getattr(_tls, "depth", 0)
+    if depth:
+        _tls.depth = depth + 1
+        try:
+            yield _tls.bound_provider
+        finally:
+            _tls.depth -= 1
+        return
+
+    deadline = time.monotonic() + timeout
+    _gate._acquire_lease(deadline)
+    try:
+        # Capture the current instance AFTER admission, without holding the
+        # gate condition: a lazy first import stays out of the condition lock.
+        # If loading fails, the lease is released and nothing was called.
+        provider = get_provider()
+    except BaseException:
+        _gate._release_lease()
+        raise
+    _tls.depth = 1
+    _tls.bound_provider = provider
+    try:
+        yield provider
+    finally:
+        _tls.depth = 0
+        _tls.bound_provider = None
+        _gate._release_lease()
 
 
 def _spec() -> str:
@@ -654,24 +909,43 @@ def _load_external(spec: str):
 def get_provider():
     """Return the configured provider, importing it lazily on first use.
 
-    Raises ProviderUnavailable (never falls back) when the configured
-    provider cannot be loaded or fails the contract.
+    A thread already inside a :func:`provider_call` lease always gets the
+    exact instance captured when that logical operation was admitted, so an
+    in-flight operation is never moved onto a freshly reconnected instance
+    mid-way. Every other caller gets the current cached provider, importing
+    it lazily on first use. Raises ProviderUnavailable (never falls back)
+    when the configured provider cannot be loaded or fails the contract.
     """
     global _provider
+    bound = getattr(_tls, "bound_provider", None)
+    if bound is not None and getattr(_tls, "depth", 0) > 0:
+        return bound
     if _provider is not None:
         return _provider
     with _provider_lock:
+        bound = getattr(_tls, "bound_provider", None)
+        if bound is not None and getattr(_tls, "depth", 0) > 0:
+            return bound
         if _provider is not None:
             return _provider
-        spec = _spec()
-        if spec == LOCAL_PROVIDER_ID:
-            provider = _LOCAL_SINGLETON
-        else:
-            provider = _load_external(spec)
-        if _configured_dir is not None:
-            provider.configure(_configured_dir)
+        if _provider is not None:
+            return _provider
+        provider = _build_current_provider()
         _provider = provider
+        _remember(provider.provider_id)
         return _provider
+
+
+def _build_current_provider():
+    """Load (and configure) the provider named by the current configuration."""
+    spec = _spec()
+    if spec == LOCAL_PROVIDER_ID:
+        provider = _LOCAL_SINGLETON
+    else:
+        provider = _load_external(spec)
+    if _configured_dir is not None:
+        provider.configure(_configured_dir)
+    return provider
 
 
 def configure(data_dir: str) -> KeyProvider:
@@ -715,6 +989,15 @@ def bind_data_dir(data_dir: str) -> None:
     """
     global _configured_dir
     _configured_dir = data_dir
+    _load_history()
+
+
+def provider_was_active(provider_id: str) -> bool:
+    """Whether ``provider_id`` has ever been an active provider in this data
+    directory (current or any earlier load/reconnect). Used to tell a pending
+    operation orphaned by a reconnect to a *different* provider_id apart from
+    a record owned by a provider that was never active here."""
+    return provider_id in _active_history
 
 
 def get_local_provider() -> "LocalProvider":
@@ -732,4 +1015,116 @@ def reset_for_tests() -> None:
     with _provider_lock:
         _provider = None
         _configured_dir = None
+        _active_history.clear()
         _LOCAL_SINGLETON._configured = False
+
+
+# -- health probe and non-disruptive reconnect -----------------------------
+def provider_status() -> dict:
+    """Return the status body for ``GET /v1/provider/status``.
+
+    ``{"provider_id": <id>, "status": "ready"|"unavailable"}``. A provider
+    that has never loaded is built here (lazy) purely to answer the probe; a
+    load/contract/configuration failure reports ``provider_id`` null and
+    status unavailable. The probe's own exception text is never returned.
+    """
+    provider = None
+    if _provider is not None:
+        provider = _provider
+    else:
+        try:
+            provider = get_provider()
+        except ProviderError:
+            return {"provider_id": None, "status": "unavailable"}
+        except Exception:
+            # Never let an unexpected factory/load error leak text.
+            return {"provider_id": None, "status": "unavailable"}
+    return _status_for(provider)
+
+
+def _status_for(provider) -> dict:
+    """Health-check one instance and project its status without leaking text."""
+    try:
+        ready = provider.health() is True
+    except ProviderError:
+        ready = False
+    except Exception:
+        ready = False
+    if ready:
+        return {"provider_id": provider.provider_id, "status": "ready"}
+    return {"provider_id": provider.provider_id, "status": "unavailable"}
+
+
+def _install_provider(candidate) -> None:
+    """Swap the active cached provider (caller holds the draining gate).
+
+    A module-level setter is required because a ``global`` declaration does
+    not propagate into the nested builder closure.
+    """
+    global _provider
+    with _provider_lock:
+        _provider = candidate
+        _remember(candidate.provider_id)
+
+
+def reconnect(timeout: float = CALL_GATE_SECONDS) -> dict:
+    """Rebuild the provider from the current configuration without dropping
+    in-flight calls.
+
+    A fresh instance is built from the factory named by ``KEYMGR_PROVIDER``,
+    contract-validated, configured against the bound data directory and health
+    checked; only a healthy instance is swapped in, and the swap happens while
+    the gate is still draining so every call admitted afterwards uses the new
+    instance. In-flight calls finish on the OLD instance while new calls wait
+    behind the shared five-second gate. On any failure (drain/build/configure/
+    health timeout) the previously active instance is retained untouched and
+    :class:`ProviderUnavailable` is raised. Returns the new status body.
+    """
+
+    def builder(deadline: float) -> None:
+        if deadline - time.monotonic() <= 0:
+            raise ProviderReconnectPending(
+                "reconnect exceeded the shared five-second budget"
+            )
+        # Build + contract validation + configure (factory work happens while
+        # new calls are held at the gate but no gate condition lock is held).
+        candidate = _build_current_provider()
+        # The health check shares the same five-second budget: a slow/blocked
+        # probe is a failed reconnect; its text is never surfaced.
+        try:
+            ready = _health_with_deadline(candidate, deadline)
+        except Exception:
+            raise ProviderUnavailable("provider health check failed")
+        if not ready:
+            raise ProviderUnavailable("provider reported unhealthy")
+        # Swap while still draining: leases are zero and no new lease can be
+        # admitted, so the old instance is retained only by calls already in
+        # flight (which captured it) and every later call lands on candidate.
+        _install_provider(candidate)
+
+    _gate.swapping(builder, timeout=timeout)
+
+    current = get_provider()
+    return _status_for(current)
+
+
+def _health_with_deadline(provider, deadline: float) -> bool:
+    """Run health() bounded by the reconnect deadline.
+
+    health() implementations are normally immediate; a probe that blocks past
+    the shared budget is treated as unavailable without waiting longer.
+    """
+    result: dict = {}
+
+    def probe() -> None:
+        try:
+            result["ready"] = provider.health() is True
+        except Exception:
+            result["ready"] = False
+
+    thread = threading.Thread(target=probe, daemon=True)
+    thread.start()
+    thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    if thread.is_alive():
+        return False
+    return bool(result.get("ready"))

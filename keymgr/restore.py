@@ -23,6 +23,7 @@ An empty bundle (``keys == []`` and ``policy is null``) creates no files but
 still commits the single ``import`` event and reports success.
 """
 
+import functools
 import hashlib
 import json
 import os
@@ -32,11 +33,23 @@ from contextlib import contextmanager
 from typing import Dict, Iterator, List, NamedTuple, Optional
 
 from . import audit as audit_mod
+from . import provider as provider_mod
 from . import tenantbundle
 from .artifacts import PHASE_COMMITTED, PHASE_ROLLED_BACK, PHASE_STAGED
 from .audit import AuditEvent, LedgerError
 from .policy import Rule
-from .provider import ProviderUnavailable
+from .provider import ProviderReconnectPending, ProviderUnavailable
+
+
+def _provider_session(func):
+    """Pin a backup/restore to one provider instance across a reconnect."""
+
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        with provider_mod.provider_call():
+            return func(self, *args, **kwargs)
+
+    return wrapper
 
 try:  # fcntl is POSIX-only; restores still work without cross-process locks.
     import fcntl
@@ -98,6 +111,7 @@ class RestoreCoordinator:
         self.recover()
 
     # -- backup ------------------------------------------------------------
+    @_provider_session
     def backup_payload(self, tenant_id: str) -> dict:
         """Build the decrypted tenant payload {format, tenant_id, keys, policy}.
 
@@ -255,6 +269,7 @@ class RestoreCoordinator:
             for cm in reversed(entered):
                 cm.__exit__(None, None, None)
 
+    @_provider_session
     def restore(
         self,
         tenant_id: str,
@@ -413,6 +428,10 @@ class RestoreCoordinator:
                     # longer hold). A backend delete that cannot be verified
                     # keeps the journal for startup and surfaces as 503
                     # instead of silently leaking a KMS/HSM object.
+                    exc_type = sys.exc_info()[0]
+                    is_pending = exc_type is not None and issubclass(
+                        exc_type, ProviderReconnectPending
+                    )
                     if not self.store.rollback_provision_journal(journal_id):
                         raise ProviderUnavailable(
                             "could not delete handles provisioned by an "
@@ -424,12 +443,18 @@ class RestoreCoordinator:
                         # multi-file path) the write set removed: the rollback
                         # is complete. This bookkeeping write must not mask the
                         # already-verified rollback. A pre-provider strand
-                        # failure (mirror tie-in failed with an empty journal)
-                        # keeps the mirror at ``bound`` for a same-id takeover
-                        # rather than downgrading it to rolled_back.
+                        # failure (mirror tie-in failed with an empty journal),
+                        # or a provider_id displaced by reconnect, keeps the
+                        # mirror at a clean ``bound`` pending strand for a
+                        # same-id continuation instead of rolling it back.
                         from .artifacts import ArtifactStrandUnavailable
 
-                        if sys.exc_info()[0] is not ArtifactStrandUnavailable:
+                        if is_pending:
+                            try:
+                                mirror.reset_for_pending_retry()
+                            except OSError:
+                                pass
+                        elif sys.exc_info()[0] is not ArtifactStrandUnavailable:
                             try:
                                 mirror.phase(PHASE_ROLLED_BACK)
                             except OSError:

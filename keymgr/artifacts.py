@@ -259,6 +259,24 @@ class ArtifactMirror:
             self.descriptor["phase"] = phase
             self._persist()
 
+    def reset_for_pending_retry(self) -> None:
+        """Return a still-pending attempt's mirror to a clean ``bound`` strand.
+
+        Used when a bound idempotent operation made NO durable provider
+        progress -- it waited out the reconnect gate, or its owning
+        provider_id was displaced by a reconnect -- after the caller has
+        already removed the (empty) provision journal and minted no handle.
+        The mirror is durably reset to the same image a fresh bind has, so the
+        operation stays PENDING and an identical retry takes it over under the
+        same operation_id exactly once.
+        """
+        with self._lock:
+            self.descriptor["phase"] = PHASE_BOUND
+            self.descriptor["handles"] = []
+            self.descriptor["journal"] = None
+            self.descriptor["snapshot"] = None
+            self._persist()
+
     def add_handle(self, provider_id: str, handle: str) -> None:
         """Record one freshly minted handle in the mirror (durable).
 

@@ -17,7 +17,11 @@ from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
 from .operations import OperationStore
 from .policy import PolicyError, PolicyStore, validate_rules
-from .provider import ProviderInvalidMaterial, ProviderUnavailable
+from .provider import (
+    ProviderInvalidMaterial,
+    ProviderReconnectPending,
+    ProviderUnavailable,
+)
 from .server import _resolve_committed_operation, serve
 from .store import IMPORT_CONFLICT, KeyStore, LockTimeout, is_valid_key_id, validate_batch_items
 
@@ -196,6 +200,28 @@ def build_parser() -> argparse.ArgumentParser:
         "delete", help="delete a tenant's policy"
     )
     p_policy_delete.add_argument("--tenant-id", required=True)
+
+    p_provider = sub.add_parser(
+        "provider", help="inspect or reconnect the KMS/HSM provider"
+    )
+    provider_sub = p_provider.add_subparsers(
+        dest="provider_command", required=True
+    )
+    p_provider_status = provider_sub.add_parser(
+        "status", help="show provider readiness (provider_id, status)"
+    )
+    p_provider_status.add_argument(
+        "--operator", required=True,
+        help="non-empty X-Operator-Id of the caller",
+    )
+    p_provider_reconnect = provider_sub.add_parser(
+        "reconnect",
+        help="rebuild the provider from the current configuration",
+    )
+    p_provider_reconnect.add_argument(
+        "--operator", required=True,
+        help="non-empty X-Operator-Id of the caller",
+    )
 
     p_serve = sub.add_parser("serve", help="run the HTTP server")
     p_serve.add_argument("--host", default="127.0.0.1")
@@ -589,6 +615,24 @@ def _idempotent_run_body(op_store, store, artifact_store, executor, operation,
                 operation, operations_mod.STATUS_FAILED, 500, body_err
             )
             return _emit_operation_result(500, body_err)
+    except ProviderReconnectPending:
+        # The provider was never effectively called (gate timeout or a
+        # displaced provider_id): the store/restore abort path already removed
+        # the empty journal and minted no handle. Reset the mirror to a clean
+        # bound strand and leave the operation PENDING for a same-id retry,
+        # answering the fixed safe 503 (exit 1) without a duplicate event.
+        if mirror is not None:
+            try:
+                mirror.reset_for_pending_retry()
+            except OSError:
+                pass
+        return _emit_operation_result(
+            503,
+            {
+                "error": "key management provider is unavailable",
+                "operation_id": op_id,
+            },
+        )
     except ProviderUnavailable:
         try:
             http_status, body_err = _provider_terminal(
@@ -655,6 +699,37 @@ def _run(argv: Optional[List[str]] = None) -> int:
 
     if args.command == "serve":
         serve(args.host, args.port, args.data_dir)
+        return 0
+
+    if args.command == "provider":
+        # Global (non-tenant) provider control: only the single operator is
+        # required. Bind the data dir so a lazily-built external provider is
+        # configured exactly like the service, but perform no tenant/audit
+        # work (these commands never append an audit event).
+        from . import provider as provider_mod
+
+        provider_mod.bind_data_dir(args.data_dir)
+        if not getattr(args, "operator", None):
+            return _fail("field operator must be a non-empty string", 2)
+        if args.provider_command == "status":
+            body = provider_mod.provider_status()
+        else:
+            try:
+                body = provider_mod.reconnect()
+            except ProviderUnavailable:
+                return _fail(
+                    "key management provider is unavailable", 1
+                )
+        # Fixed key order provider_id,status on one line.
+        print(
+            json.dumps(
+                {
+                    "provider_id": body["provider_id"],
+                    "status": body["status"],
+                },
+                separators=(",", ":"),
+            )
+        )
         return 0
 
     audit_log = AuditLog(args.data_dir)

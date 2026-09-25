@@ -11,6 +11,7 @@ from . import audit as audit_mod
 from . import envelope
 from . import keybundle
 from . import operations as operations_mod
+from . import provider as provider_mod
 from . import restore as restore_mod
 from . import tenantbundle
 from .artifacts import (
@@ -21,11 +22,17 @@ from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
 from .operations import OperationStore
 from .policy import PolicyError, PolicyStore, validate_rules
-from .provider import ProviderInvalidMaterial, ProviderUnavailable
+from .provider import (
+    ProviderInvalidMaterial,
+    ProviderReconnectPending,
+    ProviderUnavailable,
+)
 from .store import IMPORT_CONFLICT, KeyStore, LockTimeout, is_valid_key_id, validate_batch_items
 
 _AUDIT_PATH = "/v1/audit"
 _POLICY_PATH = "/v1/policy"
+_PROVIDER_STATUS_PATH = "/v1/provider/status"
+_PROVIDER_RECONNECT_PATH = "/v1/provider/reconnect"
 _OPERATIONS_PATH_RE = re.compile(r"^/v1/operations/([^/]+)$")
 _IMPORT_PATH = "/v1/keys/import"
 _BATCH_ROTATE_PATH = "/v1/keys/batch-rotate"
@@ -436,6 +443,32 @@ def make_handler(
                     )
                     self._send_json(500, body)
                     return
+            except ProviderReconnectPending:
+                # The provider call never effectively started: either it
+                # waited out the shared five-second reconnect gate, or the
+                # provider now active carries a different provider_id than the
+                # one this pending operation is bound to. No audit event was
+                # appended and nothing committed; the store's abort path
+                # already removed any (empty) journal and minted no handle.
+                # Reset the mirror to a clean bound strand, leave the
+                # operation PENDING and answer the fixed safe 503, so a retry
+                # once reconnect settles -- or a provider with the same id
+                # reconnects -- continues under the SAME operation_id/
+                # event_id, which is therefore never duplicated.
+                if mirror is not None:
+                    try:
+                        mirror.reset_for_pending_retry()
+                    except OSError:
+                        # A reset that cannot persist leaves after_terminal to
+                        # decide from the durable facts (it retains or parks
+                        # anything with surviving evidence).
+                        pass
+                body = {
+                    "error": "key management provider is unavailable",
+                    "operation_id": op_id,
+                }
+                self._send_json(503, body)
+                return
             except ProviderUnavailable:
                 # A bound KMS/HSM fault (load/contract/call/handle-delete) is
                 # a durable terminal 503 with the fixed safe message and one
@@ -748,6 +781,10 @@ def make_handler(
 
                 if path == _RESTORE_PATH:
                     self._restore_tenant(parts, operator)
+                    return
+
+                if path == _PROVIDER_RECONNECT_PATH:
+                    self._provider_reconnect()
                     return
             except ProviderInvalidMaterial as exc:
                 self._provider_invalid_material(exc)
@@ -1723,6 +1760,93 @@ def make_handler(
                 parts.path, tenant_id, operator, payload, idem_key, execute
             )
 
+        # -- provider health / reconnect ----------------------------------
+        def _no_tenant(self, parts) -> bool:
+            """Reject a tenant_id on a provider-scoped endpoint with a 400.
+
+            The provider endpoints are global, not tenant scoped: they carry
+            the single operator header only and accept no tenant_id in a
+            header, query string or body. A supplied tenant_id is a parameter
+            error. These endpoints never write audit events.
+            """
+            if self.headers.get_all("X-Tenant-Id"):
+                self._bad_request(
+                    "field tenant_id is not accepted by this endpoint"
+                )
+                return False
+            if parse_qs(parts.query, keep_blank_values=True).get("tenant_id"):
+                self._bad_request(
+                    "field tenant_id is not accepted by this endpoint"
+                )
+                return False
+            return True
+
+        def _provider_status(self) -> None:
+            """GET /v1/provider/status.
+
+            200 with keys in order ``provider_id,status``; status is only
+            ``ready`` or ``unavailable``. A provider that cannot be loaded
+            reports ``provider_id`` null (the probe builds it lazily). The
+            readiness text/exception never leaves the process.
+            """
+            parts = urlsplit(self.path)
+            if not self._no_tenant(parts):
+                return
+            body = provider_mod.provider_status()
+            self._send_json(
+                200,
+                {
+                    "provider_id": body["provider_id"],
+                    "status": body["status"],
+                },
+            )
+
+        def _provider_reconnect(self) -> None:
+            """POST /v1/provider/reconnect.
+
+            The body must be exactly ``{}``: bad JSON or any extra field is a
+            side-effect-free 400. On success the factory is rebuilt from the
+            current configuration, contract-validated and health-checked
+            behind the shared five-second gate; 200 returns the same
+            ``provider_id,status`` body. Any failure keeps the old instance
+            and answers a fixed 503 whose body never carries backend detail.
+            """
+            parts = urlsplit(self.path)
+            if not self._no_tenant(parts):
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                self._bad_request("invalid Content-Length")
+                return
+            raw = self.rfile.read(length) if length > 0 else b""
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                self._bad_request("request body must be valid JSON")
+                return
+            # Exactly the empty object: a non-object or any extra field is a
+            # 400 that happens before the factory is touched (zero side
+            # effects, no audit event).
+            if not isinstance(payload, dict) or payload:
+                self._bad_request("request body must be exactly {}")
+                return
+            try:
+                body = provider_mod.reconnect()
+            except ProviderUnavailable:
+                self._send_json(
+                    503,
+                    {"error": "key management provider is unavailable"},
+                )
+                return
+            self._send_json(
+                200,
+                {
+                    "provider_id": body["provider_id"],
+                    "status": body["status"],
+                },
+            )
+
         # -- GET ----------------------------------------------------------
         def do_GET(self) -> None:
             parts = urlsplit(self.path)
@@ -1752,6 +1876,10 @@ def make_handler(
                     self._get_policy(parts)
                 except LedgerError as exc:
                     self._server_error(exc)
+                return
+
+            if path == _PROVIDER_STATUS_PATH:
+                self._provider_status()
                 return
 
             try:
