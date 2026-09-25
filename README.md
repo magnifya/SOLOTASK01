@@ -130,7 +130,8 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 ## KMS/HSM 健康检查与无中断重连
 
 - `GET /v1/provider/status`：只需单一非空 `X-Operator-Id`，不收
-  `tenant_id`（头/查询/体均不接受，违者 `400`），也不记审计。返回 `200`，
+  `tenant_id`（头/查询/非空请求体含 `tenant_id` 均 `400` 并指出
+  `tenant_id`，拒绝先于建厂与探活），也不记审计。返回 `200`，
   键序固定 `{"provider_id","status"}`；`status` 仅 `ready`/`unavailable`。
   提供者尚未加载时该探测会惰性建厂；加载/契约/配置失败时
   `provider_id` 为 `null`、`status` 为 `unavailable`，后端异常文本绝不外泄。
@@ -155,6 +156,22 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   一次，事件绝不重复。从未在本数据目录激活过的 provider_id 仍按原“未激活
   提供者”规则终态 `503`。曾激活的 provider_id 记在
   `provider-ids.json`(0600)，跨进程可识别。
+- **跨进程激活状态 `provider-state.json`(0600)**：首次健康激活与每次成功
+  重连都原子写入（temp 文件 fsync 后 rename）紧凑 UTF-8 JSON，键序固定
+  `schema_version,provider_id,generation`——依次为固定整数 `1`、非空字符
+  串、从 1 递增的正整数；非 ASCII 原样、无末尾换行。启动时读取；文件缺失
+  由首次健康激活创建；文件损坏或字段非法时，全部提供者调用与重连一律按固
+  定文案 `503`（CLI `1`），且绝不改写该文件。
+- **跨进程五秒门限与代际提交**：所有进程的提供者调用与
+  `POST /v1/provider/reconnect` 共用同一五秒门限（进程内门闩 +
+  `provider-state.lock`/`provider-reconnect.lock` 的 flock）：旧在途调用
+  完成后重连才提交，重连期间各进程新调用等待；等待超门限的调用不触后端、
+  不铸句柄、不写审计或状态，直接固定 `503`。仅健康候选可在互斥下递增
+  `generation`；失败或提交前崩溃保留旧代。提交后各进程下次调用按当前配置
+  重建提供者，重建所得 ID 与已提交 `provider_id` 不符或不健康时 `503` 且
+  零副作用；pending 操作仍绑定原 `provider_id`，当前代不符时保持 pending
+  并 `503`，重连同 ID 后沿原 `operation_id` 恰好继续一次，`event_id`
+  不重复。
 - CLI：`provider status --operator O` 与
   `provider reconnect --operator O`，成功输出同序单行 JSON；`400→2`、
   `503→1`，成功 `0`。status 在提供者不可用时仍以退出 `0` 返回
@@ -334,6 +351,11 @@ python -m keymgr provider reconnect --operator alice
 
 ## 持久化与限制
 
+- `provider-state.json`(0600) 是数据目录的提供者激活记录：紧凑 UTF-8
+  JSON、键序 `schema_version,provider_id,generation`、无末尾换行；首次
+  健康激活与成功重连原子提交（`generation` 从 1 递增），启动读取，损坏
+  或字段非法时调用与重连按固定文案 `503` 且绝不改写（详见“KMS/HSM 健康
+  检查与无中断重连”一节）。
 - 每个密钥为数据目录下 `<key_id>.json`（0600，fsync + 原子 rename），含
   append-only `versions` 与 `current_version`；轮换在 per-key 进程内锁 +
   `<key_id>.lock` fcntl 锁下读改写，并发不丢版本、不悬指针。

@@ -1761,13 +1761,14 @@ def make_handler(
             )
 
         # -- provider health / reconnect ----------------------------------
-        def _no_tenant(self, parts) -> bool:
+        def _no_tenant(self, parts, check_body: bool = False) -> bool:
             """Reject a tenant_id on a provider-scoped endpoint with a 400.
 
             The provider endpoints are global, not tenant scoped: they carry
             the single operator header only and accept no tenant_id in a
             header, query string or body. A supplied tenant_id is a parameter
-            error. These endpoints never write audit events.
+            error raised before any factory build or health probe. These
+            endpoints never write audit events.
             """
             if self.headers.get_all("X-Tenant-Id"):
                 self._bad_request(
@@ -1779,6 +1780,22 @@ def make_handler(
                     "field tenant_id is not accepted by this endpoint"
                 )
                 return False
+            if check_body:
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                except ValueError:
+                    length = 0
+                if length > 0:
+                    raw = self.rfile.read(length)
+                    try:
+                        payload = json.loads(raw.decode("utf-8"))
+                    except (ValueError, UnicodeDecodeError):
+                        payload = None
+                    if isinstance(payload, dict) and "tenant_id" in payload:
+                        self._bad_request(
+                            "field tenant_id is not accepted by this endpoint"
+                        )
+                        return False
             return True
 
         def _provider_status(self) -> None:
@@ -1787,10 +1804,12 @@ def make_handler(
             200 with keys in order ``provider_id,status``; status is only
             ``ready`` or ``unavailable``. A provider that cannot be loaded
             reports ``provider_id`` null (the probe builds it lazily). The
-            readiness text/exception never leaves the process.
+            readiness text/exception never leaves the process. A tenant_id
+            in a header, the query string or a non-empty body is a 400
+            before the factory is built or the probe runs.
             """
             parts = urlsplit(self.path)
-            if not self._no_tenant(parts):
+            if not self._no_tenant(parts, check_body=True):
                 return
             body = provider_mod.provider_status()
             self._send_json(

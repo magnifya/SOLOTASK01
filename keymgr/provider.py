@@ -42,6 +42,11 @@ import uuid
 from contextlib import contextmanager
 from typing import NamedTuple, Optional
 
+try:  # fcntl is POSIX-only; the cross-process gate degrades gracefully.
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    fcntl = None
+
 from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -695,6 +700,272 @@ def _remember(provider_id: str) -> None:
         # a best-effort hint, not an authority.
 
 
+# -- cross-process activation state -----------------------------------------
+# ``provider-state.json`` (0600) is the data directory's activation record:
+# the provider_id currently activated and a generation counter that starts
+# at 1 and is incremented -- mutually exclusively across processes, and only
+# for a healthy candidate -- by every successful reconnect. It is written
+# atomically (temp file, fsync, rename) as compact UTF-8 JSON with the key
+# order ``schema_version,provider_id,generation``, non-ASCII kept as-is and
+# no trailing newline. The file is read at startup and before every gated
+# provider call; a missing file is created by the first healthy activation,
+# while a corrupt file or illegal fields fail every provider call and
+# reconnect with ProviderUnavailable (surfaced as the fixed 503 text) and
+# are never rewritten.
+_STATE_NAME = "provider-state.json"
+_STATE_SCHEMA_VERSION = 1
+# Cross-process half of the shared five-second gate. A reconnect takes the
+# intent lock exclusively (new calls in every process wait at admission) and
+# then the gate lock exclusively (in-flight calls finish first); ordinary
+# provider calls hold the gate lock shared for their duration.
+_GATE_LOCK_NAME = "provider-state.lock"
+_INTENT_LOCK_NAME = "provider-reconnect.lock"
+_FLOCK_POLL_SECONDS = 0.05
+
+# The generation this process has activated (None until the first gated
+# provider call adopts the on-disk state). Guarded by _state_lock together
+# with the adoption critical sections.
+_active_generation: Optional[int] = None
+_state_lock = threading.Lock()
+
+
+def _state_path() -> Optional[str]:
+    if _configured_dir is None:
+        return None
+    return os.path.join(_configured_dir, _STATE_NAME)
+
+
+def _read_state() -> Optional[tuple]:
+    """Return the activated ``(provider_id, generation)``, or None if absent.
+
+    A corrupt file or illegal field values raise ProviderUnavailable: every
+    provider call and reconnect then fails with the fixed 503 text and the
+    file is left byte-for-byte untouched (never rewritten).
+    """
+    path = _state_path()
+    if path is None:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise ProviderUnavailable(
+            "provider activation state is unreadable: %s" % exc
+        ) from exc
+    if not isinstance(data, dict):
+        raise ProviderUnavailable("provider activation state is corrupt")
+    schema = data.get("schema_version")
+    if isinstance(schema, bool) or schema != _STATE_SCHEMA_VERSION:
+        raise ProviderUnavailable("provider activation state is corrupt")
+    provider_id = data.get("provider_id")
+    if not isinstance(provider_id, str) or not provider_id:
+        raise ProviderUnavailable("provider activation state is corrupt")
+    generation = data.get("generation")
+    if (
+        isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 1
+    ):
+        raise ProviderUnavailable("provider activation state is corrupt")
+    return provider_id, generation
+
+
+def _write_state(provider_id: str, generation: int) -> None:
+    """Atomically commit the activation state (0600, compact, no newline)."""
+    payload = json.dumps(
+        {
+            "schema_version": _STATE_SCHEMA_VERSION,
+            "provider_id": provider_id,
+            "generation": generation,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    fd, tmp_path = tempfile.mkstemp(dir=_configured_dir, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, _state_path())
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _cross_process_enabled() -> bool:
+    """Whether the cross-process gate/state layer can operate."""
+    return fcntl is not None and _configured_dir is not None
+
+
+def _ensure_state_dir() -> None:
+    if _configured_dir is not None:
+        os.makedirs(_configured_dir, exist_ok=True)
+
+
+def _lock_path(name: str) -> str:
+    return os.path.join(_configured_dir, name)
+
+
+def _acquire_flock(path: str, exclusive: bool, deadline: float) -> int:
+    """Acquire a shared/exclusive flock, bounded by the shared gate budget.
+
+    A wait past the deadline raises ProviderReconnectPending: the caller has
+    made no provider call and no state/audit write, exactly like an
+    in-process gate timeout.
+    """
+    flags = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    while True:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, flags | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ProviderReconnectPending(
+                    "timed out waiting for the cross-process provider gate"
+                )
+            time.sleep(min(_FLOCK_POLL_SECONDS, remaining))
+            continue
+        return fd
+
+
+def _release_flock(fd: int) -> None:
+    if fd < 0:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    os.close(fd)
+
+
+def _intent_free() -> bool:
+    """Whether no reconnect currently holds the cross-process intent lock."""
+    fd = os.open(_lock_path(_INTENT_LOCK_NAME), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return False
+    _release_flock(fd)
+    return True
+
+
+def _acquire_gate_shared(deadline: float) -> int:
+    """Take the shared call gate, waiting out any in-progress reconnect.
+
+    A reconnect marks its intent before draining, so admission first waits
+    for the intent lock to be free, takes the shared gate lock, then
+    re-checks the intent lock: a reconnect that began in between forces a
+    release and another wait (a call already holding the gate is an
+    in-flight call the reconnect waits for). A call that cannot be admitted
+    within the budget raises ProviderReconnectPending with zero side
+    effects.
+    """
+    while True:
+        while not _intent_free():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ProviderReconnectPending(
+                    "timed out waiting for provider reconnect to settle"
+                )
+            time.sleep(min(_FLOCK_POLL_SECONDS, remaining))
+        gate_fd = _acquire_flock(_lock_path(_GATE_LOCK_NAME), False, deadline)
+        if _intent_free():
+            return gate_fd
+        _release_flock(gate_fd)
+
+
+def _adopt_state(state, deadline: float) -> None:
+    """Bring this process in line with the committed activation state.
+
+    The first gated call of a process -- and the first call after another
+    process committed a new generation -- rebuilds the provider from the
+    current configuration: a rebuilt id that differs from the committed
+    provider_id raises ProviderIdentityMismatch (a pending-preserving 503:
+    an idempotent operation bound to the previously activated provider_id
+    stays pending until a provider with a matching id is activated again),
+    and an unhealthy instance fails the call with ProviderUnavailable. Both
+    are zero side effects for the call itself (no backend mutation, handle
+    or state write).
+    """
+    global _provider, _active_generation
+    provider_id, generation = state
+    if (
+        _provider is not None
+        and _active_generation == generation
+        and _provider.provider_id == provider_id
+    ):
+        return
+    candidate = _build_current_provider()
+    if candidate.provider_id != provider_id:
+        raise ProviderIdentityMismatch(
+            "configured provider %r does not match the activated provider %r"
+            % (candidate.provider_id, provider_id)
+        )
+    if not _health_with_deadline(candidate, deadline):
+        raise ProviderUnavailable("provider reported unhealthy")
+    with _provider_lock:
+        _provider = candidate
+        _active_generation = generation
+        _remember(provider_id)
+
+
+def _ensure_activation(deadline: float) -> None:
+    """Ensure the data directory has an activation record and adopt it.
+
+    A missing ``provider-state.json`` is created by the first healthy
+    activation, serialized across processes on the intent lock (a concurrent
+    activator's commit is adopted, never overwritten). Only a healthy
+    provider activates generation 1; anything else fails with
+    ProviderUnavailable and writes nothing.
+    """
+    global _active_generation
+    _ensure_state_dir()
+    state = _read_state()
+    if state is None:
+        intent_fd = _acquire_flock(_lock_path(_INTENT_LOCK_NAME), True, deadline)
+        try:
+            state = _read_state()
+            if state is None:
+                with _state_lock:
+                    provider = get_provider()
+                    if not _health_with_deadline(provider, deadline):
+                        raise ProviderUnavailable(
+                            "provider reported unhealthy"
+                        )
+                    _write_state(provider.provider_id, 1)
+                    state = (provider.provider_id, 1)
+                    _active_generation = 1
+        finally:
+            _release_flock(intent_fd)
+    with _state_lock:
+        _adopt_state(state, deadline)
+
+
+def _ensure_current(deadline: float) -> None:
+    """Re-check the committed state now that the shared gate is held.
+
+    A reconnect may have committed a new generation between admission and
+    gate acquisition; adopt it (or fail with zero side effects) before the
+    call proceeds. A file that vanished in between is treated like
+    corruption: the call fails and nothing is rewritten.
+    """
+    state = _read_state()
+    if state is None:
+        raise ProviderUnavailable("provider activation state is missing")
+    with _state_lock:
+        _adopt_state(state, deadline)
+
+
 # -- non-disruptive reconnect gate -----------------------------------------
 # Reconnect and ordinary provider calls share ONE five-second budget. While a
 # reconnect is draining or installing a freshly built provider, every NEW
@@ -823,6 +1094,12 @@ def provider_call(timeout: Optional[float] = None):
     :data:`CALL_GATE_SECONDS`, read at call time); on timeout raises
     :class:`ProviderReconnectPending` with zero provider side effects. Nested
     use on the same thread reuses the outer lease/instance.
+
+    Admission is shared across processes: the call first adopts the
+    committed activation state (creating it on the first healthy
+    activation), then holds the shared gate flock for its duration so a
+    reconnect in any other process waits for it, while it itself waits out
+    any reconnect already in progress.
     """
     if timeout is None:
         timeout = CALL_GATE_SECONDS
@@ -837,12 +1114,22 @@ def provider_call(timeout: Optional[float] = None):
 
     deadline = time.monotonic() + timeout
     _gate._acquire_lease(deadline)
+    gate_fd = -1
     try:
+        if _cross_process_enabled():
+            # Activate/adopt BEFORE taking the shared gate: the first
+            # activation needs the intent lock, and the intent lock is
+            # always taken before the gate lock (never the other way
+            # around), so no lock-order inversion is possible.
+            _ensure_activation(deadline)
+            gate_fd = _acquire_gate_shared(deadline)
+            _ensure_current(deadline)
         # Capture the current instance AFTER admission, without holding the
         # gate condition: a lazy first import stays out of the condition lock.
         # If loading fails, the lease is released and nothing was called.
         provider = get_provider()
     except BaseException:
+        _release_flock(gate_fd)
         _gate._release_lease()
         raise
     _tls.depth = 1
@@ -852,6 +1139,7 @@ def provider_call(timeout: Optional[float] = None):
     finally:
         _tls.depth = 0
         _tls.bound_provider = None
+        _release_flock(gate_fd)
         _gate._release_lease()
 
 
@@ -986,10 +1274,20 @@ def bind_data_dir(data_dir: str) -> None:
     :func:`get_provider` gets configured on first use, while startup itself
     neither imports a module:factory provider nor creates local provider
     state. Plain reads therefore load no provider.
+
+    Also performs the startup read of the activation record
+    (``provider-state.json``): a missing file is left to the first healthy
+    activation, and a corrupt file is left byte-for-byte untouched -- the
+    fixed 503 surfaces on the first provider call or reconnect, never at
+    startup.
     """
     global _configured_dir
     _configured_dir = data_dir
     _load_history()
+    try:
+        _read_state()
+    except ProviderUnavailable:
+        pass
 
 
 def provider_was_active(provider_id: str) -> bool:
@@ -1011,10 +1309,11 @@ def get_local_provider() -> "LocalProvider":
 
 def reset_for_tests() -> None:
     """Forget the cached provider (tests only)."""
-    global _provider, _configured_dir
+    global _provider, _configured_dir, _active_generation
     with _provider_lock:
         _provider = None
         _configured_dir = None
+        _active_generation = None
         _active_history.clear()
         _LOCAL_SINGLETON._configured = False
 
@@ -1079,28 +1378,67 @@ def reconnect(timeout: float = CALL_GATE_SECONDS) -> dict:
     behind the shared five-second gate. On any failure (drain/build/configure/
     health timeout) the previously active instance is retained untouched and
     :class:`ProviderUnavailable` is raised. Returns the new status body.
+
+    A successful reconnect is also the cross-process commit point: while
+    holding the intent and gate locks of every process, it atomically writes
+    ``provider-state.json`` with the candidate's provider_id and the next
+    generation (only a healthy candidate increments the generation; a
+    failure or crash before the commit keeps the old generation). Every
+    other process adopts the committed state on its next gated call.
     """
 
     def builder(deadline: float) -> None:
+        global _active_generation
         if deadline - time.monotonic() <= 0:
             raise ProviderReconnectPending(
                 "reconnect exceeded the shared five-second budget"
             )
-        # Build + contract validation + configure (factory work happens while
-        # new calls are held at the gate but no gate condition lock is held).
-        candidate = _build_current_provider()
-        # The health check shares the same five-second budget: a slow/blocked
-        # probe is a failed reconnect; its text is never surfaced.
+        intent_fd = -1
+        gate_fd = -1
+        cross_process = _cross_process_enabled()
         try:
-            ready = _health_with_deadline(candidate, deadline)
-        except Exception:
-            raise ProviderUnavailable("provider health check failed")
-        if not ready:
-            raise ProviderUnavailable("provider reported unhealthy")
-        # Swap while still draining: leases are zero and no new lease can be
-        # admitted, so the old instance is retained only by calls already in
-        # flight (which captured it) and every later call lands on candidate.
-        _install_provider(candidate)
+            if cross_process:
+                # Serialize reconnects across all processes, then wait out
+                # their in-flight calls; both bounded by the shared budget.
+                _ensure_state_dir()
+                intent_fd = _acquire_flock(
+                    _lock_path(_INTENT_LOCK_NAME), True, deadline
+                )
+                gate_fd = _acquire_flock(
+                    _lock_path(_GATE_LOCK_NAME), True, deadline
+                )
+            with _state_lock:
+                # A corrupt activation record fails the reconnect with the
+                # fixed 503 text and is never rewritten.
+                state = _read_state() if cross_process else None
+                # Build + contract validation + configure (factory work
+                # happens while new calls are held at the gate but no gate
+                # condition lock is held).
+                candidate = _build_current_provider()
+                # The health check shares the same five-second budget: a
+                # slow/blocked probe is a failed reconnect; its text is
+                # never surfaced.
+                try:
+                    ready = _health_with_deadline(candidate, deadline)
+                except Exception:
+                    raise ProviderUnavailable("provider health check failed")
+                if not ready:
+                    raise ProviderUnavailable("provider reported unhealthy")
+                # Only a healthy candidate commits, and it commits the next
+                # generation atomically BEFORE the swap: a failure or crash
+                # earlier keeps the old generation untouched.
+                generation = (state[1] if state else 0) + 1
+                if cross_process:
+                    _write_state(candidate.provider_id, generation)
+                # Swap while still draining: leases are zero and no new
+                # lease can be admitted, so the old instance is retained
+                # only by calls already in flight (which captured it) and
+                # every later call lands on candidate.
+                _install_provider(candidate)
+                _active_generation = generation if cross_process else None
+        finally:
+            _release_flock(gate_fd)
+            _release_flock(intent_fd)
 
     _gate.swapping(builder, timeout=timeout)
 
