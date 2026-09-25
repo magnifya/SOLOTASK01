@@ -15,6 +15,9 @@ Covers:
 
 import json
 import os
+import signal
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -800,3 +803,211 @@ def test_cli_provider_requires_operator_exit_2(env):
     assert result.returncode == 2
     result = run_cli(env, "provider", "reconnect")
     assert result.returncode == 2
+
+
+# -- cross-process intent / drain ordering ----------------------------------
+# These reproduce the race an in-process thread cannot: a reconnect in THIS
+# process must establish its cross-process intent BEFORE it drains, so a call
+# admitted in a DIFFERENT process while the reconnect is still draining waits
+# instead of slipping through on the old instance and starving the reconnect.
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_TESTS_DIR)
+
+
+def _helper_env():
+    envv = dict(os.environ)
+    envv["PYTHONPATH"] = _TESTS_DIR + os.pathsep + _REPO_ROOT
+    return envv
+
+
+def _start_helper(script, *args):
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(_TESTS_DIR, script), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=_helper_env(),
+    )
+    return proc
+
+
+def _wait_until(predicate, timeout=5.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_intent_is_established_before_drain_blocks_other_process(env):
+    provider_mod.bind_data_dir(env.data_dir)
+    provider_mod.get_provider()  # generation 1, fakekms
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def in_flight():
+        with provider_mod.provider_call():
+            entered.set()
+            release.wait(10.0)
+
+    worker = threading.Thread(target=in_flight)
+    worker.start()
+    assert entered.wait(5.0)
+
+    reconn_err = {}
+
+    def reconnecting():
+        try:
+            provider_mod.reconnect()
+        except Exception as exc:  # pragma: no cover - surfaced below
+            reconn_err["exc"] = exc
+
+    reconn = threading.Thread(target=reconnecting)
+    reconn.start()
+    # Wait until the reconnect is actually draining. On the fixed code the
+    # cross-process intent latch is already held by this point (it is taken
+    # right after the drain begins); we deliberately wait on the gate flag
+    # (which the old implementation also exposes) so this regression reaches
+    # the meaningful admission assertion on either implementation.
+    assert _wait_until(lambda: provider_mod._gate._draining), (
+        "reconnect never entered the draining state"
+    )
+    # Fixed code: the cross-process intent is already held at this point.
+    # Guarded with hasattr so the meaningful cross-process assertion below
+    # still runs (and fails) against the pre-fix implementation.
+    if hasattr(provider_mod, "_reconnect_intent_held"):
+        assert _wait_until(provider_mod._reconnect_intent_held)
+
+    # A DIFFERENT process trying to start a call during that drain window must
+    # be held at the gate and give up (rc 10 == blocked) -- it may not be
+    # admitted on the old instance. Its budget (2s) is well inside the
+    # reconnect's 5s drain budget.
+    proc = _start_helper(
+        "attempt_provider_call.py", env.data_dir, "2.0"
+    )
+    proc.wait(timeout=6.0)
+    out = proc.stdout.read().strip()
+    assert proc.returncode == 10, (
+        "late cross-process call was admitted during the drain: "
+        "rc=%r out=%r err=%r"
+        % (proc.returncode, out, proc.stderr.read())
+    )
+    assert out == "blocked"
+
+    # Let the old in-flight call finish; the reconnect then settles exactly
+    # once (generation 2) and normal service resumes.
+    release.set()
+    worker.join(5.0)
+    reconn.join(8.0)
+    assert not worker.is_alive() and not reconn.is_alive()
+    assert not reconn_err, reconn_err
+    assert json.loads(_read_state_raw(env))["generation"] == 2
+
+    proc2 = _start_helper("attempt_provider_call.py", env.data_dir, "3.0")
+    proc2.wait(timeout=6.0)
+    assert proc2.returncode == 0, proc2.stderr.read()
+    assert proc2.stdout.read().strip() == "admitted:fakekms"
+
+
+def test_intent_latch_reflects_other_process_and_clears_on_exit(env):
+    provider_mod.bind_data_dir(env.data_dir)
+    assert provider_mod._reconnect_intent_held() is False
+    proc = _start_helper(
+        "hold_provider_lock.py", env.data_dir, "intent", "excl", "2"
+    )
+    try:
+        assert proc.stdout.readline().strip() == "held"
+        assert _wait_until(provider_mod._reconnect_intent_held)
+    finally:
+        proc.wait(timeout=6.0)
+    assert proc.returncode == 0
+    assert _wait_until(lambda: not provider_mod._reconnect_intent_held())
+
+
+def test_killed_reconnect_releases_intent_and_calls_resume(env):
+    provider_mod.bind_data_dir(env.data_dir)
+    provider_mod.get_provider()
+    # Simulate a process that dies while holding the intent latch. The flock
+    # is released by the kernel, so it must never wedge later calls.
+    proc = _start_helper(
+        "hold_provider_lock.py", env.data_dir, "intent", "excl", "30"
+    )
+    try:
+        assert proc.stdout.readline().strip() == "held"
+        assert _wait_until(provider_mod._reconnect_intent_held)
+        proc.send_signal(signal.SIGKILL)
+        proc.wait(timeout=5.0)
+        assert proc.returncode == -signal.SIGKILL
+        assert _wait_until(lambda: not provider_mod._reconnect_intent_held())
+        with provider_mod.provider_call(timeout=3.0) as provider:
+            assert provider.provider_id == "fakekms"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_late_http_call_during_external_intent_is_safe_503(
+    http, monkeypatch
+):
+    env, srv = http
+    # Another PROCESS owns the reconnect intent latch (e.g. a reconnect in a
+    # CLI is mid-flight). A creation request in this server process must wait
+    # out the gate and answer the fixed 503 with zero side effects.
+    proc = _start_helper(
+        "hold_provider_lock.py", env.data_dir, "intent", "excl", "4"
+    )
+    try:
+        assert proc.stdout.readline().strip() == "held"
+        assert _wait_until(provider_mod._reconnect_intent_held)
+        monkeypatch.setattr(provider_mod, "CALL_GATE_SECONDS", 0.3)
+        before = env.kms_handles()
+        status, body = srv.request(
+            "POST", "/v1/keys",
+            {"tenant_id": "t9", "algorithm": "AES256", "label": "k"},
+            OPERATOR,
+        )
+        assert status == 503
+        assert body == {"error": "key management provider is unavailable"}
+        # No backend object minted and nothing changed on disk.
+        assert env.kms_handles() == before
+    finally:
+        proc.wait(timeout=8.0)
+    # After the intent clears, normal service resumes.
+    assert _create_key(srv, tenant="t9")
+
+
+def _start_cli_subprocess(env):
+    """A real `keymgr provider reconnect` in a fresh process."""
+    from test_recovery_cli import _cli_env
+
+    return subprocess.Popen(
+        [
+            sys.executable, "-m", "keymgr",
+            "--data-dir", env.data_dir,
+            "provider", "reconnect", "--operator", "alice",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=_cli_env(),
+    )
+
+
+def test_concurrent_cross_process_reconnects_serialize_generation(env):
+    provider_mod.bind_data_dir(env.data_dir)
+    provider_mod.get_provider()
+    assert json.loads(_read_state_raw(env))["generation"] == 1
+
+    n = 4
+    procs = [_start_cli_subprocess(env) for _ in range(n)]
+    for proc in procs:
+        out, err = proc.communicate(timeout=60)
+        assert proc.returncode == 0, err
+        assert json.loads(out.strip())["status"] == "ready"
+
+    # Every success adds exactly one generation: no gap, no duplicate, no
+    # deadlock or starvation across the concurrently reconnecting processes.
+    assert json.loads(_read_state_raw(env))["generation"] == 1 + n
+
