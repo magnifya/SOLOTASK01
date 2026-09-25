@@ -1863,6 +1863,29 @@ def provider_was_active(provider_id: str) -> bool:
     return provider_id in _active_history
 
 
+def local_provider_displaced() -> bool:
+    """Whether the built-in ``local`` provider is a previously-active, now
+    displaced provider (so a bound op owned by it stays pending).
+
+    True only when local is NOT the active entry, local WAS active earlier in
+    this data directory, and a readable committed ``provider-state.json``
+    names a different active ``provider_id`` (including a mid-switch record).
+    A missing state file (nothing ever committed) and a corrupt/illegal one
+    read as False: those scenes keep the plain inactive-provider 503 (the
+    committed-state corruption contract) rather than the pending-displacement
+    one. Imports no provider and configures nothing.
+    """
+    if active_is_local():
+        return False
+    if not provider_was_active(LOCAL_PROVIDER_ID):
+        return False
+    try:
+        state = _read_committed_state()
+    except ProviderUnavailable:
+        return False
+    return state is not None and state.provider_id != LOCAL_PROVIDER_ID
+
+
 def get_local_provider() -> "LocalProvider":
     """Return the built-in local provider singleton, configured if a data
     directory has been bound (configure_local/bind_data_dir). Never imports a

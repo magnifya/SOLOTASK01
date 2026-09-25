@@ -1291,6 +1291,20 @@ class KeyStore:
         if provider_id == LOCAL_PROVIDER_ID:
             if provider_mod.active_is_local():
                 return provider_mod.get_local_provider()
+            # The built-in local provider is a provider_id like any other:
+            # when a readable committed state names a different active entry
+            # and local WAS active earlier in this data directory (a directed
+            # switchover/reconnect displaced it), a bound idempotent operation
+            # owned by it must stay PENDING until a local entry is active
+            # again, exactly like an external id. A local id never active here
+            # (or a corrupt/missing committed state) is the classic
+            # inactive-provider terminal refusal (503), never a silent
+            # fallback.
+            if provider_mod.local_provider_displaced():
+                raise ProviderIdentityMismatch(
+                    "record provider %r was displaced by a provider switch"
+                    % LOCAL_PROVIDER_ID
+                )
             raise ProviderUnavailable(
                 "record is owned by the local provider, which is not active"
             )
@@ -3207,12 +3221,23 @@ class KeyStore:
         """
         block = ver.get("provider")
         if block is None:
-            if not provider_mod.active_is_local():
+            if provider_mod.active_is_local():
+                target = provider_mod.configure_local(self.data_dir)
+            elif provider_mod.local_provider_displaced():
+                # A legacy bundle (no provenance block) is local material and
+                # a readable committed state names a different active entry
+                # while local WAS active earlier: a directed switch displaced
+                # it, so a bound import/restore must stay PENDING until local
+                # is active again, never terminalize.
+                raise ProviderIdentityMismatch(
+                    "legacy bundle is owned by the local provider %r, which "
+                    "was displaced by a provider switch" % LOCAL_PROVIDER_ID
+                )
+            else:
                 raise ProviderUnavailable(
                     "legacy bundle without a provider block is local-only; "
                     "the local provider is not active"
                 )
-            target = provider_mod.configure_local(self.data_dir)
         else:
             target = self._provider_for(block["provider_id"])
         triple = target.import_material(
