@@ -17,14 +17,19 @@ entry is activated. Every ORDINARY provider call then probes the active
 instance first: a probe returning exactly ``True`` clears the persisted
 failure count and proceeds; ``False``, a non-bool, a raised or an expired
 probe increments the active entry's persisted failure count (capped at three)
-and pins the call to the fixed 503. The first two failures never switch; the
-third re-verifies the active entry under the same five-second cross-process
-intent/drain gate a reconnect uses -- recovery clears the count and serves the
-call, otherwise the active generation fails over exactly once to the first
-healthy standby and increments the generation. Old calls finish on the
-instance they captured, later calls land on the new generation, and
-concurrent third strikes build/commit exactly once. With no healthy standby
-(or on a gate timeout) the old generation is retained. The threshold lives in
+and pins the call to the fixed 503. Each individual probe is bounded to one
+second AND to the attempt's still-remaining budget, and a result landing
+after the wait is discarded. The first two failures never switch; the third
+re-verifies the active entry and then probes the standbys in chain order --
+every probe one second at most, all of them sharing the one non-resettable
+five-second budget the attempt started at its first wait/probe -- under the
+same cross-process intent/drain gate a reconnect uses: recovery clears the
+count and serves the call, otherwise the active generation fails over
+exactly once to the first healthy standby and increments the generation.
+Exhausting the budget (or finding no healthy standby in the leftover time)
+answers 503 and retains the old generation. Old calls finish on the instance
+they captured, later calls land on the new generation, and concurrent third
+strikes build/commit exactly once. The threshold lives in
 ``provider-health.json`` (a 0600 satellite of a READY ``provider-state.json``
 with the same id and generation), so it survives restarts and is shared
 across processes; a corrupt, ahead or same-generation-wrong-id health record
@@ -762,6 +767,13 @@ def _remember(provider_id: str) -> None:
 # state lease, and fall back to waiting when the probe catches a reconnect.
 CALL_GATE_SECONDS = 5.0
 _POLL_SECONDS = 0.02
+#: Per-probe cap on the ORDINARY provider-call path: every health() -- the
+#: per-call active probe, the third-strike re-verification and each standby
+#: probe -- is bounded to this much of the attempt's shared, non-resettable
+#: five-second budget (the smaller of the two wins), so a hanging health()
+#: can spend at most one second per probe and can never starve the standby
+#: probes of the failover threshold.
+HEALTH_PROBE_SECONDS = 1.0
 
 
 class _Budget:
@@ -790,6 +802,16 @@ class _Budget:
 
     def expired(self) -> bool:
         return self.remaining() <= 0
+
+    def probe_seconds(self, per_probe: float = HEALTH_PROBE_SECONDS) -> float:
+        """The bounded wait one health() probe may take on this budget.
+
+        Always the smaller of the per-probe cap (one second on the ordinary
+        provider-call path) and the budget still remaining: probes share the
+        one non-resettable deadline, so neither a single slow probe nor a
+        chain of standby probes may spend more than the five-second total.
+        """
+        return max(0.0, min(per_probe, self.remaining()))
 
 
 class ProviderReconnectPending(ProviderUnavailable):
@@ -1434,6 +1456,22 @@ def _healthy_within(provider, deadline) -> bool:
     return _health_with_deadline(provider, deadline)
 
 
+def _healthy_probe(provider, budget: "_Budget") -> bool:
+    """Bound ONE ordinary-call health() to min(per-probe cap, remaining).
+
+    Used by every probe on the :func:`provider_call` path: the per-call
+    active probe, the third-strike re-verification and each standby probe.
+    Each probe is limited to :data:`HEALTH_PROBE_SECONDS` (one second) AND to
+    the attempt's still-remaining shared budget, so a hanging ``health()``
+    spends at most a second per probe and can never consume the whole
+    non-resettable five-second deadline before the standby probes run. A
+    result landing after the wait is discarded (the probe is simply False).
+    """
+    return _health_with_deadline(
+        provider, time.monotonic() + budget.probe_seconds()
+    )
+
+
 # Serializes per-process failure-counter updates; the matching cross-process
 # serialization is the short exclusive flock on ``provider-health.lock`` taken
 # in :func:`_health_counter_gate`. That fence is deliberately separate from the
@@ -1501,11 +1539,18 @@ def _active_probe_ready(budget: "_Budget", provider) -> str:
     one failure: the persisted count is incremented (capped at three). On the
     third failure the active entry is probed once more; recovery clears the
     count and admits, otherwise the caller performs the single failover.
+
+    Both the first probe and the third-strike re-verification are bounded by
+    :func:`_healthy_probe` to one second AND to the budget still remaining on
+    the attempt's single non-resettable deadline; a probe result that lands
+    after the bounded wait is discarded. After the third strike the SAME
+    budget pays for the failover's chain-order standby probes too, so a slow
+    active probe can never exhaust the failover threshold on its own.
     """
     state = _read_committed_state()
     if state is None or state.phase != _PHASE_READY:
         raise ProviderUnavailable("provider state is not ready")
-    if _healthy_within(provider, budget):
+    if _healthy_probe(provider, budget):
         _record_health(state, ready=True, budget=budget)
         return "admit"
     with _health_counter_gate(budget):
@@ -1530,8 +1575,10 @@ def _active_probe_ready(budget: "_Budget", provider) -> str:
             return "reject"
         # Third strike: re-verify the active entry once more inside the
         # failure gate. A recovered active clears the count and serves this
-        # very call; a still-unhealthy one triggers the single failover.
-        if _healthy_within(provider, budget):
+        # very call; a still-unhealthy one triggers the single failover. The
+        # re-verification is one more per-probe-capped health() on the SAME
+        # non-resettable budget, not a fresh five seconds.
+        if _healthy_probe(provider, budget):
             _write_health(
                 state.provider_id,
                 state.generation,
@@ -1592,6 +1639,25 @@ def _first_healthy(candidates, deadline, exclude_id: Optional[str] = None):
         if exclude_id is not None and candidate.provider_id == exclude_id:
             continue
         if _healthy_within(candidate, deadline):
+            return candidate
+    return None
+
+
+def _first_healthy_probe(
+    candidates, budget: "_Budget", exclude_id: Optional[str] = None
+):
+    """First candidate (chain order) healthy under the shared call budget.
+
+    The failover path's standby selection: each entry is probed in chain
+    order, every probe bounded to min(:data:`HEALTH_PROBE_SECONDS`, the
+    budget still remaining) on the SAME non-resettable deadline, so a slow
+    active probe can never starve the standby probes of their second and a
+    long chain stops being examined once the five seconds are spent.
+    """
+    for candidate in candidates:
+        if exclude_id is not None and candidate.provider_id == exclude_id:
+            continue
+        if _healthy_probe(candidate, budget):
             return candidate
     return None
 
@@ -1929,10 +1995,13 @@ def provider_call(timeout: Optional[float] = None):
        backed by ``provider-health.json`` (see :func:`_active_probe_ready`):
        a healthy probe clears the failure count and admits the call; the
        first two unhealthy probes pin the call to a fixed 503 without
-       switching; the third re-verifies under the same five-second
-       intent/drain gate and either clears on recovery or fails over exactly
-       once to the first healthy standby (generation + 1), after which this
-       attempt re-enters admission against the new generation.
+       switching; the third re-verifies the active entry and then walks the
+       standbys in chain order, every probe bounded to one second AND to this
+       attempt's non-resettable budget, and either clears on recovery or
+       fails over exactly once to the first healthy standby (generation +
+       1), after which this attempt re-enters admission against the new
+       generation. Exhausting the budget with no healthy standby answers the
+       fixed 503 and keeps the old generation.
 
     Calls admitted before intent existed are not kept out: they hold their
     shared lease, run on the instance they captured and are simply drained by
@@ -2406,6 +2475,12 @@ def _install_provider(candidate) -> None:
 def _failover(budget: "_Budget") -> None:
     """Switch the active provider to the first healthy standby chain entry.
 
+    Runs on the ordinary call's SAME non-resettable five-second budget (the
+    one started at that attempt's first wait/probe): the committed active is
+    re-verified with the leftover time and, if still unhealthy, the standbys
+    are probed strictly in chain order -- each probe bounded to one second AND
+    to the budget still remaining, never a fresh five seconds.
+
     Uses the same cross-process intent/drain gate as :func:`reconnect`:
     calls admitted earlier finish on the instance they captured, every later
     call waits from the moment intent is established, and the switch commits
@@ -2468,8 +2543,8 @@ def _failover(budget: "_Budget") -> None:
                 _install_provider(chosen)
                 _active_state = (chosen.provider_id, 1)
                 return
-            if _current_consistent(state) and _healthy_within(
-                _provider, budget.deadline
+            if _current_consistent(state) and _healthy_probe(
+                _provider, budget
             ):
                 # A concurrent reconnect/failover already restored a healthy
                 # active instance while this one waited: nothing to commit.
@@ -2485,15 +2560,15 @@ def _failover(budget: "_Budget") -> None:
                     "configured provider does not match the committed "
                     "provider state"
                 )
-            if _healthy_within(committed, budget.deadline):
+            if _healthy_probe(committed, budget):
                 # The committed active is healthy (a foreign reconnect or
                 # failover committed while this one waited): adopt it
                 # instead of committing a second generation.
                 _install_provider(committed)
                 _active_state = (committed.provider_id, state.generation)
                 return
-            target = _first_healthy(
-                candidates, budget.deadline, exclude_id=state.provider_id
+            target = _first_healthy_probe(
+                candidates, budget, exclude_id=state.provider_id
             )
             if target is None:
                 raise ProviderUnavailable(
@@ -2835,10 +2910,15 @@ def switchover(
 
 
 def _health_with_deadline(provider, deadline: float) -> bool:
-    """Run health() bounded by the reconnect deadline.
+    """Run health() bounded by an absolute monotonic deadline.
 
-    health() implementations are normally immediate; a probe that blocks past
-    the shared budget is treated as unavailable without waiting longer.
+    health() implementations are normally immediate; a probe that has not
+    returned by ``deadline`` is treated as unavailable without waiting
+    longer, and its eventual result is never read (it lands in a thread this
+    call has discarded). The ordinary provider-call path hands in a deadline
+    one second out (or sooner, when the shared five-second budget has less
+    left) via :func:`_healthy_probe`; reconnect/switchover/first-load probes
+    hand in their own gate deadline. Never raises.
     """
     result: dict = {}
 

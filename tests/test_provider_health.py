@@ -28,6 +28,7 @@ never replayed on the standby after an automatic failover.
 import json
 import os
 import threading
+import time
 
 import pytest
 
@@ -211,6 +212,124 @@ def test_third_strike_reverify_recovery_clears_without_switch(
     assert result == "ok" and provider_id == "fakekms"
     # Recovery on re-verification: no generation move, count reset.
     assert _read_state(env)["generation"] == 1
+    assert json.loads(_read_health_raw(env))["consecutive_failures"] == 0
+
+
+# -- per-probe 1 s cap sharing the non-resettable 5 s attempt budget ----------
+def test_slow_probe_counts_once_and_waits_about_one_second(bound, monkeypatch):
+    env = bound
+    # A hanging health() costs at most the 1 s per-probe cap (NOT the whole
+    # five-second budget) and counts exactly one failure per call.
+    def hanging():
+        time.sleep(60.0)
+        return True
+
+    monkeypatch.setattr(provider_mod.get_provider(), "health", hanging)
+    for n in (1, 2):
+        t0 = time.monotonic()
+        result, detail = _call()
+        elapsed = time.monotonic() - t0
+        assert result == "err" and detail == "ProviderReconnectPending"
+        assert 0.9 <= elapsed < 2.5, elapsed
+        assert json.loads(_read_health_raw(env))[
+            "consecutive_failures"
+        ] == n
+    assert _read_state(env)["generation"] == 1
+
+
+def test_late_probe_result_is_void(bound, monkeypatch):
+    env = bound
+    # A True landing AFTER the bounded 1 s probe wait is discarded: the call
+    # is one failure and nothing retroactively clears the persisted count.
+    def slow_true():
+        time.sleep(1.4)
+        return True
+
+    monkeypatch.setattr(provider_mod.get_provider(), "health", slow_true)
+    t0 = time.monotonic()
+    assert _call()[:1] == ("err",)
+    assert time.monotonic() - t0 < 2.0
+    assert json.loads(_read_health_raw(env))["consecutive_failures"] == 1
+    time.sleep(1.2)  # let the underlying health() return its late True
+    assert json.loads(_read_health_raw(env))["consecutive_failures"] == 1
+    assert _read_state(env)["generation"] == 1
+
+
+def test_slow_active_third_strike_reaches_healthy_standby_in_budget(
+    bound, monkeypatch
+):
+    env = bound
+    # Calls one and two fail instantly (count 2). On the third call the
+    # active health() HANGS on its first probe only; every later active
+    # re-verification returns False at once. The failover must still reach
+    # the healthy local standby with the LEFTOVER shared budget (the hanging
+    # probe capped at 1 s), rather than spending all five seconds on the
+    # active probe and never failing over -- the threshold-exhaustion bug.
+    invocations = {"n": 0}
+
+    def active_health():
+        invocations["n"] += 1
+        if invocations["n"] == 3:  # the initial probe on the third call
+            time.sleep(60.0)
+        return False
+
+    # The faults file keeps EVERY (rebuilt) fakekms instance unhealthy, while
+    # the patch makes only the cached active's third-call first probe hang.
+    env.set_faults({"health": False})
+    monkeypatch.setattr(provider_mod.get_provider(), "health", active_health)
+    assert _call()[:1] == ("err",)
+    assert _call()[:1] == ("err",)
+    t0 = time.monotonic()
+    result, provider_id = _call()
+    elapsed = time.monotonic() - t0
+    assert result == "ok" and provider_id == "local"
+    # The single hanging probe was capped to ~1 s; the standby was probed in
+    # the remaining ~4 s of the same non-resettable five-second budget.
+    assert 0.9 <= elapsed < 2.5, elapsed
+    assert _read_state(env)["generation"] == 2
+    assert json.loads(_read_health_raw(env)) == {
+        "schema_version": 1,
+        "provider_id": "local",
+        "generation": 2,
+        "status": "ready",
+        "consecutive_failures": 0,
+    }
+
+
+def test_third_strike_with_no_room_for_standby_keeps_old_generation(
+    bound, monkeypatch
+):
+    env = bound
+    # A small shared budget: after the active's capped probes only a sliver
+    # remains, and the standby's 1 s probe cannot fit that leftover. The
+    # standby is therefore not reached: fixed 503, old generation retained,
+    # count capped at three (no reset and no fresh budget).
+    monkeypatch.setattr(provider_mod, "CALL_GATE_SECONDS", 2.2)
+    env.set_faults({"health_sleep": 60.0})
+
+    def hang():
+        time.sleep(60.0)
+
+    monkeypatch.setattr(provider_mod.get_local_provider(), "health", hang)
+    results = [_call() for _ in range(3)]
+    assert all(
+        result == ("err", "ProviderReconnectPending") for result in results
+    )
+    assert _read_state(env)["generation"] == 1
+    health = json.loads(_read_health_raw(env))
+    assert health["consecutive_failures"] == 3
+    assert health["status"] == "unavailable"
+
+
+def test_status_probe_does_not_touch_failure_count(bound):
+    env = bound
+    env.set_faults({"health": False})
+    for _ in range(3):
+        assert provider_mod.provider_status() == {
+            "provider_id": "fakekms",
+            "status": "unavailable",
+        }
+    # status is observability only: it never increments the threshold.
     assert json.loads(_read_health_raw(env))["consecutive_failures"] == 0
 
 
