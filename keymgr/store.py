@@ -2,6 +2,7 @@
 
 import base64
 import functools
+import hashlib
 import json
 import os
 import re
@@ -13,13 +14,13 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Iterator, List, Optional, Tuple
+from typing import Iterator, List, NamedTuple, Optional, Tuple
 
 from . import audit as audit_mod
 from . import keybundle
 from . import provider as provider_mod
 from .artifacts import PHASE_COMMITTED, PHASE_ROLLED_BACK, PHASE_STAGED
-from .audit import AuditEvent, AuditLog, LedgerError
+from .audit import AuditEvent, AuditLog, InvalidCursor, LedgerError
 from .provider import (
     LOCAL_PROVIDER_ID,
     ProviderIdentityMismatch,
@@ -110,6 +111,13 @@ _TENANT_MISMATCH = object()
 # snapshot whose pre-image cannot be proven, so the record must be hidden
 # entirely rather than projected from disk.
 _HIDE_UNCOMMITTED = object()
+
+
+class KeyListPage(NamedTuple):
+    """Result of one key-list query: a page of records and the next cursor."""
+
+    records: List["KeyRecord"]
+    next_cursor: Optional[str]
 
 
 class LockTimeout(Exception):
@@ -305,6 +313,22 @@ class KeyRecord:
         return {
             "algorithm": self.current.algorithm,
             "label": self.label,
+            "created_at": self.created_at,
+            "public_key": self.current.public_key,
+        }
+
+    def to_list_response(self) -> dict:
+        """One item of GET /v1/keys (200). Never contains private material.
+
+        ``created_at`` is the first version's timestamp; every other field
+        projects the committed current snapshot.
+        """
+        return {
+            "key_id": self.key_id,
+            "label": self.label,
+            "current_version": self.current_version,
+            "algorithm": self.current.algorithm,
+            "status": self.status,
             "created_at": self.created_at,
             "public_key": self.current.public_key,
         }
@@ -987,6 +1011,7 @@ class KeyStore:
                 audit_mod.ACTION_ENCRYPT,
                 audit_mod.ACTION_DECRYPT,
                 audit_mod.ACTION_AUDIT,
+                audit_mod.ACTION_LIST,
             )
         ):
             event = self.audit.new_event(
@@ -3450,6 +3475,138 @@ class KeyStore:
                 records.append(record)
         records.sort(key=lambda r: r.key_id)
         return records
+
+    # -- tenant key listing ------------------------------------------------
+    def _list_committed(self, tenant_id: str) -> List["KeyRecord"]:
+        """Read every tenant key and project its committed state.
+
+        Unsettled records (an in-flight or crashed rotate/revoke/batch/
+        restore) are projected by the same ``_committed_record`` rules the
+        single-key reads use: an uncommitted trailing version or revocation
+        is trimmed, and an unprovable record is hidden. A directory that
+        cannot be read is a storage failure (LedgerError -> 500), never an
+        silently empty page.
+        """
+        try:
+            names = os.listdir(self.data_dir)
+        except OSError as exc:
+            raise LedgerError("cannot read key directory: %s" % exc) from exc
+        records = []
+        for name in names:
+            if not (name.endswith(".json") and is_valid_key_id(name[:-5])):
+                continue
+            record = self._read_record(os.path.join(self.data_dir, name))
+            if record is None or record.tenant_id != tenant_id:
+                continue
+            committed = self._committed_record(record)
+            if committed is not None:
+                records.append(committed)
+        return records
+
+    @staticmethod
+    def _list_fingerprint(records: List["KeyRecord"]) -> str:
+        """Stable digest identifying one visible key-list snapshot.
+
+        Every projected field the response or the filters expose is folded
+        in, so any committed change to the visible set invalidates cursors
+        issued against the previous snapshot -- exactly the audit ledger's
+        cursor rule.
+        """
+        digest = hashlib.sha256()
+        for record in records:
+            digest.update(record.key_id.encode("utf-8"))
+            digest.update(b":")
+            digest.update(record.created_at.encode("utf-8"))
+            digest.update(b":")
+            digest.update(str(record.current_version).encode("ascii"))
+            digest.update(b":")
+            digest.update(record.current.algorithm.encode("utf-8"))
+            digest.update(b":")
+            digest.update(record.status.encode("utf-8"))
+            digest.update(b":")
+            digest.update(record.label.encode("utf-8"))
+            digest.update(b":")
+            digest.update(
+                (record.current.public_key or "").encode("utf-8")
+            )
+            digest.update(b"\n")
+        digest.update(b"count=%d" % len(records))
+        return digest.hexdigest()
+
+    def list_page(
+        self,
+        tenant_id: str,
+        status: Optional[str] = None,
+        algorithm: Optional[str] = None,
+        limit: int = 100,
+        cursor: Optional[str] = None,
+    ) -> KeyListPage:
+        """Return one tenant-isolated, filter-bound, snapshot-bound page.
+
+        Items are the committed projection of the tenant's keys, ordered by
+        (created_at, key_id) ascending; ``created_at`` is the first
+        version's timestamp while every other projected field (and the
+        status/algorithm filters) reads the committed current snapshot.
+        Cursors follow the audit ledger's rules: HMAC-signed and bound to
+        the tenant, the filters, the limit and the visible snapshot, so a
+        tampered, cross-tenant, filter-mismatched or stale cursor raises
+        InvalidCursor and a concurrent change can never cause a duplicate
+        or a gap within an already-issued page chain.
+        """
+        anchor = None
+        fingerprint = None
+        if cursor is not None:
+            payload = self.audit._decode_cursor(cursor)
+            try:
+                if payload.get("t") != tenant_id:
+                    raise InvalidCursor("cursor does not match tenant_id")
+                if payload.get("s") != status or payload.get("a") != algorithm:
+                    raise InvalidCursor("cursor does not match filters")
+                if int(payload.get("l", -1)) != limit:
+                    raise InvalidCursor("cursor does not match limit")
+                anchor = (payload["ts"], payload["kid"])
+                fingerprint = payload["f"]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise InvalidCursor("malformed cursor") from exc
+
+        visible = [
+            record
+            for record in self._list_committed(tenant_id)
+            if (status is None or record.status == status)
+            and (algorithm is None or record.current.algorithm == algorithm)
+        ]
+        visible.sort(key=lambda r: (r.created_at, r.key_id))
+        # The snapshot is scoped to exactly the records this tenant and
+        # these filters can see: another tenant's activity must not
+        # invalidate the cursor, while any change to the visible set does.
+        current_fingerprint = self._list_fingerprint(visible)
+        if fingerprint is not None and fingerprint != current_fingerprint:
+            raise InvalidCursor("cursor snapshot is no longer valid")
+
+        selected = visible
+        if anchor is not None:
+            selected = [
+                r for r in selected if (r.created_at, r.key_id) > anchor
+            ]
+
+        page = selected[:limit]
+        if len(selected) > limit and page:
+            last = page[-1]
+            next_cursor = self.audit._encode_cursor(
+                {
+                    "v": 1,
+                    "t": tenant_id,
+                    "s": status,
+                    "a": algorithm,
+                    "l": limit,
+                    "ts": last.created_at,
+                    "kid": last.key_id,
+                    "f": current_fingerprint,
+                }
+            )
+        else:
+            next_cursor = None
+        return KeyListPage(records=page, next_cursor=next_cursor)
 
     def backup_entry(self, record: KeyRecord) -> dict:
         """Project a record for a tenant backup payload.

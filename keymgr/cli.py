@@ -177,6 +177,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_audit.add_argument("--cursor", default=None,
                          help="pagination cursor from a previous response")
 
+    p_list = tenant_parser(
+        "list", help="list a tenant's keys (one paginated snapshot)"
+    )
+    p_list.add_argument("--status", default=None,
+                        help="one of: active, revoked")
+    p_list.add_argument("--algorithm", default=None,
+                        help="one of: %s" % ", ".join(SUPPORTED_ALGORITHMS))
+    p_list.add_argument("--limit", type=int, default=100,
+                        help="page size, 1-1000 (default: %(default)s)")
+    p_list.add_argument("--cursor", default=None,
+                        help="pagination cursor from a previous response")
+
     p_policy = sub.add_parser("policy", help="manage a tenant's action policy")
     p_policy.add_argument(
         "--operator", required=True,
@@ -1538,6 +1550,55 @@ def _run(argv: Optional[List[str]] = None) -> int:
             # operation all look identical: never leak existence.
             return _fail("operation not found", 4)
         _print(record.to_status_response())
+        return 0
+
+    if args.command == "list":
+        # Parameter validation (exit 2) precedes authorization (exit 3),
+        # exactly like the HTTP endpoint.
+        if not args.tenant_id:
+            return _fail("field tenant_id must be a non-empty string", 2)
+        if args.status is not None and args.status not in ("active", "revoked"):
+            return _fail("field status must be one of: active, revoked", 2)
+        if args.algorithm is not None and args.algorithm not in SUPPORTED_ALGORITHMS:
+            return _fail(
+                "unsupported value for field algorithm: %r (supported: %s)"
+                % (args.algorithm, ", ".join(SUPPORTED_ALGORITHMS)),
+                2,
+            )
+        if not 1 <= args.limit <= 1000:
+            return _fail(
+                "field limit must be an integer between 1 and 1000", 2
+            )
+        if not allowed(audit_mod.ACTION_LIST):
+            if not _attempt(
+                store, args.tenant_id, None,
+                audit_mod.ACTION_LIST, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            return _fail("action not permitted by policy", 3)
+        try:
+            page = store.list_page(
+                args.tenant_id,
+                status=args.status,
+                algorithm=args.algorithm,
+                limit=args.limit,
+                cursor=args.cursor,
+            )
+        except InvalidCursor:
+            return _fail("invalid or expired cursor", 2)
+        except LedgerError as exc:
+            return _ledger_fail(exc)
+        if not _attempt(
+            store, args.tenant_id, None,
+            audit_mod.ACTION_LIST, audit_mod.OUTCOME_SUCCESS,
+        ):
+            return 1
+        _print(
+            {
+                "items": [r.to_list_response() for r in page.records],
+                "next_cursor": page.next_cursor,
+            }
+        )
         return 0
 
     if args.command == "audit":

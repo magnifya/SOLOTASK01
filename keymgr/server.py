@@ -31,6 +31,7 @@ from .provider import (
 from .store import IMPORT_CONFLICT, KeyStore, LockTimeout, is_valid_key_id, validate_batch_items
 
 _AUDIT_PATH = "/v1/audit"
+_KEYS_PATH = "/v1/keys"
 _POLICY_PATH = "/v1/policy"
 _PROVIDER_STATUS_PATH = "/v1/provider/status"
 _PROVIDER_RECONNECT_PATH = "/v1/provider/reconnect"
@@ -1987,6 +1988,13 @@ def make_handler(
                     self._server_error(exc)
                 return
 
+            if path == _KEYS_PATH:
+                try:
+                    self._list_keys(parts, operator)
+                except LedgerError as exc:
+                    self._server_error(exc)
+                return
+
             if path == _POLICY_PATH:
                 try:
                     self._get_policy(parts)
@@ -2157,6 +2165,102 @@ def make_handler(
                 self._send_json(404, {"error": "operation not found"})
                 return
             self._send_json(200, record.to_status_response())
+
+        # -- key listing ---------------------------------------------------
+        def _list_keys(self, parts, operator: str) -> None:
+            """GET /v1/keys: one paginated snapshot of the tenant's keys.
+
+            The tenant comes from exactly one non-empty source (single
+            X-Tenant-Id header or single ?tenant_id= parameter), like the
+            audit endpoint. Every query parameter is single-valued:
+            ``status`` (active|revoked), ``algorithm`` (AES256|RSA2048),
+            ``limit`` (1-1000, default 100) and ``cursor``; a duplicate,
+            empty, illegal or out-of-range value is a 400 naming the field,
+            and all parameter validation precedes authorization. A policy
+            denial is a 403 with one rejected ``list`` event (key_id null);
+            a success appends one ``list`` success event (key_id null) and
+            answers 200 with keys in the order ``items,next_cursor``.
+            """
+            tenant_id = self._audit_tenant(parts)
+            if tenant_id is None:
+                return
+            qs = parse_qs(parts.query, keep_blank_values=True)
+
+            values, errored = self._single_param(qs, "status")
+            if errored:
+                return
+            status = values[0] if values else None
+            if status is not None and status not in ("active", "revoked"):
+                self._bad_request(
+                    "field status must be one of: active, revoked"
+                )
+                return
+
+            values, errored = self._single_param(qs, "algorithm")
+            if errored:
+                return
+            algorithm = values[0] if values else None
+            if algorithm is not None and algorithm not in SUPPORTED_ALGORITHMS:
+                self._bad_request(
+                    "unsupported value for field algorithm: %r (supported: %s)"
+                    % (algorithm, ", ".join(SUPPORTED_ALGORITHMS))
+                )
+                return
+
+            limit = 100
+            values, errored = self._single_param(qs, "limit")
+            if errored:
+                return
+            if values:
+                raw_limit = values[0]
+                if not _POSITIVE_INT_RE.fullmatch(raw_limit):
+                    self._bad_request(
+                        "field limit must be an integer between 1 and 1000"
+                    )
+                    return
+                limit = int(raw_limit)
+                if not 1 <= limit <= 1000:
+                    self._bad_request(
+                        "field limit must be an integer between 1 and 1000"
+                    )
+                    return
+
+            values, errored = self._single_param(qs, "cursor")
+            if errored:
+                return
+            cursor = values[0] if values else None
+
+            # Parameter validation (400) precedes authorization; a policy
+            # rejection of a key list is recorded with the original action
+            # ("list") and outcome rejected, key_id null.
+            if not self._enforce(
+                tenant_id, None, audit_mod.ACTION_LIST, operator
+            ):
+                return
+
+            try:
+                page = store.list_page(
+                    tenant_id,
+                    status=status,
+                    algorithm=algorithm,
+                    limit=limit,
+                    cursor=cursor,
+                )
+            except InvalidCursor:
+                self._bad_request("invalid or expired cursor")
+                return
+            if not self._record_attempt(
+                tenant_id, None, audit_mod.ACTION_LIST,
+                audit_mod.OUTCOME_SUCCESS,
+            ):
+                return
+            self._send_json(
+                200,
+                {
+                    "items": [r.to_list_response() for r in page.records],
+                    "next_cursor": page.next_cursor,
+                },
+            )
 
         # -- audit ---------------------------------------------------------
         def _single_param(self, qs, name):

@@ -61,6 +61,17 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `AES256`/`RSA2048`。`201` → `{key_id, algorithm, public_key}`（AES 的
   `public_key` 为 null，RSA 为 PEM）。
 - `GET /v1/keys/{key_id}` → `{algorithm, label, created_at, public_key}`。
+- `GET /v1/keys`：本租户密钥快照分页清单。单一租户来源（单一头或单一
+  `?tenant_id=`）；可选单值参数 `status`(active|revoked)、
+  `algorithm`(AES256|RSA2048)、`limit`(1–1000，默认 100)、`cursor`，重复/
+  空/非法/越界均 `400` 并指出字段，校验先于授权。`200` →
+  `{items, next_cursor}`，项键序 `key_id,label,current_version,algorithm,
+  status,created_at,public_key`（`created_at` 取首版时间，其余字段与筛选取
+  已提交当前快照，未结算记录沿用既有投影），按 `(created_at, key_id)` 升序，
+  空页 `items:[]`，末页 `next_cursor:null`。游标沿用审计游标规则（HMAC 签名，
+  绑定租户/筛选/limit/可见快照），篡改、过期、跨租户或筛选不符均 `400`；并发
+  变更使旧游标失效而非重漏。策略拒绝 `403` 记一条 `list/rejected`，成功记一条
+  `list/success`，`key_id` 均为 null；存储/账本失败 `500`。
 - `POST /v1/keys/{key_id}/rotate`，body `{tenant_id, algorithm}`，需
   `Idempotency-Key`。`201` → `{key_id, version, algorithm, public_key,
   operation_id}`，版本严格递增、只追加。
@@ -315,7 +326,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `{tenant_id, deleted:true}`。
 - 规则元素 `{subject, actions, effect}`：`subject` 为区分大小写的非空字符串；
   `actions` 为非空数组，取值
-  `create/read/rotate/revoke/import/export/encrypt/decrypt/audit`，单条内
+  `create/read/rotate/revoke/import/export/encrypt/decrypt/audit/list`，单条内
   重复去重；`effect` 为 `allow`/`deny`；未知字段、类型错误、同
   subject+effect+无序动作集的重复规则均 `400`；`rules:[]` 合法（全拒绝）。
 - 执行：管理动作 policy_* 免检；租户无策略时全部允许；有策略时匹配规则中
@@ -327,7 +338,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 
 - 事件字段 `{event_id, tenant_id, action, key_id, outcome, timestamp}`；
   `action` 为 `create/read/rotate/batch_rotate/revoke/import/export/
-  encrypt/decrypt/audit/tenant_conflict/policy_read/policy_update/
+  encrypt/decrypt/audit/list/tenant_conflict/policy_read/policy_update/
   policy_delete`，`outcome` 为 `success/rejected`。信封加密/解密事件只含
   元数据（无 plaintext、aad、envelope、数据密钥或私钥）；幂等 HTTP encrypt
   每个终态至多一条 `event_id=operation_id,action=encrypt` 事件（成功 200 与
@@ -360,6 +371,9 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 # 密钥
 python -m keymgr gen      --tenant-id t --algorithm RSA2048 --label k --operator alice
 python -m keymgr show     --tenant-id t --key-id <id> --operator alice
+python -m keymgr list     --tenant-id t --operator alice \
+                          [--status active|revoked] [--algorithm AES256|RSA2048] \
+                          [--limit 100] [--cursor <cursor>]
 python -m keymgr current  --tenant-id t --key-id <id> --operator alice
 python -m keymgr version  --tenant-id t --key-id <id> --version 1 --operator alice
 python -m keymgr rotate   --tenant-id t --key-id <id> --algorithm AES256 \
