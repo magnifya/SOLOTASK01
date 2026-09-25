@@ -130,6 +130,8 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 - `GET /v1/provider/status` 与 `POST /v1/provider/reconnect`：KMS/HSM
   健康检查与无中断重连，见下（全局、非租户作用域，不带也不接受
   `tenant_id`，不记审计）。
+- `POST /v1/provider/switchover`：主备链定向切换，见下（同样全局、非
+  租户作用域，不记审计）。
 
 ## KMS/HSM 健康检查与无中断重连
 
@@ -171,6 +173,20 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `provider_id`，绝不在备端重放；重连回同 id 提供者后，同
   `Idempotency-Key` 的请求在同一 `operation_id`/`event_id` 下继续恰好
   一次。
+- **定向切换（`POST /v1/provider/switchover`）**：只需单一非空
+  `X-Operator-Id`，不收 `tenant_id`（头/查询/体均 `400`），不记审计。
+  请求体严格为 `{"provider_id": P}`（P 非空）：坏 JSON、非对象、缺
+  字段、空值或任何多余字段均无副作用 `400` 并指出字段；未配置
+  `KEYMGR_PROVIDER_CHAIN` 或 P 不在链中同样 `400` 指出 `provider_id`
+  且零副作用。P 即当前活动项时：健康则 `200` 且代不变，否则固定
+  `503`。目标建厂/契约/健康检查失败或共用 5 秒门限耗尽均固定 `503`
+  （体 `{"error":"key management provider is unavailable"}`）且零副作
+  用。成功复用同一跨进程意图/排水门：在途旧调用由其捕获的实例完成，
+  后到调用等待；先原子写 `switching`（旧 ID、P、原代、reason
+  `reconnect`），再写 `ready`（P、null、代+1）；同目标并发切换只提交
+  一次；写间崩溃仅在 P 健康时完成该切换，否则保留 `switching` 并
+  `503`。`200` 键序固定 `provider_id,status`，值为 P、`ready`。
+  pending 幂等操作仍绑定原 `provider_id`。
 - **跨进程激活状态 `provider-state.json`(0600)**：首次健康激活、每次成功
   重连与每次主备切换都原子提交（temp 文件 fsync 后 rename）该文件：紧凑
   UTF-8 JSON、非 ASCII 原样、无末尾换行，键序固定
@@ -188,10 +204,11 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   共用 5 秒门限）下互斥递增 generation；失败或提交前崩溃保留旧代。提交
   后各进程下次调用重建当前配置，所得 `provider_id` 不符或不健康则
   `503`（链配置时改为触发故障转移）且零副作用。
-- CLI：`provider status --operator O` 与
-  `provider reconnect --operator O`，成功输出同序单行 JSON；`400→2`、
-  `503→1`，成功 `0`。status 在提供者不可用时仍以退出 `0` 返回
-  `{"provider_id":null,"status":"unavailable"}`。
+- CLI：`provider status --operator O`、
+  `provider reconnect --operator O` 与
+  `provider switchover --operator O --provider-id P`，成功输出同序单行
+  JSON；`400→2`、`503→1`，成功 `0`。status 在提供者不可用时仍以退出
+  `0` 返回 `{"provider_id":null,"status":"unavailable"}`。
 
 ## 幂等操作
 

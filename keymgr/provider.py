@@ -19,7 +19,9 @@ cross-process intent/drain gate a reconnect uses -- old calls finish on the
 instance they captured, later calls land on the new generation, and
 concurrent triggers build/commit exactly once. A recovered primary is never
 re-selected automatically; only ``reconnect`` re-selects the first healthy
-entry. Pending idempotent operations stay bound to their original
+entry, while ``switchover`` moves the active provider to one NAMED chain
+entry under the same gate (``switching`` then ``ready`` commits, reason
+``reconnect``). Pending idempotent operations stay bound to their original
 ``provider_id`` and are never replayed on a standby.
 
 Provider contract
@@ -112,6 +114,16 @@ class ProviderInvalidMaterial(ProviderError):
 
     Surfaced as HTTP ``400`` / CLI exit code ``2``; the message names the
     offending field but never embeds the material itself.
+    """
+
+
+class ProviderSwitchoverInvalid(ProviderError):
+    """A switchover request names no usable chain target.
+
+    Raised when no provider chain is configured or the requested
+    ``provider_id`` is not one of the chain entries. Surfaced as HTTP
+    ``400`` / CLI exit code ``2`` with the field named, and raised before
+    any state write, provider swap or audit event (zero side effects).
     """
 
 
@@ -2181,6 +2193,180 @@ def reconnect(timeout: float = CALL_GATE_SECONDS) -> dict:
 
     current = get_provider()
     return _status_for(current)
+
+
+def _build_unconfigured(spec: str):
+    """Build one chain entry for a membership check WITHOUT configuring it.
+
+    A factory/contract failure still raises :class:`ProviderUnavailable`,
+    but no data-directory state (e.g. ``local.dek``) is created: the local
+    entry is a fresh, unconfigured instance whose ``provider_id`` is
+    ``local`` without touching the data directory.
+    """
+    if spec == LOCAL_PROVIDER_ID:
+        return LocalProvider()
+    return _load_external(spec)
+
+
+def _chain_member(target_provider_id: str, specs: List[str]):
+    """Return the spec building ``target_provider_id`` without configuring.
+
+    Raises :class:`ProviderSwitchoverInvalid` when no entry builds that id
+    (the HTTP layer turns this into a 400 naming provider_id). Built ids
+    must be unique, like :func:`_build_candidates`; a duplicate is a
+    malformed chain and raises :class:`ProviderUnavailable` (503). No entry
+    is configured, so the check has zero data-directory side effects.
+    """
+    target_spec = None
+    seen = set()
+    for spec in specs:
+        candidate = _build_unconfigured(spec)
+        if candidate.provider_id in seen:
+            raise ProviderUnavailable(
+                "provider chain entries must build unique provider_id values"
+            )
+        seen.add(candidate.provider_id)
+        if candidate.provider_id == target_provider_id:
+            target_spec = spec
+    if target_spec is None:
+        raise ProviderSwitchoverInvalid(
+            "field provider_id is not in the configured provider chain"
+        )
+    return target_spec
+
+
+def switchover(
+    target_provider_id: str, timeout: float = CALL_GATE_SECONDS
+) -> dict:
+    """Switch the active provider to the named chain entry, directed.
+
+    Unlike :func:`reconnect` (which re-selects the FIRST healthy chain
+    entry) this moves the active provider to exactly
+    ``target_provider_id``. Requires ``KEYMGR_PROVIDER_CHAIN``: an unset
+    chain, or a target no chain entry builds, is
+    :class:`ProviderSwitchoverInvalid` (HTTP 400 / CLI exit 2). The
+    membership check runs BEFORE the drain gate and configures nothing, so
+    a 400 is strictly side-effect-free and never waits behind another
+    switch: only the single target is ever configured.
+
+    Ordering and failure semantics are the reconnect ones: serialize
+    in-process, establish the cross-process intent, drain calls admitted
+    earlier (they finish on the instance they captured; every later call
+    waits on one shared five-second budget), then under the exclusive
+    state lease:
+
+    * an interrupted ``switching`` record is completed only for a healthy
+      target, else kept byte-for-byte with the fixed 503;
+    * a target that already IS the committed active entry answers 200
+      with the generation unchanged when it probes healthy, else 503 with
+      zero side effects;
+    * otherwise the target is configured and health-probed (any failure or
+      an exhausted budget: the fixed 503, old generation retained
+      byte-for-byte), then committed as ``switching`` (old id, target id,
+      the ORIGINAL generation, reason ``reconnect``) followed by ``ready``
+      (target id, null, generation+1), and only then installed. Concurrent
+      switchovers to the same target serialize on the gate: only the first
+      commits, later ones adopt the committed generation.
+
+    A missing state file (never activated) is created by this first
+    healthy activation of the target at generation 1. Returns the
+    ``provider_id,status`` body of the newly active target.
+    """
+    global _active_state
+    if not isinstance(target_provider_id, str) or not target_provider_id:
+        raise ProviderSwitchoverInvalid(
+            "field provider_id must be a non-empty string"
+        )
+    if not _chain_configured():
+        raise ProviderSwitchoverInvalid(
+            "field provider_id cannot be switched over: no provider chain "
+            "is configured"
+        )
+    # A set-but-malformed chain is unusable (fixed 503), as at every other
+    # provider operation. Locate the target BEFORE touching the gate: this
+    # neither waits nor configures any entry, so a "not in chain" 400 has
+    # strictly zero side effects even while another switch is draining.
+    specs = _chain_specs()
+    target_spec = _chain_member(target_provider_id, specs)
+    budget = _Budget(timeout)
+    _gate.acquire_serialized(budget)
+    intent = _intent_lease()
+    state_lease = _FileLease()
+    draining = False
+    try:
+        intent.acquire(True, budget.deadline)
+        _gate.begin_draining()
+        draining = True
+        _gate.wait_drained(budget)
+        if budget.expired():
+            raise ProviderReconnectPending(
+                "switchover exceeded the shared five-second budget"
+            )
+        # Lock order: _state_sync_lock -> state lock file.
+        with _state_sync_lock:
+            state_lease.acquire(True, budget.deadline)
+            if budget.expired():
+                raise ProviderReconnectPending(
+                    "switchover exceeded the shared five-second budget"
+                )
+            # A corrupt state file fails the switchover and is never
+            # rewritten; an interrupted switch is completed only for a
+            # healthy target, else kept byte-for-byte (fixed 503).
+            state = _read_committed_state()
+            if state is not None and state.phase == _PHASE_SWITCHING:
+                state = _complete_switch(state, budget.deadline)
+            # Build/configure only the single target (membership was proven
+            # pre-gate): a factory/contract/configure failure here is the
+            # fixed 503 with the old generation retained byte-for-byte.
+            target = _build_spec(target_spec)
+            if state is not None and state.provider_id == target.provider_id:
+                # Already the active entry (possibly committed by a
+                # concurrent switchover to the same target while this one
+                # waited): healthy -> 200 with the generation unchanged,
+                # unhealthy -> the fixed 503. Nothing is committed.
+                if not _healthy_within(target, budget.deadline):
+                    raise ProviderUnavailable("provider reported unhealthy")
+                _install_provider(target)
+                _active_state = (target.provider_id, state.generation)
+                return _status_for(target)
+            if not _healthy_within(target, budget.deadline):
+                raise ProviderUnavailable("provider reported unhealthy")
+            if state is None:
+                # First activation: the switchover target becomes the
+                # committed active entry at generation 1.
+                generation = 1
+                _write_committed_state(
+                    target.provider_id, generation, _REASON_INITIAL
+                )
+            else:
+                generation = state.generation + 1
+                # Two atomic commits: switching(old id, target id, the
+                # original generation, reason reconnect), then
+                # ready(target id, null, generation+1). A crash between
+                # them keeps the old generation and is completed (healthy
+                # target) or kept (fixed 503) at the next read.
+                _write_committed_state(
+                    state.provider_id,
+                    state.generation,
+                    _REASON_RECONNECT,
+                    target_provider_id=target.provider_id,
+                    phase=_PHASE_SWITCHING,
+                )
+                _write_committed_state(
+                    target.provider_id, generation, _REASON_RECONNECT
+                )
+            _install_provider(target)
+            _active_state = (target.provider_id, generation)
+    finally:
+        # Always release in reverse order; failure or timeout leaves the
+        # previously active instance and committed state untouched.
+        state_lease.release()
+        if draining:
+            _gate.end_draining()
+        intent.release()
+        _gate.release_serialized()
+
+    return _status_for(get_provider())
 
 
 def _health_with_deadline(provider, deadline: float) -> bool:

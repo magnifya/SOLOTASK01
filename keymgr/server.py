@@ -25,6 +25,7 @@ from .policy import PolicyError, PolicyStore, validate_rules
 from .provider import (
     ProviderInvalidMaterial,
     ProviderReconnectPending,
+    ProviderSwitchoverInvalid,
     ProviderUnavailable,
 )
 from .store import IMPORT_CONFLICT, KeyStore, LockTimeout, is_valid_key_id, validate_batch_items
@@ -33,6 +34,7 @@ _AUDIT_PATH = "/v1/audit"
 _POLICY_PATH = "/v1/policy"
 _PROVIDER_STATUS_PATH = "/v1/provider/status"
 _PROVIDER_RECONNECT_PATH = "/v1/provider/reconnect"
+_PROVIDER_SWITCHOVER_PATH = "/v1/provider/switchover"
 _OPERATIONS_PATH_RE = re.compile(r"^/v1/operations/([^/]+)$")
 _IMPORT_PATH = "/v1/keys/import"
 _BATCH_ROTATE_PATH = "/v1/keys/batch-rotate"
@@ -785,6 +787,10 @@ def make_handler(
 
                 if path == _PROVIDER_RECONNECT_PATH:
                     self._provider_reconnect()
+                    return
+
+                if path == _PROVIDER_SWITCHOVER_PATH:
+                    self._provider_switchover()
                     return
             except ProviderInvalidMaterial as exc:
                 self._provider_invalid_material(exc)
@@ -1861,6 +1867,88 @@ def make_handler(
                 return
             try:
                 body = provider_mod.reconnect()
+            except ProviderUnavailable:
+                self._send_json(
+                    503,
+                    {"error": "key management provider is unavailable"},
+                )
+                return
+            self._send_json(
+                200,
+                {
+                    "provider_id": body["provider_id"],
+                    "status": body["status"],
+                },
+            )
+
+        def _provider_switchover(self) -> None:
+            """POST /v1/provider/switchover.
+
+            Directed switch of the active KMS/HSM provider to one NAMED
+            chain entry. Like reconnect it needs only the single non-empty
+            X-Operator-Id and rejects any tenant_id (header, query or body)
+            with a side-effect-free 400. The body must be strictly
+            ``{"provider_id": P}`` with P a non-empty string: bad JSON, a
+            non-object, a missing/empty/non-string provider_id or any extra
+            field is a 400 naming the field before the gate or factory is
+            touched. A provider switchover only works with
+            ``KEYMGR_PROVIDER_CHAIN`` configured: no chain, or a P that is
+            not a chain entry, is likewise a 400. Success drains in-flight
+            calls behind the shared five-second gate, commits
+            ``switching`` (old id, P, the original generation, reason
+            reconnect) then ``ready`` (P, null, generation+1) and answers
+            200 ``provider_id,status`` (P, ``ready``); P already active is
+            a healthy 200 with the generation unchanged. A target that
+            fails to build/contract-validate/configure/probe healthy, or a
+            budget exhausted while waiting, answers the fixed 503 with zero
+            side effects.
+            """
+            parts = urlsplit(self.path)
+            if not self._no_tenant(parts):
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                self._bad_request("invalid Content-Length")
+                return
+            raw = self.rfile.read(length) if length > 0 else b""
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                self._bad_request("request body must be valid JSON")
+                return
+            # A tenant_id field is named directly, like on reconnect.
+            if isinstance(payload, dict) and "tenant_id" in payload:
+                self._bad_request(
+                    "field tenant_id is not accepted by this endpoint"
+                )
+                return
+            if not isinstance(payload, dict):
+                self._bad_request("request body must be a JSON object")
+                return
+            # Strictly {"provider_id": P}: every other field is a 400 naming
+            # it, before the provider is touched (zero side effects).
+            extra = [key for key in payload if key != "provider_id"]
+            if extra:
+                self._bad_request(
+                    "field %s is not accepted by this endpoint" % extra[0]
+                )
+                return
+            target = payload.get("provider_id")
+            if not isinstance(target, str) or not target:
+                self._bad_request(
+                    "field provider_id must be a non-empty string"
+                    if "provider_id" in payload
+                    else "missing required field: provider_id"
+                )
+                return
+            try:
+                body = provider_mod.switchover(target)
+            except ProviderSwitchoverInvalid as exc:
+                # No chain configured, or P is not a chain entry: 400 naming
+                # provider_id, with no state write, swap or audit event.
+                self._bad_request(str(exc))
+                return
             except ProviderUnavailable:
                 self._send_json(
                     503,

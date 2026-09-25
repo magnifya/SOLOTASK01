@@ -622,7 +622,9 @@ def test_first_healthy_activation_writes_state_file(env):
     raw = _read_state_raw(env)
     # Compact UTF-8 JSON, fixed key order, no trailing newline, mode 0600.
     assert raw == (
-        b'{"schema_version":1,"provider_id":"fakekms","generation":1}'
+        b'{"schema_version":2,"provider_id":"fakekms",'
+        b'"target_provider_id":null,"generation":1,'
+        b'"reason":"initial","phase":"ready"}'
     )
     assert os.stat(_state_path(env)).st_mode & 0o777 == 0o600
 
@@ -632,9 +634,12 @@ def test_successful_reconnect_increments_generation(env):
     provider_mod.get_provider()
     provider_mod.reconnect()
     assert json.loads(_read_state_raw(env)) == {
-        "schema_version": 1,
+        "schema_version": 2,
         "provider_id": "fakekms",
+        "target_provider_id": None,
         "generation": 2,
+        "reason": "reconnect",
+        "phase": "ready",
     }
     provider_mod.reconnect()
     assert json.loads(_read_state_raw(env))["generation"] == 3
@@ -655,7 +660,9 @@ def test_non_ascii_provider_id_written_unescaped(env, monkeypatch):
     monkeypatch.setenv("FAKE_KMS_PROVIDER_ID", "fakekms-ü")
     provider_mod.reconnect()
     assert _read_state_raw(env) == (
-        '{"schema_version":1,"provider_id":"fakekms-ü","generation":1}'
+        '{"schema_version":2,"provider_id":"fakekms-ü",'
+        '"target_provider_id":null,"generation":1,'
+        '"reason":"initial","phase":"ready"}'
     ).encode("utf-8")
 
 
