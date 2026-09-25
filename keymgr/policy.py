@@ -44,6 +44,7 @@ POLICY_ACTIONS = (
     "encrypt",
     "decrypt",
     "audit",
+    "list",
 )
 EFFECTS = ("allow", "deny")
 _POLICY_DIR = "policies"

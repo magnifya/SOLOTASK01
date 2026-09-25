@@ -126,6 +126,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 - `GET /v1/policy` / `PUT /v1/policy` / `DELETE /v1/policy`：读/替换/删除
   租户策略，见下。
 - `GET /v1/audit`：本租户审计查询，见下。
+- `GET /v1/keys`：本租户密钥快照分页清单，见下。
 - `GET /v1/operations/{operation_id}`：查询幂等操作，见下。
 - `GET /v1/provider/status` 与 `POST /v1/provider/reconnect`：KMS/HSM
   健康检查与无中断重连，见下（全局、非租户作用域，不带也不接受
@@ -323,11 +324,26 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `outcome=rejected`、携带当时已知 `key_id` 的事件（create/解密前的 import/
   audit 查询为 null）。参数校验先于授权，授权先于存在性判断。
 
+## 密钥清单
+
+- `GET /v1/keys`：单一非空操作者/租户来源（同 `GET /v1/audit`）。参数均须
+  单值：`status=active|revoked`、`algorithm=AES256|RSA2048`、`limit`
+  （1–1000，默认 100）、`cursor`；重复、空、非法或越界参数为 `400` 且指明
+  字段，校验先于授权。`200` → `{items, next_cursor}`，项键序
+  `key_id,label,current_version,algorithm,status,created_at,public_key`
+  （`created_at` 取首版本时间，其余字段与筛选均取提交视图投影，绝不包含
+  秘密字段），按 `(created_at, key_id)` 升序；空页 `items:[]`，末页
+  `next_cursor:null`。游标沿用审计游标规则（HMAC 签名，绑定租户/筛选/
+  快照），篡改、过期、跨租户或筛选不符均 `400`；重启或并发变更下有效游标
+  链不重不漏、既有页不变。策略新增 `list` 动作：拒绝 `403` 记一条
+  `list/rejected`（key_id null），成功记一条 `list/success`（key_id
+  null）；审计的 `action` 筛选接受 `list`。存储/账本失败为 `500`。
+
 ## 审计
 
 - 事件字段 `{event_id, tenant_id, action, key_id, outcome, timestamp}`；
   `action` 为 `create/read/rotate/batch_rotate/revoke/import/export/
-  encrypt/decrypt/audit/tenant_conflict/policy_read/policy_update/
+  encrypt/decrypt/audit/list/tenant_conflict/policy_read/policy_update/
   policy_delete`，`outcome` 为 `success/rejected`。信封加密/解密事件只含
   元数据（无 plaintext、aad、envelope、数据密钥或私钥）；幂等 HTTP encrypt
   每个终态至多一条 `event_id=operation_id,action=encrypt` 事件（成功 200 与
@@ -369,6 +385,9 @@ python -m keymgr batch-rotate --tenant-id t --operator alice \
                           --items '[{"key_id":"<id1>","algorithm":"AES256"},{"key_id":"<id2>","algorithm":"RSA2048"}]'
 python -m keymgr revoke   --tenant-id t --key-id <id> --reason r --operator alice
 python -m keymgr status   --tenant-id t --key-id <id> --operator alice
+python -m keymgr list     --tenant-id t --operator alice \
+                          [--status active] [--algorithm AES256] \
+                          [--limit 100] [--cursor <c>]
 # 导出/导入、备份/恢复
 python -m keymgr export   --tenant-id t --key-id <id> --passphrase pw --operator alice
 # 信封加密/解密（plaintext/aad 为 base64，version 缺省 current）

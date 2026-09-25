@@ -27,6 +27,7 @@ ACTION_EXPORT = "export"
 ACTION_ENCRYPT = "encrypt"
 ACTION_DECRYPT = "decrypt"
 ACTION_AUDIT = "audit"
+ACTION_LIST = "list"
 ACTION_TENANT_CONFLICT = "tenant_conflict"
 # Policy management actions. These are audited but are never themselves
 # governed by a tenant policy (management is exempt from enforcement).
@@ -44,6 +45,7 @@ ACTIONS = (
     ACTION_ENCRYPT,
     ACTION_DECRYPT,
     ACTION_AUDIT,
+    ACTION_LIST,
     ACTION_TENANT_CONFLICT,
     ACTION_POLICY_READ,
     ACTION_POLICY_UPDATE,

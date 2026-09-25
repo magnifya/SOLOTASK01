@@ -24,7 +24,7 @@ from .provider import (
     ProviderUnavailable,
 )
 from .server import _resolve_committed_operation, serve
-from .store import IMPORT_CONFLICT, KeyStore, LockTimeout, is_valid_key_id, validate_batch_items
+from .store import IMPORT_CONFLICT, LIST_STATUSES, KeyStore, LockTimeout, is_valid_key_id, validate_batch_items
 
 DEFAULT_DATA_DIR = os.environ.get("KEYMGR_DATA_DIR", "keymgr_data")
 
@@ -176,6 +176,18 @@ def build_parser() -> argparse.ArgumentParser:
                          help="page size, 1-1000 (default: %(default)s)")
     p_audit.add_argument("--cursor", default=None,
                          help="pagination cursor from a previous response")
+
+    p_list = tenant_parser(
+        "list", help="list a tenant's keys (paginated snapshot)"
+    )
+    p_list.add_argument("--status", default=None,
+                        help="one of: %s" % ", ".join(LIST_STATUSES))
+    p_list.add_argument("--algorithm", default=None,
+                        help="one of: %s" % ", ".join(SUPPORTED_ALGORITHMS))
+    p_list.add_argument("--limit", type=int, default=100,
+                        help="page size, 1-1000 (default: %(default)s)")
+    p_list.add_argument("--cursor", default=None,
+                        help="pagination cursor from a previous response")
 
     p_policy = sub.add_parser("policy", help="manage a tenant's action policy")
     p_policy.add_argument(
@@ -1580,6 +1592,53 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 "next_cursor": page.next_cursor,
             }
         )
+        return 0
+
+    if args.command == "list":
+        # Parameter validation (exit 2) precedes authorization, exactly like
+        # the HTTP endpoint.
+        if not args.tenant_id:
+            return _fail("field tenant_id must be a non-empty string", 2)
+        if args.status is not None and args.status not in LIST_STATUSES:
+            return _fail(
+                "field status must be one of: %s" % ", ".join(LIST_STATUSES),
+                2,
+            )
+        if args.algorithm is not None and args.algorithm not in SUPPORTED_ALGORITHMS:
+            return _fail(
+                "unsupported value for field algorithm: %r (supported: %s)"
+                % (args.algorithm, ", ".join(SUPPORTED_ALGORITHMS)),
+                2,
+            )
+        if not 1 <= args.limit <= 1000:
+            return _fail(
+                "field limit must be an integer between 1 and 1000", 2
+            )
+        if not allowed(audit_mod.ACTION_LIST):
+            if not _attempt(
+                store, args.tenant_id, None,
+                audit_mod.ACTION_LIST, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            return _fail("action not permitted by policy", 3)
+        try:
+            items, next_cursor = store.list_page(
+                args.tenant_id,
+                status=args.status,
+                algorithm=args.algorithm,
+                limit=args.limit,
+                cursor=args.cursor,
+            )
+        except InvalidCursor:
+            return _fail("invalid or expired cursor", 2)
+        except LedgerError as exc:
+            return _ledger_fail(exc)
+        if not _attempt(
+            store, args.tenant_id, None,
+            audit_mod.ACTION_LIST, audit_mod.OUTCOME_SUCCESS,
+        ):
+            return 1
+        _print({"items": items, "next_cursor": next_cursor})
         return 0
 
     if args.command == "policy":

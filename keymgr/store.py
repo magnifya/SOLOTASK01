@@ -2,6 +2,7 @@
 
 import base64
 import functools
+import hashlib
 import json
 import os
 import re
@@ -19,7 +20,7 @@ from . import audit as audit_mod
 from . import keybundle
 from . import provider as provider_mod
 from .artifacts import PHASE_COMMITTED, PHASE_ROLLED_BACK, PHASE_STAGED
-from .audit import AuditEvent, AuditLog, LedgerError
+from .audit import AuditEvent, AuditLog, InvalidCursor, LedgerError
 from .provider import (
     LOCAL_PROVIDER_ID,
     ProviderIdentityMismatch,
@@ -49,6 +50,9 @@ def is_valid_key_id(key_id) -> bool:
 # A batch rotation carries 1-100 items.
 BATCH_MIN_ITEMS = 1
 BATCH_MAX_ITEMS = 100
+
+# Status filter values accepted by the key-list endpoint.
+LIST_STATUSES = ("active", "revoked")
 
 
 def validate_batch_items(raw) -> Tuple[Optional[List[Tuple[str, str]]], Optional[str]]:
@@ -987,6 +991,7 @@ class KeyStore:
                 audit_mod.ACTION_ENCRYPT,
                 audit_mod.ACTION_DECRYPT,
                 audit_mod.ACTION_AUDIT,
+                audit_mod.ACTION_LIST,
             )
         ):
             event = self.audit.new_event(
@@ -3450,6 +3455,144 @@ class KeyStore:
                 records.append(record)
         records.sort(key=lambda r: r.key_id)
         return records
+
+    # -- key listing (GET /v1/keys) -----------------------------------------
+    def list_committed(self, tenant_id: str) -> list:
+        """Committed-view records of one tenant, for the list projection.
+
+        Every file is projected through exactly the same committed-view rules
+        as a single-key read: an unsettled create/import/restore file is
+        hidden, an uncommitted rotate/revoke shows its durable pre-image, and
+        an unsettled batch group shows the validated snapshot projection (or
+        is hidden when that cannot be proven). Uncommitted state is never
+        exposed.
+        """
+        records = []
+        try:
+            names = os.listdir(self.data_dir)
+        except OSError:
+            return records
+        for name in names:
+            if not (name.endswith(".json") and is_valid_key_id(name[:-5])):
+                continue
+            record = self._read_record(os.path.join(self.data_dir, name))
+            if record is None or record.tenant_id != tenant_id:
+                continue
+            view = self._committed_record(record)
+            if view is not None:
+                records.append(view)
+        return records
+
+    @staticmethod
+    def _list_item(record: KeyRecord) -> dict:
+        """Public list projection of one record. Never carries secret fields."""
+        current = record.current
+        return {
+            "key_id": record.key_id,
+            "label": record.label,
+            "current_version": record.current_version,
+            "algorithm": current.algorithm,
+            "status": record.status,
+            "created_at": record.created_at,
+            "public_key": current.public_key,
+        }
+
+    @staticmethod
+    def _list_fingerprint(records) -> str:
+        """Stable digest of the filtered, sorted visible list snapshot."""
+        digest = hashlib.sha256()
+        for record in records:
+            current = record.current
+            for field_value in (
+                record.key_id,
+                record.created_at,
+                record.label,
+                str(record.current_version),
+                current.algorithm,
+                record.status,
+                current.public_key or "",
+            ):
+                digest.update(field_value.encode("utf-8"))
+                digest.update(b"\x00")
+            digest.update(b"\n")
+        digest.update(b"count=%d" % len(records))
+        return digest.hexdigest()
+
+    def list_page(
+        self,
+        tenant_id: str,
+        status: Optional[str] = None,
+        algorithm: Optional[str] = None,
+        limit: int = 100,
+        cursor: Optional[str] = None,
+    ) -> Tuple[list, Optional[str]]:
+        """Return one tenant-isolated, filter-bound, snapshot-bound key page.
+
+        Items are committed-view projections ordered by ``(created_at,
+        key_id)`` ascending; ``created_at`` is the first version's timestamp,
+        every other field (and the filters) reads the same projection. The
+        cursor follows the audit cursor rules: an HMAC-signed token bound to
+        the tenant, the filters, the limit and the list snapshot it was
+        issued against, so a tampered, cross-tenant, filter-mismatched or
+        stale cursor raises :class:`InvalidCursor` and a valid chain pages
+        the unchanged snapshot without duplicates or omissions, across
+        restarts. Returns ``(items, next_cursor)``; the last page's
+        ``next_cursor`` is None.
+        """
+        anchor = None
+        fingerprint = None
+        if cursor is not None:
+            payload = self.audit._decode_cursor(cursor)
+            try:
+                if payload.get("t") != tenant_id:
+                    raise InvalidCursor("cursor does not match tenant_id")
+                if payload.get("s") != status or payload.get("a") != algorithm:
+                    raise InvalidCursor("cursor does not match filters")
+                if int(payload.get("l", -1)) != limit:
+                    raise InvalidCursor("cursor does not match limit")
+                anchor = (payload["ca"], payload["kid"])
+                fingerprint = payload["f"]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise InvalidCursor("malformed cursor") from exc
+
+        selected = [
+            record
+            for record in self.list_committed(tenant_id)
+            if (status is None or record.status == status)
+            and (algorithm is None or record.current.algorithm == algorithm)
+        ]
+        selected.sort(key=lambda r: (r.created_at, r.key_id))
+        # The snapshot is scoped to exactly the items this tenant and these
+        # filters can see: another tenant's activity must not invalidate the
+        # cursor, while any change to the visible set does.
+        current_fingerprint = self._list_fingerprint(selected)
+        if fingerprint is not None and fingerprint != current_fingerprint:
+            raise InvalidCursor("cursor snapshot is no longer valid")
+
+        if anchor is not None:
+            selected = [
+                r for r in selected if (r.created_at, r.key_id) > anchor
+            ]
+
+        page = selected[:limit]
+        if len(selected) > limit and page:
+            last = page[-1]
+            next_cursor = self.audit._encode_cursor(
+                {
+                    "v": 1,
+                    "t": tenant_id,
+                    "s": status,
+                    "a": algorithm,
+                    "l": limit,
+                    "ca": last.created_at,
+                    "kid": last.key_id,
+                    "f": current_fingerprint,
+                }
+            )
+        else:
+            next_cursor = None
+        return [self._list_item(r) for r in page], next_cursor
+
 
     def backup_entry(self, record: KeyRecord) -> dict:
         """Project a record for a tenant backup payload.
