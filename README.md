@@ -2,10 +2,10 @@
 
 一个多租户密钥管理服务，同时提供 HTTP API 与命令行入口。支持 AES256 / RSA2048
 密钥的生成、版本化轮换、吊销、加密导出/导入、租户级加密备份/恢复、按租户的
-操作者策略、只追加的审计账，以及可插拔的 KMS/HSM 提供者。轮换/导入/恢复是
-幂等变更：同一 `Idempotency-Key` 的重试只重放原结果，进程在任一步骤崩溃后
-重启都能据 `operation_id` 判定是否已耐久并一致收尾。私钥只保存在服务端，
-任何响应与审计投影都不含私钥、句柄或包装材料。
+操作者策略、只追加的审计账，以及可插拔的 KMS/HSM 提供者。轮换/批量轮换/
+导入/恢复/信封加密是幂等变更：同一 `Idempotency-Key` 的重试只重放原结果，
+进程在任一步骤崩溃后重启都能据 `operation_id` 判定是否已耐久并一致收尾。
+私钥只保存在服务端，任何响应与审计投影都不含私钥、句柄或包装材料。
 
 ## 依赖与安装
 
@@ -85,11 +85,14 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   幂等键。
 - `POST /v1/keys/{key_id}/encrypt`，body
   `{tenant_id, version?, plaintext, aad?}`；`plaintext`、`aad` 为 base64，
-  `version` 缺省为 current。`200` →
-  `{format:"keymgr-envelope-v1", envelope}`，`envelope` 为 base64，内含
+  `version` 缺省为 current。需 `Idempotency-Key`。`200` →
+  `{format:"keymgr-envelope-v1", envelope, operation_id}`（键序
+  `format,envelope,operation_id`），`envelope` 为 base64，内含
   key_id、version、算法、nonce/tag、密文及**包装后的数据密钥**：每次生成新
   的 256 位数据密钥，以 AES-256-GCM 加密明文；AES256 版本用 AES-GCM 包装数
-  据密钥，RSA2048 版本用 RSA-OAEP-SHA256 包装。
+  据密钥，RSA2048 版本用 RSA-OAEP-SHA256 包装。绑定后的错误体仅
+  `{error, operation_id}`；持久化的绑定只存 plaintext/aad 的摘要，明文与
+  AAD 绝不落盘。
 - `POST /v1/keys/{key_id}/decrypt`，body `{tenant_id, envelope, aad?}`，接
   受 `keymgr-envelope-v1`。`200` → `{plaintext}`（base64）。信封内 key_id
   必须与路径一致；缺字段、非法 base64、篡改、AAD 不符为 `400` 且错误指明
@@ -111,8 +114,9 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 
 ## 幂等操作
 
-- rotate/import/restore/batch-rotate（CLI：
-  `rotate`/`import`/`restore`/`batch-rotate`）必须携带**单一**
+- rotate/import/restore/batch-rotate 与 HTTP encrypt（CLI：
+  `rotate`/`import`/`restore`/`batch-rotate`；CLI 的 `encrypt` 保持非幂
+  等、不携带该头）必须携带**单一**
   `Idempotency-Key` 头（CLI 必填 `--idempotency-key`），值为 1–128 个
   `[A-Za-z0-9._~-]` 字符。缺失、为空、重复、非法一律 `400`（CLI `2`），且该
   校验先于请求体读取与一切业务：不写审计、操作记录、密钥或提供者句柄。
@@ -125,9 +129,9 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   体给出已有 `operation_id`。绑定前的导入/恢复解密无副作用：口令错误 `400`
   不占用该键。
 - 状态：`pending`/`succeeded`/`failed`/`conflict`/`timed_out`。成功为 `201`
-  succeeded；同租户冲突为 `409` conflict；`403/404/400` 与提供者/账本失败为
-  failed（保留原状态码）。并发同键仅一个执行，其余等待；等待超 5 秒返回
-  `503` timed_out（CLI `1`），等待方不写任何东西。
+  （encrypt 为 `200`）succeeded；同租户冲突为 `409` conflict；`403/404/400`
+  与提供者/账本失败为 failed（保留原状态码）。并发同键仅一个执行，其余等
+  待；等待超 5 秒返回 `503` timed_out（CLI `1`），等待方不写任何东西。
 - 多/单轮换互斥：批量轮换与单键 rotate 都按 `key_id` 排序获取 per-key
   进程内锁 + `<key_id>.lock` fcntl 排他锁（整批共享一个 5 秒截止时刻）。对同一
   key 的并发变更要么全在批量之前、要么全在之后；等待同一被占 key 超过 5 秒的
@@ -140,8 +144,16 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `404`/`409` 响应与审计投影并置终态（拒绝终态的状态码随事件持久化，严格
   重放）；事件未入帐则置 failed(`500`)，半成品文件、提供者句柄与标记由
   outbox/provision 恢复回滚。不重复记账（账本按 event_id 去重），不误判。
-- **operation 工件镜像**：rotate/import/restore/batch-rotate 在幂等键绑定
-  记录耐久**之后**、首次调用提供者**之前**，原子创建
+- **encrypt 的崩溃一致性**：信封加密不写密钥文件、不铸句柄，唯一提交点
+  是 `event_id=operation_id`、`action=encrypt` 的审计事件（每终态至多一
+  条）。提交前先把确切的 `200` 响应（含不透明 envelope）随操作记录耐久；
+  事件入账前崩溃则操作保持 `pending`、GET 操作不暴露 envelope，同键重试在
+  同一 `operation_id` 下重新执行；事件耐久后重启或重试原样重放该响应，绝
+  不重新加密。操作记录与镜像中的规范化请求体只存 plaintext/aad 的
+  SHA-256 摘要，明文、AAD、数据/私钥、句柄与后端异常细节绝不进入响应、
+  审计或任何文件。
+- **operation 工件镜像**：rotate/import/restore/batch-rotate/encrypt 在幂等
+  键绑定记录耐久**之后**、首次调用提供者**之前**，原子创建
   `operation-artifacts/<operation_id>.json`（0600、temp 文件 fsync 后 rename；
   非幂等入口与未绑定请求不创建该目录）。镜像是一次尝试全部耐久工件的交叉
   索引，记录租户、操作者、路径、规范化请求体、`kind`/审计动作、完整写集
@@ -284,7 +296,7 @@ python -m keymgr policy --operator admin set|show|delete --tenant-id t [--rules 
   策略文件与标记，下一次启动重试，全部句柄确认删除后才移除整组文件。
 - 私钥与口令只存在于口令加密的包内或经提供者包装后的记录中；游标 HMAC 密钥
   存于 `audit.secret`(0600)。材料不会出现在任何响应、审计投影或错误信息中。
-- rotate/import/restore/batch-rotate 另有 0600 的 operation 工件镜像
+- rotate/import/restore/batch-rotate/encrypt 另有 0600 的 operation 工件镜像
   `operation-artifacts/<operation_id>.json`：绑定后、调用提供者前创建，交叉
   关联 `operations/<id>.json`、`provisions/<id>.json`、restore 标记（含空
   restore 标记）或 batch snapshot，记录租户/操作者/路径/规范请求/动作/写集/

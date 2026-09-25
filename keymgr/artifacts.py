@@ -2,7 +2,7 @@
 
 After an Idempotency-Key is bound (the ``operations/<id>.json`` record is
 durable) and before any KMS/HSM provider is called, the rotate / import /
-restore / batch-rotate executors create one mirror file
+restore / batch-rotate / encrypt executors create one mirror file
 ``operation-artifacts/<operation_id>.json`` (0600, fsynced, atomic rename).
 
 The mirror is the single crash-recovery cross-reference tying together every
@@ -67,6 +67,7 @@ _KIND_ACTIONS = {
     "batch_rotate": audit_mod.ACTION_BATCH_ROTATE,
     "import": audit_mod.ACTION_IMPORT,
     "restore": audit_mod.ACTION_IMPORT,
+    "encrypt": audit_mod.ACTION_ENCRYPT,
 }
 
 
@@ -158,11 +159,11 @@ class ArtifactMirror:
         stays pending for a same-id retry) rather than a failed(500) terminal.
 
         The facts are validated strictly rather than filtered: the kind must
-        be one of the four mirrored mutations, the action must be the audit
+        be one of the mirrored mutations, the action must be the audit
         action that kind commits with, and the write set must list unique
-        canonical key ids with the kind's exact shape (rotate/import a single
-        key_id; batch_rotate the full non-empty item set; restore the possibly
-        empty set of newly created keys). Anything else is an
+        canonical key ids with the kind's exact shape (rotate/import/encrypt
+        a single key_id; batch_rotate the full non-empty item set; restore
+        the possibly empty set of newly created keys). Anything else is an
         :class:`ArtifactInconsistent` programming/corruption error instead of
         being silently normalized away, so the mirror's cross-reference can
         never disagree with the operation it mirrors.
@@ -208,7 +209,7 @@ class ArtifactMirror:
             seen.add(key_id)
             normalized.append(key_id)
         normalized.sort()
-        if kind in ("rotate", "import") and len(normalized) != 1:
+        if kind in ("rotate", "import", "encrypt") and len(normalized) != 1:
             raise ArtifactInconsistent(
                 "mirror kind %r requires exactly one write-set key, got %d"
                 % (kind, len(normalized))
@@ -854,11 +855,11 @@ class ArtifactStore:
         carries must already be self-consistent before it is compared against
         anything else:
 
-        * ``kind`` (once described) is one of the four mirrored mutations and
+        * ``kind`` (once described) is one of the mirrored mutations and
           ``action`` is exactly the audit action that kind commits with;
         * ``write_set`` is a list of unique canonical key ids with the kind's
-          exact shape (rotate/import one key; batch a non-empty set; restore a
-          possibly empty set);
+          exact shape (rotate/import/encrypt one key; batch a non-empty set;
+          restore a possibly empty set);
         * ``handles`` is a duplicate-free list of non-empty
           ``{provider_id, handle}`` pairs;
         * the journal/snapshot references name the operation itself and a
@@ -935,7 +936,7 @@ class ArtifactStore:
             if not _is_key_id(key_id) or key_id in seen:
                 return False
             seen.add(key_id)
-        if kind in ("rotate", "import") and len(seen) != 1:
+        if kind in ("rotate", "import", "encrypt") and len(seen) != 1:
             return False
         if kind == "batch_rotate" and not seen:
             return False
@@ -957,7 +958,7 @@ class ArtifactStore:
         if not isinstance(details, dict) or details.get("kind") != kind:
             return False
         write_set = descriptor.get("write_set") or []
-        if kind in ("rotate", "import"):
+        if kind in ("rotate", "import", "encrypt"):
             return details.get("key_id") == (write_set[0] if write_set else None)
         if kind == "batch_rotate":
             items = details.get("items")
@@ -1041,7 +1042,7 @@ class ArtifactStore:
             return False
         kind = descriptor.get("kind")
         write_set = descriptor.get("write_set") or []
-        if kind in ("rotate", "import"):
+        if kind in ("rotate", "import", "encrypt"):
             if event.key_id != (write_set[0] if write_set else None):
                 return False
         elif event.key_id is not None:
@@ -1086,6 +1087,19 @@ class ArtifactStore:
         response = result.get("response")
         if http_status is None and response is None:
             return True
+        if descriptor.get("kind") == "encrypt":
+            # An encrypt commits no write set: its staged 200 body carries
+            # only the opaque envelope and the operation id, so the fixed
+            # shape is all there is to verify -- the durable event named
+            # after the operation_id is the commit fact.
+            return (
+                http_status == 200
+                and isinstance(response, dict)
+                and response.get("format") == "keymgr-envelope-v1"
+                and isinstance(response.get("envelope"), str)
+                and response.get("operation_id")
+                == descriptor.get("operation_id")
+            )
         if http_status != 201 or not isinstance(response, dict):
             return False
         kind = descriptor.get("kind")

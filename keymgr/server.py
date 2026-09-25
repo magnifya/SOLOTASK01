@@ -90,8 +90,9 @@ def make_handler(
         def _idempotency_key(self):
             """Return a valid Idempotency-Key, else send 400 (no side effect).
 
-            The header is required on rotate/import/restore: exactly one
-            header whose value is 1-128 unreserved ASCII characters. A
+            The header is required on rotate/batch-rotate/import/restore/
+            encrypt: exactly one header whose value is 1-128 unreserved
+            ASCII characters. A
             missing, empty, duplicated or illegal value is a 400 that happens
             before any tenant work, audit event or provider call.
             """
@@ -242,6 +243,8 @@ def make_handler(
                 action = audit_mod.ACTION_BATCH_ROTATE
             elif kind == "rotate":
                 action = audit_mod.ACTION_ROTATE
+            elif kind == "encrypt":
+                action = audit_mod.ACTION_ENCRYPT
             else:
                 action = audit_mod.ACTION_IMPORT
             audit_key_id = (
@@ -1178,36 +1181,51 @@ def make_handler(
                 return None
 
         def _encrypt_key(self, key_id: str, parts, operator: str) -> None:
-            """POST /v1/keys/{key_id}/encrypt.
+            """POST /v1/keys/{key_id}/encrypt (idempotent).
 
-            Body ``{tenant_id, version?, plaintext, aad?}``; plaintext and aad
-            are base64, version defaults to the current version. The answer
-            carries only the opaque envelope token -- never the data key, the
-            KEK or any backend material.
+            Body ``{tenant_id, version?, plaintext, aad?}``; plaintext and
+            aad are base64, version defaults to the current version. The
+            Idempotency-Key is validated before the body is read, and every
+            parse/parameter failure before the key is bound is a
+            side-effect-free 400 (no audit event, operation record or
+            provider call). Once bound, the operation commits exactly one
+            ``encrypt`` audit event named after the operation_id; an
+            identical retry replays the stored response byte-for-byte, a
+            same-key different request answers 409 naming the original
+            operation. The answer carries only the opaque envelope token --
+            never the data key, the KEK or any backend material -- and the
+            persisted binding carries only digests of the plaintext/aad,
+            never the values themselves.
             """
-            action = audit_mod.ACTION_ENCRYPT
-            base = self._crypto_request_base(key_id, parts, action)
-            if base is None:
+            idem_key = self._idempotency_key()
+            if idem_key is None:
                 return
-            tenant_id, payload = base
+            payload = self._read_json_object(audit=False)
+            if payload is None:
+                return
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                self._bad_request("field tenant_id must be a non-empty string")
+                return
+            tenant_id = self._tenant(parts, payload, audit=False)
+            if tenant_id is None:
+                return
+            if self._bad_key_id(key_id, audit=False):
+                return
             version = payload.get("version")
             if version is not None and (
                 not isinstance(version, int)
                 or isinstance(version, bool)
                 or version < 1
             ):
-                self._reject_crypto(
-                    tenant_id, key_id, action, 400,
-                    "field version must be a positive integer",
-                )
+                self._bad_request("field version must be a positive integer")
                 return
             plaintext = payload.get("plaintext")
             if not isinstance(plaintext, str):
-                self._reject_crypto(
-                    tenant_id, key_id, action, 400,
+                self._bad_request(
                     "field plaintext must be a base64 string"
                     if "plaintext" in payload
-                    else "missing required field: plaintext",
+                    else "missing required field: plaintext"
                 )
                 return
             try:
@@ -1215,44 +1233,94 @@ def make_handler(
                     plaintext, "plaintext"
                 )
             except envelope.EnvelopeError as exc:
-                self._reject_crypto(
-                    tenant_id, key_id, action, 400, str(exc)
-                )
+                self._bad_request(str(exc))
                 return
-            aad = self._request_aad(tenant_id, key_id, action, payload)
-            if aad is None:
-                return
-            if not self._enforce(tenant_id, key_id, action, operator):
-                return
-            status, record, ver, kek = store.crypto_material(
-                key_id, tenant_id, version
+            aad = b""
+            raw_aad = payload.get("aad")
+            if raw_aad is not None:
+                try:
+                    aad = envelope.b64_decode_field(raw_aad, "aad")
+                except envelope.EnvelopeError as exc:
+                    self._bad_request(str(exc))
+                    return
+            # The persisted binding must never carry the plaintext or the
+            # AAD: in the normalized request the operation record and the
+            # mirror store, both values are replaced by their digests.
+            # Semantically identical requests still bind identically (and
+            # replay); a different plaintext or aad binds differently and
+            # therefore conflicts.
+            binding = dict(payload)
+            binding["plaintext"] = (
+                "sha256:" + hashlib.sha256(raw_plaintext).hexdigest()
             )
-            if status == store.CRYPTO_NOT_FOUND:
-                # Unknown key, unknown version and cross-tenant access are
-                # indistinguishable, all 404.
-                self._reject_crypto(
-                    tenant_id, key_id, action, 404, "key not found"
+            if isinstance(raw_aad, str):
+                binding["aad"] = (
+                    "sha256:" + hashlib.sha256(aad).hexdigest()
                 )
-                return
-            if status == store.CRYPTO_REVOKED:
-                self._reject_crypto(
-                    tenant_id, key_id, action, 409, "key is revoked"
+
+            def execute(operation, mirror=None):
+                # Kind/exact key_id are durable before the authorization
+                # check, so any terminal replays from context alone.
+                operation_store.update_details(
+                    operation, {"kind": "encrypt", "key_id": key_id}
                 )
-                return
-            token = envelope.encode_envelope(
-                key_id=key_id,
-                version=ver.version,
-                algorithm=ver.algorithm,
-                kek=kek,
-                plaintext=raw_plaintext,
-                aad=aad,
-            )
-            if not self._record_attempt(
-                tenant_id, key_id, action, audit_mod.OUTCOME_SUCCESS
-            ):
-                return
-            self._send_json(
-                200, {"format": envelope.FORMAT, "envelope": token}
+                if mirror is not None:
+                    mirror.describe(
+                        {"kind": "encrypt", "write_set": [key_id]}
+                    )
+                # Authorization follows validation and precedes existence; a
+                # denial is a bound terminal 403 whose single rejected
+                # encrypt event is named after the operation_id.
+                if not policy_store.is_allowed(
+                    tenant_id, audit_mod.ACTION_ENCRYPT, operator
+                ):
+                    return self._idempotent_rejection(
+                        operation, tenant_id, key_id,
+                        audit_mod.ACTION_ENCRYPT, 403,
+                        "action not permitted by policy",
+                    )
+                status, record, ver, kek = store.crypto_material(
+                    key_id, tenant_id, version
+                )
+                if status == store.CRYPTO_NOT_FOUND:
+                    # Unknown key, unknown version and cross-tenant access
+                    # are indistinguishable, all 404.
+                    return self._idempotent_rejection(
+                        operation, tenant_id, key_id,
+                        audit_mod.ACTION_ENCRYPT, 404, "key not found",
+                    )
+                if status == store.CRYPTO_REVOKED:
+                    return self._idempotent_rejection(
+                        operation, tenant_id, key_id,
+                        audit_mod.ACTION_ENCRYPT, 409, "key is revoked",
+                    )
+                token = envelope.encode_envelope(
+                    key_id=key_id,
+                    version=ver.version,
+                    algorithm=ver.algorithm,
+                    kek=kek,
+                    plaintext=raw_plaintext,
+                    aad=aad,
+                )
+                # Stage the exact 200 body BEFORE the commit-point append:
+                # once the event is durable a crash/restart or a retry
+                # replays this verbatim without re-encrypting; before it the
+                # operation stays pending and the envelope hidden.
+                body = {
+                    "format": envelope.FORMAT,
+                    "envelope": token,
+                    "operation_id": operation.operation_id,
+                }
+                operation_store.stage_terminal(operation, 200, body)
+                store.audit_attempt(
+                    tenant_id, key_id, audit_mod.ACTION_ENCRYPT,
+                    audit_mod.OUTCOME_SUCCESS,
+                    event_id=operation.operation_id,
+                )
+                return 200, {"format": envelope.FORMAT, "envelope": token}
+
+            self._idempotent_guard(
+                parts.path, tenant_id, operator, binding, idem_key, execute
             )
 
         def _decrypt_key(self, key_id: str, parts, operator: str) -> None:
@@ -2203,6 +2271,13 @@ def _resolve_committed_operation(store, policy_store, record, event):
                 "operation_id": op_id,
             },
         )
+    if kind == "encrypt":
+        # The exact 200 body (opaque envelope included) is always staged
+        # before the commit-point event append, so recovery replays it from
+        # the staged result and never reaches this fallback; without it only
+        # the operation id can be projected -- the envelope cannot be
+        # re-created without re-encrypting, which recovery must never do.
+        return 200, {"operation_id": op_id}
     # Cannot rebuild the projection; the mutation did commit, so keep it
     # succeeded with an operation_id-only body rather than pending forever.
     return 201, {"operation_id": op_id}

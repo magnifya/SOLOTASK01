@@ -631,9 +631,11 @@ def test_committed_result_survives_mirror_cleanup_failure(server):
     key_id = _create_key(srv)
 
     real_discard = srv.artifact_store.discard
+    discard_called = threading.Event()
 
     def failing_discard(operation_id):
         # Simulate a failed mirror unlink at request cleanup time.
+        discard_called.set()
         return False
 
     srv.artifact_store.discard = failing_discard
@@ -643,6 +645,11 @@ def test_committed_result_survives_mirror_cleanup_failure(server):
             {"tenant_id": "t1", "algorithm": "AES256"},
             {"X-Operator-Id": "alice", "Idempotency-Key": "cleanup-fail"},
         )
+        # The handler thread runs the post-response mirror cleanup
+        # asynchronously: wait until it actually invoked the failing
+        # discard before restoring the real one, so the mirror is
+        # guaranteed to survive.
+        assert discard_called.wait(5)
     finally:
         srv.artifact_store.discard = real_discard
 

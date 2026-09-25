@@ -1,8 +1,9 @@
 """Idempotent operation records for mutating key endpoints.
 
-The rotate / import / restore endpoints accept an ``Idempotency-Key`` header
-(CLI: ``--idempotency-key``). One key, scoped by tenant and operator, is bound
-to exactly one operation: its canonical request (path and normalized body) and
+The rotate / batch-rotate / import / restore / encrypt endpoints accept an
+``Idempotency-Key`` header (CLI: ``--idempotency-key``). One key, scoped by
+tenant and operator, is bound to exactly one operation: its canonical request
+(path and normalized body) and
 its outcome (HTTP status and response body). A retried request presenting the
 same binding replays the stored status/response without any side effect; the
 same key with a different binding is a conflict that names the original
@@ -81,13 +82,14 @@ def is_valid_idempotency_key(value) -> bool:
 def state_for_http_status(http_status: int) -> str:
     """Map a terminal response's HTTP status to its operation state.
 
-    201 is the only success; an explicit request conflict (409) is the
-    "conflict" state. Every other terminal refusal (400/403/404) or backend
-    failure (500/503) records as "failed". A crash-recovered operation whose
-    audit event is durable therefore lands in the same state the original
-    request would have, including a reconstructed rejection.
+    201 is the mutation success and 200 the envelope-encrypt success; an
+    explicit request conflict (409) is the "conflict" state. Every other
+    terminal refusal (400/403/404) or backend failure (500/503) records as
+    "failed". A crash-recovered operation whose audit event is durable
+    therefore lands in the same state the original request would have,
+    including a reconstructed rejection.
     """
-    if http_status == 201:
+    if http_status in (200, 201):
         return STATUS_SUCCEEDED
     if http_status == 409:
         return STATUS_CONFLICT
@@ -100,7 +102,28 @@ _KIND_ACTIONS = {
     "batch_rotate": "batch_rotate",
     "import": "import",
     "restore": "import",
+    "encrypt": "encrypt",
 }
+
+
+def _is_encrypt_operation(record: "OperationRecord") -> bool:
+    """Whether a pending record is an idempotent envelope encrypt.
+
+    An encrypt commits no key file, provider handle or journal -- its only
+    commit point is the audit event named after the operation_id -- so its
+    crash rules differ from the mutating kinds: a missing event NEVER
+    finalizes it (the binding stays pending, its staged envelope hidden, for
+    a same-key retry to re-drive under the same operation_id), and a durable
+    event always finalizes it from the staged response, even when its mirror
+    evidence is parked. The kind is recorded in the durable details once the
+    executor runs; the path check covers a crash between the bind and that
+    first details write.
+    """
+    details = record.details
+    if isinstance(details, dict) and details.get("kind") == "encrypt":
+        return True
+    path = record.path or ""
+    return path.endswith("/encrypt")
 
 
 def _event_matches_operation(record: "OperationRecord", event) -> bool:
@@ -625,8 +648,16 @@ class OperationStore:
             # The artifact-mirror settlement runs first: a surviving mirror
             # whose evidence is incomplete/inconsistent (unreadable ledger,
             # uncertain commit, corrupt/missing basis) keeps the operation
-            # pending for a later open rather than guessing a terminal.
-            if is_parked is not None and is_parked(operation_id):
+            # pending for a later open rather than guessing a terminal. An
+            # idempotent encrypt is the exception: it has no files, handles
+            # or journals to reap, so the ledger alone decides it -- a parked
+            # mirror never wedges it.
+            encrypt_op = _is_encrypt_operation(record)
+            if (
+                is_parked is not None
+                and is_parked(operation_id)
+                and not encrypt_op
+            ):
                 continue
             event = None
             try:
@@ -678,6 +709,13 @@ class OperationStore:
                     response,
                 )
             else:
+                if encrypt_op:
+                    # The event never reached the ledger, so the encrypt
+                    # committed nothing (no key, handle or file exists to
+                    # roll back). Keep the operation PENDING -- its staged
+                    # envelope stays hidden -- for a same-key HTTP/CLI retry
+                    # to re-drive under the same operation_id.
+                    continue
                 self.finish(
                     record,
                     STATUS_FAILED,
