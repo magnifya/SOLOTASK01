@@ -163,16 +163,19 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   提供者”规则终态 `503`。曾激活的 provider_id 记在
   `provider-ids.json`(0600)，跨进程可识别。
 - **主备故障转移（`KEYMGR_PROVIDER_CHAIN`）**：链配置后，首次健康激活
-  选链中首个健康项。每次提供者调用都会探测活动实例；活动实例不健康时，
-  复用同一 5 秒跨进程意图/排水门切到首个健康备项（排除当前活动 id）：
-  在途旧调用由其进入时捕获的实例完成，切换提交后到达的调用只用新代，
-  并发触发仅一次建厂/提交（其余等待者直接采用已提交的代）。切换失败
-  （无健康备项、门限超时、提交失败）不改旧代，固定 `503`（CLI `1`），
-  不铸句柄、不写审计、不外泄后端文本。主项恢复健康后**不自动回切**；
-  只有 reconnect 按链序重选首个健康项。pending 幂等操作仍绑定原
-  `provider_id`，绝不在备端重放；重连回同 id 提供者后，同
-  `Idempotency-Key` 的请求在同一 `operation_id`/`event_id` 下继续恰好
-  一次。
+  选链中首个健康项。每次普通提供者调用先探测活动实例并维护持久化故障
+  门限（`provider-health.json`，见下）：探活 `True` 将连续失败数清零
+  （写 `ready`/0）后继续；`False`、非 bool 或异常将活动项连续失败数加
+  一（至多 3）并返回固定 `503`。前两次失败不切换；第三次在同一 5 秒跨
+  进程意图/排水门内重验活动项：恢复则清零并继续本次调用，否则仅一次
+  切至首个健康备项（排除当前活动 id）并令 generation 加 1：在途旧调用
+  由其进入时捕获的实例完成，切换提交后到达的调用只用新代，并发失败只
+  触发一次建厂/提交（其余等待者直接采用已提交的代）。无健康备项或门
+  限超时时保留旧代，固定 `503`（CLI `1`），不铸句柄、不写审计、不外
+  泄后端文本。主项恢复健康后**不自动回切**；只有 reconnect 按链序重
+  选首个健康项。pending 幂等操作仍绑定原 `provider_id`，绝不在备端重
+  放；重连回同 id 提供者后，同 `Idempotency-Key` 的请求在同一
+  `operation_id`/`event_id` 下继续恰好一次。
 - **定向切换（`POST /v1/provider/switchover`）**：只需单一非空
   `X-Operator-Id`，不收 `tenant_id`（头/查询/体均 `400`），不记审计。
   请求体严格为 `{"provider_id": P}`（P 非空）：坏 JSON、非对象、缺
@@ -203,7 +206,18 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   文件。仅健康候选能在跨进程排他锁（`provider-state.lock`，与进程内门
   共用 5 秒门限）下互斥递增 generation；失败或提交前崩溃保留旧代。提交
   后各进程下次调用重建当前配置，所得 `provider_id` 不符或不健康则
-  `503`（链配置时改为触发故障转移）且零副作用。
+  `503`（链配置时不健康活动项改由持久化故障门限处理）且零副作用。
+- **持久化故障门限 `provider-health.json`(0600)**：主备链活动项的连续
+  失败计数，原子提交（temp 文件 fsync 后 rename）：紧凑 UTF-8 JSON、非
+  ASCII 原样、无末尾换行，键序固定
+  `schema_version,provider_id,generation,status,consecutive_failures`
+  （依次为固定整数 1、非空字符串、正整数、`ready`/`unavailable`、0–3
+  整数）。它须与 `ready` 的 `provider-state.json` 同 ID 同代：文件缺失
+  或代落后时据后者重建为 `ready`/0；损坏、代超前或同代错 ID 时普通提
+  供者调用一律固定 `503` 且绝不改写该文件。故障转移先提交
+  `provider-state.json`（`switching` 再 `ready`、代+1），再写新代的
+  `ready`/0；重启（或任一进程的下一次普通调用）按上述规则收敛，并发
+  失败只触发一次切换。
 - CLI：`provider status --operator O`、
   `provider reconnect --operator O` 与
   `provider switchover --operator O --provider-id P`，成功输出同序单行
