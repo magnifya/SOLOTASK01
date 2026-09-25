@@ -1287,10 +1287,24 @@ class KeyStore:
         imported lazily here. A record naming an inactive provider cannot be
         rotated/exported/imported and fails 503 rather than switching
         providers.
+
+        When the owning id is not active but WAS active in this data
+        directory earlier (``local`` included -- a directed switchover /
+        reconnect / failover displaced it), this raises
+        :class:`ProviderIdentityMismatch`: a bound idempotent operation must
+        stay PENDING (non-terminal 503, no audit event) until a provider with
+        that same id is active again, rather than being frozen as a terminal
+        failure. An id that was never active here keeps the classic
+        inactive-provider terminal refusal.
         """
         if provider_id == LOCAL_PROVIDER_ID:
             if provider_mod.active_is_local():
                 return provider_mod.get_local_provider()
+            if provider_mod.provider_was_active(LOCAL_PROVIDER_ID):
+                raise ProviderIdentityMismatch(
+                    "the local provider was active in this data directory "
+                    "earlier and has been displaced"
+                )
             raise ProviderUnavailable(
                 "record is owned by the local provider, which is not active"
             )
@@ -1298,11 +1312,11 @@ class KeyStore:
         if active.provider_id != provider_id:
             # The active provider carries a different id. If the record's id
             # WAS active earlier in this data directory, the record belongs to
-            # an instance displaced by a reconnect: a PENDING idempotent
-            # operation must stay pending until a provider with the same id is
-            # reconnected, rather than being frozen as a terminal failure. A
-            # provider id never active here is the classic inactive-provider
-            # refusal (503), never a silent switch.
+            # an instance displaced by a reconnect/switchover: a PENDING
+            # idempotent operation must stay pending until a provider with the
+            # same id is reconnected, rather than being frozen as a terminal
+            # failure. A provider id never active here is the classic
+            # inactive-provider refusal (503), never a silent switch.
             if provider_mod.provider_was_active(provider_id):
                 raise ProviderIdentityMismatch(
                     "record provider %r was displaced by a reconnect to %r"
@@ -3208,6 +3222,17 @@ class KeyStore:
         block = ver.get("provider")
         if block is None:
             if not provider_mod.active_is_local():
+                # A legacy bundle is local-owned material. If local WAS active
+                # in this data directory earlier and has since been displaced
+                # by a switchover/reconnect, the bound import/restore must stay
+                # PENDING (non-terminal 503) until local is active again. An
+                # id that was never active here is the classic terminal
+                # inactive-provider refusal.
+                if provider_mod.provider_was_active(LOCAL_PROVIDER_ID):
+                    raise ProviderIdentityMismatch(
+                        "the local provider was active in this data directory "
+                        "earlier and has been displaced"
+                    )
                 raise ProviderUnavailable(
                     "legacy bundle without a provider block is local-only; "
                     "the local provider is not active"
