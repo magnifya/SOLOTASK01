@@ -13,6 +13,7 @@ from . import keybundle
 from . import operations as operations_mod
 from . import provider as provider_mod
 from . import restore as restore_mod
+from . import signing as signing_mod
 from . import tenantbundle
 from .artifacts import (
     ArtifactAlreadyTerminal,
@@ -53,6 +54,8 @@ _ROTATE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/rotate$")
 _REVOKE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/revoke$")
 _EXPORT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/export$")
 _ENCRYPT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/encrypt$")
+_SIGN_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/sign$")
+_VERIFY_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/verify$")
 _MIGRATE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/migrate$")
 _DECRYPT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/decrypt$")
 _STATUS_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/status$")
@@ -783,6 +786,16 @@ def make_handler(
                 decrypt_match = _DECRYPT_PATH_RE.match(path)
                 if decrypt_match is not None:
                     self._decrypt_key(decrypt_match.group(1), parts, operator)
+                    return
+
+                sign_match = _SIGN_PATH_RE.match(path)
+                if sign_match is not None:
+                    self._sign_key(sign_match.group(1), parts, operator)
+                    return
+
+                verify_match = _VERIFY_PATH_RE.match(path)
+                if verify_match is not None:
+                    self._verify_key(verify_match.group(1), parts, operator)
                     return
 
                 if path == _IMPORT_PATH:
@@ -1591,6 +1604,189 @@ def make_handler(
             self._send_json(
                 200, {"plaintext": envelope.b64_encode(plaintext)}
             )
+
+        # -- sign / verify --------------------------------------------------
+        def _sign_verify_base(self, key_id, parts, accepted_fields):
+            """Shared parse/validate prelude for sign and verify.
+
+            Returns ``(tenant_id, version, raw_message)`` (or, for verify,
+            the decoded signature is checked by the caller's body) or None
+            after the response was sent.
+
+            Identity rules follow decrypt: an unparseable body, a bad or
+            conflicting tenant_id and a malformed key_id are the audited
+            tenant_conflict cases. Every OTHER body problem -- an extra
+            field, a non-positive-integer version, a missing/non-string
+            message or bad base64 -- is a plain 400 naming the field and is
+            NOT written to the audit ledger, per the sign/verify contract.
+            Returns ``(tenant_id, version, raw_message, payload)``; the
+            already-parsed payload is returned so verify can validate its
+            extra ``signature`` field without reading the body twice.
+            """
+            payload = self._read_json_object()
+            if payload is None:
+                return None
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                if not self._record_conflict():
+                    return None
+                self._bad_request("field tenant_id must be a non-empty string")
+                return None
+            tenant_id = self._tenant(parts, payload)
+            if tenant_id is None:
+                return None
+            if self._bad_key_id(key_id):
+                return None
+            extra = [f for f in payload if f not in accepted_fields]
+            if extra:
+                self._bad_request(
+                    "field %s is not accepted by this endpoint" % extra[0]
+                )
+                return None
+            version = payload.get("version")
+            if version is not None and (
+                not isinstance(version, int)
+                or isinstance(version, bool)
+                or version < 1
+            ):
+                self._bad_request(
+                    "field version must be a positive integer"
+                )
+                return None
+            if "message" not in payload:
+                self._bad_request("missing required field: message")
+                return None
+            message = payload.get("message")
+            try:
+                raw_message = signing_mod.b64_decode_field(message, "message")
+            except ValueError as exc:
+                self._bad_request(str(exc))
+                return None
+            return tenant_id, version, raw_message, payload
+
+        def _sign_key(self, key_id: str, parts, operator: str) -> None:
+            """POST /v1/keys/{key_id}/sign.
+
+            Body is exactly ``{tenant_id, version?, message}``; message is
+            canonical standard base64 and may be empty, version defaults to
+            current. Signing uses RSASSA-PKCS1-v1_5/SHA-256 and is
+            deterministic, so the endpoint needs no Idempotency-Key. Success
+            is ``200 {"key_id","version","signature"}`` with the signature as
+            standard base64. Only RSA2048 versions can sign: an AES256 (or a
+            revoked) version is 409; unknown/foreign key or version is 404;
+            a policy denial is 403; a provider or material failure is the
+            fixed 503 text. The message and signature never enter the audit
+            ledger; a private key, handle or wrapped material never enters a
+            response.
+            """
+            action = audit_mod.ACTION_SIGN
+            base = self._sign_verify_base(
+                key_id, parts, {"tenant_id", "version", "message"}
+            )
+            if base is None:
+                return
+            tenant_id, version, raw_message, _payload = base
+            if not self._enforce(tenant_id, key_id, action, operator):
+                return
+            status, _record, ver, private_key = store.signing_material(
+                key_id, tenant_id, version
+            )
+            if status == store.SIGN_NOT_FOUND:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 404, "key not found"
+                )
+                return
+            if status == store.SIGN_REVOKED:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 409, "key is revoked"
+                )
+                return
+            if status == store.SIGN_WRONG_ALGORITHM:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 409,
+                    "key version does not support signing",
+                )
+                return
+            # ProviderUnavailable (provider load/backend/corrupt material)
+            # propagates to do_POST's fixed 503, with no event written.
+            signature = signing_mod.rsa_sign(private_key, raw_message)
+            if not self._record_attempt(
+                tenant_id, key_id, action, audit_mod.OUTCOME_SUCCESS
+            ):
+                return
+            self._send_json(
+                200,
+                {
+                    "key_id": key_id,
+                    "version": ver.version,
+                    "signature": signing_mod.b64_encode(signature),
+                },
+            )
+
+        def _verify_key(self, key_id: str, parts, operator: str) -> None:
+            """POST /v1/keys/{key_id}/verify.
+
+            Body is exactly ``{tenant_id, version?, message, signature}``;
+            both are standard base64 (message may be empty). Verification
+            uses ONLY the version's stored PUBLIC key: no KMS/HSM provider is
+            loaded, probed or contacted, so an old version still verifies
+            after a restart, rotation or migration. A matching signature is
+            ``200 {"valid": true}``; any non-matching value is
+            ``200 {"valid": false}`` (never an error). A policy denial is
+            403, an unknown/foreign key or version is 404, and an AES256 or
+            revoked version is 409 -- each with a same-name rejected event
+            carrying key_id. The message and signature never enter the audit
+            ledger.
+            """
+            action = audit_mod.ACTION_VERIFY
+            base = self._sign_verify_base(
+                key_id, parts,
+                {"tenant_id", "version", "message", "signature"},
+            )
+            if base is None:
+                return
+            tenant_id, version, raw_message, payload = base
+            signature_text = payload.get("signature")
+            try:
+                raw_signature = signing_mod.b64_decode_field(
+                    signature_text, "signature"
+                )
+            except ValueError as exc:
+                self._bad_request(str(exc))
+                return
+            if not self._enforce(tenant_id, key_id, action, operator):
+                return
+            # Verification needs the public key only: deliberately no
+            # provider session, so a provider outage cannot block it.
+            status, _record, ver, public_key = store.verification_key(
+                key_id, tenant_id, version
+            )
+            if status == store.SIGN_NOT_FOUND:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 404, "key not found"
+                )
+                return
+            if status == store.SIGN_REVOKED:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 409, "key is revoked"
+                )
+                return
+            if status == store.SIGN_WRONG_ALGORITHM:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 409,
+                    "key version does not support verification",
+                )
+                return
+            valid = signing_mod.rsa_verify(
+                public_key, raw_message, raw_signature
+            )
+            # A non-matching signature is a normal verification result, not
+            # a rejection: the call succeeded and audits as verify/success.
+            if not self._record_attempt(
+                tenant_id, key_id, action, audit_mod.OUTCOME_SUCCESS
+            ):
+                return
+            self._send_json(200, {"valid": valid})
 
         def _import_key(self, parts, operator: str) -> None:
             """POST /v1/keys/import.

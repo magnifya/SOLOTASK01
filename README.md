@@ -141,6 +141,26 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   字段；未知或跨租户的 key/version 为 `404`；吊销版本（含旧版本）为 `409`；
   提供者不可用为 `503`，沿用固定脱敏文案。私钥、数据密钥只存在于进程内存，
   绝不进入响应或审计。
+- `POST /v1/keys/{key_id}/sign`，**非幂等**（无需 `Idempotency-Key`），body
+  仅 `{tenant_id, version?, message}`；`message` 为标准 base64（可空），
+  `version` 缺省为 current。用 RSASSA-PKCS1-v1_5/SHA-256 **确定性**签名，
+  `200` 键序固定 `key_id,version,signature`，`signature` 为标准 base64。
+  正文结构、字段、UUID4、base64 或 version 非正整数均 `400` 并指出字段，
+  且不记账；身份参数失败照旧记 `tenant_conflict`。拒权 `403`；未知/跨租户
+  key 或 version 为 `404`；AES256 版本或吊销版本（含旧版本）为 `409`；
+  提供者或私钥材料故障一律固定文案 `503`（沿用 README 文案），不记账。
+  成功记 `sign/success`，业务拒绝记 `sign/rejected`，均带 key_id。签名经私
+  钥在内存中计算；message、signature 绝不入审计，私钥、句柄与包装材料绝不
+  入响应、审计或任何新文件。
+- `POST /v1/keys/{key_id}/verify`，body 仅
+  `{tenant_id, version?, message, signature}`，二者均为标准 base64
+  （message 可空），`version` 缺省为 current。**只用该版本存储的公钥**验签：
+  绝不加载、探活或调用 KMS/HSM 提供者，因此重启、轮换或迁移后的旧版本（甚
+  至其原提供者不可用时）仍可验签。`200` 仅返 `{valid}`；签名不匹配（含长度
+  /填充非法）一律 `{"valid": false}`，不是错误，仍记 `verify/success`。正文
+  校验与身份规则同 sign（正文 400 不记账，身份冲突照旧）；拒权 `403`，未知/
+  跨租户 key 或 version 为 `404`，AES256 或吊销版本为 `409`，业务拒绝记
+  `verify/rejected`，均带 key_id。message 与 signature 绝不入审计。
 - `POST /v1/backup`，body `{tenant_id, passphrase}` →
   `{format:"tenant-backup-v1", bundle}`；载荷
   `{format, tenant_id, keys, policy}`，空租户为 `keys:[]、policy:null`。
@@ -344,8 +364,8 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `{tenant_id, deleted:true}`。
 - 规则元素 `{subject, actions, effect}`：`subject` 为区分大小写的非空字符串；
   `actions` 为非空数组，取值
-  `create/read/rotate/revoke/import/export/migrate/encrypt/decrypt/audit/
-  list`，单条内重复去重；`effect` 为 `allow`/`deny`；未知字段、类型错误、同
+  `create/read/rotate/revoke/import/export/migrate/encrypt/decrypt/
+  sign/verify/audit/list`，单条内重复去重；`effect` 为 `allow`/`deny`；未知字段、类型错误、同
   subject+effect+无序动作集的重复规则均 `400`；`rules:[]` 合法（全拒绝）。
 - 执行：管理动作 policy_* 免检；租户无策略时全部允许；有策略时匹配规则中
   deny 优先于 allow，无匹配则拒绝 → `403`，并记一条原动作名、
@@ -356,9 +376,12 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 
 - 事件字段 `{event_id, tenant_id, action, key_id, outcome, timestamp}`；
   `action` 为 `create/read/rotate/batch_rotate/revoke/import/export/
-  migrate/encrypt/decrypt/audit/list/tenant_conflict/policy_read/
-  policy_update/policy_delete`，`outcome` 为 `success/rejected`。信封加密/解密事件只含
-  元数据（无 plaintext、aad、envelope、数据密钥或私钥）；幂等 HTTP encrypt
+  migrate/encrypt/decrypt/sign/verify/audit/list/tenant_conflict/
+  policy_read/policy_update/policy_delete`，`outcome` 为 `success/rejected`。
+  信封加密/解密事件只含元数据（无 plaintext、aad、envelope、数据密钥或私钥）；
+  签名/验签事件同样只含元数据（无 message、signature、私钥或句柄），成功记
+  `sign`/`verify` 的 success、业务拒绝记同名 rejected，均携带当时 key_id；
+  正文 `400` 不记账，提供者故障的 sign `503` 也不记账。幂等 HTTP encrypt
   每个终态至多一条 `event_id=operation_id,action=encrypt` 事件（成功 200 与
   绑定后拒绝都随操作重放，绝不重复记账），非幂等 CLI/decrypt 每次请求各记一
   条；策略拒绝写一条对应 `encrypt`/`decrypt` 的 rejected 事件（携带 key_id），

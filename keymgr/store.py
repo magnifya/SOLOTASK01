@@ -19,6 +19,7 @@ from typing import Iterator, List, NamedTuple, Optional, Tuple
 from . import audit as audit_mod
 from . import keybundle
 from . import provider as provider_mod
+from . import signing as signing_mod
 from .artifacts import PHASE_COMMITTED, PHASE_ROLLED_BACK, PHASE_STAGED
 from .audit import AuditEvent, AuditLog, InvalidCursor, LedgerError
 from .provider import (
@@ -1026,6 +1027,8 @@ class KeyStore:
                 audit_mod.ACTION_MIGRATE,
                 audit_mod.ACTION_ENCRYPT,
                 audit_mod.ACTION_DECRYPT,
+                audit_mod.ACTION_SIGN,
+                audit_mod.ACTION_VERIFY,
                 audit_mod.ACTION_AUDIT,
                 audit_mod.ACTION_LIST,
             )
@@ -3735,6 +3738,116 @@ class KeyStore:
             exported = provider.export_material(ver.handle)
             kek = self._kek_for_version(ver, exported.encrypted_material)
             return self.CRYPTO_OK, record, ver, kek
+
+    # -- sign / verify ------------------------------------------------------
+    # Outcomes shared by signing_material and verification_key: the version
+    # is usable, the key/version is not found for this tenant, the key is
+    # revoked (every version refuses), or the version is not an RSA2048 one.
+    SIGN_OK = "ok"
+    SIGN_NOT_FOUND = "not_found"
+    SIGN_REVOKED = "revoked"
+    SIGN_WRONG_ALGORITHM = "wrong_algorithm"
+
+    @_provider_session
+    def signing_material(
+        self,
+        key_id: str,
+        tenant_id: str,
+        version: Optional[int] = None,
+    ) -> tuple:
+        """Resolve an RSA2048 version's private key for deterministic signing.
+
+        Returns ``(status, record, ver, private_key)``: on SIGN_OK
+        ``private_key`` is the loaded 2048-bit RSA private key exported by the
+        version's owning provider. SIGN_NOT_FOUND covers an unknown key, a
+        foreign tenant and an unknown version (existence never leaks);
+        SIGN_REVOKED means the key is revoked (every version refuses signing);
+        SIGN_WRONG_ALGORITHM means the resolved version is not RSA2048.
+
+        Like envelope crypto the read runs under the key locks over the
+        committed projection, adopts a raw legacy record exactly like export,
+        and asks the owning provider for the material -- a record owned by an
+        inactive provider or corrupt stored material raises
+        ProviderUnavailable (503), never a silent fallback. Nothing is
+        persisted and no audit event is written here.
+        """
+        if not is_valid_key_id(key_id):
+            return self.SIGN_NOT_FOUND, None, None, None
+        path = self._path_for(key_id)
+        with self.key_locks(key_id):
+            on_disk = self._read_record(path)
+            if on_disk is None or on_disk.tenant_id != tenant_id:
+                return self.SIGN_NOT_FOUND, None, None, None
+            record = self._committed_record(on_disk)
+            if record is None:
+                return self.SIGN_NOT_FOUND, None, None, None
+            # Adopt a raw legacy record now, under the key locks and only
+            # while the local provider is active (same rule as export).
+            self._take_over_legacy(record)
+            if record.status == "revoked":
+                return self.SIGN_REVOKED, record, None, None
+            if version is None:
+                ver = record.current
+            else:
+                ver = record.get_version(version)
+                if ver is None:
+                    return self.SIGN_NOT_FOUND, record, None, None
+            if ver.algorithm != "RSA2048":
+                return self.SIGN_WRONG_ALGORITHM, record, ver, None
+            provider = self._provider_for(ver.provider_id)
+            exported = provider.export_material(ver.handle)
+            try:
+                private_key = signing_mod.load_rsa_private_key(
+                    exported.encrypted_material
+                )
+            except signing_mod.SigningError as exc:
+                # Corrupt stored private material is a backend inconsistency,
+                # never a client error: the fixed provider-failure 503.
+                raise ProviderUnavailable(str(exc)) from exc
+            return self.SIGN_OK, record, ver, private_key
+
+    def verification_key(
+        self,
+        key_id: str,
+        tenant_id: str,
+        version: Optional[int] = None,
+    ) -> tuple:
+        """Resolve an RSA2048 version's PUBLIC key for signature verification.
+
+        Returns ``(status, record, ver, public_key)`` with the same status
+        semantics as :meth:`signing_material`. Verification uses ONLY the
+        public PEM stored on the key record: deliberately NOT wrapped in a
+        provider session, it never loads, probes or contacts a KMS/HSM
+        provider and never adopts a legacy record, so an old version still
+        verifies after a restart, a rotation, a migration or a provider
+        outage. A corrupt stored public key is a backend inconsistency
+        (ProviderUnavailable -> fixed 503), never a client error.
+        """
+        if not is_valid_key_id(key_id):
+            return self.SIGN_NOT_FOUND, None, None, None
+        path = self._path_for(key_id)
+        with self.key_locks(key_id):
+            on_disk = self._read_record(path)
+            if on_disk is None or on_disk.tenant_id != tenant_id:
+                return self.SIGN_NOT_FOUND, None, None, None
+            record = self._committed_record(on_disk)
+            if record is None:
+                return self.SIGN_NOT_FOUND, None, None, None
+            if record.status == "revoked":
+                return self.SIGN_REVOKED, record, None, None
+            if version is None:
+                ver = record.current
+            else:
+                ver = record.get_version(version)
+                if ver is None:
+                    return self.SIGN_NOT_FOUND, record, None, None
+            if ver.algorithm != "RSA2048":
+                return self.SIGN_WRONG_ALGORITHM, record, ver, None
+            try:
+                public_key = signing_mod.load_rsa_public_key(ver.public_key)
+            except signing_mod.SigningError as exc:
+                raise ProviderUnavailable(str(exc)) from exc
+            return self.SIGN_OK, record, ver, public_key
 
     # -- export / import ---------------------------------------------------
     def _export_version(self, ver: VersionRecord) -> dict:
