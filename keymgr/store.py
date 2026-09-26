@@ -456,6 +456,22 @@ class NativeWrap(NamedTuple):
     handle: str
 
 
+class NativeRewrap(NamedTuple):
+    """A resolved source/target pair whose DEK must be re-wrapped natively.
+
+    Returned by :meth:`KeyStore.native_rewrap_binding` when BOTH versions of
+    a rewrap are owned by the same provider_id and that provider declares
+    the ``rewrap_key`` operation: the caller passes this provider and the
+    two handles to ``envelope.rewrap_envelope_native`` instead of exporting
+    either KEK, so the DEK, the KEK private material and the plaintext never
+    enter the service process.
+    """
+
+    provider: object
+    source_handle: str
+    target_handle: str
+
+
 class KeyStore:
     """File-backed key store with one JSON file per key."""
 
@@ -4082,6 +4098,62 @@ class KeyStore:
             if source_ver.is_revoked or target_ver.is_revoked:
                 return self.REWRAP_REVOKED, record, source_ver, target_ver
             return self.REWRAP_OK, record, source_ver, target_ver
+
+    @_provider_session
+    def native_rewrap_binding(
+        self,
+        key_id: str,
+        tenant_id: str,
+        source_version: int,
+        target_version: int,
+    ) -> tuple:
+        """Resolve a KMS/HSM-native rewrap binding for two versions of a key.
+
+        Returns ``(status, native)`` with the REWRAP_* status semantics of
+        :meth:`rewrap_versions`. On REWRAP_OK ``native`` is a
+        :class:`NativeRewrap` ``(provider, source_handle, target_handle)``
+        triple when BOTH versions are owned by the same provider_id and that
+        provider declares the optional ``rewrap_key`` operation, and None
+        otherwise (the caller then keeps the export-based rewrap path). The
+        record is re-read under the key locks over the committed projection,
+        so a concurrent revoke/rotate/migrate between the caller's version
+        resolution and the provider call is still answered 409/404 and the
+        handles are always the currently committed ones. A record owned by
+        an inactive provider raises ProviderUnavailable (503), never a
+        silent fallback. Nothing is persisted and no audit event is written
+        here.
+        """
+        if not is_valid_key_id(key_id):
+            return self.REWRAP_NOT_FOUND, None
+        path = self._path_for(key_id)
+        with self.key_locks(key_id):
+            on_disk = self._read_record(path)
+            if on_disk is None or on_disk.tenant_id != tenant_id:
+                return self.REWRAP_NOT_FOUND, None
+            record = self._committed_record(on_disk)
+            if record is None:
+                return self.REWRAP_NOT_FOUND, None
+            self._take_over_legacy(record)
+            if record.status == "revoked":
+                return self.REWRAP_REVOKED, None
+            source_ver = record.get_version(source_version)
+            target_ver = record.get_version(target_version)
+            if source_ver is None or target_ver is None:
+                return self.REWRAP_NOT_FOUND, None
+            if source_ver.is_revoked or target_ver.is_revoked:
+                return self.REWRAP_REVOKED, None
+            if source_ver.provider_id != target_ver.provider_id:
+                # A native rewrap happens inside ONE provider; versions owned
+                # by different providers keep the export-based path.
+                return self.REWRAP_OK, None
+            provider = self._provider_for(source_ver.provider_id)
+            if not provider_mod.declares_rewrap_key(provider):
+                return self.REWRAP_OK, None
+            return self.REWRAP_OK, NativeRewrap(
+                provider=provider,
+                source_handle=source_ver.handle,
+                target_handle=target_ver.handle,
+            )
 
     # -- sign / verify ------------------------------------------------------
     # Outcomes shared by sign_message and verification_key: the version

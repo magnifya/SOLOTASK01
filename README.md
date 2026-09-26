@@ -210,7 +210,15 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `200` 键序固定 `format,envelope`，`format` 固定
   `keymgr-envelope-v1`。成功记 `rewrap/success`（带 key_id）。无 CLI；
   AAD 只可随信封返回，明文、数据密钥、私钥、句柄绝不入其他响应、审计、
-  错误或落盘。
+  错误或落盘。当源、目标版本同属一个 `provider_id` 且该提供者声明
+  `rewrap_key` 时走 KMS/HSM 原生路径：端点在五秒门限内调用绑定提供者的
+  `rewrap_key(src, dst, envelope)`（`envelope` 为令牌经 base64 解码的
+  信封字节），由提供者在内部认证包装 DEK 与内容 GCM 标签并把同一 DEK
+  改包到目标句柄，服务绝不调用 `export_material`，DEK、KEK 私钥与明文
+  不进入服务进程；认证失败仍为指出 envelope 的 `400`（不记账），缺方
+  法、返回结构/类型/长度不符或提供者故障为固定文案 `503` 且不记账。
+  其余情形（分属不同提供者或提供者未声明）沿用导出 KEK 在内存中改包
+  的旧路径。
 - `POST /v1/keys/{key_id}/sign`，**非幂等**（无需 `Idempotency-Key`），
   body 仅 `{tenant_id, version?, message}`；`message` 为标准 base64（可空），
   `version` 缺省为 current。用 RSASSA-PKCS1-v1_5/SHA-256 **确定性**签名，
@@ -575,7 +583,22 @@ python -m keymgr provider reconnect --operator alice
   提供者的 `wrap_key`，绝不调用 `export_material` 且不加载 KEK 私钥，再
   构造既有信封；异常或非法结果固定 `503`（不记审计、操作保持 pending，
   重试复用 operation_id，provider_id 恢复后至多继续一次）；未声明者沿用
-  导出旧路径。本地提供者已实现并声明 `wrap_key`。另可实现可选 `health()`（无参、返回 `bool`）：缺少视为健康，非
+  导出旧路径。本地提供者已实现并声明 `wrap_key`。`capabilities.operations`
+  还可另含 `rewrap_key`：声明即须实现
+  `rewrap_key(src: str, dst: str, envelope: bytes) -> tuple[bytes, bytes | None]`
+  ——`envelope` 为令牌经 base64 解码的信封字节，方法在 KMS/HSM 内以源句
+  柄 KEK 认证包装 DEK 与内容 GCM 标签，再把同一 DEK 改包到目标句柄并按
+  序返回 `(wrapped_key, wrap_nonce)`；src、dst 任一不是非空 str 抛
+  `ValueError`，envelope 非 bytes 抛 `TypeError`，envelope 为空或结构、
+  算法、长度非法抛 `ValueError`，认证失败抛 `ProviderInvalidMaterial`，
+  未知/算法不符句柄或后端故障抛 `ProviderUnavailable`；AES256 目标成功
+  须返回 48 字节 wrapped_key 与 12 字节 wrap_nonce，RSA2048 目标须返回
+  256 字节 wrapped_key 与 None；声明而无可调用方法，或返回结构/类型/长
+  度不符，均为提供者不可用。两版本同属一个 provider_id 且声明时，
+  rewrap 端点在五秒门限内调用绑定提供者的 `rewrap_key`，绝不调用
+  `export_material`，DEK、KEK 私钥与明文不进入服务进程（认证失败 400
+  指出 envelope，异常/故障固定 503 且不记审计）；否则沿用导出旧路径。
+  本地提供者已实现并声明 `rewrap_key`。另可实现可选 `health()`（无参、返回 `bool`）：缺少视为健康，非
   `bool`/抛异常视为不可用。普通 provider 调用路径上单次探活至多等 1
   秒（超时按一次失败、迟到结果作废），且一次调用的全部探活/等待共用不
   可重置的 5 秒总预算。模块缺失/工厂失败/契约不符/后端异常一律 `503`
