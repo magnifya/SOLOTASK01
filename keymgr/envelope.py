@@ -94,23 +94,29 @@ def b64_encode(raw: bytes) -> str:
     return base64.b64encode(raw).decode("ascii")
 
 
-def _wrap_dek(algorithm: str, kek) -> tuple:
-    """Wrap a fresh 32-byte DEK under the KEK. Returns (dek, wk, wrap_nonce)."""
-    dek = os.urandom(_KEY_LEN)
+def _wrap_dek_with(algorithm: str, kek, dek: bytes) -> tuple:
+    """Wrap an existing DEK under the KEK. Returns (wrapped_key, wrap_nonce)."""
     if algorithm == _AES256:
         if not isinstance(kek, (bytes, bytearray)) or len(kek) != _KEY_LEN:
             raise EnvelopeError("server key material is invalid for AES256")
         wrap_nonce = os.urandom(_NONCE_LEN)
         sealed = AESGCM(bytes(kek)).encrypt(wrap_nonce, dek, None)
-        return dek, sealed, wrap_nonce
+        return sealed, wrap_nonce
     if algorithm == _RSA2048:
         if not isinstance(kek, rsa.RSAPrivateKey) or kek.key_size != 2048:
             raise EnvelopeError(
                 "server key material is invalid for RSA2048"
             )
         sealed = kek.public_key().encrypt(dek, _OAEP)
-        return dek, sealed, None
+        return sealed, None
     raise EnvelopeError("unsupported algorithm for envelope: %r" % algorithm)
+
+
+def _wrap_dek(algorithm: str, kek) -> tuple:
+    """Wrap a fresh 32-byte DEK under the KEK. Returns (dek, wk, wrap_nonce)."""
+    dek = os.urandom(_KEY_LEN)
+    sealed, wrap_nonce = _wrap_dek_with(algorithm, kek, dek)
+    return dek, sealed, wrap_nonce
 
 
 def _unwrap_dek(opened: "OpenedEnvelope", kek) -> bytes:
@@ -321,3 +327,60 @@ def open_envelope(opened: OpenedEnvelope, kek) -> bytes:
         raise EnvelopeError(
             "field envelope is tampered or cannot be authenticated"
         ) from exc
+
+
+def rewrap_envelope(
+    opened: OpenedEnvelope,
+    source_kek,
+    *,
+    target_version: int,
+    target_algorithm: str,
+    target_kek,
+) -> str:
+    """Re-wrap an authenticated envelope's data key under a new KEK version.
+
+    The source envelope is fully authenticated first: the DEK is unwrapped
+    with the source KEK and the content GCM tag is verified (the recovered
+    plaintext is used only for that check, never stored or returned). Only
+    then is the SAME data key wrapped under the target version's KEK. The
+    key_id, nonce, tag, ciphertext and aad bytes are carried over unchanged;
+    the version, algorithm and wrap fields are rebuilt for the target. The
+    data key itself exists only in process memory for the duration of the
+    call and never enters the returned token in the clear.
+    """
+    dek = _unwrap_dek(opened, source_kek)
+    try:
+        AESGCM(dek).decrypt(
+            opened.nonce, opened.ciphertext + opened.tag, opened.aad
+        )
+    except InvalidTag as exc:
+        raise EnvelopeError(
+            "field envelope is tampered or cannot be authenticated"
+        ) from exc
+    wrapped_key, wrap_nonce = _wrap_dek_with(
+        target_algorithm, target_kek, dek
+    )
+    wrap = (
+        WRAP_AES_GCM
+        if target_algorithm == _AES256
+        else WRAP_RSA_OAEP_SHA256
+    )
+    payload = {
+        "format": FORMAT,
+        "key_id": opened.key_id,
+        "version": target_version,
+        "algorithm": target_algorithm,
+        "enc": ENC_AES_GCM,
+        "wrap": wrap,
+        "nonce": b64_encode(opened.nonce),
+        "tag": b64_encode(opened.tag),
+        "ciphertext": b64_encode(opened.ciphertext),
+        "wrapped_key": b64_encode(wrapped_key),
+        "aad": b64_encode(opened.aad),
+    }
+    if wrap_nonce is not None:
+        payload["wrap_nonce"] = b64_encode(wrap_nonce)
+    raw = json.dumps(
+        payload, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return b64_encode(raw)

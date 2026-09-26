@@ -1027,6 +1027,7 @@ class KeyStore:
                 audit_mod.ACTION_MIGRATE,
                 audit_mod.ACTION_ENCRYPT,
                 audit_mod.ACTION_DECRYPT,
+                audit_mod.ACTION_REWRAP,
                 audit_mod.ACTION_SIGN,
                 audit_mod.ACTION_VERIFY,
                 audit_mod.ACTION_AUDIT,
@@ -3738,6 +3739,55 @@ class KeyStore:
             exported = provider.export_material(ver.handle)
             kek = self._kek_for_version(ver, exported.encrypted_material)
             return self.CRYPTO_OK, record, ver, kek
+
+    # Outcomes of rewrap_versions, which resolves two versions of one key in
+    # a single locked read: OK / not found / revoked (same semantics as
+    # crypto_material).
+    REWRAP_OK = "ok"
+    REWRAP_NOT_FOUND = "not_found"
+    REWRAP_REVOKED = "revoked"
+
+    def rewrap_versions(
+        self,
+        key_id: str,
+        tenant_id: str,
+        source_version: int,
+        target_version: Optional[int] = None,
+    ) -> tuple:
+        """Resolve the source and target VERSION records for a rewrap.
+
+        Returns ``(status, record, source_ver, target_ver)``. Both versions
+        are read under ONE per-key lock over the committed projection, but no
+        provider is probed and no material exported: a same-version 409 and
+        a source-algorithm 400 must be answerable while a KMS/HSM is down.
+        ``target_version`` defaults to the current version. A missing
+        key/version (for either side), a foreign tenant and a revoked key
+        share the same indistinct statuses as crypto_material. The caller
+        then resolves each KEK with crypto_material exactly once.
+        """
+        if not is_valid_key_id(key_id):
+            return self.REWRAP_NOT_FOUND, None, None, None
+        path = self._path_for(key_id)
+        with self.key_locks(key_id):
+            on_disk = self._read_record(path)
+            if on_disk is None or on_disk.tenant_id != tenant_id:
+                return self.REWRAP_NOT_FOUND, None, None, None
+            record = self._committed_record(on_disk)
+            if record is None:
+                return self.REWRAP_NOT_FOUND, None, None, None
+            self._take_over_legacy(record)
+            if record.status == "revoked":
+                return self.REWRAP_REVOKED, record, None, None
+            source_ver = record.get_version(source_version)
+            if source_ver is None:
+                return self.REWRAP_NOT_FOUND, record, None, None
+            if target_version is None:
+                target_ver = record.current
+            else:
+                target_ver = record.get_version(target_version)
+                if target_ver is None:
+                    return self.REWRAP_NOT_FOUND, record, None, None
+            return self.REWRAP_OK, record, source_ver, target_ver
 
     # -- sign / verify ------------------------------------------------------
     # Outcomes shared by signing_material and verification_key: the version

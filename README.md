@@ -141,8 +141,27 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   字段；未知或跨租户的 key/version 为 `404`；吊销版本（含旧版本）为 `409`；
   提供者不可用为 `503`，沿用固定脱敏文案。私钥、数据密钥只存在于进程内存，
   绝不进入响应或审计。
-- `POST /v1/keys/{key_id}/sign`，**非幂等**（无需 `Idempotency-Key`），body
-  仅 `{tenant_id, version?, message}`；`message` 为标准 base64（可空），
+- `POST /v1/keys/{key_id}/rewrap`，**非幂等**（无需
+  `Idempotency-Key`），body 仅
+  `{tenant_id, envelope, target_version?, aad?}`；`envelope`、`aad` 为
+  标准带填充 base64，`target_version` 缺省为 current（须正整数）。把已
+  认证信封内的数据密钥从源版本重新包装到目标版本：先以源版本 KEK 完整
+  认证原信封（解包数据密钥并校验内容 GCM tag），再仅把**同一数据密钥**
+  按目标版本重新包装；`nonce`、`tag`、`ciphertext`、`aad`、`key_id` 字
+  节不变，version、algorithm 及包装字段按目标重建（AES256→AES-GCM，
+  RSA2048→RSA-OAEP-SHA256）。正文、UUID4、base64、信封结构非法或信封
+  key_id 异于路径，均在授权前 `400` 指出字段且**不记账**；仅 tenant 来
+  源缺失/冲突照旧记 `tenant_conflict`。策略动作新增 `rewrap`，拒权 `403`
+  并记 `rewrap/rejected`（带 key_id）；授权后未知/跨租户 key 或未知版本
+  `404`，算法与源版本不符或认证失败 `400`（不记账），吊销或目标与源同
+  版本 `409`，提供者/材料故障 `503` 且 error 固定
+  `key management provider is unavailable`（不记账）；账本失败 `500`。
+  `200` 键序固定 `format,envelope`，`format` 固定
+  `keymgr-envelope-v1`。成功记 `rewrap/success`（带 key_id）。无 CLI；
+  AAD 只可随信封返回，明文、数据密钥、私钥、句柄绝不入其他响应、审计、
+  错误或落盘。
+- `POST /v1/keys/{key_id}/sign`，**非幂等**（无需 `Idempotency-Key`），
+  body 仅 `{tenant_id, version?, message}`；`message` 为标准 base64（可空），
   `version` 缺省为 current。用 RSASSA-PKCS1-v1_5/SHA-256 **确定性**签名，
   `200` 键序固定 `key_id,version,signature`，`signature` 为标准 base64。
   正文结构、字段、UUID4、base64 或 version 非正整数均 `400` 并指出字段，
@@ -365,7 +384,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 - 规则元素 `{subject, actions, effect}`：`subject` 为区分大小写的非空字符串；
   `actions` 为非空数组，取值
   `create/read/rotate/revoke/import/export/migrate/encrypt/decrypt/
-  sign/verify/audit/list`，单条内重复去重；`effect` 为 `allow`/`deny`；未知字段、类型错误、同
+  rewrap/sign/verify/audit/list`，单条内重复去重；`effect` 为 `allow`/`deny`；未知字段、类型错误、同
   subject+effect+无序动作集的重复规则均 `400`；`rules:[]` 合法（全拒绝）。
 - 执行：管理动作 policy_* 免检；租户无策略时全部允许；有策略时匹配规则中
   deny 优先于 allow，无匹配则拒绝 → `403`，并记一条原动作名、
@@ -376,12 +395,14 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 
 - 事件字段 `{event_id, tenant_id, action, key_id, outcome, timestamp}`；
   `action` 为 `create/read/rotate/batch_rotate/revoke/import/export/
-  migrate/encrypt/decrypt/sign/verify/audit/list/tenant_conflict/
+  migrate/encrypt/decrypt/rewrap/sign/verify/audit/list/tenant_conflict/
   policy_read/policy_update/policy_delete`，`outcome` 为 `success/rejected`。
-  信封加密/解密事件只含元数据（无 plaintext、aad、envelope、数据密钥或私钥）；
+  信封加密/解密/重包装事件只含元数据（无 plaintext、aad、envelope、数据密钥或私钥）；
   签名/验签事件同样只含元数据（无 message、signature、私钥或句柄），成功记
   `sign`/`verify` 的 success、业务拒绝记同名 rejected，均携带当时 key_id；
-  正文 `400` 不记账，提供者故障的 sign `503` 也不记账。幂等 HTTP encrypt
+  重包装成功记 `rewrap/success`、拒权/业务拒绝记 `rewrap/rejected`，均带
+  key_id，正文 `400`（含算法不符与认证失败）与提供者故障的 `503` 都不记账；
+  sign 的正文 `400` 与提供者故障 `503` 同样不记账。幂等 HTTP encrypt
   每个终态至多一条 `event_id=operation_id,action=encrypt` 事件（成功 200 与
   绑定后拒绝都随操作重放，绝不重复记账），非幂等 CLI/decrypt 每次请求各记一
   条；策略拒绝写一条对应 `encrypt`/`decrypt` 的 rejected 事件（携带 key_id），

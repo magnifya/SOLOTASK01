@@ -58,6 +58,7 @@ _SIGN_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/sign$")
 _VERIFY_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/verify$")
 _MIGRATE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/migrate$")
 _DECRYPT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/decrypt$")
+_REWRAP_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/rewrap$")
 _STATUS_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/status$")
 _VERSION_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/versions/([^/]+)$")
 _CURRENT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/current$")
@@ -597,7 +598,8 @@ def make_handler(
             return False
 
         # -- parsing helpers ---------------------------------------------
-        def _read_json_object(self, audit: bool = True):
+        def _read_json_object(self, audit: bool = True,
+                              parse_conflict=None):
             """Return the request body as a dict, or None after responding.
 
             A body that cannot be parsed carries no usable tenant. By default
@@ -606,24 +608,33 @@ def make_handler(
             mutation endpoints pass ``audit=False``: an Idempotency-Key has
             already been validated on them, but no operation is bound yet, so
             a parse/parameter failure must leave no audit event, operation
-            record, key or provider handle behind.
+            record, key or provider handle behind. A non-idempotent endpoint
+            can pass ``parse_conflict=False`` while leaving ``audit=True``:
+            the parse/non-object 400 is a plain body error that writes
+            nothing, while a later tenant-parameter failure on the SAME body
+            still records its invisible tenant_conflict (sign/verify).
             """
+            write_conflict = (
+                audit if parse_conflict is None else parse_conflict
+            )
+
+            def bad(message: str) -> None:
+                if not write_conflict or self._record_conflict():
+                    self._bad_request(message)
+
             try:
                 length = int(self.headers.get("Content-Length", 0))
             except ValueError:
-                if not audit or self._record_conflict():
-                    self._bad_request("invalid Content-Length")
+                bad("invalid Content-Length")
                 return None
             raw = self.rfile.read(length) if length > 0 else b""
             try:
                 payload = json.loads(raw.decode("utf-8"))
             except (ValueError, UnicodeDecodeError):
-                if not audit or self._record_conflict():
-                    self._bad_request("request body must be valid JSON")
+                bad("request body must be valid JSON")
                 return None
             if not isinstance(payload, dict):
-                if not audit or self._record_conflict():
-                    self._bad_request("request body must be a JSON object")
+                bad("request body must be a JSON object")
                 return None
             return payload
 
@@ -786,6 +797,11 @@ def make_handler(
                 decrypt_match = _DECRYPT_PATH_RE.match(path)
                 if decrypt_match is not None:
                     self._decrypt_key(decrypt_match.group(1), parts, operator)
+                    return
+
+                rewrap_match = _REWRAP_PATH_RE.match(path)
+                if rewrap_match is not None:
+                    self._rewrap_key(rewrap_match.group(1), parts, operator)
                     return
 
                 sign_match = _SIGN_PATH_RE.match(path)
@@ -1605,6 +1621,181 @@ def make_handler(
                 200, {"plaintext": envelope.b64_encode(plaintext)}
             )
 
+        def _rewrap_key(self, key_id: str, parts, operator: str) -> None:
+            """POST /v1/keys/{key_id}/rewrap.
+
+            Body is exactly ``{tenant_id, envelope, target_version?, aad?}``
+            (non-idempotent, no Idempotency-Key). ``envelope`` and ``aad``
+            are canonical standard base64; ``target_version`` defaults to the
+            key's current version. An unparseable/non-object body, the UUID4
+            key_id, the base64 fields, the envelope structure and an envelope
+            key_id differing from the path are all parameter validation: a
+            400 naming the field, written to no ledger. Only a wrong/missing
+            tenant *source* records the invisible tenant_conflict.
+
+            Authorization (``rewrap``) precedes existence: a denial is 403
+            with a ``rewrap/rejected`` event carrying key_id. After that an
+            unknown/cross-tenant key or an unknown version is 404, a revoked
+            key or an already-current target is 409, an algorithm mismatch
+            with the SOURCE version or a failed authentication is 400, and a
+            provider/material failure is the fixed 503 text (not audited).
+            Success rewraps the SAME authenticated data key under the target
+            version: nonce, tag, ciphertext, aad and key_id bytes are carried
+            over unchanged and the answer is
+            ``200 {"format","envelope"}``. The data key, plaintext, handles
+            and material never enter a response, the ledger or any file.
+            """
+            action = audit_mod.ACTION_REWRAP
+            # Like sign/verify, a malformed body is a plain 400 with no
+            # tenant_conflict: only an actual tenant-source failure below is
+            # audited.
+            payload = self._read_json_object(parse_conflict=False)
+            if payload is None:
+                return
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                if not self._record_conflict():
+                    return
+                self._bad_request("field tenant_id must be a non-empty string")
+                return
+            tenant_id = self._tenant(parts, payload)
+            if tenant_id is None:
+                return
+            # A malformed key_id is parameter validation on this endpoint:
+            # 400 with no event (the tenant source itself was valid).
+            if self._bad_key_id(key_id, audit=False):
+                return
+            extra = [
+                f for f in payload
+                if f not in ("tenant_id", "envelope", "target_version", "aad")
+            ]
+            if extra:
+                self._bad_request(
+                    "field %s is not accepted by this endpoint" % extra[0]
+                )
+                return
+            target_version = payload.get("target_version")
+            if target_version is not None and (
+                not isinstance(target_version, int)
+                or isinstance(target_version, bool)
+                or target_version < 1
+            ):
+                self._bad_request(
+                    "field target_version must be a positive integer"
+                )
+                return
+            token = payload.get("envelope")
+            if not isinstance(token, str) or not token:
+                self._bad_request(
+                    "field envelope must be a non-empty base64 string"
+                    if "envelope" in payload
+                    else "missing required field: envelope"
+                )
+                return
+            try:
+                aad_text = payload.get("aad")
+                aad = (
+                    b""
+                    if aad_text is None
+                    else envelope.b64_decode_field(aad_text, "aad")
+                )
+            except envelope.EnvelopeError as exc:
+                self._bad_request(str(exc))
+                return
+            # Structural validation, key_id agreement and AAD agreement are
+            # parameter validation, all before authorization.
+            try:
+                opened = envelope.decode_envelope(token)
+            except envelope.EnvelopeError as exc:
+                self._bad_request(str(exc))
+                return
+            if opened.key_id != key_id:
+                self._bad_request(
+                    "field envelope key_id does not match the request key_id"
+                )
+                return
+            if opened.aad != aad:
+                self._bad_request("field aad does not match the envelope")
+                return
+            if not self._enforce(tenant_id, key_id, action, operator):
+                return
+            # Step 1: resolve both VERSION records under one key lock with no
+            # provider contact, so the 404/409/400 answers below never depend
+            # on a KMS/HSM being reachable.
+            status, _record, source_ver, target_ver = store.rewrap_versions(
+                key_id, tenant_id, opened.version,
+                target_version=target_version,
+            )
+            if status == store.REWRAP_NOT_FOUND:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 404, "key not found"
+                )
+                return
+            if status == store.REWRAP_REVOKED:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 409, "key is revoked"
+                )
+                return
+            if opened.algorithm != source_ver.algorithm:
+                # A 400 after authorization is still a parameter/validation
+                # failure: per the rewrap contract it is NOT audited, and it
+                # precedes the same-version conflict.
+                self._bad_request(
+                    "field envelope algorithm does not match the source key version"
+                )
+                return
+            if target_ver.version == source_ver.version:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 409,
+                    "target_version is the envelope's current key version",
+                )
+                return
+            # Step 2: export each KEK (one crypto_material call per distinct
+            # version). Provider/material faults propagate to do_POST's fixed
+            # 503 and are deliberately NOT audited; nothing has been written.
+            src_status, _r1, _src_ver, source_kek = store.crypto_material(
+                key_id, tenant_id, source_ver.version
+            )
+            if src_status == store.CRYPTO_NOT_FOUND:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 404, "key not found"
+                )
+                return
+            if src_status == store.CRYPTO_REVOKED:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 409, "key is revoked"
+                )
+                return
+            tgt_status, _r2, _tgt_ver, target_kek = store.crypto_material(
+                key_id, tenant_id, target_ver.version
+            )
+            if tgt_status == store.CRYPTO_NOT_FOUND:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 404, "key not found"
+                )
+                return
+            if tgt_status == store.CRYPTO_REVOKED:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 409, "key is revoked"
+                )
+                return
+            try:
+                new_token = envelope.rewrap_envelope(
+                    opened, source_kek,
+                    target_version=target_ver.version,
+                    target_algorithm=target_ver.algorithm,
+                    target_kek=target_kek,
+                )
+            except envelope.EnvelopeError as exc:
+                # The source envelope did not authenticate: 400, no event.
+                self._bad_request(str(exc))
+                return
+            if not self._record_attempt(
+                tenant_id, key_id, action, audit_mod.OUTCOME_SUCCESS
+            ):
+                return
+            self._send_json(200, {"format": envelope.FORMAT, "envelope": new_token})
+
         # -- sign / verify --------------------------------------------------
         def _sign_verify_base(self, key_id, parts, accepted_fields):
             """Shared parse/validate prelude for sign and verify.
@@ -1613,17 +1804,17 @@ def make_handler(
             the decoded signature is checked by the caller's body) or None
             after the response was sent.
 
-            Identity rules follow decrypt: an unparseable body, a bad or
-            conflicting tenant_id and a malformed key_id are the audited
-            tenant_conflict cases. Every OTHER body problem -- an extra
-            field, a non-positive-integer version, a missing/non-string
+            Identity rules follow decrypt: a bad or conflicting tenant_id and
+            a malformed key_id are the audited tenant_conflict cases. Every
+            OTHER body problem -- an unparseable body, a non-object body, an
+            extra field, a non-positive-integer version, a missing/non-string
             message or bad base64 -- is a plain 400 naming the field and is
             NOT written to the audit ledger, per the sign/verify contract.
             Returns ``(tenant_id, version, raw_message, payload)``; the
             already-parsed payload is returned so verify can validate its
             extra ``signature`` field without reading the body twice.
             """
-            payload = self._read_json_object()
+            payload = self._read_json_object(parse_conflict=False)
             if payload is None:
                 return None
             body_tenant = payload.get("tenant_id")

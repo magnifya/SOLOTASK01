@@ -341,11 +341,19 @@ def test_body_400s_are_not_audited(stack):
 
 def test_raw_json_and_tenant_400s(stack):
     key_id = _make_key(stack.client)
-    # Bad JSON is a 400 (an invisible tenant_conflict, like decrypt).
+    # Bad JSON / a non-object body is a plain 400, written to NO ledger.
     status, _ = stack.client.call(
         "POST", "/v1/keys/%s/sign" % key_id, None, raw=b"{not json"
     )
     assert status == 400
+    status, _ = stack.client.call(
+        "POST", "/v1/keys/%s/sign" % key_id, None, raw=b"[1, 2]"
+    )
+    assert status == 400
+    raw_ledger = open(
+        os.path.join(stack.data_dir, "audit.log"), "rb"
+    ).read()
+    assert b"tenant_conflict" not in raw_ledger
     # Missing/empty tenant.
     status, err = stack.client.call(
         "POST", "/v1/keys/%s/sign" % key_id, {"message": b64(b"x")}
