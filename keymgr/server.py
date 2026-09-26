@@ -93,6 +93,11 @@ def make_handler(
         def _server_error(self, exc: Exception) -> None:
             # A ledger write failure aborts the request with 500; mutations
             # have already rolled back their key-file change by this point.
+            # The audit endpoint reports every ledger failure with one fixed
+            # body instead.
+            if getattr(self, "_audit_fixed_ledger_body", False):
+                self._send_json(500, {"error": "audit ledger is unavailable"})
+                return
             self._send_json(500, {"error": "audit ledger failure: %s" % exc})
 
         def _provider_unavailable(self, exc: Exception) -> None:
@@ -2501,11 +2506,17 @@ def make_handler(
                 return
 
             if path == _AUDIT_PATH:
-                # Audit failures are 500, not audited themselves.
+                # Audit failures are 500 with a fixed body, not audited
+                # themselves.
+                self._audit_fixed_ledger_body = True
                 try:
                     self._get_audit(parts, operator)
-                except LedgerError as exc:
-                    self._server_error(exc)
+                except LedgerError:
+                    self._send_json(
+                        500, {"error": "audit ledger is unavailable"}
+                    )
+                finally:
+                    self._audit_fixed_ledger_body = False
                 return
 
             if path == _KEYS_PATH:

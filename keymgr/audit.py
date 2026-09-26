@@ -67,6 +67,38 @@ OUTCOMES = (OUTCOME_SUCCESS, OUTCOME_REJECTED)
 _LOG_NAME = "audit.log"
 _LOCK_NAME = "audit.log.lock"
 _SECRET_NAME = "audit.secret"
+_ANCHOR_NAME = "audit-anchor.json"
+
+# Key order of a legacy (pre-chain) ledger line; chained lines append
+# prev_mac and mac after these seven keys.
+_EVENT_KEYS = (
+    "event_id",
+    "tenant_id",
+    "action",
+    "key_id",
+    "outcome",
+    "timestamp",
+    "seq",
+)
+_CHAIN_KEYS = _EVENT_KEYS + ("prev_mac", "mac")
+_ANCHOR_KEYS = ("schema_version", "legacy_bytes", "legacy_mac")
+_LEGACY_DOMAIN = b"legacy\0"
+_HEX_LOWER = frozenset("0123456789abcdef")
+
+
+def _compact_json(obj: dict) -> bytes:
+    """Canonical ledger encoding: compact UTF-8 JSON, non-ASCII as-is."""
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
+
+
+def _is_hex64(value) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(ch in _HEX_LOWER for ch in value)
+    )
 
 
 class LedgerError(Exception):
@@ -140,6 +172,13 @@ class AuditLog:
     share a monotonic ``seq`` without interleaving or losing lines. Pagination
     cursors are HMAC-signed and bound to the tenant, the active filters and the
     ledger snapshot they were issued against.
+
+    The ledger is tamper-evident: on first load the pre-existing (legacy)
+    lines are strictly validated and committed into ``audit-anchor.json``
+    (byte count plus an HMAC over ``"legacy\\0" + raw bytes``); every line
+    appended afterwards carries ``prev_mac``/``mac`` chaining back to that
+    anchor. Anchor, prefix and chain are re-verified on every locked read
+    and write; any mismatch raises ``LedgerError``.
     """
 
     def __init__(self, data_dir: str) -> None:
@@ -148,6 +187,7 @@ class AuditLog:
         self._log_path = os.path.join(data_dir, _LOG_NAME)
         self._lock_path = os.path.join(data_dir, _LOCK_NAME)
         self._secret_path = os.path.join(data_dir, _SECRET_NAME)
+        self._anchor_path = os.path.join(data_dir, _ANCHOR_NAME)
         self._append_lock = threading.Lock()
         self._secret: Optional[bytes] = None
 
@@ -196,50 +236,223 @@ class AuditLog:
         try:
             # Re-check under the lock: another process may have completed
             # the initialization while this one waited.
-            try:
-                with open(self._secret_path, "rb") as fh:
-                    secret = fh.read()
-                if secret:
-                    self._secret = secret
-                    return secret
-            except FileNotFoundError:
-                pass
-            secret = os.urandom(32).hex().encode("ascii")
-            out = os.open(
-                self._secret_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
-            )
-            try:
-                os.write(out, secret)
-                os.fsync(out)
-            finally:
-                os.close(out)
-            self._secret = secret
-            return secret
+            return self._signing_secret_locked()
         finally:
             self._unlock_file(fd)
 
-    # -- reads -------------------------------------------------------------
-    def _read_all_locked(self) -> List[AuditEvent]:
-        """Read every ledger line. Caller must hold no lock; takes none."""
+    def _signing_secret_locked(self) -> bytes:
+        """Read-or-create the HMAC secret; caller holds the file lock."""
+        if self._secret is not None:
+            return self._secret
         try:
-            with open(self._log_path, "r", encoding="utf-8") as fh:
-                lines = fh.readlines()
+            with open(self._secret_path, "rb") as fh:
+                secret = fh.read()
+            if secret:
+                self._secret = secret
+                return secret
         except FileNotFoundError:
-            return []
+            pass
+        secret = os.urandom(32).hex().encode("ascii")
+        out = os.open(
+            self._secret_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+        )
+        try:
+            os.write(out, secret)
+            os.fsync(out)
+        finally:
+            os.close(out)
+        self._secret = secret
+        return secret
+
+    # -- reads -------------------------------------------------------------
+    def _read_log_bytes_locked(self) -> bytes:
+        """Raw ledger bytes (empty when no log exists yet)."""
+        try:
+            with open(self._log_path, "rb") as fh:
+                return fh.read()
+        except FileNotFoundError:
+            return b""
         except OSError as exc:
             raise LedgerError("cannot read audit log: %s" % exc) from exc
+
+    @staticmethod
+    def _split_lines(raw: bytes) -> List[bytes]:
+        """Split into records on newlines; any empty line is corruption."""
+        if not raw:
+            return []
+        lines = raw.split(b"\n")
+        if lines[-1] == b"":
+            lines.pop()
+        if any(not line for line in lines):
+            raise LedgerError("audit ledger is corrupt: empty line")
+        return lines
+
+    @staticmethod
+    def _parse_line(line: bytes) -> dict:
+        try:
+            obj = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise LedgerError("audit ledger is corrupt: %s" % exc) from exc
+        if not isinstance(obj, dict):
+            raise LedgerError("audit ledger is corrupt: not an object")
+        return obj
+
+    @staticmethod
+    def _check_event_fields(obj: dict, expected_seq: int, seen: set) -> None:
+        """Type, seq-continuity and event_id-uniqueness checks (both formats)."""
+        seq = obj["seq"]
+        if (
+            not isinstance(obj["event_id"], str)
+            or not isinstance(obj["action"], str)
+            or not isinstance(obj["outcome"], str)
+            or not isinstance(obj["timestamp"], str)
+            or (
+                obj["tenant_id"] is not None
+                and not isinstance(obj["tenant_id"], str)
+            )
+            or (
+                obj["key_id"] is not None
+                and not isinstance(obj["key_id"], str)
+            )
+        ):
+            raise LedgerError("audit ledger is corrupt: bad field types")
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+            raise LedgerError("audit ledger is corrupt: bad seq")
+        if seq != expected_seq:
+            raise LedgerError("audit ledger is corrupt: non-sequential seq")
+        if obj["event_id"] in seen:
+            raise LedgerError("audit ledger is corrupt: duplicate event_id")
+        seen.add(obj["event_id"])
+
+    def _validate_legacy_lines(self, lines: List[bytes]) -> List[AuditEvent]:
+        """Strictly validate pre-chain lines: exact key order, field types,
+        seq continuous from 1 and unique event_ids."""
         events: List[AuditEvent] = []
+        seen: set = set()
         for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                events.append(AuditEvent.from_json(json.loads(line)))
-            except (ValueError, KeyError, TypeError):
-                # A torn/corrupt tail line must not poison reads; the writer
-                # only ever fsyncs complete lines.
-                continue
+            obj = self._parse_line(line)
+            if tuple(obj.keys()) != _EVENT_KEYS:
+                raise LedgerError("audit ledger is corrupt: bad event keys")
+            self._check_event_fields(obj, len(events) + 1, seen)
+            events.append(AuditEvent.from_json(obj))
         return events
+
+    def _read_anchor_locked(self):
+        """Return (legacy_bytes, legacy_mac), or None if no anchor exists."""
+        try:
+            with open(self._anchor_path, "rb") as fh:
+                raw = fh.read()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise LedgerError("cannot read audit anchor: %s" % exc) from exc
+        try:
+            obj = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise LedgerError("audit anchor is corrupt: %s" % exc) from exc
+        if not isinstance(obj, dict) or tuple(obj.keys()) != _ANCHOR_KEYS:
+            raise LedgerError("audit anchor is corrupt: bad keys")
+        schema_version = obj["schema_version"]
+        legacy_bytes = obj["legacy_bytes"]
+        legacy_mac = obj["legacy_mac"]
+        if isinstance(schema_version, bool) or schema_version != 1:
+            raise LedgerError("audit anchor is corrupt: bad schema_version")
+        if (
+            isinstance(legacy_bytes, bool)
+            or not isinstance(legacy_bytes, int)
+            or legacy_bytes < 0
+        ):
+            raise LedgerError("audit anchor is corrupt: bad legacy_bytes")
+        if not _is_hex64(legacy_mac):
+            raise LedgerError("audit anchor is corrupt: bad legacy_mac")
+        return legacy_bytes, legacy_mac
+
+    def _write_anchor_locked(self, legacy_bytes: int, legacy_mac: str) -> None:
+        """Commit the anchor atomically (temp file, fsync, rename), 0600."""
+        payload = _compact_json(
+            {
+                "schema_version": 1,
+                "legacy_bytes": legacy_bytes,
+                "legacy_mac": legacy_mac,
+            }
+        )
+        tmp_path = self._anchor_path + ".tmp"
+        try:
+            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                view = memoryview(payload)
+                while view:
+                    view = view[os.write(fd, view):]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp_path, self._anchor_path)
+        except OSError as exc:
+            raise LedgerError("cannot write audit anchor: %s" % exc) from exc
+
+    def _secret_locked(self) -> bytes:
+        try:
+            return self._signing_secret_locked()
+        except OSError as exc:
+            raise LedgerError("cannot load audit secret: %s" % exc) from exc
+
+    def _load_locked(self):
+        """Verify anchor, legacy prefix and chain under the held locks.
+
+        On first load (no anchor yet) the whole existing log is validated as
+        legacy lines and the anchor committing to its bytes is created. Every
+        later load re-verifies the anchor, the MAC'd legacy prefix and the
+        full prev_mac/mac chain. Any inconsistency raises LedgerError; no
+        line is ever skipped and nothing is re-signed. Returns the events
+        plus the mac the next appended line must name as its prev_mac.
+        """
+        raw = self._read_log_bytes_locked()
+        anchor = self._read_anchor_locked()
+        if anchor is None:
+            # First load: validate the whole log as legacy lines before the
+            # anchor commits to exactly these bytes.
+            events = self._validate_legacy_lines(self._split_lines(raw))
+            legacy_mac = hmac.new(
+                self._secret_locked(), _LEGACY_DOMAIN + raw, hashlib.sha256
+            ).hexdigest()
+            self._write_anchor_locked(len(raw), legacy_mac)
+            return events, legacy_mac
+        legacy_bytes, legacy_mac = anchor
+        if legacy_bytes > len(raw):
+            raise LedgerError("audit ledger is shorter than its anchor")
+        prefix = raw[:legacy_bytes]
+        secret = self._secret_locked()
+        actual = hmac.new(
+            secret, _LEGACY_DOMAIN + prefix, hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(actual, legacy_mac):
+            raise LedgerError("audit ledger prefix does not match its anchor")
+        events = self._validate_legacy_lines(self._split_lines(prefix))
+        seen = {event.event_id for event in events}
+        prev_mac = legacy_mac
+        seq = len(events)
+        for line in self._split_lines(raw[legacy_bytes:]):
+            obj = self._parse_line(line)
+            if tuple(obj.keys()) != _CHAIN_KEYS:
+                raise LedgerError("audit ledger is corrupt: bad chained keys")
+            if not _is_hex64(obj["prev_mac"]) or not _is_hex64(obj["mac"]):
+                raise LedgerError("audit ledger is corrupt: bad mac")
+            seq += 1
+            self._check_event_fields(obj, seq, seen)
+            if obj["prev_mac"] != prev_mac:
+                raise LedgerError("audit ledger chain is broken")
+            expected = hmac.new(
+                secret,
+                _compact_json({key: obj[key] for key in _CHAIN_KEYS[:8]}),
+                hashlib.sha256,
+            ).hexdigest()
+            if not hmac.compare_digest(expected, obj["mac"]):
+                raise LedgerError("audit ledger chain is broken")
+            if _compact_json(obj) != line:
+                raise LedgerError("audit ledger is corrupt: non-canonical line")
+            events.append(AuditEvent.from_json(obj))
+            prev_mac = obj["mac"]
+        return events, prev_mac
 
     def _read_all(self) -> List[AuditEvent]:
         """Read under both locks for a consistent cross-process snapshot.
@@ -251,7 +464,8 @@ class AuditLog:
         with self._append_lock:
             fd = self._locked_file()
             try:
-                return self._read_all_locked()
+                events, _ = self._load_locked()
+                return events
             finally:
                 self._unlock_file(fd)
 
@@ -300,13 +514,17 @@ class AuditLog:
     def append(self, event: AuditEvent) -> AuditEvent:
         """Append one event durably, assigning the next monotonic seq.
 
-        Raises LedgerError if the line cannot be committed. The fsync before
-        release means a returned event is on disk.
+        The line is hash-chained: it carries the previous entry's mac (or
+        the anchor's legacy_mac for the first chained line) as prev_mac and
+        its own mac over the canonical encoding of the eight preceding keys.
+        Raises LedgerError if the chain does not verify or the line cannot
+        be committed. The fsync before release means a returned event is on
+        disk.
         """
         with self._append_lock:
             fd = self._locked_file()
             try:
-                existing = self._read_all_locked()
+                existing, tail_mac = self._load_locked()
                 # Idempotent on event_id: recovery re-append after a crash
                 # between the ledger write and the outbox-marker clear must
                 # not produce a duplicate line.
@@ -315,9 +533,16 @@ class AuditLog:
                         event.seq = prior.seq
                         return event
                 event.seq = (existing[-1].seq + 1) if existing else 1
-                line = json.dumps(event.to_json(), separators=(",", ":")) + "\n"
+                payload = event.to_json()
+                payload["prev_mac"] = tail_mac
+                payload["mac"] = hmac.new(
+                    self._secret_locked(),
+                    _compact_json(payload),
+                    hashlib.sha256,
+                ).hexdigest()
+                line = _compact_json(payload) + b"\n"
                 try:
-                    with open(self._log_path, "a", encoding="utf-8") as fh:
+                    with open(self._log_path, "ab") as fh:
                         fh.write(line)
                         fh.flush()
                         os.fsync(fh.fileno())

@@ -426,6 +426,20 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `"_restore":true` 与写集清单），只追加一条 `import` 事件；批量轮换是多
   key outbox（标记带 `"_batch_rotate":true`、写集 key_ids 与 provision/
   snapshot 引用），只追加一条 `batch_rotate` 事件（`key_id` null）。
+- **防篡改链**：首次加载 `audit.log` 时在 `audit.log.lock` 内把既有内容按
+  旧格式严格校验（每行键序固定 `event_id,tenant_id,action,key_id,outcome,
+  timestamp,seq`，类型依次为 str、str|null、str、str|null、str、str、正
+  int，`seq` 从 1 连续、`event_id` 唯一；空行、坏 JSON、未知键均为损坏），
+  校验后创建 0600 的 `audit-anchor.json`（temp 文件 fsync 后 rename；紧凑
+  UTF-8 JSON、非 ASCII 原样、无末行，键序 `schema_version,legacy_bytes,
+  legacy_mac`，值为 1、日志字节数、HMAC-SHA256(`audit.secret`,
+  `"legacy\0"`+原始字节) 的 64 位小写 hex）。此后新行键序为上述七键加
+  `prev_mac,mac`（紧凑 JSON 并换行）：首行 `prev_mac` 为 `legacy_mac`，
+  之后取前条 `mac`；`mac` 为前八键按同口径编码的 HMAC-SHA256 小写 hex。
+  每次读写都在锁内验证锚点、前缀与全链，校验失败抛 `LedgerError`，不跳过
+  不重签；锚点创建或 I/O 失败亦同。`GET /v1/audit` 遇 `LedgerError` 固定
+  `500` `{"error":"audit ledger is unavailable"}`，CLI `audit` 同体、退出
+  `1`、零副作用。
 
 ## 命令行
 

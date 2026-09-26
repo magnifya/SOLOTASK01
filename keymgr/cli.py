@@ -1723,11 +1723,13 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 "field limit must be an integer between 1 and 1000", 2
             )
         if not allowed(audit_mod.ACTION_AUDIT):
-            if not _attempt(
-                store, args.tenant_id, None,
-                audit_mod.ACTION_AUDIT, audit_mod.OUTCOME_REJECTED,
-            ):
-                return 1
+            try:
+                store.audit_attempt(
+                    args.tenant_id, None,
+                    audit_mod.ACTION_AUDIT, audit_mod.OUTCOME_REJECTED,
+                )
+            except LedgerError:
+                return _fail("audit ledger is unavailable", 1)
             return _fail("action not permitted by policy", 3)
         try:
             page = store.audit.query(
@@ -1739,8 +1741,8 @@ def _run(argv: Optional[List[str]] = None) -> int:
             )
         except InvalidCursor:
             return _fail("invalid or expired cursor", 2)
-        except LedgerError as exc:
-            return _ledger_fail(exc)
+        except LedgerError:
+            return _fail("audit ledger is unavailable", 1)
         _print(
             {
                 "events": [e.to_response() for e in page.events],
