@@ -4,8 +4,9 @@ import base64
 import os
 from typing import NamedTuple, Optional
 
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 SUPPORTED_ALGORITHMS = ("AES256", "RSA2048")
 
@@ -55,3 +56,43 @@ def generate_key(algorithm: str) -> GeneratedKey:
     if algorithm == "RSA2048":
         return _generate_rsa2048()
     raise ValueError("unsupported algorithm: %r" % (algorithm,))
+
+
+def rsa2048_sign(private_key, message: bytes) -> bytes:
+    """Sign ``message`` with RSASSA-PKCS1-v1_5 / SHA-256 (deterministic).
+
+    ``private_key`` must be a 2048-bit RSA private key (the store layer has
+    already validated the loaded material). The signature never leaves the
+    service except as the base64 response field.
+    """
+    if not isinstance(private_key, rsa.RSAPrivateKey) or (
+        private_key.key_size != 2048
+    ):
+        raise ValueError("signing requires a 2048-bit RSA private key")
+    return private_key.sign(message, padding.PKCS1v15(), hashes.SHA256())
+
+
+def rsa2048_verify(public_pem: str, message: bytes, signature: bytes) -> bool:
+    """Verify an RSASSA-PKCS1-v1_5 / SHA-256 signature against a PEM public key.
+
+    Uses only the stored public material. A mismatching signature returns
+    False; a stored public key that is not a usable 2048-bit RSA PEM raises
+    ValueError (a backend inconsistency, surfaced as 503 by the caller).
+    """
+    try:
+        public_key = serialization.load_pem_public_key(
+            public_pem.encode("utf-8")
+        )
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValueError(
+            "stored RSA2048 public key is not a PEM public key"
+        ) from exc
+    if not isinstance(public_key, rsa.RSAPublicKey) or (
+        public_key.key_size != 2048
+    ):
+        raise ValueError("stored RSA2048 public key is not a 2048-bit RSA key")
+    try:
+        public_key.verify(signature, message, padding.PKCS1v15(), hashes.SHA256())
+    except InvalidSignature:
+        return False
+    return True

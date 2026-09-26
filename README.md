@@ -141,6 +141,20 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   字段；未知或跨租户的 key/version 为 `404`；吊销版本（含旧版本）为 `409`；
   提供者不可用为 `503`，沿用固定脱敏文案。私钥、数据密钥只存在于进程内存，
   绝不进入响应或审计。
+- `POST /v1/keys/{key_id}/sign`，body 仅 `{tenant_id, version?, message}`；
+  `message` 为标准 base64（可为空串），`version` 缺省为 current。以
+  RSASSA-PKCS1-v1_5/SHA-256 确定性签名，成功 `200` 键序固定
+  `{key_id, version, signature}`，`signature` 为标准 base64。body 结构、
+  字段、UUID4、base64 或 version 非正整数均 `400` 并指出字段（不记审计）；
+  策略拒绝 `403`；未知/跨租户 key 或 version 为 `404`；AES256 或吊销版本
+  为 `409`；提供者或材料故障为 `503`，沿用固定文案
+  `key management provider is unavailable`。
+- `POST /v1/keys/{key_id}/verify`，body 仅
+  `{tenant_id, version?, message, signature}`（均为标准 base64）。只用已存
+  公钥验签，不调用提供者；成功 `200` 仅返回 `{valid}`，签名不匹配为
+  `false` 而非错误。错误规则同 sign（`503` 仅用于损坏的存储公钥材料）。
+  重启、轮换、迁移后旧版本仍可验签。message/signature 绝不进入审计；私钥、
+  句柄与包装材料绝不进入响应、审计或任何新文件。
 - `POST /v1/backup`，body `{tenant_id, passphrase}` →
   `{format:"tenant-backup-v1", bundle}`；载荷
   `{format, tenant_id, keys, policy}`，空租户为 `keys:[]、policy:null`。
@@ -344,8 +358,8 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `{tenant_id, deleted:true}`。
 - 规则元素 `{subject, actions, effect}`：`subject` 为区分大小写的非空字符串；
   `actions` 为非空数组，取值
-  `create/read/rotate/revoke/import/export/migrate/encrypt/decrypt/audit/
-  list`，单条内重复去重；`effect` 为 `allow`/`deny`；未知字段、类型错误、同
+  `create/read/rotate/revoke/import/export/migrate/encrypt/decrypt/sign/
+  verify/audit/list`，单条内重复去重；`effect` 为 `allow`/`deny`；未知字段、类型错误、同
   subject+effect+无序动作集的重复规则均 `400`；`rules:[]` 合法（全拒绝）。
 - 执行：管理动作 policy_* 免检；租户无策略时全部允许；有策略时匹配规则中
   deny 优先于 allow，无匹配则拒绝 → `403`，并记一条原动作名、
@@ -356,9 +370,11 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 
 - 事件字段 `{event_id, tenant_id, action, key_id, outcome, timestamp}`；
   `action` 为 `create/read/rotate/batch_rotate/revoke/import/export/
-  migrate/encrypt/decrypt/audit/list/tenant_conflict/policy_read/
+  migrate/encrypt/decrypt/sign/verify/audit/list/tenant_conflict/policy_read/
   policy_update/policy_delete`，`outcome` 为 `success/rejected`。信封加密/解密事件只含
-  元数据（无 plaintext、aad、envelope、数据密钥或私钥）；幂等 HTTP encrypt
+  元数据（无 plaintext、aad、envelope、数据密钥或私钥）；sign/verify 事件
+  同样只含元数据（无 message 或 signature），成功记 `success`，业务拒绝
+  （403/404/409）记同名 `rejected` 且均携带 `key_id`，body 400 不记账；幂等 HTTP encrypt
   每个终态至多一条 `event_id=operation_id,action=encrypt` 事件（成功 200 与
   绑定后拒绝都随操作重放，绝不重复记账），非幂等 CLI/decrypt 每次请求各记一
   条；策略拒绝写一条对应 `encrypt`/`decrypt` 的 rejected 事件（携带 key_id），

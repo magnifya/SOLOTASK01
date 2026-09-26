@@ -1026,6 +1026,8 @@ class KeyStore:
                 audit_mod.ACTION_MIGRATE,
                 audit_mod.ACTION_ENCRYPT,
                 audit_mod.ACTION_DECRYPT,
+                audit_mod.ACTION_SIGN,
+                audit_mod.ACTION_VERIFY,
                 audit_mod.ACTION_AUDIT,
                 audit_mod.ACTION_LIST,
             )
