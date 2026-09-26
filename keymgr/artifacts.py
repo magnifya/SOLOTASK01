@@ -67,6 +67,7 @@ _KIND_ACTIONS = {
     "batch_rotate": audit_mod.ACTION_BATCH_ROTATE,
     "import": audit_mod.ACTION_IMPORT,
     "restore": audit_mod.ACTION_IMPORT,
+    "migrate": audit_mod.ACTION_MIGRATE,
     # Envelope encryption is a read-only idempotent operation: it mints no
     # provider handle and writes no key file, but its one audit event is still
     # named after the operation_id, so its mirror commits by the ledger event.
@@ -76,6 +77,10 @@ _KIND_ACTIONS = {
 # Kinds that only ever READ the key set and can never record a freshly minted
 # provider handle, a provision journal, a batch snapshot or a restore marker.
 _READ_ONLY_KINDS = frozenset(("encrypt",))
+
+# Kinds whose success terminal is HTTP 200 (rather than the 201 of a creating
+# mutation): read-only encrypt and the in-place migrate (no new key/version).
+_STATUS_200_KINDS = frozenset(("encrypt", "migrate"))
 
 
 class ArtifactInconsistent(Exception):
@@ -216,7 +221,9 @@ class ArtifactMirror:
             seen.add(key_id)
             normalized.append(key_id)
         normalized.sort()
-        if kind in ("rotate", "import", "encrypt") and len(normalized) != 1:
+        if kind in ("rotate", "import", "migrate", "encrypt") and len(
+            normalized
+        ) != 1:
             raise ArtifactInconsistent(
                 "mirror kind %r requires exactly one write-set key, got %d"
                 % (kind, len(normalized))
@@ -975,7 +982,9 @@ class ArtifactStore:
             if not _is_key_id(key_id) or key_id in seen:
                 return False
             seen.add(key_id)
-        if kind in ("rotate", "import", "encrypt") and len(seen) != 1:
+        if kind in ("rotate", "import", "migrate", "encrypt") and len(
+            seen
+        ) != 1:
             return False
         if kind == "batch_rotate" and not seen:
             return False
@@ -997,7 +1006,7 @@ class ArtifactStore:
         if not isinstance(details, dict) or details.get("kind") != kind:
             return False
         write_set = descriptor.get("write_set") or []
-        if kind in ("rotate", "import", "encrypt"):
+        if kind in ("rotate", "import", "migrate", "encrypt"):
             return details.get("key_id") == (write_set[0] if write_set else None)
         if kind == "batch_rotate":
             items = details.get("items")
@@ -1081,7 +1090,7 @@ class ArtifactStore:
             return False
         kind = descriptor.get("kind")
         write_set = descriptor.get("write_set") or []
-        if kind in ("rotate", "import", "encrypt"):
+        if kind in ("rotate", "import", "migrate", "encrypt"):
             if event.key_id != (write_set[0] if write_set else None):
                 return False
         elif event.key_id is not None:
@@ -1131,8 +1140,9 @@ class ArtifactStore:
         kind = descriptor.get("kind")
         tenant_id = descriptor.get("tenant_id")
         write_set = descriptor.get("write_set") or []
-        # Mutating operations stage a 201; the read-only encrypt stages a 200.
-        allowed_status = 200 if kind in _READ_ONLY_KINDS else 201
+        # A creating mutation stages a 201; an in-place/non-creating operation
+        # (read-only encrypt, whole-key migrate) stages a 200.
+        allowed_status = 200 if kind in _STATUS_200_KINDS else 201
         if http_status != allowed_status:
             return False
         if kind in ("rotate", "import"):
@@ -1146,6 +1156,34 @@ class ArtifactStore:
                 version = response.get("version")
                 if not isinstance(version, int) or key.get_version(version) is None:
                     return False
+        elif kind == "migrate":
+            key_id = write_set[0] if write_set else None
+            if response.get("key_id") != key_id:
+                return False
+            target = response.get("provider_id")
+            if not isinstance(target, str) or not target:
+                return False
+            versions = response.get("versions")
+            if (
+                not isinstance(versions, list)
+                or not versions
+                or not all(
+                    isinstance(number, int) and not isinstance(number, bool)
+                    and number > 0
+                    for number in versions
+                )
+                or versions != sorted(versions)
+                or len(set(versions)) != len(versions)
+            ):
+                return False
+            key = self.key_store._read_record(self.key_store._path_for(key_id))
+            if key is None or key.tenant_id != tenant_id:
+                return False
+            if [ver.version for ver in key.versions] != versions:
+                return False
+            # Every version must actually be rebound to the ready provider.
+            if any(ver.provider_id != target for ver in key.versions):
+                return False
         elif kind == "batch_rotate":
             items = response.get("items")
             if not isinstance(items, list):
@@ -1623,6 +1661,13 @@ class ArtifactStore:
         operation_id = descriptor["operation_id"]
         journal_id = descriptor.get("journal") or operation_id
         if os.path.exists(self.key_store._provision_path(journal_id)):
+            return True
+        if descriptor.get("kind") == "migrate" and os.path.exists(
+            self.key_store._migration_path(operation_id)
+        ):
+            # A surviving migration snapshot means the scene is intentionally
+            # preserved: an uncommitted move still owes its file restore/new
+            # handle delete, or a committed one still owes old-handle cleanup.
             return True
         if descriptor.get("snapshot") and os.path.exists(
             self.key_store._batch_snapshot_path(descriptor["snapshot"])

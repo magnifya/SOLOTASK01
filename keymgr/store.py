@@ -24,6 +24,7 @@ from .audit import AuditEvent, AuditLog, InvalidCursor, LedgerError
 from .provider import (
     LOCAL_PROVIDER_ID,
     ProviderIdentityMismatch,
+    ProviderInvalidMaterial,
     ProviderReconnectPending,
     ProviderUnavailable,
 )
@@ -125,6 +126,15 @@ class LockTimeout(Exception):
 
     Raised only for idempotent operations after the lock-wait budget is
     exhausted; the caller answers timed_out and has mutated nothing.
+    """
+
+
+class KeyAlreadyMigrated(Exception):
+    """Bound 409 signal: every version is already on the ready provider.
+
+    Raised by :meth:`KeyStore.migrate` after the idempotency key is bound:
+    no provider call is made, no journal/handle/event is written, and the
+    caller turns it into the bound conflict terminal.
     """
 
 
@@ -386,6 +396,11 @@ class KeyStore:
         # resolved later by the RestoreCoordinator, which reaps their
         # journals itself.
         self._recover_provisions()
+        # ... and finally settle whole-key migrations: a committed move reaps
+        # its OLD handles from its migration snapshot; an uncommitted one
+        # (journal already reaped above) restores the key file's pre-move
+        # bytes.
+        self._recover_migrations()
 
     # -- provider helpers --------------------------------------------------
     @staticmethod
@@ -1008,6 +1023,7 @@ class KeyStore:
                 audit_mod.ACTION_REVOKE,
                 audit_mod.ACTION_IMPORT,
                 audit_mod.ACTION_EXPORT,
+                audit_mod.ACTION_MIGRATE,
                 audit_mod.ACTION_ENCRYPT,
                 audit_mod.ACTION_DECRYPT,
                 audit_mod.ACTION_AUDIT,
@@ -1510,6 +1526,51 @@ class KeyStore:
                 return previous_record
         return None
 
+    def _migration_committed_view(
+        self, record: KeyRecord, desc: dict
+    ) -> Optional[KeyRecord]:
+        """Project a key file carrying an unsettled migrate marker.
+
+        A migrate rewrites the same version set's provider triples in place,
+        so its pre-image cannot be derived from the in-memory record: it is
+        rebuilt exclusively from the durable ``migrations/<event_id>.json``
+        snapshot (the key file's literal pre-move bytes). A durable matching
+        ``migrate`` success makes the on-disk triples authoritative; an
+        absent/unreadable ledger, a corrupt/missing snapshot or any mismatch
+        hides the record rather than exposing uncommitted triples.
+        """
+        eid = desc.get("event_id") if isinstance(desc, dict) else None
+        if not is_valid_key_id(eid):
+            return None
+        try:
+            event = self.audit.get_event(eid)
+        except LedgerError:
+            return None
+        if event is not None:
+            if (
+                event.outcome == audit_mod.OUTCOME_SUCCESS
+                and event.action == audit_mod.ACTION_MIGRATE
+                and event.tenant_id == record.tenant_id
+            ):
+                return record
+        facts = self._validated_migration_snapshot(
+            self._read_migration_snapshot(eid)
+        )
+        if facts is None:
+            return None
+        (_eid, tenant_id, key_id, previous_bytes, _old) = facts
+        if key_id != record.key_id or tenant_id != record.tenant_id:
+            return None
+        try:
+            previous = KeyRecord.from_json(
+                json.loads(previous_bytes.decode("utf-8"))
+            )
+        except (ValueError, KeyError, TypeError):
+            return None
+        # A projection must never be rewritten by the lazy legacy takeover.
+        previous._unsettled_projection = True
+        return previous
+
     def _committed_record(
         self, record: KeyRecord
     ) -> Optional[KeyRecord]:
@@ -1568,6 +1629,14 @@ class KeyStore:
         # A single-key rotate appends one new version. Batch groups never
         # reach this branch: they are projected from the durable snapshot
         # above (an in-memory trim cannot prove another key's pre-image).
+        if action == audit_mod.ACTION_MIGRATE:
+            # A migrate rewrites the SAME versions' provider triples in place,
+            # so the pre-image cannot be derived by trimming the in-memory
+            # record: project it exclusively from the durable migration
+            # snapshot (the key file's literal pre-move bytes), exactly like
+            # a batch group. A missing/corrupt snapshot or an unreadable
+            # ledger hides the record rather than exposing uncommitted triples.
+            return self._migration_committed_view(record, desc)
         if action == audit_mod.ACTION_ROTATE:
             if len(record.versions) <= 1:
                 return None
@@ -1921,6 +1990,527 @@ class KeyStore:
                 except OSError:
                     pass
         return record
+
+    # -- whole-key provider migration --------------------------------------
+    # A migrate rebinds EVERY version of one existing key from its current
+    # provider(s) to the chain's ready provider: each version is exported by
+    # its owning provider and imported into the ready one, and the key file is
+    # rewritten in place with the fresh provider triples (version numbers,
+    # timestamps, algorithm, public key, current pointer and revocation state
+    # are all preserved). The move is one outbox transaction:
+    #   * migrations/<event_id>.json durably stores the key file's pre-migration
+    #     bytes and every OLD (provider_id, handle) pair BEFORE any provider
+    #     call, so an uncommitted attempt can always restore the old record
+    #     verbatim and a committed one can still reap its old handles;
+    #   * a provision journal records every freshly minted handle, so a
+    #     pre-commit failure deletes exactly the new backend objects;
+    #   * one ``migrate`` audit event (event_id == operation_id) is the commit
+    #     point; old handles are deleted only AFTER it (best effort: a failed
+    #     delete never unwrites the commit, it retries on replay/startup).
+    _MIGRATE_DIR = "migrations"
+
+    def _migration_path(self, event_id: str) -> str:
+        return os.path.join(
+            self.data_dir, self._MIGRATE_DIR, event_id + ".json"
+        )
+
+    def _read_migration_snapshot(self, event_id: str) -> Optional[dict]:
+        try:
+            with open(self._migration_path(event_id), "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        return data
+
+    @staticmethod
+    def _valid_old_handle_pairs(raw) -> Optional[list]:
+        if not isinstance(raw, list):
+            return None
+        pairs = []
+        seen = set()
+        for entry in raw:
+            if not isinstance(entry, dict):
+                return None
+            provider_id = entry.get("provider_id")
+            handle = entry.get("handle")
+            if not (
+                isinstance(provider_id, str) and provider_id
+                and isinstance(handle, str) and handle
+            ):
+                return None
+            pair = (provider_id, handle)
+            if pair in seen:
+                return None
+            seen.add(pair)
+            pairs.append({"provider_id": provider_id, "handle": handle})
+        return pairs
+
+    def _validated_migration_snapshot(
+        self, snapshot: Optional[dict]
+    ) -> Optional[Tuple[str, str, str, bytes, list]]:
+        """Validate a migration snapshot; return its facts or None.
+
+        Facts: ``(event_id, tenant_id, key_id, previous_bytes, old_pairs)``.
+        The previous image must decode to a KeyRecord with matching key_id and
+        tenant, contiguous versions and a sane current pointer -- the same
+        strictness batch snapshots enforce, so crash recovery never restores
+        guessed bytes.
+        """
+        if not isinstance(snapshot, dict):
+            return None
+        event_id = snapshot.get("operation_id")
+        tenant_id = snapshot.get("tenant_id")
+        key_id = snapshot.get("key_id")
+        if not (
+            is_valid_key_id(event_id)
+            and isinstance(tenant_id, str) and tenant_id
+            and is_valid_key_id(key_id)
+            and snapshot.get("action") == audit_mod.ACTION_MIGRATE
+        ):
+            return None
+        previous_b64 = snapshot.get("previous_b64")
+        if not isinstance(previous_b64, str):
+            return None
+        try:
+            previous_bytes = base64.b64decode(previous_b64, validate=True)
+            previous_data = json.loads(previous_bytes.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+        try:
+            previous = KeyRecord.from_json(previous_data)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if (
+            previous.key_id != key_id
+            or previous.tenant_id != tenant_id
+            or not previous.versions
+            or [ver.version for ver in previous.versions]
+            != list(range(1, len(previous.versions) + 1))
+            or not 1 <= previous.current_version <= len(previous.versions)
+        ):
+            return None
+        old_pairs = self._valid_old_handle_pairs(snapshot.get("old_handles"))
+        if old_pairs is None:
+            return None
+        previous_pairs = [
+            {"provider_id": ver.provider_id, "handle": ver.handle}
+            for ver in previous.versions
+        ]
+        return (
+            event_id, tenant_id, key_id, previous_bytes, old_pairs,
+            previous_pairs,
+        )
+
+    def _write_migration_snapshot(
+        self,
+        event: AuditEvent,
+        previous_bytes: bytes,
+        old_pairs: list,
+    ) -> str:
+        """Durably record a migrate's previous key file and old handles.
+
+        Written (0600, fsync, atomic rename) before the first provider call.
+        """
+        directory = os.path.join(self.data_dir, self._MIGRATE_DIR)
+        os.makedirs(directory, exist_ok=True)
+        path = self._migration_path(event.event_id)
+        payload = {
+            "operation_id": event.event_id,
+            "tenant_id": event.tenant_id,
+            "key_id": event.key_id,
+            "action": audit_mod.ACTION_MIGRATE,
+            "previous_b64": base64.b64encode(previous_bytes).decode("ascii"),
+            "old_handles": old_pairs,
+        }
+        fd, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        return path
+
+    def _migration_peer(self, provider_id: str):
+        """Resolve a healthy configured chain entry for migrate/cleanup.
+
+        Inside a provider_call lease the bound ready provider is returned
+        directly; any other id must be an entry of the configured primary/
+        standby chain (built, configured and health-probed with the same
+        one-probe cap). A missing, contract-broken or unhealthy entry is the
+        fixed provider failure (503), never a silent fallback.
+        """
+        return provider_mod.migration_peer_provider(provider_id)
+
+    @_provider_session
+    def migrate(
+        self,
+        key_id: str,
+        tenant_id: str,
+        event_id: Optional[str] = None,
+        lock_timeout: Optional[float] = None,
+        pre_commit=None,
+        mirror=None,
+    ) -> Optional[Tuple[KeyRecord, str, list]]:
+        """Migrate every version of one key to the ready chain provider.
+
+        Returns ``(record, provider_id, versions)`` on success where
+        ``versions`` is the ascending list of version numbers; None for an
+        unknown or foreign key. Raises :class:`KeyAlreadyMigrated` (bound 409)
+        when every version is already bound to the ready provider.
+        Provider/build/health/material/timeout failures raise
+        :class:`ProviderUnavailable` (503, fixed client text).
+
+        Version numbers, created_at, algorithm, public_key, current pointer
+        and revocation state are preserved verbatim; only the per-version
+        ``(provider_id, handle, encrypted_material)`` triples change. Raw key
+        material exists only between the source export and the target import
+        and is never persisted, audited or returned.
+        """
+        if not is_valid_key_id(key_id):
+            return None
+        path = self._path_for(key_id)
+        with self.key_locks(key_id, timeout=lock_timeout):
+            record = self._read_record(path)
+            if record is None or record.tenant_id != tenant_id:
+                return None
+            self._ensure_settled(record)
+            ready = provider_mod.get_provider()
+            target_id = ready.provider_id
+            moving = [
+                ver for ver in record.versions
+                if ver.provider_id != target_id
+            ]
+            if not moving:
+                # Bound 409: nothing to move. No provider call was made and
+                # no journal, snapshot, handle or event is written.
+                raise KeyAlreadyMigrated(key_id)
+            previous_bytes = self._read_file_bytes(path)
+            event = self.audit.new_event(
+                tenant_id, audit_mod.ACTION_MIGRATE, key_id,
+                audit_mod.OUTCOME_SUCCESS, event_id=event_id,
+            )
+            # Snapshot the old record bytes and every old handle BEFORE the
+            # first provider call: rollback can restore verbatim and a
+            # committed move can still reap its old backend objects.
+            old_pairs = [
+                {"provider_id": ver.provider_id, "handle": ver.handle}
+                for ver in moving
+            ]
+            self._write_migration_snapshot(event, previous_bytes, old_pairs)
+            journal_id, journal_path = self._new_provision_journal(
+                event.event_id, event.tenant_id, event.action
+            )
+            new_handles = []
+            peer_cache = {}
+
+            def peer_for(provider_id: str):
+                # One resolved (and health-probed) instance per provider id
+                # for this attempt: repeated versions owned by the same
+                # provider never rebuild the chain entry.
+                if provider_id not in peer_cache:
+                    peer_cache[provider_id] = self._migration_peer(provider_id)
+                return peer_cache[provider_id]
+
+            try:
+                if mirror is not None:
+                    try:
+                        mirror.provision(journal_id)
+                    except OSError as exc:
+                        self.drop_provision_journal(journal_id)
+                        self._discard_file(self._migration_path(event.event_id))
+                        from .artifacts import ArtifactStrandUnavailable
+
+                        raise ArtifactStrandUnavailable(str(exc), 500)
+                for ver in moving:
+                    source = peer_for(ver.provider_id)
+                    exported = source.export_material(ver.handle)
+                    # The exported public part must agree with the recorded
+                    # one (None for AES256, the PEM for RSA2048); a
+                    # disagreement is corrupted backend state, a 503 rather
+                    # than a field-level 400.
+                    if exported.public_key != ver.public_key:
+                        raise ProviderUnavailable(
+                            "exported public key does not match the record"
+                        )
+                    try:
+                        triple = ready.import_material(
+                            ver.algorithm,
+                            ver.public_key,
+                            exported.encrypted_material,
+                        )
+                    except ProviderInvalidMaterial as exc:
+                        # Material that does not fit the target algorithm is a
+                        # provider failure for a migrate (503), never a 400.
+                        raise ProviderUnavailable(
+                            "migrated material does not match the key algorithm"
+                        ) from exc
+                    try:
+                        self._append_provision(
+                            journal_path, target_id, triple.handle
+                        )
+                        new_handles.append(triple.handle)
+                        if mirror is not None:
+                            mirror.add_handle(target_id, triple.handle)
+                    except BaseException:
+                        # The backend object is minted but its durable
+                        # journal entry (or mirror entry) may not have landed:
+                        # delete it directly before the shared rollback path
+                        # reconciles whatever did land, so it can never orphan.
+                        try:
+                            ready.delete(triple.handle)
+                        except Exception:
+                            pass
+                        raise
+                    # Preserve every immutable fact of the version; only the
+                    # provider triple is rebound.
+                    ver.provider_id = target_id
+                    ver.handle = triple.handle
+                    ver.encrypted_material = triple.encrypted_material
+                    if triple.public_key is not None:
+                        ver.public_key = triple.public_key
+                if mirror is not None:
+                    mirror.phase(PHASE_STAGED)
+                previous = json.loads(previous_bytes.decode("utf-8"))
+                staged_versions = sorted(ver.version for ver in record.versions)
+
+                def stage_committed(committed_record):
+                    if pre_commit is not None:
+                        pre_commit(
+                            committed_record, target_id, staged_versions
+                        )
+
+                self._commit_mutation(
+                    path, record, event, previous,
+                    provider=ready, new_handles=tuple(new_handles),
+                    journal_id=journal_id,
+                    pre_commit=stage_committed,
+                )
+            except BaseException as exc:
+                from .artifacts import ArtifactStrandUnavailable
+
+                if isinstance(exc, ArtifactStrandUnavailable):
+                    raise
+                if isinstance(exc, ProviderReconnectPending) and not new_handles:
+                    # No provider work was effectively made (gate/budget
+                    # timeout, a displaced owning id, or a peer probe that
+                    # failed BEFORE the first handle): no handle minted. Drop
+                    # the empty journal and the unused snapshot, reset the
+                    # mirror to a clean bound strand and stay PENDING for a
+                    # same-key continuation.
+                    self.drop_provision_journal(journal_id)
+                    self._discard_file(self._migration_path(event.event_id))
+                    if mirror is not None:
+                        try:
+                            mirror.reset_for_pending_retry()
+                        except OSError:
+                            pass
+                    raise
+                cleaned = True
+                for handle in new_handles:
+                    try:
+                        ready.delete(handle)
+                    except Exception:
+                        cleaned = False
+                if not self.rollback_provision_journal(journal_id):
+                    cleaned = False
+                if not cleaned:
+                    # Keep the migration snapshot: startup rollback restores
+                    # the old record and reaps every new handle.
+                    raise ProviderUnavailable(
+                        "could not delete a handle provisioned by a failed "
+                        "migration; cleanup will be retried at startup"
+                    ) from exc
+                self._discard_file(self._migration_path(event.event_id))
+                if mirror is not None:
+                    try:
+                        mirror.phase(PHASE_ROLLED_BACK)
+                    except OSError:
+                        pass
+                raise
+            # Commit point durable: the new triples are authoritative. The
+            # new handles are owned by the record; drop their journal.
+            self.drop_provision_journal(journal_id)
+            # Delete the OLD backend objects only now: their deletion is
+            # post-commit housekeeping, so a backend hiccup never unwrites the
+            # committed migration nor changes the response -- the migration
+            # snapshot stays behind and the startup sweep (or the next replay)
+            # finishes the idempotent deletes.
+            if self._delete_old_migration_handles(
+                old_pairs, peers=peer_cache
+            ):
+                self._discard_file(self._migration_path(event.event_id))
+            if mirror is not None:
+                try:
+                    mirror.phase(PHASE_COMMITTED)
+                except OSError:
+                    pass
+            versions = sorted(ver.version for ver in record.versions)
+            return record, target_id, versions
+
+    @staticmethod
+    def _discard_file(path: str) -> bool:
+        try:
+            os.unlink(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+
+    def _delete_old_migration_handles(
+        self, old_pairs: list, peers: Optional[dict] = None
+    ) -> bool:
+        """Best-effort idempotent deletion of a committed migrate's old handles.
+
+        Each old pair is routed to its own (possibly standby) chain provider.
+        ``peers`` reuses the attempt's already-resolved/probed instances; a
+        None entry resolves lazily. Returns True only when every delete was
+        confirmed; a False result leaves the migration snapshot for a
+        replay/startup retry.
+        """
+        cleaned = True
+        resolved = dict(peers or {})
+        for pair in old_pairs:
+            provider_id = pair["provider_id"]
+            try:
+                if provider_id not in resolved:
+                    resolved[provider_id] = self._migration_peer(provider_id)
+                resolved[provider_id].delete(pair["handle"])
+            except Exception:
+                cleaned = False
+        return cleaned
+
+    def _recover_migrations(self) -> None:
+        """Settle ``migrations/<event_id>.json`` snapshots left by crashes.
+
+        The ledger event named after the snapshot is the authority:
+
+        * a durable matching ``migrate`` success: the rebound key file is
+          authoritative -- finish post-commit housekeeping (delete every OLD
+          handle idempotently), then drop the snapshot;
+        * no event, or a durable rejected terminal with this id: the move never
+          committed -- delete every freshly minted handle (the provision
+          journal), restore the key file's previous bytes verbatim, clear its
+          marker and drop journal + snapshot;
+        * an unreadable ledger, an id/action/tenant collision, a corrupt
+          snapshot or a failed backend delete preserves the whole scene for
+          the next open.
+        """
+        directory = os.path.join(self.data_dir, self._MIGRATE_DIR)
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            event_id = name[:-5]
+            if not is_valid_key_id(event_id):
+                continue
+            path = os.path.join(directory, name)
+            facts = self._validated_migration_snapshot(
+                self._read_migration_snapshot(event_id)
+            )
+            if facts is None:
+                # Corrupt snapshot: neither the old image nor the handle sets
+                # can be trusted -- preserve everything for resolution.
+                continue
+            (
+                _eid, tenant_id, key_id, previous_bytes,
+                old_pairs, previous_pairs,
+            ) = facts
+            try:
+                event = self.audit.get_event(event_id)
+            except LedgerError:
+                continue
+            if event is not None and (
+                event.tenant_id != tenant_id
+                or event.action != audit_mod.ACTION_MIGRATE
+            ):
+                # A durable foreign event carries this id: park.
+                continue
+            key_path = self._path_for(key_id)
+            if event is not None and event.outcome == audit_mod.OUTCOME_SUCCESS:
+                # Committed: reap the OLD handles, then retire the snapshot.
+                # (The key marker and the new-handle journal were settled by
+                # _recover_pending_events before this sweep ran.)
+                if self._delete_old_migration_handles(old_pairs):
+                    self._discard_file(path)
+                continue
+            # Pre-commit crash/rejection: delete every NEW handle first, then
+            # restore the old file bytes only once the backend objects are
+            # gone. Any failure preserves the full scene for a later open.
+            journal_pairs = set(self.read_provision_journal(event_id))
+            if not self._rollback_provision_entries(list(journal_pairs)):
+                continue
+            with self._key_lock(key_id), self._file_lock(key_id):
+                current = self._read_record(key_path)
+                old_pair_set = {
+                    (pair["provider_id"], pair["handle"])
+                    for pair in previous_pairs
+                }
+                known_pairs = old_pair_set | journal_pairs
+                current_pairs = (
+                    {
+                        (ver.provider_id, ver.handle)
+                        for ver in current.versions
+                    }
+                    if current is not None
+                    else set()
+                )
+                if (
+                    current is None
+                    or current.key_id != key_id
+                    or current.tenant_id != tenant_id
+                    or not current_pairs
+                    or not current_pairs.issubset(known_pairs)
+                ):
+                    # Missing key, or the file references triples this
+                    # snapshot never knew (e.g. a later, possibly committed
+                    # migration governs it): never overwrite committed state
+                    # on a guess -- preserve the whole scene for a later open.
+                    continue
+                live_marker = current.pending_event
+                live_marker_id = None
+                if isinstance(live_marker, dict):
+                    nested = live_marker.get("event")
+                    desc = nested if isinstance(nested, dict) else live_marker
+                    live_marker_id = (
+                        desc.get("event_id") if isinstance(desc, dict) else None
+                    )
+                if live_marker_id is not None and live_marker_id != event_id:
+                    # Another operation's unresolved outbox owns this file: do
+                    # not restore across it; preserve the scene.
+                    continue
+                if current_pairs == old_pair_set:
+                    # The file already reflects the pre-move image (the marker
+                    # write never landed): clear any stray marker only.
+                    if isinstance(current.pending_event, dict):
+                        current.pending_event = None
+                        try:
+                            self._write_atomic(key_path, current.to_json())
+                        except OSError:
+                            continue
+                else:
+                    # The file holds triples this uncommitted attempt minted
+                    # (possibly only some versions); those handles were just
+                    # deleted, so restore the pre-move bytes verbatim.
+                    try:
+                        self._write_bytes_atomic(key_path, previous_bytes)
+                    except OSError:
+                        continue
+            self.drop_provision_journal(event_id)
+            self._discard_file(path)
 
     # -- atomic batch rotation --------------------------------------------
     # A batch rotates 1-100 existing keys of one tenant as one logical

@@ -28,7 +28,14 @@ from .provider import (
     ProviderSwitchoverInvalid,
     ProviderUnavailable,
 )
-from .store import IMPORT_CONFLICT, KeyStore, LockTimeout, is_valid_key_id, validate_batch_items
+from .store import (
+    IMPORT_CONFLICT,
+    KeyAlreadyMigrated,
+    KeyStore,
+    LockTimeout,
+    is_valid_key_id,
+    validate_batch_items,
+)
 
 _AUDIT_PATH = "/v1/audit"
 _KEYS_PATH = "/v1/keys"
@@ -46,6 +53,7 @@ _ROTATE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/rotate$")
 _REVOKE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/revoke$")
 _EXPORT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/export$")
 _ENCRYPT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/encrypt$")
+_MIGRATE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/migrate$")
 _DECRYPT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/decrypt$")
 _STATUS_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/status$")
 _VERSION_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/versions/([^/]+)$")
@@ -254,6 +262,8 @@ def make_handler(
                 action = audit_mod.ACTION_ROTATE
             elif kind == "encrypt":
                 action = audit_mod.ACTION_ENCRYPT
+            elif kind == "migrate":
+                action = audit_mod.ACTION_MIGRATE
             else:
                 action = audit_mod.ACTION_IMPORT
             audit_key_id = (
@@ -763,6 +773,11 @@ def make_handler(
                 encrypt_match = _ENCRYPT_PATH_RE.match(path)
                 if encrypt_match is not None:
                     self._encrypt_key(encrypt_match.group(1), parts, operator)
+                    return
+
+                migrate_match = _MIGRATE_PATH_RE.match(path)
+                if migrate_match is not None:
+                    self._migrate_key(migrate_match.group(1), parts, operator)
                     return
 
                 decrypt_match = _DECRYPT_PATH_RE.match(path)
@@ -1381,6 +1396,120 @@ def make_handler(
             self._idempotent_guard(
                 parts.path, tenant_id, operator, binding_payload,
                 idem_key, execute,
+            )
+
+        def _migrate_key(self, key_id: str, parts, operator: str) -> None:
+            """POST /v1/keys/{key_id}/migrate (idempotent).
+
+            Body is exactly ``{"tenant_id": T}`` and a single
+            ``Idempotency-Key`` is required, validated (with every parse/
+            parameter check) BEFORE the key is bound: such failures are
+            side-effect-free 400s with no audit event, operation record, key
+            change or provider handle. After binding, authorization is the
+            ``migrate`` policy action, an unknown/foreign key is 404, and a
+            key whose versions are all already on the ready provider is 409.
+            Success is ``200 {"key_id","provider_id","versions",
+            "operation_id"}``: the ready provider id and the ascending version
+            list. A missing/unhealthy provider, a material mismatch or a
+            timeout is the fixed 503; the body never carries material or a
+            handle.
+            """
+            idem_key = self._idempotency_key()
+            if idem_key is None:
+                return
+            payload = self._read_json_object(audit=False)
+            if payload is None:
+                return
+            extra = [field for field in payload if field != "tenant_id"]
+            if extra:
+                self._bad_request(
+                    "field %s is not accepted by this endpoint" % extra[0]
+                )
+                return
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                self._bad_request("field tenant_id must be a non-empty string")
+                return
+            tenant_id = self._tenant(parts, payload, audit=False)
+            if tenant_id is None:
+                return
+            if self._bad_key_id(key_id, audit=False):
+                return
+
+            def execute(operation, mirror=None):
+                operation_store.update_details(
+                    operation,
+                    {"kind": "migrate", "key_id": key_id},
+                )
+                if mirror is not None:
+                    mirror.describe(
+                        {"kind": "migrate", "write_set": [key_id]}
+                    )
+                if not policy_store.is_allowed(
+                    tenant_id, audit_mod.ACTION_MIGRATE, operator
+                ):
+                    return self._idempotent_rejection(
+                        operation, tenant_id, key_id,
+                        audit_mod.ACTION_MIGRATE, 403,
+                        "action not permitted by policy",
+                    )
+
+                def stage_success(committed_record, provider_id, versions):
+                    # Runs after the rebound key file landed, before the
+                    # commit-point ledger append: the exact 200 body is
+                    # durable with the event and replayed verbatim.
+                    body = {
+                        "key_id": key_id,
+                        "provider_id": provider_id,
+                        "versions": versions,
+                        "operation_id": operation.operation_id,
+                    }
+                    operation_store.stage_terminal(operation, 200, body)
+
+                try:
+                    result = store.migrate(
+                        key_id, tenant_id,
+                        event_id=operation.operation_id,
+                        lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
+                        pre_commit=stage_success,
+                        mirror=mirror,
+                    )
+                except KeyAlreadyMigrated:
+                    # Bound 409: every version is already on the ready
+                    # provider. No provider call, file change, handle or
+                    # success event happened; the conflict is a terminal like
+                    # any other bound refusal.
+                    return self._idempotent_rejection(
+                        operation, tenant_id, key_id,
+                        audit_mod.ACTION_MIGRATE, 409,
+                        "key is already managed by the ready provider",
+                    )
+                except LockTimeout:
+                    # A contended key waits past the five-second budget: the
+                    # migrate made no provider call and wrote nothing, so keep
+                    # the op PENDING (mirror reset, no audit event) and answer
+                    # the endpoint's fixed provider 503 text; a same-key retry
+                    # continues under the same operation_id.
+                    raise ProviderReconnectPending(
+                        "migrate exceeded the shared five-second budget"
+                    )
+                if result is None:
+                    return self._idempotent_rejection(
+                        operation, tenant_id, key_id,
+                        audit_mod.ACTION_MIGRATE, 404, "key not found",
+                    )
+                _record, provider_id, versions = result
+                return (
+                    200,
+                    {
+                        "key_id": key_id,
+                        "provider_id": provider_id,
+                        "versions": versions,
+                    },
+                )
+
+            self._idempotent_guard(
+                parts.path, tenant_id, operator, payload, idem_key, execute
             )
 
         def _decrypt_key(self, key_id: str, parts, operator: str) -> None:
@@ -2511,6 +2640,8 @@ def _resolve_committed_operation(store, policy_store, record, event):
             if status == 409:
                 if kind == "restore":
                     return "backup target already contains this data"
+                if kind == "migrate":
+                    return "key is already managed by the ready provider"
                 return "key_id already exists for this tenant"
             if kind == "restore":
                 return "tenant backup not found"
@@ -2560,6 +2691,20 @@ def _resolve_committed_operation(store, policy_store, record, event):
         # unknown or foreign at commit time and no version was appended.
         return error(404, message_for(404))
 
+    if kind == "migrate":
+        key_id = event.key_id or details.get("key_id")
+        key = store.get(key_id, tenant_id)
+        if key is not None:
+            return (
+                200,
+                {
+                    "key_id": key_id,
+                    "provider_id": key.current.provider_id,
+                    "versions": sorted(ver.version for ver in key.versions),
+                    "operation_id": op_id,
+                },
+            )
+        return 200, {"operation_id": op_id}
     if kind == "rotate":
         key_id = event.key_id or details.get("key_id")
         key = store.get(key_id, tenant_id)

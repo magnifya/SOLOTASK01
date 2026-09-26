@@ -84,6 +84,21 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `{items:[{key_id, version, algorithm, public_key}, ...], operation_id}`，
   items 严格按请求序；各 key 沿用单键 rotate 语义，整批原子提交（共享一把
   per-key 锁顺序、单一 provision/snapshot 记账、单条提交事件）。
+- `POST /v1/keys/{key_id}/migrate`，body 仅 `{"tenant_id": T}`，需
+  `Idempotency-Key` 与操作者头。把主备链中该键**全部版本**从各自当前
+  绑定的提供者导出、导入此刻 **ready** 的链项并就地重绑键文件：版本号、
+  算法、公钥、各版本时间、`current` 与吊销状态保持不变，仅替换每版的
+  `provider_id/handle/encrypted_material`。各版本由其原提供者导出；
+  ready 项缺失/不健康、材料与算法/公钥不符或共用 5 秒门限超时，一律
+  固定 `503`（`error` 为 `key management provider is unavailable`）。
+  绑定后策略拒绝 `403`、未知/跨租户键 `404`；所有版本已在 ready 项上时
+  `409`（绑定后才判定，不铸句柄、不写事件）。成功 `200`，键序固定
+  `key_id,provider_id,versions,operation_id`，`versions` 为升序正整数
+  数组；绑定后错误体仅 `{"error","operation_id"}`。提交前失败删除全部
+  新句柄并恢复旧键文件；提交点之后才幂等删除原句柄——删除失败仍按
+  成功重放并由重启清理，崩溃/重试绝不重复迁移或重复记账（每操作至多
+  一条 `event_id=operation_id,action=migrate,key_id=K` 事件）。明文
+  密钥材料只在导出与导入之间驻留内存，绝不进入响应、审计或错误。
 - `GET /v1/keys/{key_id}/versions/{version}` 与
   `GET /v1/keys/{key_id}/current` →
   `{key_id, version, created_at, algorithm, public_key}`；version 须为正整数。
@@ -256,10 +271,10 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 
 ## 幂等操作
 
-- HTTP 的 rotate/import/restore/batch-rotate/encrypt（CLI：
-  `rotate`/`import`/`restore`/`batch-rotate`；CLI `encrypt` 维持非幂等、
-  无此头）必须携带**单一** `Idempotency-Key` 头（前四个 CLI 必填
-  `--idempotency-key`），值为 1–128 个 `[A-Za-z0-9._~-]` 字符。缺失、为空、
+- HTTP 的 rotate/import/restore/batch-rotate/migrate/encrypt（CLI：
+  `rotate`/`import`/`restore`/`batch-rotate`/`migrate`；CLI `encrypt`
+  维持非幂等、无此头）必须携带**单一** `Idempotency-Key` 头（前五个 CLI
+  必填 `--idempotency-key`），值为 1–128 个 `[A-Za-z0-9._~-]` 字符。缺失、为空、
   重复、非法一律 `400`（CLI `2`），且该校验先于请求体读取与一切业务：不写
   审计、操作记录、密钥或提供者句柄。
 - 键全局唯一，绑定记录 `operation_id`(UUID4)、租户、操作者、路径、规范化体
@@ -291,23 +306,26 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   时保持 `pending`（信封无法在无请求的情况下重建，故绝不臆造终态），由同键
   HTTP 重试在同一 `operation_id` 下恰好再执行一次。不重复记账（账本按
   event_id 去重），不误判。
-- **operation 工件镜像**：rotate/import/restore/batch-rotate 以及 HTTP
-  encrypt 在幂等键绑定记录耐久**之后**、首次调用提供者**之前**，原子创建
+- **operation 工件镜像**：rotate/import/restore/batch-rotate/migrate 以及
+  HTTP encrypt 在幂等键绑定记录耐久**之后**、首次调用提供者**之前**，原子创建
   `operation-artifacts/<operation_id>.json`（0600、temp 文件 fsync 后 rename；
   非幂等入口与未绑定请求不创建该目录；CLI `encrypt` 为非幂等入口不创建）。
   镜像是一次尝试全部耐久工件的交叉索引，记录租户、操作者、路径、规范化请求
-  体、`kind`/审计动作、完整写集（rotate/import/encrypt 为该 key_id，batch
-  为全部 key_id，restore 为全部新建 key_id 及是否含策略）、阶段
+  体、`kind`/审计动作、完整写集（rotate/import/migrate/encrypt 为该
+  key_id，batch 为全部 key_id，restore 为全部新建 key_id 及是否含策略）、阶段
   （`bound`→`provisioning`→`staged`→`committed`/`rolled_back`）、
   `provisions/<id>.json` 引用（batch 另引用 `batch-rotations/<id>.json`，空
-  restore 另记录其 `restore-empty-*` 标记）以及每铸一个句柄即登记的新句柄
-  `provider_id`/`handle`；只读 encrypt 不铸句柄、无 journal/snapshot，镜像始
-  终停在 `bound`，事件耐久且无残留证据即清除。镜像与 journal 条目同步落盘，
-  二者永不矛盾。请求到达终态后：事件确认且 action/tenant/operation 一致、写
-  集文件拥有全部新句柄且 journal/snapshot 已清，才删镜像并保留新版本（encrypt
-  另核对暂存信封命名写集 key 且版本存在）；事件未入账时，变更类先由 outbox
-  恢复幂等删除全部新句柄并恢复可信旧写集，证据清零才删镜像；encrypt 则保持
-  pending 并保留镜像作为待重试线索。账本不可读、提交不确定（同 id 事件
+  restore 另记录其 `restore-empty-*` 标记，migrate 另引用其
+  `migrations/<id>.json`：旧键文件字节与全部旧句柄）以及每铸一个句柄即登记的
+  新句柄 `provider_id`/`handle`；只读 encrypt 不铸句柄、无 journal/snapshot，
+  镜像始终停在 `bound`，事件耐久且无残留证据即清除。镜像与 journal 条目同步落
+  盘，二者永不矛盾。请求到达终态后：事件确认且 action/tenant/operation 一致、
+  写集文件拥有全部新句柄且 journal/snapshot 已清，才删镜像并保留新版本（
+  encrypt 另核对暂存信封命名写集 key 且版本存在；migrate 另核对每版均已绑定
+  暂存响应所报的 ready provider 且版本序一致，其 `migrations/<id>.json` 仅在
+  全部旧句柄确认删除后才消失）；事件未入账时，变更类先由 outbox 恢复幂等删除
+  全部新句柄并恢复可信旧写集，证据清零才删镜像；encrypt 则保持 pending 并保留
+  镜像作为待重试线索。账本不可读、提交不确定（同 id 事件
   action/tenant 不符）、镜像缺失/损坏、镜像与 `operations/<id>.json` 绑定不
   一致、引用缺失/不一致或 batch snapshot 损坏时，**保留整组证据**（镜像、标
   记、journal、snapshot 与句柄），不猜测回滚也不暴露未提交 current：该
@@ -326,8 +344,8 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `{tenant_id, deleted:true}`。
 - 规则元素 `{subject, actions, effect}`：`subject` 为区分大小写的非空字符串；
   `actions` 为非空数组，取值
-  `create/read/rotate/revoke/import/export/encrypt/decrypt/audit/list`，单条内
-  重复去重；`effect` 为 `allow`/`deny`；未知字段、类型错误、同
+  `create/read/rotate/revoke/import/export/migrate/encrypt/decrypt/audit/
+  list`，单条内重复去重；`effect` 为 `allow`/`deny`；未知字段、类型错误、同
   subject+effect+无序动作集的重复规则均 `400`；`rules:[]` 合法（全拒绝）。
 - 执行：管理动作 policy_* 免检；租户无策略时全部允许；有策略时匹配规则中
   deny 优先于 allow，无匹配则拒绝 → `403`，并记一条原动作名、
@@ -338,8 +356,8 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 
 - 事件字段 `{event_id, tenant_id, action, key_id, outcome, timestamp}`；
   `action` 为 `create/read/rotate/batch_rotate/revoke/import/export/
-  encrypt/decrypt/audit/list/tenant_conflict/policy_read/policy_update/
-  policy_delete`，`outcome` 为 `success/rejected`。信封加密/解密事件只含
+  migrate/encrypt/decrypt/audit/list/tenant_conflict/policy_read/
+  policy_update/policy_delete`，`outcome` 为 `success/rejected`。信封加密/解密事件只含
   元数据（无 plaintext、aad、envelope、数据密钥或私钥）；幂等 HTTP encrypt
   每个终态至多一条 `event_id=operation_id,action=encrypt` 事件（成功 200 与
   绑定后拒绝都随操作重放，绝不重复记账），非幂等 CLI/decrypt 每次请求各记一
@@ -378,6 +396,8 @@ python -m keymgr current  --tenant-id t --key-id <id> --operator alice
 python -m keymgr version  --tenant-id t --key-id <id> --version 1 --operator alice
 python -m keymgr rotate   --tenant-id t --key-id <id> --algorithm AES256 \
                           --operator alice --idempotency-key rotate-0001
+python -m keymgr migrate  --tenant-id t --key-id <id> --operator alice \
+                          --idempotency-key migrate-0001
 python -m keymgr batch-rotate --tenant-id t --operator alice \
                           --idempotency-key batch-0001 \
                           --items '[{"key_id":"<id1>","algorithm":"AES256"},{"key_id":"<id2>","algorithm":"RSA2048"}]'
@@ -431,7 +451,10 @@ python -m keymgr provider reconnect --operator alice
   动”以已提交的 `provider-state.json` 为准（`provider_id` 为 `local`），
   旧记录接管等门控不会因此导入任何 module:factory 提供者。
 - 轮换/导出/导入/恢复必须命中记录登记的 provider：记录属于未激活提供者，或
-  导入/恢复来源块与当前提供者不符，均 `503`，不静默切换。
+  导入/恢复来源块与当前提供者不符，均 `503`，不静默切换。唯一例外是
+  `POST /v1/keys/{key_id}/migrate`：它显式把各版本由其原提供者（链内
+  任意一项，需健康）导出、导入当前 ready 项；原提供者不在链中、建厂/
+  契约失败或不健康均固定 `503`，绝不回退本地。
 - 启动时安全扫描旧记录：仅当本地提供者活动时，把裸 `private_material`/空句
   柄的旧版本校验并包装为本地对象，先包装后原子重写，失败保持原文件字节不
   变（新建句柄随即释放，不影响启动）；配置了外部提供者时启动与普通读取既不
@@ -456,10 +479,11 @@ python -m keymgr provider reconnect --operator alice
   策略文件与标记，下一次启动重试，全部句柄确认删除后才移除整组文件。
 - 私钥与口令只存在于口令加密的包内或经提供者包装后的记录中；游标 HMAC 密钥
   存于 `audit.secret`(0600)。材料不会出现在任何响应、审计投影或错误信息中。
-- rotate/import/restore/batch-rotate 另有 0600 的 operation 工件镜像
+- rotate/import/restore/batch-rotate/migrate 另有 0600 的 operation 工件镜像
   `operation-artifacts/<operation_id>.json`：绑定后、调用提供者前创建，交叉
   关联 `operations/<id>.json`、`provisions/<id>.json`、restore 标记（含空
-  restore 标记）或 batch snapshot，记录租户/操作者/路径/规范请求/动作/写集/
-  阶段及新句柄；确认提交并核对句柄归属后随 journal/snapshot 一并清理，未提交
-  时待全部新句柄删除、旧写集恢复后清理，任何证据缺失或不一致则整组保留（详见
-  “幂等操作”一节）。
+  restore 标记）或 batch snapshot；migrate 另关联其
+  `migrations/<id>.json` 快照（旧键文件字节与全部旧句柄），记录租户/操作
+  者/路径/规范请求/动作/写集/阶段及新句柄；确认提交并核对句柄归属后随
+  journal/snapshot 一并清理，未提交时待全部新句柄删除、旧写集恢复后清理，
+  任何证据缺失或不一致则整组保留（详见“幂等操作”一节）。

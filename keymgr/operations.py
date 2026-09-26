@@ -100,6 +100,7 @@ _KIND_ACTIONS = {
     "batch_rotate": "batch_rotate",
     "import": "import",
     "restore": "import",
+    "migrate": "migrate",
     "encrypt": "encrypt",
 }
 

@@ -24,7 +24,14 @@ from .provider import (
     ProviderUnavailable,
 )
 from .server import _resolve_committed_operation, serve
-from .store import IMPORT_CONFLICT, KeyStore, LockTimeout, is_valid_key_id, validate_batch_items
+from .store import (
+    IMPORT_CONFLICT,
+    KeyAlreadyMigrated,
+    KeyStore,
+    LockTimeout,
+    is_valid_key_id,
+    validate_batch_items,
+)
 
 DEFAULT_DATA_DIR = os.environ.get("KEYMGR_DATA_DIR", "keymgr_data")
 
@@ -76,6 +83,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_rotate.add_argument("--algorithm", required=True,
                           help="one of: %s" % ", ".join(SUPPORTED_ALGORITHMS))
     p_rotate.add_argument(
+        "--idempotency-key", required=True,
+        help="1-128 chars A-Za-z0-9._~- ; retries reuse the result",
+    )
+
+    p_migrate = tenant_parser(
+        "migrate",
+        help="migrate all key versions to the ready provider chain entry",
+    )
+    p_migrate.add_argument("--key-id", required=True)
+    p_migrate.add_argument(
         "--idempotency-key", required=True,
         help="1-128 chars A-Za-z0-9._~- ; retries reuse the result",
     )
@@ -382,6 +399,8 @@ def _provider_terminal(
         action = audit_mod.ACTION_BATCH_ROTATE
     elif kind == "rotate":
         action = audit_mod.ACTION_ROTATE
+    elif kind == "migrate":
+        action = audit_mod.ACTION_MIGRATE
     else:
         action = audit_mod.ACTION_IMPORT
     audit_key_id = (
@@ -917,6 +936,93 @@ def _run(argv: Optional[List[str]] = None) -> int:
                     audit_mod.ACTION_ROTATE, 404, "key not found",
                 )
             return 201, record.to_rotate_response()
+
+        return idempotent_run(
+            op_store, store, path, args.tenant_id, args.operator, body,
+            args.idempotency_key, lambda: None, execute,
+            artifact_store=artifact_store,
+        )
+
+    if args.command == "migrate":
+        # Like rotate: the Idempotency-Key is validated before anything else;
+        # a malformed key/tenant/key-id exits 2 with no audit event, operation
+        # record, key change or provider handle.
+        if _idem_key_error(args.idempotency_key):
+            return 2
+        if not args.tenant_id:
+            return _fail("field tenant_id must be a non-empty string", 2)
+        if not is_valid_key_id(args.key_id):
+            return _fail("field key_id must be a UUID4", 2)
+
+        body = {"tenant_id": args.tenant_id}
+        path = "/v1/keys/%s/migrate" % args.key_id
+
+        def execute(operation, mirror=None):
+            op_store.update_details(
+                operation,
+                {"kind": "migrate", "key_id": args.key_id},
+            )
+            if mirror is not None:
+                mirror.describe(
+                    {"kind": "migrate", "write_set": [args.key_id]}
+                )
+            if not policies.is_allowed(
+                args.tenant_id, audit_mod.ACTION_MIGRATE, args.operator
+            ):
+                return _terminal_rejection(
+                    op_store, store, operation,
+                    args.tenant_id, args.key_id,
+                    audit_mod.ACTION_MIGRATE, 403,
+                    "action not permitted by policy",
+                )
+
+            def stage_success(committed_record, provider_id, versions):
+                body = {
+                    "key_id": args.key_id,
+                    "provider_id": provider_id,
+                    "versions": versions,
+                    "operation_id": operation.operation_id,
+                }
+                op_store.stage_terminal(operation, 200, body)
+
+            try:
+                result = store.migrate(
+                    args.key_id, args.tenant_id,
+                    event_id=operation.operation_id,
+                    lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
+                    pre_commit=stage_success,
+                    mirror=mirror,
+                )
+            except KeyAlreadyMigrated:
+                return _terminal_rejection(
+                    op_store, store, operation,
+                    args.tenant_id, args.key_id,
+                    audit_mod.ACTION_MIGRATE, 409,
+                    "key is already managed by the ready provider",
+                )
+            except LockTimeout:
+                # The migrate endpoint answers every timeout with the fixed
+                # provider 503 text (CLI exit 1) and stays PENDING: no audit
+                # terminal, a same-key retry continues under the same
+                # operation_id.
+                raise ProviderReconnectPending(
+                    "migrate exceeded the shared five-second budget"
+                )
+            if result is None:
+                return _terminal_rejection(
+                    op_store, store, operation,
+                    args.tenant_id, args.key_id,
+                    audit_mod.ACTION_MIGRATE, 404, "key not found",
+                )
+            _record, provider_id, versions = result
+            return (
+                200,
+                {
+                    "key_id": args.key_id,
+                    "provider_id": provider_id,
+                    "versions": versions,
+                },
+            )
 
         return idempotent_run(
             op_store, store, path, args.tenant_id, args.operator, body,

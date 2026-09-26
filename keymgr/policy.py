@@ -41,6 +41,7 @@ POLICY_ACTIONS = (
     "revoke",
     "import",
     "export",
+    "migrate",
     "encrypt",
     "decrypt",
     "audit",

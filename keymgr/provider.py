@@ -2008,6 +2008,7 @@ def provider_call(timeout: Optional[float] = None):
         return
 
     budget = _Budget(timeout)
+    _tls.budget = budget
     lease = None
     gate_held = False
     admitted = False
@@ -2131,6 +2132,7 @@ def provider_call(timeout: Optional[float] = None):
         finally:
             _tls.depth = 0
             _tls.bound_provider = None
+            _tls.budget = None
             lease.release()
             _gate.release_lease()
     finally:
@@ -2287,6 +2289,51 @@ def get_provider():
             _provider = provider
         _remember(provider.provider_id)
         return _provider
+
+
+def migration_peer_provider(provider_id: str):
+    """Resolve a healthy chain entry for a whole-key migration.
+
+    Called only inside a :func:`provider_call` lease (the migrate data path
+    and the post-commit/startup old-handle cleanup): the bound READY entry is
+    returned directly -- it was admitted and health-probed by the lease. Any
+    other id must name an entry of the configured primary/standby chain; that
+    entry is built, configured with the bound data directory and health-probed
+    under the SAME attempt's shared non-resettable five-second budget (one
+    probe capped at one second). A chain that is not configured, an id no
+    chain entry builds, or an unhealthy/missing/contract-broken entry all raise
+    :class:`ProviderUnavailable` (the fixed 503); no fallback is ever used.
+    """
+    ready = get_provider()
+    if provider_id == ready.provider_id:
+        return ready
+    if not _chain_configured():
+        raise ProviderUnavailable(
+            "record provider %r is not the active provider" % provider_id
+        )
+    budget = getattr(_tls, "budget", None)
+    deadline = budget.deadline if budget is not None else None
+    peer = None
+    for candidate in _build_candidates(_specs()):
+        if candidate.provider_id == provider_id:
+            peer = candidate
+            break
+    if peer is None:
+        raise ProviderUnavailable(
+            "record provider %r is not in the configured provider chain"
+            % provider_id
+        )
+    if budget is not None:
+        healthy = _healthy_within(peer, budget)
+    else:
+        healthy = _healthy_within(
+            peer, deadline or (time.monotonic() + CALL_GATE_SECONDS)
+        )
+    if not healthy:
+        raise ProviderUnavailable(
+            "migration peer provider %r is unavailable" % provider_id
+        )
+    return peer
 
 
 def _build_spec(spec: str):
