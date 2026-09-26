@@ -341,11 +341,22 @@ def test_body_400s_are_not_audited(stack):
 
 def test_raw_json_and_tenant_400s(stack):
     key_id = _make_key(stack.client)
-    # Bad JSON is a 400 (an invisible tenant_conflict, like decrypt).
+    # Bad JSON is a plain 400 that is NOT audited (neither a sign/verify
+    # event nor an invisible tenant_conflict).
     status, _ = stack.client.call(
         "POST", "/v1/keys/%s/sign" % key_id, None, raw=b"{not json"
     )
     assert status == 400
+    # A non-object body is the same plain, unaudited 400.
+    status, _ = stack.client.call(
+        "POST", "/v1/keys/%s/verify" % key_id, None, raw=b"[1,2,3]"
+    )
+    assert status == 400
+    # Neither parse failure wrote a tenant_conflict nor a sign/verify event.
+    assert [
+        e for e in _audit_events(stack)
+        if e.action in ("sign", "verify", "tenant_conflict")
+    ] == []
     # Missing/empty tenant.
     status, err = stack.client.call(
         "POST", "/v1/keys/%s/sign" % key_id, {"message": b64(b"x")}

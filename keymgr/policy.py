@@ -44,6 +44,7 @@ POLICY_ACTIONS = (
     "migrate",
     "encrypt",
     "decrypt",
+    "rewrap",
     "sign",
     "verify",
     "audit",
