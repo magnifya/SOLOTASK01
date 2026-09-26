@@ -14,10 +14,16 @@ Fault injection is driven by a JSON file named by ``FAKE_KMS_FAULTS``:
       "health_nonbool": "yes",      # health() returns a non-bool (unavailable)
       "health_sleep": 6.0,          # health() blocks past the reconnect budget
       "provider_id": "fakekms-alt"  # override the factory's provider_id
+      "declare_sign": true,         # capabilities.operations gains "sign"
+      "sign_not_callable": true,    # declare sign but break the method (contract)
+      "sign_short": true,           # sign() returns a malformed short value
+      "sign_tamper": true           # sign() returns a flipped-byte signature
     }
 
 Materials are stored base64-wrapped with a static prefix so nothing here ever
 resembles plaintext, and handles are random UUIDs recorded in the state file.
+Per-process per-operation call counts are exposed via ``call_count(op)`` so
+tests can assert which provider operations a request actually used.
 """
 
 import base64
@@ -26,6 +32,9 @@ import os
 import threading
 import time
 import uuid
+
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 
 PROVIDER_ID = "fakekms"
 
@@ -78,7 +87,13 @@ def reset():
     _call_counts.clear()
 
 
+def call_count(op):
+    """How many times operation ``op`` was entered in this process."""
+    return _call_counts.get(op, 0)
+
+
 def _check_fault(op):
+    _call_counts[op] = _call_counts.get(op, 0) + 1
     faults = _faults()
     sleep = faults.get("sleep")
     if isinstance(sleep, dict) and op in sleep:
@@ -90,9 +105,7 @@ def _check_fault(op):
         raise RuntimeError("backend failure in %s" % op)
     fail_after = faults.get("fail_after")
     if isinstance(fail_after, dict) and op in fail_after:
-        count = _call_counts.get(op, 0) + 1
-        _call_counts[op] = count
-        if count > int(fail_after[op]):
+        if _call_counts[op] > int(fail_after[op]):
             raise RuntimeError("backend failure in %s" % op)
 
 
@@ -109,22 +122,31 @@ def _unwrap(blob):
 
 
 class FakeKmsProvider:
-    capabilities = {
-        "algorithms": ["AES256", "RSA2048"],
-        "operations": [
-            "generate",
-            "rotate",
-            "import_material",
-            "export_material",
-            "delete",
-        ],
-    }
-
     def __init__(self):
         # The id can be overridden per process (FAKE_KMS_PROVIDER_ID) so a
         # reconnect can install a provider carrying a different provider_id,
         # exercising the pending-operation displacement rule.
         self.provider_id = os.environ.get("FAKE_KMS_PROVIDER_ID", PROVIDER_ID)
+        if _faults().get("sign_not_callable"):
+            # Contract-violation injection: the provider declares "sign" in
+            # its capabilities but the attribute is not a callable method.
+            self.sign = True
+
+    @property
+    def capabilities(self):
+        operations = [
+            "generate",
+            "rotate",
+            "import_material",
+            "export_material",
+            "delete",
+        ]
+        if _faults().get("declare_sign"):
+            operations.append("sign")
+        return {
+            "algorithms": ["AES256", "RSA2048"],
+            "operations": operations,
+        }
 
     def configure(self, data_dir):
         _check_fault("configure")
@@ -190,6 +212,38 @@ class FakeKmsProvider:
                 "public_key": entry["public_key"],
                 "encrypted_material": _unwrap(entry["material"]),
             }
+
+    def sign(self, handle, message):
+        """Optional native RSASSA-PKCS1-v1_5/SHA-256 signature (declared via
+        the ``declare_sign`` fault key)."""
+        if not isinstance(handle, str) or not handle:
+            raise ValueError("sign requires a non-empty handle string")
+        if not isinstance(message, bytes):
+            raise TypeError("sign message must be bytes")
+        _check_fault("sign")
+        with _lock:
+            state = _load_state()
+            entry = state["handles"].get(handle)
+        if entry is None:
+            raise RuntimeError("unknown handle")
+        if entry.get("algorithm") != "RSA2048":
+            raise RuntimeError("handle is not an RSA2048 key")
+        faults = _faults()
+        if faults.get("sign_short"):
+            # Contract-violation injection: a malformed, short signature.
+            return b"short"
+        private_key = serialization.load_pem_private_key(
+            _unwrap(entry["material"]).encode("utf-8"), password=None
+        )
+        signature = private_key.sign(
+            message, padding.PKCS1v15(), hashes.SHA256()
+        )
+        if faults.get("sign_tamper"):
+            # Contract-violation injection: 256 bytes that do not verify.
+            tampered = bytearray(signature)
+            tampered[0] ^= 0x01
+            return bytes(tampered)
+        return signature
 
     def delete(self, handle):
         _check_fault("delete")

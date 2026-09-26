@@ -1866,8 +1866,12 @@ def make_handler(
             standard base64. Only RSA2048 versions can sign: an AES256 (or a
             revoked) version is 409; unknown/foreign key or version is 404;
             a policy denial is 403; a provider or material failure is the
-            fixed 503 text. The message and signature never enter the audit
-            ledger; a private key, handle or wrapped material never enters a
+            fixed 503 text. When the version's provider declares the optional
+            ``sign`` operation the signature is produced inside the KMS/HSM
+            (no export, no private key in this process) and verified against
+            the version's public key; otherwise the export path signs in
+            memory. The message and signature never enter the audit ledger;
+            a private key, handle or wrapped material never enters a
             response.
             """
             action = audit_mod.ACTION_SIGN
@@ -1879,8 +1883,8 @@ def make_handler(
             tenant_id, version, raw_message, _payload = base
             if not self._enforce(tenant_id, key_id, action, operator):
                 return
-            status, _record, ver, private_key = store.signing_material(
-                key_id, tenant_id, version
+            status, _record, ver, signature = store.sign_message(
+                key_id, tenant_id, version, raw_message
             )
             if status == store.SIGN_NOT_FOUND:
                 self._reject_crypto(
@@ -1898,9 +1902,9 @@ def make_handler(
                     "key version does not support signing",
                 )
                 return
-            # ProviderUnavailable (provider load/backend/corrupt material)
+            # ProviderUnavailable (provider load/backend/corrupt material, a
+            # malformed native signature or a failed public-key verification)
             # propagates to do_POST's fixed 503, with no event written.
-            signature = signing_mod.rsa_sign(private_key, raw_message)
             if not self._record_attempt(
                 tenant_id, key_id, action, audit_mod.OUTCOME_SUCCESS
             ):

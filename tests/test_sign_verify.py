@@ -591,3 +591,134 @@ def test_no_idempotency_key_required(stack):
     )
     assert status == 200, body
     assert "operation_id" not in body
+
+
+# -- KMS/HSM-native sign path -------------------------------------------------
+@pytest.fixture()
+def native_stack(tmp_path, monkeypatch):
+    faults_path = tmp_path / "kms-faults.json"
+    faults_path.write_text(json.dumps({"declare_sign": True}))
+    yield from _build_server(tmp_path, monkeypatch, external=True)
+
+
+@pytest.fixture()
+def broken_sign_stack(tmp_path, monkeypatch):
+    faults_path = tmp_path / "kms-faults.json"
+    faults_path.write_text(json.dumps({
+        "declare_sign": True, "sign_not_callable": True,
+    }))
+    yield from _build_server(tmp_path, monkeypatch, external=True)
+
+
+def _sign(client, key_id, message, **extra):
+    body = {"tenant_id": "t", "message": message}
+    body.update(extra)
+    return client.call("POST", "/v1/keys/%s/sign" % key_id, body)
+
+
+def test_native_sign_uses_provider_sign_and_never_exports(native_stack):
+    import fake_kms
+
+    key_id = _make_key(native_stack.client)
+    message = b64(b"native hello")
+    status, body = _sign(native_stack.client, key_id, message)
+    assert status == 200, body
+    assert list(body.keys()) == ["key_id", "version", "signature"]
+    raw = base64.b64decode(body["signature"], validate=True)
+    assert len(raw) == 256
+    # The native path called sign() and never exported material.
+    assert fake_kms.call_count("sign") == 1
+    assert fake_kms.call_count("export_material") == 0
+    # The signature verifies through the public-key-only endpoint.
+    status, verified = native_stack.client.call(
+        "POST", "/v1/keys/%s/verify" % key_id,
+        {"tenant_id": "t", "message": message,
+         "signature": body["signature"]},
+    )
+    assert (status, verified) == (200, {"valid": True})
+
+
+def test_native_sign_is_deterministic_across_rotation(native_stack):
+    key_id = _make_key(native_stack.client)
+    _, first = _sign(native_stack.client, key_id, b64(b"same"))
+    _rotate(native_stack.client, key_id)
+    _, again = _sign(native_stack.client, key_id, b64(b"same"), version=1)
+    assert again["version"] == 1
+    assert again["signature"] == first["signature"]
+
+
+def test_native_sign_malformed_result_is_503_and_not_audited(native_stack):
+    key_id = _make_key(native_stack.client)
+    with open(native_stack.faults_path, "w") as fh:
+        json.dump({"declare_sign": True, "sign_short": True}, fh)
+    status, body = _sign(native_stack.client, key_id, b64(b"x"))
+    assert status == 503
+    assert body == {"error": "key management provider is unavailable"}
+    assert [e for e in _audit_events(native_stack) if e.action == "sign"] == []
+
+
+def test_native_sign_failed_verification_is_503_and_not_audited(native_stack):
+    key_id = _make_key(native_stack.client)
+    with open(native_stack.faults_path, "w") as fh:
+        json.dump({"declare_sign": True, "sign_tamper": True}, fh)
+    status, body = _sign(native_stack.client, key_id, b64(b"x"))
+    assert status == 503
+    assert body == {"error": "key management provider is unavailable"}
+    assert [e for e in _audit_events(native_stack) if e.action == "sign"] == []
+
+
+def test_native_sign_backend_failure_is_503_without_export_fallback(
+    native_stack,
+):
+    import fake_kms
+
+    key_id = _make_key(native_stack.client)
+    with open(native_stack.faults_path, "w") as fh:
+        json.dump({"declare_sign": True, "fail": {"sign": True}}, fh)
+    status, body = _sign(native_stack.client, key_id, b64(b"x"))
+    assert status == 503
+    assert body == {"error": "key management provider is unavailable"}
+    # A failing native sign never falls back to exporting material.
+    assert fake_kms.call_count("export_material") == 0
+    assert [e for e in _audit_events(native_stack) if e.action == "sign"] == []
+
+
+def test_declared_sign_without_callable_method_breaks_contract(
+    broken_sign_stack,
+):
+    # Declaring "sign" in capabilities without a callable sign() method is a
+    # provider-contract failure: every provider call is the fixed 503.
+    status, body = broken_sign_stack.client.call(
+        "POST", "/v1/keys",
+        {"tenant_id": "t", "algorithm": "RSA2048", "label": "k"},
+    )
+    assert status == 503
+    assert body == {"error": "key management provider is unavailable"}
+
+
+def test_local_provider_sign_contract(tmp_path):
+    from keymgr import signing as signing_mod
+
+    provider = provider_mod.LocalProvider()
+    provider.configure(str(tmp_path / "pdata"))
+    rsa_triple = provider.generate("RSA2048")
+    aes_triple = provider.generate("AES256")
+    # A handle that is not a non-empty string is a ValueError.
+    with pytest.raises(ValueError):
+        provider.sign("", b"x")
+    with pytest.raises(ValueError):
+        provider.sign(123, b"x")
+    # A non-bytes message is a TypeError.
+    with pytest.raises(TypeError):
+        provider.sign(rsa_triple.handle, "x")
+    # An unknown handle and a non-RSA handle are ProviderUnavailable.
+    with pytest.raises(provider_mod.ProviderUnavailable):
+        provider.sign("no-such-handle", b"x")
+    with pytest.raises(provider_mod.ProviderUnavailable):
+        provider.sign(aes_triple.handle, b"x")
+    # Success is a 256-byte signature verifiable with the public key.
+    signature = provider.sign(rsa_triple.handle, b"hello")
+    assert isinstance(signature, bytes)
+    assert len(signature) == 256
+    public_key = signing_mod.load_rsa_public_key(rsa_triple.public_key)
+    assert signing_mod.rsa_verify(public_key, b"hello", signature)

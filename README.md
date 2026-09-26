@@ -168,9 +168,12 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   且不记账；身份参数失败照旧记 `tenant_conflict`。拒权 `403`；未知/跨租户
   key 或 version 为 `404`；AES256 版本或吊销版本（含旧版本）为 `409`；
   提供者或私钥材料故障一律固定文案 `503`（沿用 README 文案），不记账。
-  成功记 `sign/success`，业务拒绝记 `sign/rejected`，均带 key_id。签名经私
-  钥在内存中计算；message、signature 绝不入审计，私钥、句柄与包装材料绝不
-  入响应、审计或任何新文件。
+  成功记 `sign/success`，业务拒绝记 `sign/rejected`，均带 key_id。版本的
+  提供者声明 `sign` 操作时走 KMS/HSM 原生路径：在五秒门限内调用绑定提供者
+  的 `sign(handle, message)`，绝不调用 `export_material`，私钥不进入服务
+  进程，并以版本公钥验签；结果非 256 字节、验签失败或提供者异常均为固定文
+  案 `503` 且不记账。未声明者沿用导出私钥在内存中计算。message、signature
+  绝不入审计，私钥、句柄与包装材料绝不入响应、审计或任何新文件。
 - `POST /v1/keys/{key_id}/verify`，body 仅
   `{tenant_id, version?, message, signature}`，二者均为标准 base64
   （message 可空），`version` 缺省为 current。**只用该版本存储的公钥**验签：
@@ -477,7 +480,12 @@ python -m keymgr provider reconnect --operator alice
   generate/rotate/import_material/export_material/delete）及这五个方法。
   generate/rotate/import_material → `{handle, public_key, encrypted_material}`；
   export_material(handle) → `{public_key, encrypted_material}`；delete(handle)
-  幂等。另可实现可选 `health()`（无参、返回 `bool`）：缺少视为健康，非
+  幂等。`capabilities.operations` 可另含 `sign`：声明即须实现
+  `sign(handle: str, message: bytes) -> bytes`——handle 非非空 str 抛
+  `ValueError`、message 非 bytes 抛 `TypeError`、未知/非 RSA 句柄或后端故
+  障抛 `ProviderUnavailable`，成功返回 256 字节 RSASSA-PKCS1-v1_5/SHA-256
+  签名；声明而无该方法（或方法不可调用）即契约不符。本地提供者已实现并声
+  明 `sign`。另可实现可选 `health()`（无参、返回 `bool`）：缺少视为健康，非
   `bool`/抛异常视为不可用。普通 provider 调用路径上单次探活至多等 1
   秒（超时按一次失败、迟到结果作废），且一次调用的全部探活/等待共用不
   可重置的 5 秒总预算。模块缺失/工厂失败/契约不符/后端异常一律 `503`

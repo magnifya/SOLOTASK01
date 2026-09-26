@@ -59,6 +59,26 @@ A provider instance exposes:
   a method that raises or returns anything but a real bool reports unavailable.
   The probe's own text never leaves the process.
 
+Native signing (optional)
+-------------------------
+``capabilities["operations"]`` MAY additionally list ``"sign"``. Declaring it
+makes ``sign(handle: str, message: bytes) -> bytes`` contractual: a provider
+that declares the operation without a callable ``sign`` method fails the
+contract (and a declared-but-non-callable ``sign`` attribute is invalid too).
+The method signs with RSASSA-PKCS1-v1_5/SHA-256 inside the KMS/HSM and returns
+the 256-byte signature; private material never crosses the boundary. A handle
+that is not a non-empty string raises ``ValueError``, a non-bytes message
+raises ``TypeError``, and an unknown handle, a handle that is not an RSA key,
+or any backend failure raises :class:`ProviderUnavailable`. When a version's
+owning provider declares ``sign``, the service calls it on the bound provider
+inside the ordinary five-second provider-call gate, never calls
+``export_material`` for signing and never loads the private key into the
+service process; it verifies the returned signature against the version's
+stored public key and treats a malformed result, a failed verification or any
+provider exception as the fixed 503 (no audit event). A provider that does
+NOT declare ``sign`` keeps the export-based signing path. The built-in local
+provider declares and implements ``sign``.
+
 The factory named by ``KEYMGR_PROVIDER=module:factory`` is imported lazily on
 first use and called with no arguments. A missing module/factory, a factory
 raising, or a returned object failing the contract all raise
@@ -88,6 +108,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from . import signing as signing_mod
 from .crypto import SUPPORTED_ALGORITHMS, generate_key
 
 #: Default provider id and the id of the built-in software provider.
@@ -105,6 +126,10 @@ OPERATIONS = (
     OP_EXPORT_MATERIAL,
     OP_DELETE,
 )
+#: Optional operation: KMS/HSM-native RSASSA-PKCS1-v1_5/SHA-256 signing. A
+#: provider lists it in ``capabilities["operations"]`` only when it implements
+#: ``sign(handle, message)``; it is never part of the required five.
+OP_SIGN = "sign"
 
 _DEK_NAME = "local.dek"
 _REGISTRY_NAME = "local-registry.json"
@@ -224,6 +249,19 @@ class KeyProvider:
     def delete(self, handle: str) -> None:
         raise NotImplementedError
 
+    def sign(self, handle: str, message: bytes) -> bytes:
+        """Optional KMS/HSM-native RSASSA-PKCS1-v1_5/SHA-256 signature.
+
+        Contractual only when ``capabilities["operations"]`` declares
+        ``"sign"``; then this MUST be implemented: ``handle`` must be a
+        non-empty string (``ValueError`` otherwise), ``message`` must be
+        bytes (``TypeError`` otherwise), an unknown or non-RSA handle and any
+        backend failure raise :class:`ProviderUnavailable`, and a success
+        returns the 256-byte signature. Private material never crosses the
+        provider boundary.
+        """
+        raise NotImplementedError
+
     def health(self) -> bool:
         """Optional KMS/HSM readiness probe.
 
@@ -280,6 +318,13 @@ def _validate_external(obj) -> None:
                 "provider %r is missing a callable %s() operation"
                 % (provider_id, name)
             )
+    # ``sign`` is optional, but declaring it makes the method contractual: a
+    # provider listing it without a callable sign() is invalid.
+    if OP_SIGN in operations and not callable(getattr(obj, "sign", None)):
+        raise ProviderUnavailable(
+            "provider %r declares the sign operation without a callable "
+            "sign() method" % provider_id
+        )
     configure = getattr(obj, "configure", None)
     if configure is not None and not callable(configure):
         raise ProviderUnavailable(
@@ -367,6 +412,26 @@ class _SafeProvider:
         # (the caller may retry, and delete must remain idempotent).
         self._call("delete", handle)
 
+    def sign(self, handle: str, message: bytes) -> bytes:
+        """KMS/HSM-native sign, with the error contract enforced.
+
+        Only invoked when the provider declared ``sign`` (contract validation
+        guarantees a callable method then); a backend fault is normalized to
+        :class:`ProviderUnavailable` like every other operation, and a result
+        that is not bytes is a contract failure, never passed on.
+        """
+        if not callable(getattr(self._inner, "sign", None)):
+            raise ProviderUnavailable(
+                "provider %r declares sign without a callable sign() method"
+                % self.provider_id
+            )
+        result = self._call("sign", handle, message)
+        if not isinstance(result, bytes):
+            raise ProviderUnavailable(
+                "provider returned a non-bytes signature from sign"
+            )
+        return result
+
     def health(self) -> bool:
         """Optional readiness probe normalized to a bool.
 
@@ -388,6 +453,24 @@ class _SafeProvider:
         return result is True
 
 
+def declares_sign(provider) -> bool:
+    """Whether a bound provider declares the optional ``sign`` operation.
+
+    Declaration is purely by ``capabilities["operations"]`` containing
+    ``"sign"``: a declaring external provider was contract-validated to have
+    a callable ``sign`` method, and the built-in local provider always
+    declares and implements it. Anything else (including a provider whose
+    capabilities are not a mapping) keeps the export-based signing path.
+    """
+    caps = getattr(provider, "capabilities", None)
+    if not isinstance(caps, dict):
+        return False
+    operations = caps.get("operations")
+    if not isinstance(operations, (list, tuple)):
+        return False
+    return OP_SIGN in operations
+
+
 class LocalProvider(KeyProvider):
     """Built-in software provider.
 
@@ -403,7 +486,10 @@ class LocalProvider(KeyProvider):
     provider_id = LOCAL_PROVIDER_ID
     capabilities = {
         "algorithms": tuple(SUPPORTED_ALGORITHMS),
-        "operations": OPERATIONS,
+        # The local provider declares and implements the optional native
+        # ``sign`` operation: signing happens inside the provider and the
+        # unwrapped private key never crosses the boundary.
+        "operations": OPERATIONS + (OP_SIGN,),
     }
 
     def __init__(self) -> None:
@@ -683,6 +769,38 @@ class LocalProvider(KeyProvider):
             if handle in self._registry:
                 del self._registry[handle]
                 self._persist_registry_locked()
+
+    def sign(self, handle: str, message: bytes) -> bytes:
+        """Sign ``message`` with a registered RSA2048 handle, in-provider.
+
+        The wrapped private key is unwrapped inside the provider and never
+        returned: only the 256-byte RSASSA-PKCS1-v1_5/SHA-256 signature
+        crosses the boundary. A handle that is not a non-empty string is a
+        ``ValueError``, a non-bytes message a ``TypeError``; an unknown or
+        non-RSA handle (or corrupt stored material) is
+        :class:`ProviderUnavailable`.
+        """
+        if not isinstance(handle, str) or not handle:
+            raise ValueError("sign requires a non-empty handle string")
+        if not isinstance(message, bytes):
+            raise TypeError("sign message must be bytes")
+        self._require_configured()
+        with self._lock:
+            meta = self._registry.get(handle)
+            if meta is None:
+                raise ProviderUnavailable("unknown handle")
+            if meta.get("algorithm") != "RSA2048":
+                raise ProviderUnavailable(
+                    "handle does not belong to an RSA2048 key"
+                )
+            raw = self._unwrap_locked(meta.get("wrapped"))
+        try:
+            private_key = signing_mod.load_rsa_private_key(raw)
+        except signing_mod.SigningError as exc:
+            raise ProviderUnavailable(
+                "stored local material is corrupt"
+            ) from exc
+        return signing_mod.rsa_sign(private_key, message)
 
 
 # -- module:factory loading -------------------------------------------------

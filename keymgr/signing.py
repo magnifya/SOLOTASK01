@@ -16,6 +16,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 _RSA_KEY_SIZE = 2048
+#: Byte length of an RSASSA-PKCS1-v1_5 signature over a 2048-bit RSA key.
+SIGNATURE_BYTES = _RSA_KEY_SIZE // 8
 #: RSASSA-PKCS1-v1_5/SHA-256: deterministic, no randomness or nonce.
 _PKCS1_PADDING = padding.PKCS1v15()
 _SHA256 = hashes.SHA256()
