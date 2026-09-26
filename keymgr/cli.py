@@ -26,6 +26,7 @@ from .provider import (
 from .server import _resolve_committed_operation, serve
 from .store import (
     IMPORT_CONFLICT,
+    ExpectedVersionMismatch,
     KeyAlreadyMigrated,
     KeyStore,
     LockTimeout,
@@ -84,6 +85,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_rotate.add_argument("--algorithm", required=True,
                           help="one of: %s" % ", ".join(SUPPORTED_ALGORITHMS))
     p_rotate.add_argument(
+        "--expected-version", default=None,
+        help="optional optimistic-concurrency precondition: the committed "
+        "current_version must equal this positive integer or the rotation "
+        "is a 409 conflict",
+    )
+    p_rotate.add_argument(
         "--idempotency-key", required=True,
         help="1-128 chars A-Za-z0-9._~- ; retries reuse the result",
     )
@@ -104,7 +111,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_batch_rotate.add_argument(
         "--items", required=True,
-        help='JSON array of {"key_id","algorithm"} items (1-100, unique ids)',
+        help='JSON array of {"key_id","algorithm","expected_version"?} items '
+        "(1-100, unique ids)",
     )
     p_batch_rotate.add_argument(
         "--idempotency-key", required=True,
@@ -895,11 +903,28 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 % (args.algorithm, ", ".join(SUPPORTED_ALGORITHMS)),
                 2,
             )
+        # The optional optimistic-concurrency precondition is a positive
+        # integer; a malformed value is an exit-2 parameter error before the
+        # Idempotency-Key is bound (no audit, operation, key or handle).
+        expected_version = None
+        if args.expected_version is not None:
+            if not re.fullmatch(r"[0-9]+", args.expected_version):
+                return _fail(
+                    "field expected_version must be a positive integer", 2
+                )
+            expected_version = int(args.expected_version)
+            if expected_version < 1:
+                return _fail(
+                    "field expected_version must be a positive integer", 2
+                )
 
         body = {
             "tenant_id": args.tenant_id,
             "algorithm": args.algorithm,
         }
+        if expected_version is not None:
+            # The canonical idempotent request carries the precondition.
+            body["expected_version"] = expected_version
         path = "/v1/keys/%s/rotate" % args.key_id
 
         def execute(operation, mirror=None):
@@ -929,13 +954,26 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 body["operation_id"] = operation.operation_id
                 op_store.stage_terminal(operation, 201, body)
 
-            record = store.rotate(
-                args.key_id, args.tenant_id, args.algorithm,
-                event_id=operation.operation_id,
-                lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
-                pre_commit=stage_success,
-                mirror=mirror,
-            )
+            try:
+                record = store.rotate(
+                    args.key_id, args.tenant_id, args.algorithm,
+                    event_id=operation.operation_id,
+                    lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
+                    pre_commit=stage_success,
+                    mirror=mirror,
+                    expected_version=expected_version,
+                )
+            except ExpectedVersionMismatch:
+                # The precondition failed on the committed current_version
+                # under the per-key lock, before any provider call, journal,
+                # handle or file write: a bound conflict terminal with one
+                # rotate/rejected event.
+                return _terminal_rejection(
+                    op_store, store, operation,
+                    args.tenant_id, args.key_id,
+                    audit_mod.ACTION_ROTATE, 409,
+                    "expected_version does not match current_version",
+                )
             if record is None:
                 return _terminal_rejection(
                     op_store, store, operation,
@@ -1069,7 +1107,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                     "kind": "batch_rotate",
                     "items": [
                         {"key_id": key_id, "algorithm": algorithm}
-                        for key_id, algorithm in items
+                        for key_id, algorithm, _ in items
                     ],
                 },
             )
@@ -1077,7 +1115,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 mirror.describe(
                     {
                         "kind": "batch_rotate",
-                        "write_set": [key_id for key_id, _ in items],
+                        "write_set": [key_id for key_id, _, _ in items],
                     }
                 )
             # Authorization follows rotate; the rejection event is a single
@@ -1104,19 +1142,31 @@ def _run(argv: Optional[List[str]] = None) -> int:
                                 "algorithm": records_by_id[key_id].current.algorithm,
                                 "public_key": records_by_id[key_id].current.public_key,
                             }
-                            for key_id, _ in items
+                            for key_id, _, _ in items
                         ],
                         "operation_id": operation.operation_id,
                     },
                 )
 
-            status, result = store.batch_rotate(
-                args.tenant_id, items,
-                event_id=operation.operation_id,
-                lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
-                pre_commit=stage_success,
-                mirror=mirror,
-            )
+            try:
+                status, result = store.batch_rotate(
+                    args.tenant_id, items,
+                    event_id=operation.operation_id,
+                    lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
+                    pre_commit=stage_success,
+                    mirror=mirror,
+                )
+            except ExpectedVersionMismatch:
+                # Every item's precondition was compared against the same
+                # committed view under the held locks, before any journal,
+                # handle or file write: one mismatch fails the WHOLE batch
+                # as a bound conflict terminal (event key_id null).
+                return _terminal_rejection(
+                    op_store, store, operation,
+                    args.tenant_id, None,
+                    audit_mod.ACTION_BATCH_ROTATE, 409,
+                    "expected_version does not match current_version",
+                )
             if status == store.BATCH_NOT_FOUND:
                 return _terminal_rejection(
                     op_store, store, operation,
