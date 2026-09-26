@@ -2,10 +2,12 @@
 
 A bundle is an opaque, single base64 token. Its plaintext carries one full key
 record (label, every version with its algorithm, timestamps, public and private
-material, the current-version pointer and the revocation fields). The key is
-derived from the passphrase with a memory-hard KDF and the payload is sealed
-with AES-256-GCM, so a wrong passphrase and any tampering both fail
-authentication rather than yielding partial plaintext.
+material and per-version revocation fields, the current-version pointer and the
+key-level revocation fields). The key is derived from the passphrase with a
+memory-hard KDF and the payload is sealed with AES-256-GCM, so a wrong
+passphrase and any tampering both fail authentication rather than yielding
+partial plaintext. Versions in bundles written before version revocation
+existed carry no revocation fields and import as active.
 """
 
 import base64
@@ -214,6 +216,47 @@ def validate_provider_block(block, where: str):
     return clean
 
 
+def validate_version_revocation(ver: dict, where: str) -> dict:
+    """Validate the optional per-version revocation fields of versions[i].
+
+    The fields are absent in bundles written before version revocation
+    existed; a missing (or null) ``status`` means ``active`` and the three
+    detail fields must then be absent/null. A ``revoked`` version must carry
+    non-empty ``reason``/``operator``/``revoked_at`` strings.
+    """
+    status = ver.get("status")
+    if status is None:
+        status = "active"
+    if status not in ("active", "revoked"):
+        raise InvalidBundle(
+            "field %s.status must be 'active' or 'revoked'" % where
+        )
+    reason = ver.get("reason")
+    operator = ver.get("operator")
+    revoked_at = ver.get("revoked_at")
+    if status == "revoked":
+        for name, value in (
+            ("reason", reason),
+            ("operator", operator),
+            ("revoked_at", revoked_at),
+        ):
+            if not isinstance(value, str) or not value:
+                raise InvalidBundle(
+                    "field %s.%s must be a non-empty string for a revoked "
+                    "version" % (where, name)
+                )
+    elif any(v is not None for v in (reason, operator, revoked_at)):
+        raise InvalidBundle(
+            "revocation fields must be null for an active version"
+        )
+    return {
+        "status": status,
+        "reason": reason,
+        "operator": operator,
+        "revoked_at": revoked_at,
+    }
+
+
 def validate_version(ver, where: str) -> dict:
     """Validate one versions[i] block; ``where`` names it in error messages."""
     if not isinstance(ver, dict):
@@ -243,6 +286,7 @@ def validate_version(ver, where: str) -> dict:
             "field %s.private_material must be a non-empty string" % where
         )
     provider = validate_provider_block(ver.get("provider"), where)
+    revocation = validate_version_revocation(ver, where)
     return {
         "version": number,
         "created_at": created_at,
@@ -250,6 +294,10 @@ def validate_version(ver, where: str) -> dict:
         "public_key": public_key,
         "private_material": private_material,
         "provider": provider,
+        "status": revocation["status"],
+        "reason": revocation["reason"],
+        "operator": revocation["operator"],
+        "revoked_at": revocation["revoked_at"],
     }
 
 

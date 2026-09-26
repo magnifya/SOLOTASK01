@@ -106,6 +106,20 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `{key_id, status, reason, operator, revoked_at}`；重复/并发吊销幂等，保留
   首次值。
 - `GET /v1/keys/{key_id}/status`：字段同 revoke；active 时后三项为 null。
+- `POST /v1/keys/{key_id}/versions/{version}/revoke`：单版本吊销（无 CLI，
+  非幂等入口，无需 `Idempotency-Key`）。body 严格为 `{tenant_id, reason,
+  operator}` 三个非空字符串，多余字段 `400` 并指出字段；key_id/version
+  违反既有格式 `400` 并指出字段。正文与参数 `400` 均不记账，身份冲突
+  （tenant 来源缺失/冲突、非法 key_id）照旧记 `tenant_conflict`。策略与
+  审计动作为 `revoke_version`：拒权 `403`、未知/跨租户 key 或未知版本
+  `404`、整 key 已吊销 `409`，分别记 `revoke_version` 的
+  rejected/success 事件（均带 key_id）；存储/账本失败 `500`，写账失败
+  回滚键文件。`200` 键序固定 `key_id,version,status,reason,operator,
+  revoked_at`；首次吊销记 UTC 时间，重复/并发吊销保留首次值且不再记账
+  （单次审计）。
+- `GET /v1/keys/{key_id}/versions/{version}/status`：字段同版本 revoke
+  （active 时后三项为 null）；沿用 `read` 动作与 GET version 的身份、
+  版本参数与 404 规则。
 - `POST /v1/keys/{key_id}/export`，body `{tenant_id, passphrase}` →
   `{format:"keymgr-export-v1", bundle}`，bundle 为不透明 base64（scrypt +
   AES-256-GCM，`format` 作为 AAD）。
@@ -386,7 +400,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `{tenant_id, deleted:true}`。
 - 规则元素 `{subject, actions, effect}`：`subject` 为区分大小写的非空字符串；
   `actions` 为非空数组，取值
-  `create/read/rotate/revoke/import/export/migrate/encrypt/decrypt/
+  `create/read/rotate/revoke/revoke_version/import/export/migrate/encrypt/decrypt/
   rewrap/sign/verify/audit/list`，单条内重复去重；`effect` 为 `allow`/`deny`；未知字段、类型错误、同
   subject+effect+无序动作集的重复规则均 `400`；`rules:[]` 合法（全拒绝）。
 - 执行：管理动作 policy_* 免检；租户无策略时全部允许；有策略时匹配规则中
@@ -397,7 +411,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 ## 审计
 
 - 事件字段 `{event_id, tenant_id, action, key_id, outcome, timestamp}`；
-  `action` 为 `create/read/rotate/batch_rotate/revoke/import/export/
+  `action` 为 `create/read/rotate/batch_rotate/revoke/revoke_version/import/export/
   migrate/encrypt/decrypt/rewrap/sign/verify/audit/list/tenant_conflict/
   policy_read/policy_update/policy_delete`，`outcome` 为 `success/rejected`。
   信封加密/解密/重包装事件只含元数据（无 plaintext、aad、envelope、数据密钥或私钥）；
@@ -527,7 +541,11 @@ python -m keymgr provider reconnect --operator alice
 
 - 每个密钥为数据目录下 `<key_id>.json`（0600，fsync + 原子 rename），含
   append-only `versions` 与 `current_version`；轮换在 per-key 进程内锁 +
-  `<key_id>.lock` fcntl 锁下读改写，并发不丢版本、不悬指针。
+  `<key_id>.lock` fcntl 锁下读改写，并发不丢版本、不悬指针。密钥文件、
+  导出包与备份包中的每个版本对象在原字段后携带
+  `status,reason,operator,revoked_at`（`active|revoked` 与三个
+  `str|null`）；缺这些字段的旧数据一律视为 active，导入/恢复/迁移原样
+  保留，包格式与 JSON 口径不变。
 - 导入/恢复/批量轮换在提供者调用前先建按 event_id 命名的 provision journal
   （首行耐久记录 operation_id、租户与动作，每铸一个句柄即以 0600 原子重写登记
   provider_id 与句柄）；提交后句柄归记录所有并删除 journal，未提交（冲突、

@@ -157,6 +157,13 @@ class VersionRecord:
     provider_id: str = LOCAL_PROVIDER_ID
     handle: str = ""
     encrypted_material: str = ""
+    # Per-version revocation state. Records written before version
+    # revocation existed carry no status on disk and are treated as
+    # "active" (the three detail fields are then null).
+    status: str = "active"
+    reason: Optional[str] = None
+    operator: Optional[str] = None
+    revoked_at: Optional[str] = None
 
     def to_json(self) -> dict:
         """Serialize to a plain dict suitable for JSON storage."""
@@ -168,6 +175,10 @@ class VersionRecord:
             "provider_id": self.provider_id,
             "handle": self.handle,
             "encrypted_material": self.encrypted_material,
+            "status": self.status,
+            "reason": self.reason,
+            "operator": self.operator,
+            "revoked_at": self.revoked_at,
         }
 
     @classmethod
@@ -189,6 +200,10 @@ class VersionRecord:
                 if "encrypted_material" in data
                 else data["private_material"]
             ),
+            status=data.get("status", "active"),
+            reason=data.get("reason"),
+            operator=data.get("operator"),
+            revoked_at=data.get("revoked_at"),
         )
 
     def to_version_response(self, key_id: str) -> dict:
@@ -199,6 +214,20 @@ class VersionRecord:
             "created_at": self.created_at,
             "algorithm": self.algorithm,
             "public_key": self.public_key,
+        }
+
+    def to_version_status_response(self, key_id: str) -> dict:
+        """Body of GET .../versions/{v}/status and POST .../versions/{v}/revoke.
+
+        For an active version the revocation fields are null.
+        """
+        return {
+            "key_id": key_id,
+            "version": self.version,
+            "status": self.status,
+            "reason": self.reason,
+            "operator": self.operator,
+            "revoked_at": self.revoked_at,
         }
 
 
@@ -1022,6 +1051,7 @@ class KeyStore:
                 audit_mod.ACTION_ROTATE,
                 audit_mod.ACTION_BATCH_ROTATE,
                 audit_mod.ACTION_REVOKE,
+                audit_mod.ACTION_REVOKE_VERSION,
                 audit_mod.ACTION_IMPORT,
                 audit_mod.ACTION_EXPORT,
                 audit_mod.ACTION_MIGRATE,
@@ -1117,6 +1147,7 @@ class KeyStore:
         new_handles=(),
         journal_id: Optional[str] = None,
         pre_commit=None,
+        marker_extra: Optional[dict] = None,
     ) -> None:
         """Commit a key-file change and its event as one logical transaction.
 
@@ -1141,6 +1172,11 @@ class KeyStore:
         if journal_id:
             marker = dict(marker)
             marker["journal"] = journal_id
+        if marker_extra:
+            # Extra durable facts the committed-view projection needs (a
+            # version revoke records its target version this way).
+            marker = dict(marker)
+            marker.update(marker_extra)
         record.pending_event = marker
 
         def release_handles() -> bool:
@@ -1657,6 +1693,30 @@ class KeyStore:
             record.reason = None
             record.operator = None
             record.revoked_at = None
+            return record
+        if action == audit_mod.ACTION_REVOKE_VERSION:
+            # A pending version-revoke marker is always a first-time
+            # active->revoked transition of ONE version (a repeat revoke
+            # writes no marker and appends no event), and it adds no
+            # version: its pre-image is this same record with that one
+            # version still active. The marker carries the target version;
+            # project it active rather than exposing uncommitted revocation
+            # state. A marker whose target cannot be identified hides the
+            # record rather than guessing.
+            target = desc.get("version")
+            if (
+                not isinstance(target, int)
+                or isinstance(target, bool)
+                or target < 1
+            ):
+                return None
+            target_ver = record.get_version(target)
+            if target_ver is None:
+                return None
+            target_ver.status = "active"
+            target_ver.reason = None
+            target_ver.operator = None
+            target_ver.revoked_at = None
             return record
         # create/import new files and any unrecognized marker shape: the
         # safe projection is "not here".
@@ -3618,6 +3678,64 @@ class KeyStore:
                 self.audit.append(event)
         return record
 
+    # Outcomes of revoke_version: the version is (now) revoked, the key or
+    # version does not exist for this tenant, or the whole key is already
+    # revoked (which outranks any per-version state).
+    VERSION_REVOKE_OK = "ok"
+    VERSION_REVOKE_NOT_FOUND = "not_found"
+    VERSION_REVOKE_KEY_REVOKED = "key_revoked"
+
+    def revoke_version(
+        self, key_id: str, tenant_id: str, version: int,
+        reason: str, operator: str,
+    ) -> tuple:
+        """Mark one version as revoked, keeping the first revocation's values.
+
+        Returns ``(status, record, ver)`` with the VERSION_REVOKE_*
+        semantics: VERSION_REVOKE_NOT_FOUND covers an unknown key, a foreign
+        tenant and an unknown version alike (existence never leaks);
+        VERSION_REVOKE_KEY_REVOKED means the whole key is already revoked.
+        The read-modify-write runs under the same per-key locks as rotation
+        and is committed atomically (the audit event is the commit point and
+        a ledger failure rolls the file back), so repeated or concurrent
+        revokes are idempotent: the first reason/operator/revoked_at win and
+        are never overwritten, and only the first revoke writes an event --
+        a repeat changes nothing and appends nothing.
+        """
+        if not _KEY_ID_RE.fullmatch(key_id):
+            return self.VERSION_REVOKE_NOT_FOUND, None, None
+        path = self._path_for(key_id)
+        with self._key_lock(key_id), self._file_lock(key_id):
+            record = self._read_record(path)
+            if record is None or record.tenant_id != tenant_id:
+                return self.VERSION_REVOKE_NOT_FOUND, None, None
+            self._ensure_settled(record)
+            if record.status == "revoked":
+                # A whole-key revocation outranks any per-version state.
+                return self.VERSION_REVOKE_KEY_REVOKED, record, None
+            ver = record.get_version(version)
+            if ver is None:
+                return self.VERSION_REVOKE_NOT_FOUND, record, None
+            if ver.status != "revoked":
+                previous = record.to_json()
+                event = self.audit.new_event(
+                    tenant_id, audit_mod.ACTION_REVOKE_VERSION, key_id,
+                    audit_mod.OUTCOME_SUCCESS,
+                )
+                ver.status = "revoked"
+                ver.reason = reason
+                ver.operator = operator
+                ver.revoked_at = event.timestamp
+                # The marker names the target version so the committed-view
+                # projection can hide exactly this uncommitted transition.
+                self._commit_mutation(
+                    path, record, event, previous,
+                    marker_extra={"version": ver.version},
+                )
+            # Idempotent repeat: the first values stand and no further
+            # event is written (a single audit event per version revoke).
+        return self.VERSION_REVOKE_OK, record, record.get_version(version)
+
     def get_version(
         self, key_id: str, tenant_id: str, version: int
     ) -> Optional[tuple]:
@@ -3637,10 +3755,12 @@ class KeyStore:
 
     # -- envelope crypto material ------------------------------------------
     # Outcomes of crypto_material: the version's KEK is ready, the key or
-    # version does not exist for this tenant, or the key is revoked.
+    # version does not exist for this tenant, the key is revoked, or the
+    # resolved version itself is revoked.
     CRYPTO_OK = "ok"
     CRYPTO_NOT_FOUND = "not_found"
     CRYPTO_REVOKED = "revoked"
+    CRYPTO_VERSION_REVOKED = "version_revoked"
 
     @staticmethod
     def _kek_for_version(ver: VersionRecord, raw_material: str):
@@ -3701,7 +3821,8 @@ class KeyStore:
         are the committed view. CRYPTO_NOT_FOUND covers an unknown key, a
         foreign tenant and an unknown version alike (existence never leaks);
         CRYPTO_REVOKED means the key is revoked (every version refuses
-        crypto). The read runs under the key locks over the committed
+        crypto); CRYPTO_VERSION_REVOKED means the resolved version itself is
+        revoked (refused before any provider call). The read runs under the key locks over the committed
         projection, adopts a raw legacy record exactly like export, and asks
         the owning provider for the material -- a record owned by an inactive
         provider raises ProviderUnavailable (503), never a silent fallback.
@@ -3735,17 +3856,21 @@ class KeyStore:
                 ver = record.get_version(version)
                 if ver is None:
                     return self.CRYPTO_NOT_FOUND, record, None, None
+            if ver.status == "revoked":
+                # A revoked version refuses crypto before any provider call.
+                return self.CRYPTO_VERSION_REVOKED, record, ver, None
             provider = self._provider_for(ver.provider_id)
             exported = provider.export_material(ver.handle)
             kek = self._kek_for_version(ver, exported.encrypted_material)
             return self.CRYPTO_OK, record, ver, kek
 
     # Outcomes of rewrap_versions, which resolves two versions of one key in
-    # a single locked read: OK / not found / revoked (same semantics as
-    # crypto_material).
+    # a single locked read: OK / not found / revoked / a version itself is
+    # revoked (same semantics as crypto_material).
     REWRAP_OK = "ok"
     REWRAP_NOT_FOUND = "not_found"
     REWRAP_REVOKED = "revoked"
+    REWRAP_VERSION_REVOKED = "version_revoked"
 
     def rewrap_versions(
         self,
@@ -3781,21 +3906,27 @@ class KeyStore:
             source_ver = record.get_version(source_version)
             if source_ver is None:
                 return self.REWRAP_NOT_FOUND, record, None, None
+            if source_ver.status == "revoked":
+                return self.REWRAP_VERSION_REVOKED, record, source_ver, None
             if target_version is None:
                 target_ver = record.current
             else:
                 target_ver = record.get_version(target_version)
                 if target_ver is None:
                     return self.REWRAP_NOT_FOUND, record, None, None
+            if target_ver.status == "revoked":
+                return self.REWRAP_VERSION_REVOKED, record, source_ver, target_ver
             return self.REWRAP_OK, record, source_ver, target_ver
 
     # -- sign / verify ------------------------------------------------------
     # Outcomes shared by sign_message and verification_key: the version
     # is usable, the key/version is not found for this tenant, the key is
-    # revoked (every version refuses), or the version is not an RSA2048 one.
+    # revoked (every version refuses), the resolved version itself is
+    # revoked, or the version is not an RSA2048 one.
     SIGN_OK = "ok"
     SIGN_NOT_FOUND = "not_found"
     SIGN_REVOKED = "revoked"
+    SIGN_VERSION_REVOKED = "version_revoked"
     SIGN_WRONG_ALGORITHM = "wrong_algorithm"
 
     def _resolve_signing_version(
@@ -3833,6 +3964,8 @@ class KeyStore:
                 ver = record.get_version(version)
                 if ver is None:
                     return self.SIGN_NOT_FOUND, record, None
+            if ver.status == "revoked":
+                return self.SIGN_VERSION_REVOKED, record, ver
             if ver.algorithm != "RSA2048":
                 return self.SIGN_WRONG_ALGORITHM, record, ver
             return self.SIGN_OK, record, ver
@@ -3948,6 +4081,8 @@ class KeyStore:
                 ver = record.get_version(version)
                 if ver is None:
                     return self.SIGN_NOT_FOUND, record, None, None
+            if ver.status == "revoked":
+                return self.SIGN_VERSION_REVOKED, record, ver, None
             if ver.algorithm != "RSA2048":
                 return self.SIGN_WRONG_ALGORITHM, record, ver, None
             try:
@@ -3980,6 +4115,10 @@ class KeyStore:
                 "handle": ver.handle,
                 "encrypted_material": ver.encrypted_material,
             },
+            "status": ver.status,
+            "reason": ver.reason,
+            "operator": ver.operator,
+            "revoked_at": ver.revoked_at,
         }
 
     def export_payload(self, record: KeyRecord) -> dict:
@@ -4097,6 +4236,10 @@ class KeyStore:
             provider_id=target.provider_id,
             handle=triple.handle,
             encrypted_material=triple.encrypted_material,
+            status=ver.get("status", "active"),
+            reason=ver.get("reason"),
+            operator=ver.get("operator"),
+            revoked_at=ver.get("revoked_at"),
         )
         return record, target
 

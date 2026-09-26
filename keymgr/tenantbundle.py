@@ -10,9 +10,10 @@ tenant::
 
 ``keys`` is a list of per-key projections (``key_id``, ``label``,
 ``current_version``, ``status``, ``reason``, ``operator``, ``revoked_at`` and
-every ``versions`` entry with public and private material); ``policy`` is
-either null or ``{"rules": [...]}``. Private key material only ever exists
-sealed inside the authenticated bundle.
+every ``versions`` entry with public and private material plus its own
+``status``/``reason``/``operator``/``revoked_at`` revocation fields);
+``policy`` is either null or ``{"rules": [...]}``. Private key material only
+ever exists sealed inside the authenticated bundle.
 """
 
 import json

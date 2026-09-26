@@ -61,6 +61,12 @@ _DECRYPT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/decrypt$")
 _REWRAP_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/rewrap$")
 _STATUS_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/status$")
 _VERSION_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/versions/([^/]+)$")
+_VERSION_REVOKE_PATH_RE = re.compile(
+    r"^/v1/keys/([^/]+)/versions/([^/]+)/revoke$"
+)
+_VERSION_STATUS_PATH_RE = re.compile(
+    r"^/v1/keys/([^/]+)/versions/([^/]+)/status$"
+)
 _CURRENT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/current$")
 _POSITIVE_INT_RE = re.compile(r"[0-9]+")
 _MISSING = object()
@@ -790,6 +796,14 @@ def make_handler(
                     self._revoke_key(revoke_match.group(1), parts, operator)
                     return
 
+                version_revoke_match = _VERSION_REVOKE_PATH_RE.match(path)
+                if version_revoke_match is not None:
+                    self._revoke_version(
+                        version_revoke_match.group(1),
+                        version_revoke_match.group(2), parts, operator,
+                    )
+                    return
+
                 export_match = _EXPORT_PATH_RE.match(path)
                 if export_match is not None:
                     self._export_key(export_match.group(1), parts, operator)
@@ -1173,6 +1187,99 @@ def make_handler(
                 return
             self._send_json(200, record.to_status_response())
 
+        def _revoke_version(self, key_id: str, raw_version: str, parts,
+                            operator: str) -> None:
+            """POST /v1/keys/{key_id}/versions/{version}/revoke.
+
+            The body must be exactly ``{tenant_id, reason, operator}`` --
+            three non-empty strings, no other field. Every body/parameter
+            400 (unparseable or non-object body aside, which follows the
+            usual tenant_conflict contract, as do a bad tenant source and a
+            malformed UUID4 key_id) is side-effect free and writes NO audit
+            event. Authorization uses the ``revoke_version`` policy/audit
+            action: a denial is 403 with a ``revoke_version/rejected`` event
+            carrying key_id. An unknown/cross-tenant key or version is 404,
+            an already-revoked key is 409 -- each with its rejected event --
+            and a storage/ledger failure is 500 (a failed ledger write rolls
+            the key file back). Success is 200 with the key order
+            ``key_id,version,status,reason,operator,revoked_at``; the first
+            revoke records the UTC timestamp and repeated/concurrent revokes
+            keep the first values and append no further event.
+            """
+            payload = self._read_json_object()
+            if payload is None:
+                return
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                # The body must itself carry a non-empty tenant_id.
+                if not self._record_conflict():
+                    return
+                self._bad_request("field tenant_id must be a non-empty string")
+                return
+            tenant_id = self._tenant(parts, payload)
+            if tenant_id is None:
+                return
+            if self._bad_key_id(key_id):
+                return
+            version = self._parse_version(raw_version)
+            if version is None:
+                # A malformed version is a plain 400 naming the field; like
+                # every other body/parameter 400 on this endpoint it is not
+                # audited.
+                return
+            extra = [
+                f for f in payload
+                if f not in ("tenant_id", "reason", "operator")
+            ]
+            if extra:
+                self._bad_request(
+                    "field %s is not accepted by this endpoint" % extra[0]
+                )
+                return
+            for field in ("reason", "operator"):
+                value = payload.get(field)
+                if not isinstance(value, str) or not value:
+                    self._bad_request(
+                        "field %s must be a non-empty string" % field
+                        if value is not None
+                        else "missing required field: %s" % field
+                    )
+                    return
+            if not self._enforce(
+                tenant_id, key_id, audit_mod.ACTION_REVOKE_VERSION, operator
+            ):
+                return
+            status, _record, ver = store.revoke_version(
+                key_id, tenant_id, version,
+                payload["reason"], payload["operator"],
+            )
+            if status == store.VERSION_REVOKE_NOT_FOUND:
+                if not self._record_attempt(
+                    tenant_id, key_id, audit_mod.ACTION_REVOKE_VERSION,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._send_json(
+                    404,
+                    {
+                        "error": (
+                            "key not found"
+                            if _record is None
+                            else "version not found"
+                        )
+                    },
+                )
+                return
+            if status == store.VERSION_REVOKE_KEY_REVOKED:
+                if not self._record_attempt(
+                    tenant_id, key_id, audit_mod.ACTION_REVOKE_VERSION,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._send_json(409, {"error": "key is revoked"})
+                return
+            self._send_json(200, ver.to_version_status_response(key_id))
+
         def _export_key(self, key_id: str, parts, operator: str) -> None:
             """POST /v1/keys/{key_id}/export.
 
@@ -1394,6 +1501,13 @@ def make_handler(
                         operation, tenant_id, key_id, action, 409,
                         "key is revoked",
                     )
+                if status == store.CRYPTO_VERSION_REVOKED:
+                    # A revoked version refuses crypto before any provider
+                    # call; the rejection carries the original action.
+                    return self._idempotent_rejection(
+                        operation, tenant_id, key_id, action, 409,
+                        "key version is revoked",
+                    )
                 token = envelope.encode_envelope(
                     key_id=key_id,
                     version=ver.version,
@@ -1605,6 +1719,11 @@ def make_handler(
                     tenant_id, key_id, action, 409, "key is revoked"
                 )
                 return
+            if status == store.CRYPTO_VERSION_REVOKED:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 409, "key version is revoked"
+                )
+                return
             if opened.algorithm != ver.algorithm:
                 self._reject_crypto(
                     tenant_id, key_id, action, 400,
@@ -1747,6 +1866,11 @@ def make_handler(
                     tenant_id, key_id, action, 409, "key is revoked"
                 )
                 return
+            if status == store.REWRAP_VERSION_REVOKED:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 409, "key version is revoked"
+                )
+                return
             if opened.algorithm != source_ver.algorithm:
                 # A 400 after authorization is still a parameter/validation
                 # failure: per the rewrap contract it is NOT audited, and it
@@ -1777,6 +1901,11 @@ def make_handler(
                     tenant_id, key_id, action, 409, "key is revoked"
                 )
                 return
+            if src_status == store.CRYPTO_VERSION_REVOKED:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 409, "key version is revoked"
+                )
+                return
             tgt_status, _r2, _tgt_ver, target_kek = store.crypto_material(
                 key_id, tenant_id, target_ver.version
             )
@@ -1788,6 +1917,11 @@ def make_handler(
             if tgt_status == store.CRYPTO_REVOKED:
                 self._reject_crypto(
                     tenant_id, key_id, action, 409, "key is revoked"
+                )
+                return
+            if tgt_status == store.CRYPTO_VERSION_REVOKED:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 409, "key version is revoked"
                 )
                 return
             try:
@@ -1907,6 +2041,11 @@ def make_handler(
                     tenant_id, key_id, action, 409, "key is revoked"
                 )
                 return
+            if status == store.SIGN_VERSION_REVOKED:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 409, "key version is revoked"
+                )
+                return
             if status == store.SIGN_WRONG_ALGORITHM:
                 self._reject_crypto(
                     tenant_id, key_id, action, 409,
@@ -1975,6 +2114,11 @@ def make_handler(
             if status == store.SIGN_REVOKED:
                 self._reject_crypto(
                     tenant_id, key_id, action, 409, "key is revoked"
+                )
+                return
+            if status == store.SIGN_VERSION_REVOKED:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 409, "key version is revoked"
                 )
                 return
             if status == store.SIGN_WRONG_ALGORITHM:
@@ -2538,6 +2682,14 @@ def make_handler(
                 return
 
             try:
+                version_status_match = _VERSION_STATUS_PATH_RE.match(path)
+                if version_status_match is not None:
+                    self._get_version_status(
+                        version_status_match.group(1),
+                        version_status_match.group(2), parts, operator,
+                    )
+                    return
+
                 version_match = _VERSION_PATH_RE.match(path)
                 if version_match is not None:
                     self._get_version(
@@ -2636,6 +2788,52 @@ def make_handler(
                 return
             _record, ver = result
             self._send_json(200, ver.to_version_response(key_id))
+
+        def _get_version_status(self, key_id: str, raw_version: str, parts,
+                                operator: str) -> None:
+            """GET /v1/keys/{key_id}/versions/{version}/status.
+
+            Follows the read contract of GET .../versions/{v}: tenant and
+            key_id identity rules (tenant_conflict), a malformed version is
+            a rejected ``read`` (400 naming the field), authorization is the
+            ``read`` action, and an unknown/cross-tenant key or version is
+            404. Success is 200 with the key order
+            ``key_id,version,status,reason,operator,revoked_at``; for an
+            active version the last three are null.
+            """
+            tenant_id = self._tenant(parts)
+            if tenant_id is None:
+                return
+            if self._bad_key_id(key_id):
+                return
+            version = self._parse_version(raw_version)
+            if version is None:
+                # Bad version parameter: tenant and key are known, so the
+                # rejection is visible to them.
+                self._reject_read(
+                    tenant_id, key_id, 400,
+                    "field version must be a positive integer",
+                )
+                return
+            if not self._enforce(
+                tenant_id, key_id, audit_mod.ACTION_READ, operator
+            ):
+                return
+            result = store.get_version(key_id, tenant_id, version)
+            if result is None:
+                # Unknown key, unknown version and cross-tenant access are
+                # indistinguishable, all 404.
+                self._reject_read(
+                    tenant_id, key_id, 404, "version not found"
+                )
+                return
+            if not self._record_attempt(
+                tenant_id, key_id, audit_mod.ACTION_READ,
+                audit_mod.OUTCOME_SUCCESS,
+            ):
+                return
+            _record, ver = result
+            self._send_json(200, ver.to_version_status_response(key_id))
 
         def _get_current(self, key_id: str, parts, operator: str) -> None:
             tenant_id = self._tenant(parts)

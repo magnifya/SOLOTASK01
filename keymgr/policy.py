@@ -39,6 +39,7 @@ POLICY_ACTIONS = (
     "read",
     "rotate",
     "revoke",
+    "revoke_version",
     "import",
     "export",
     "migrate",
