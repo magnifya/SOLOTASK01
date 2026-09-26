@@ -228,6 +228,16 @@ def decode_envelope(token: str) -> OpenedEnvelope:
         raw = base64.b64decode(token.encode("ascii"), validate=True)
     except (ValueError, TypeError, binascii.Error) as exc:
         raise EnvelopeError("field envelope is not valid base64") from exc
+    return decode_envelope_bytes(raw)
+
+
+def decode_envelope_bytes(raw: bytes) -> OpenedEnvelope:
+    """Parse an envelope from its raw (already base64-decoded) bytes.
+
+    This is the shape a KMS/HSM-native ``rewrap_key`` provider receives: the
+    token's decoded payload. Raises EnvelopeError (a ``ValueError``) for any
+    malformed, truncated or unsupported-format payload.
+    """
     try:
         obj = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as exc:
@@ -473,6 +483,46 @@ def open_envelope_native(opened: OpenedEnvelope, provider, handle: str) -> bytes
         ) from exc
 
 
+def _rewrap_token(
+    opened: OpenedEnvelope,
+    *,
+    target_version: int,
+    target_algorithm: str,
+    wrapped_key: bytes,
+    wrap_nonce: Optional[bytes],
+) -> str:
+    """Build the rewrapped envelope token around a re-wrapped data key.
+
+    The key_id, nonce, tag, ciphertext and aad bytes are carried over from
+    the authenticated source envelope unchanged; the version, algorithm and
+    wrap fields are rebuilt for the target.
+    """
+    wrap = (
+        WRAP_AES_GCM
+        if target_algorithm == _AES256
+        else WRAP_RSA_OAEP_SHA256
+    )
+    payload = {
+        "format": FORMAT,
+        "key_id": opened.key_id,
+        "version": target_version,
+        "algorithm": target_algorithm,
+        "enc": ENC_AES_GCM,
+        "wrap": wrap,
+        "nonce": b64_encode(opened.nonce),
+        "tag": b64_encode(opened.tag),
+        "ciphertext": b64_encode(opened.ciphertext),
+        "wrapped_key": b64_encode(wrapped_key),
+        "aad": b64_encode(opened.aad),
+    }
+    if wrap_nonce is not None:
+        payload["wrap_nonce"] = b64_encode(wrap_nonce)
+    raw = json.dumps(
+        payload, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return b64_encode(raw)
+
+
 def rewrap_envelope(
     opened: OpenedEnvelope,
     source_kek,
@@ -504,27 +554,103 @@ def rewrap_envelope(
     wrapped_key, wrap_nonce = _wrap_dek_with(
         target_algorithm, target_kek, dek
     )
-    wrap = (
-        WRAP_AES_GCM
-        if target_algorithm == _AES256
-        else WRAP_RSA_OAEP_SHA256
+    return _rewrap_token(
+        opened,
+        target_version=target_version,
+        target_algorithm=target_algorithm,
+        wrapped_key=wrapped_key,
+        wrap_nonce=wrap_nonce,
     )
-    payload = {
-        "format": FORMAT,
-        "key_id": opened.key_id,
-        "version": target_version,
-        "algorithm": target_algorithm,
-        "enc": ENC_AES_GCM,
-        "wrap": wrap,
-        "nonce": b64_encode(opened.nonce),
-        "tag": b64_encode(opened.tag),
-        "ciphertext": b64_encode(opened.ciphertext),
-        "wrapped_key": b64_encode(wrapped_key),
-        "aad": b64_encode(opened.aad),
-    }
-    if wrap_nonce is not None:
-        payload["wrap_nonce"] = b64_encode(wrap_nonce)
-    raw = json.dumps(
-        payload, separators=(",", ":"), sort_keys=True
-    ).encode("utf-8")
-    return b64_encode(raw)
+
+
+def rewrap_envelope_native(
+    opened: OpenedEnvelope,
+    token: str,
+    provider,
+    source_handle: str,
+    target_handle: str,
+    *,
+    target_version: int,
+    target_algorithm: str,
+) -> str:
+    """Re-wrap via a KMS/HSM-native ``rewrap_key`` provider operation.
+
+    The provider receives the source and target handles plus the envelope's
+    raw (base64-decoded) bytes; INSIDE the provider it unwraps the data key
+    under the source KEK, authenticates the content GCM tag and re-wraps the
+    SAME data key under the target KEK. The service never calls
+    ``export_material`` and the DEK, the KEK private material and the
+    plaintext never enter this process: only the re-wrapped
+    ``(wrapped_key, wrap_nonce)`` pair crosses the boundary, and the new
+    token is built here from the already-parsed source fields.
+
+    Provider error mapping follows the contract unchanged: an authentication
+    failure raises ``ProviderInvalidMaterial`` (surfaced as a 400 naming the
+    envelope); an unknown/algorithm-mismatched handle or any backend failure
+    raises ``ProviderUnavailable`` (the fixed 503, no audit event); an
+    unexpected ``ValueError``/``TypeError`` from the provider is a contract
+    violation and is normalized to ``ProviderUnavailable``. The result is
+    validated as a two-tuple of the exact target-algorithm shapes (48/12 for
+    AES256, 256/None for RSA2048): a non-tuple, wrong arity, wrong types or
+    wrong lengths are contract failures normalized to ``ProviderUnavailable``.
+    """
+    from .provider import (
+        ProviderInvalidMaterial,
+        ProviderUnavailable,
+    )
+
+    # The token was already validated by decode_envelope, so this decode
+    # cannot fail; the provider receives exactly the decoded envelope bytes.
+    envelope_bytes = base64.b64decode(token.encode("ascii"), validate=True)
+    try:
+        result = provider.rewrap_key(
+            source_handle, target_handle, envelope_bytes
+        )
+    except (ProviderInvalidMaterial, ProviderUnavailable):
+        raise
+    except Exception as exc:
+        # A conforming provider answers a valid call with either the pair or
+        # a contract error; any other exception (including a residual
+        # ValueError/TypeError for an envelope this service already validated
+        # structurally) is a contract/backend failure -> 503.
+        raise ProviderUnavailable(
+            "provider rewrap_key raised a contract violation"
+        ) from exc
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise ProviderUnavailable(
+            "provider returned a malformed result from rewrap_key"
+        )
+    wrapped_key, wrap_nonce = result
+    expected_len = (
+        _KEY_LEN + _TAG_LEN
+        if target_algorithm == _AES256
+        else _RSA_WRAP_LEN
+    )
+    if (
+        not isinstance(wrapped_key, bytes)
+        or len(wrapped_key) != expected_len
+    ):
+        raise ProviderUnavailable(
+            "provider returned a malformed wrapped_key from rewrap_key"
+        )
+    if target_algorithm == _AES256:
+        if not isinstance(wrap_nonce, bytes) or len(wrap_nonce) != _NONCE_LEN:
+            raise ProviderUnavailable(
+                "provider returned a malformed wrap_nonce from rewrap_key"
+            )
+    elif target_algorithm == _RSA2048:
+        if wrap_nonce is not None:
+            raise ProviderUnavailable(
+                "provider returned a non-null wrap_nonce for RSA2048"
+            )
+    else:
+        raise ProviderUnavailable(
+            "unsupported algorithm for envelope: %r" % target_algorithm
+        )
+    return _rewrap_token(
+        opened,
+        target_version=target_version,
+        target_algorithm=target_algorithm,
+        wrapped_key=wrapped_key,
+        wrap_nonce=wrap_nonce,
+    )

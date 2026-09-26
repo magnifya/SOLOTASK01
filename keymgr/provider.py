@@ -135,6 +135,38 @@ contract failure: the fixed 503 (no audit event). A provider that does NOT
 declare ``wrap_key`` keeps the export-based encrypt path. The built-in local
 provider declares and implements ``wrap_key``.
 
+Native DEK rewrap (optional)
+----------------------------
+``capabilities["operations"]`` MAY additionally list ``"rewrap_key"``.
+Declaring it makes
+``rewrap_key(src: str, dst: str, envelope: bytes) -> tuple[bytes, bytes | None]``
+contractual: a provider that declares the operation without a callable
+``rewrap_key`` method fails the contract (and a declared-but-non-callable
+``rewrap_key`` attribute is invalid too). ``envelope`` is the raw
+base64-decoded bytes of a ``keymgr-envelope-v1`` token. The method
+authenticates the wrapped data key AND the content GCM tag inside the
+KMS/HSM, then re-wraps the SAME data key under the ``dst`` handle's KEK and
+returns ``(wrapped_key, wrap_nonce)``; the DEK, the KEK private material and
+the plaintext never cross the boundary. A ``src``/``dst`` that is not a
+non-empty string raises ``ValueError``; a non-bytes ``envelope`` raises
+``TypeError``; an empty ``envelope`` or one whose structure, algorithm or
+field lengths are invalid raises ``ValueError``; an authentication failure
+(a tampered or wrong-key envelope) raises :class:`ProviderInvalidMaterial`;
+an unknown or algorithm-mismatched handle, or any backend failure, raises
+:class:`ProviderUnavailable`. A success MUST return the exact envelope
+shapes for the TARGET algorithm: an AES256 target returns a 48-byte
+``wrapped_key`` and a 12-byte ``wrap_nonce``; an RSA2048 target returns a
+256-byte ``wrapped_key`` and a null ``wrap_nonce``. When both the source and
+target versions of a rewrap are owned by the same ``provider_id`` and that
+provider declares ``rewrap_key``, the service's rewrap path calls it on the
+bound provider inside the ordinary five-second provider-call gate, never
+calls ``export_material`` and never lets the DEK, a KEK private key or the
+plaintext into the service process; an authentication failure surfaces as a
+400 naming the envelope, while a malformed result or any provider fault is
+the fixed 503 (no audit event). Versions owned by different providers, or a
+provider that does NOT declare ``rewrap_key``, keep the export-based rewrap
+path. The built-in local provider declares and implements ``rewrap_key``.
+
 The factory named by ``KEYMGR_PROVIDER=module:factory`` is imported lazily on
 first use and called with no arguments. A missing module/factory, a factory
 raising, or a returned object failing the contract all raise
@@ -164,6 +196,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from . import envelope as envelope_mod
 from . import signing as signing_mod
 from .crypto import SUPPORTED_ALGORITHMS, generate_key
 
@@ -196,6 +229,11 @@ OP_UNWRAP_KEY = "unwrap_key"
 #: ``capabilities["operations"]`` only when it implements
 #: ``wrap_key(handle, data_key)``; it is never part of the required five.
 OP_WRAP_KEY = "wrap_key"
+#: Optional operation: KMS/HSM-native re-wrap of a ``keymgr-envelope-v1``
+#: data key between two handles. A provider lists it in
+#: ``capabilities["operations"]`` only when it implements
+#: ``rewrap_key(src, dst, envelope)``; it is never part of the required five.
+OP_REWRAP_KEY = "rewrap_key"
 
 _DEK_NAME = "local.dek"
 _REGISTRY_NAME = "local-registry.json"
@@ -375,6 +413,27 @@ class KeyProvider:
         """
         raise NotImplementedError
 
+    def rewrap_key(
+        self, src: str, dst: str, envelope: bytes
+    ) -> Tuple[bytes, Optional[bytes]]:
+        """Optional KMS/HSM-native re-wrap of an envelope data key.
+
+        Contractual only when ``capabilities["operations"]`` declares
+        ``"rewrap_key"``; then this MUST be implemented: ``src`` and ``dst``
+        must be non-empty strings (``ValueError`` otherwise), ``envelope``
+        must be bytes (``TypeError`` otherwise) and non-empty with a valid
+        ``keymgr-envelope-v1`` structure, algorithm and field lengths
+        (``ValueError`` otherwise), an authentication failure raises
+        :class:`ProviderInvalidMaterial`, an unknown or algorithm-mismatched
+        handle and any backend failure raise :class:`ProviderUnavailable`,
+        and a success returns ``(wrapped_key, wrap_nonce)`` for the TARGET
+        algorithm -- a 48-byte wrapped key plus a 12-byte nonce for AES256,
+        or a 256-byte wrapped key plus ``None`` for RSA2048. The data key,
+        the KEK private material and the plaintext never cross the provider
+        boundary.
+        """
+        raise NotImplementedError
+
     def health(self) -> bool:
         """Optional KMS/HSM readiness probe.
 
@@ -455,6 +514,15 @@ def _validate_external(obj) -> None:
         raise ProviderUnavailable(
             "provider %r declares the wrap_key operation without a "
             "callable wrap_key() method" % provider_id
+        )
+    # ``rewrap_key`` is optional under the same rule: declaring it makes a
+    # callable rewrap_key() method contractual.
+    if OP_REWRAP_KEY in operations and not callable(
+        getattr(obj, "rewrap_key", None)
+    ):
+        raise ProviderUnavailable(
+            "provider %r declares the rewrap_key operation without a "
+            "callable rewrap_key() method" % provider_id
         )
     configure = getattr(obj, "configure", None)
     if configure is not None and not callable(configure):
@@ -654,6 +722,59 @@ class _SafeProvider:
             )
         return result
 
+    def rewrap_key(self, src: str, dst: str, envelope: bytes):
+        """KMS/HSM-native DEK re-wrap, with the error contract enforced.
+
+        Only invoked when the provider declared ``rewrap_key`` (contract
+        validation guarantees a callable method then). The boundary argument
+        rules are enforced here too, so a provider cannot silently accept a
+        malformed call: a bad ``src``/``dst`` handle is a ``ValueError`` and
+        a non-bytes or empty ``envelope`` a ``TypeError``/``ValueError``,
+        exactly as the contract requires of the method itself. The structural
+        envelope validation stays with the provider (the service hands over
+        the raw decoded bytes). ``ValueError``/``TypeError``/
+        :class:`ProviderError` from the provider pass through unchanged (an
+        authentication failure surfaces as :class:`ProviderInvalidMaterial`);
+        any other exception is a backend fault normalized to
+        :class:`ProviderUnavailable`. A result that is not a two-element
+        tuple of ``(bytes, bytes | None)`` is a contract failure; the
+        algorithm-specific lengths (48/12 for AES256, 256/None for RSA2048)
+        are enforced by the envelope caller, which is the only layer that
+        knows the target algorithm.
+        """
+        if not isinstance(src, str) or not src:
+            raise ValueError("rewrap_key requires a non-empty src handle")
+        if not isinstance(dst, str) or not dst:
+            raise ValueError("rewrap_key requires a non-empty dst handle")
+        if not isinstance(envelope, bytes):
+            raise TypeError("rewrap_key envelope must be bytes")
+        if not envelope:
+            raise ValueError("rewrap_key envelope must be non-empty")
+        if not callable(getattr(self._inner, "rewrap_key", None)):
+            raise ProviderUnavailable(
+                "provider %r declares rewrap_key without a callable "
+                "rewrap_key() method" % self.provider_id
+            )
+        try:
+            result = self._inner.rewrap_key(src, dst, envelope)
+        except (ValueError, TypeError, ProviderError):
+            raise
+        except Exception as exc:
+            raise ProviderUnavailable(
+                "provider %r operation rewrap_key failed" % self.provider_id
+            ) from exc
+        if (
+            not isinstance(result, tuple)
+            or len(result) != 2
+            or not isinstance(result[0], bytes)
+            or not result[0]
+            or (result[1] is not None and not isinstance(result[1], bytes))
+        ):
+            raise ProviderUnavailable(
+                "provider returned a malformed rewrap result from rewrap_key"
+            )
+        return result
+
     def health(self) -> bool:
         """Optional readiness probe normalized to a bool.
 
@@ -731,6 +852,25 @@ def declares_wrap_key(provider) -> bool:
     return OP_WRAP_KEY in operations
 
 
+def declares_rewrap_key(provider) -> bool:
+    """Whether a bound provider declares the optional ``rewrap_key`` operation.
+
+    Declaration is purely by ``capabilities["operations"]`` containing
+    ``"rewrap_key"``: a declaring external provider was contract-validated to
+    have a callable ``rewrap_key`` method, and the built-in local provider
+    always declares and implements it. Anything else (including a provider
+    whose capabilities are not a mapping) keeps the export-based rewrap
+    path.
+    """
+    caps = getattr(provider, "capabilities", None)
+    if not isinstance(caps, dict):
+        return False
+    operations = caps.get("operations")
+    if not isinstance(operations, (list, tuple)):
+        return False
+    return OP_REWRAP_KEY in operations
+
+
 class LocalProvider(KeyProvider):
     """Built-in software provider.
 
@@ -747,10 +887,12 @@ class LocalProvider(KeyProvider):
     capabilities = {
         "algorithms": tuple(SUPPORTED_ALGORITHMS),
         # The local provider declares and implements the optional native
-        # ``sign``, ``unwrap_key`` and ``wrap_key`` operations: signing and
-        # native DEK wrapping/unwrapping happen inside the provider and the
-        # unwrapped private key never crosses the boundary.
-        "operations": OPERATIONS + (OP_SIGN, OP_UNWRAP_KEY, OP_WRAP_KEY),
+        # ``sign``, ``unwrap_key``, ``wrap_key`` and ``rewrap_key``
+        # operations: signing and native DEK wrapping/unwrapping/rewrapping
+        # happen inside the provider and the unwrapped private key never
+        # crosses the boundary.
+        "operations": OPERATIONS
+        + (OP_SIGN, OP_UNWRAP_KEY, OP_WRAP_KEY, OP_REWRAP_KEY),
     }
 
     def __init__(self) -> None:
@@ -1187,6 +1329,125 @@ class LocalProvider(KeyProvider):
                 ) from exc
             wrapped = private_key.public_key().encrypt(data_key, _OAEP)
             return wrapped, None
+        raise ProviderUnavailable(
+            "handle does not belong to a supported algorithm"
+        )
+
+    @staticmethod
+    def _kek_from_raw(algorithm: str, raw: str):
+        """Load the KEK for a registered handle from its raw material.
+
+        Returns the raw 32-byte key for AES256 or the loaded 2048-bit RSA
+        private key for RSA2048; corrupt stored material is
+        :class:`ProviderUnavailable`.
+        """
+        if algorithm == "AES256":
+            try:
+                kek = base64.b64decode(raw.encode("ascii"), validate=True)
+            except (ValueError, TypeError) as exc:
+                raise ProviderUnavailable(
+                    "stored local material is corrupt"
+                ) from exc
+            if len(kek) != 32:
+                raise ProviderUnavailable("stored local material is corrupt")
+            return kek
+        if algorithm == "RSA2048":
+            try:
+                return signing_mod.load_rsa_private_key(raw)
+            except signing_mod.SigningError as exc:
+                raise ProviderUnavailable(
+                    "stored local material is corrupt"
+                ) from exc
+        raise ProviderUnavailable(
+            "handle does not belong to a supported algorithm"
+        )
+
+    def rewrap_key(self, src: str, dst: str, envelope: bytes):
+        """Re-wrap an envelope's data key between two registered handles.
+
+        The envelope is parsed, its data key unwrapped under the ``src``
+        handle's KEK and its content GCM tag verified -- all inside the
+        provider -- and only then is the SAME data key re-wrapped under the
+        ``dst`` handle's KEK. The DEK, the KEK private material and the
+        plaintext never leave the provider: only the
+        ``(wrapped_key, wrap_nonce)`` pair crosses the boundary (48-byte
+        AES-256-GCM blob + 12-byte nonce for an AES256 target, 256-byte
+        RSA-OAEP-SHA256 blob + ``None`` for RSA2048). A ``src``/``dst`` that
+        is not a non-empty string is a ``ValueError``; a non-bytes
+        ``envelope`` a ``TypeError``; an empty or structurally invalid
+        envelope a ``ValueError``; an unknown handle, a ``src`` handle whose
+        algorithm does not match the envelope, or corrupt stored material is
+        :class:`ProviderUnavailable`; an envelope that fails authentication
+        (wrap tag, OAEP padding or content GCM tag) is
+        :class:`ProviderInvalidMaterial`.
+        """
+        if not isinstance(src, str) or not src:
+            raise ValueError("rewrap_key requires a non-empty src handle")
+        if not isinstance(dst, str) or not dst:
+            raise ValueError("rewrap_key requires a non-empty dst handle")
+        if not isinstance(envelope, bytes):
+            raise TypeError("rewrap_key envelope must be bytes")
+        if not envelope:
+            raise ValueError("rewrap_key envelope must be non-empty")
+        self._require_configured()
+        # Structural validation: EnvelopeError is a ValueError, exactly the
+        # contract's answer for an invalid structure/algorithm/length.
+        opened = envelope_mod.decode_envelope_bytes(envelope)
+        with self._lock:
+            src_meta = self._registry.get(src)
+            if src_meta is None:
+                raise ProviderUnavailable("unknown handle")
+            dst_meta = self._registry.get(dst)
+            if dst_meta is None:
+                raise ProviderUnavailable("unknown handle")
+            src_algorithm = src_meta.get("algorithm")
+            dst_algorithm = dst_meta.get("algorithm")
+            src_raw = self._unwrap_locked(src_meta.get("wrapped"))
+            dst_raw = self._unwrap_locked(dst_meta.get("wrapped"))
+        if src_algorithm != opened.algorithm:
+            raise ProviderUnavailable(
+                "src handle algorithm does not match the envelope"
+            )
+        src_kek = self._kek_from_raw(src_algorithm, src_raw)
+        dst_kek = self._kek_from_raw(dst_algorithm, dst_raw)
+        # Unwrap the data key under the source KEK.
+        if opened.algorithm == "AES256":
+            try:
+                dek = AESGCM(src_kek).decrypt(
+                    opened.wrap_nonce, opened.wrapped_key, None
+                )
+            except InvalidTag as exc:
+                raise ProviderInvalidMaterial(
+                    "wrapped_key cannot be authenticated"
+                ) from exc
+        else:
+            try:
+                dek = src_kek.decrypt(opened.wrapped_key, _OAEP)
+            except ValueError as exc:
+                # RSA-OAEP decryption failures (wrong key/padding) land here.
+                raise ProviderInvalidMaterial(
+                    "wrapped_key cannot be authenticated"
+                ) from exc
+        if len(dek) != _DEK_LEN:
+            raise ProviderInvalidMaterial(
+                "unwrapped data key must be 32 bytes"
+            )
+        # Authenticate the content GCM tag before re-wrapping the same DEK.
+        try:
+            AESGCM(dek).decrypt(
+                opened.nonce, opened.ciphertext + opened.tag, opened.aad
+            )
+        except InvalidTag as exc:
+            raise ProviderInvalidMaterial(
+                "envelope cannot be authenticated"
+            ) from exc
+        # Re-wrap the SAME data key under the target KEK.
+        if dst_algorithm == "AES256":
+            wrap_nonce = os.urandom(_NONCE_LEN)
+            wrapped = AESGCM(dst_kek).encrypt(wrap_nonce, dek, None)
+            return wrapped, wrap_nonce
+        if dst_algorithm == "RSA2048":
+            return dst_kek.public_key().encrypt(dek, _OAEP), None
         raise ProviderUnavailable(
             "handle does not belong to a supported algorithm"
         )

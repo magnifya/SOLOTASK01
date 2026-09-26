@@ -207,6 +207,15 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `404`，算法与源版本不符或认证失败 `400`（不记账），吊销或目标与源同
   版本 `409`，提供者/材料故障 `503` 且 error 固定
   `key management provider is unavailable`（不记账）；账本失败 `500`。
+  源与目标版本同属一个 `provider_id` 且该提供者声明 `rewrap_key` 时走
+  KMS/HSM 原生路径：在五秒门限内调用绑定提供者的
+  `rewrap_key(src_handle, dst_handle, envelope_bytes)`（`envelope_bytes`
+  为令牌经 base64 解码的信封字节），由提供者在内部认证包装 DEK 与内容
+  GCM 标签后改包同一 DEK，绝不调用 `export_material`，DEK、KEK 私钥与
+  明文不进入服务进程；认证失败仍为指出 envelope 的 `400`（不记账），
+  提供者异常或返回结构/类型/长度不符为固定文案 `503` 且不记账。两版本
+  分属不同提供者或该提供者未声明 `rewrap_key` 时，沿用导出 KEK 在内存
+  中改包的旧路径。
   `200` 键序固定 `format,envelope`，`format` 固定
   `keymgr-envelope-v1`。成功记 `rewrap/success`（带 key_id）。无 CLI；
   AAD 只可随信封返回，明文、数据密钥、私钥、句柄绝不入其他响应、审计、
@@ -575,7 +584,23 @@ python -m keymgr provider reconnect --operator alice
   提供者的 `wrap_key`，绝不调用 `export_material` 且不加载 KEK 私钥，再
   构造既有信封；异常或非法结果固定 `503`（不记审计、操作保持 pending，
   重试复用 operation_id，provider_id 恢复后至多继续一次）；未声明者沿用
-  导出旧路径。本地提供者已实现并声明 `wrap_key`。另可实现可选 `health()`（无参、返回 `bool`）：缺少视为健康，非
+  导出旧路径。本地提供者已实现并声明 `wrap_key`。`capabilities.operations`
+  还可另含 `rewrap_key`：声明即须实现
+  `rewrap_key(src: str, dst: str, envelope: bytes) -> tuple[bytes, bytes | None]`
+  ——`envelope` 为令牌经 base64 解码的信封字节，方法在 KMS/HSM 内认证包
+  装 DEK 与内容 GCM 标签，再将同一 DEK 改包到 `dst` 句柄的 KEK 下并按序
+  返回 `(wrapped_key, wrap_nonce)`；`src`、`dst` 任一不是非空 str 抛
+  `ValueError`，`envelope` 非 bytes 抛 `TypeError`，`envelope` 为空或结
+  构、算法、长度非法抛 `ValueError`，认证失败抛
+  `ProviderInvalidMaterial`，未知/算法不符句柄或后端故障抛
+  `ProviderUnavailable`；目标 AES256 成功须返回 48 字节 wrapped_key 与
+  12 字节 wrap_nonce，RSA2048 须返回 256 字节 wrapped_key 与 None；声明
+  而无可调用方法，或返回结构/类型/长度不符，均为提供者不可用。两版本同
+  属一个 `provider_id` 且声明时，rewrap 端点在五秒门限内调用绑定提供者
+  的 `rewrap_key`，绝不调用 `export_material`，DEK、KEK 私钥与明文不进
+  入服务进程（认证失败 `400` 指出 envelope，异常/故障固定 `503` 且不记
+  审计）；否则沿用导出旧路径。本地提供者已实现并声明 `rewrap_key`。
+  另可实现可选 `health()`（无参、返回 `bool`）：缺少视为健康，非
   `bool`/抛异常视为不可用。普通 provider 调用路径上单次探活至多等 1
   秒（超时按一次失败、迟到结果作废），且一次调用的全部探活/等待共用不
   可重置的 5 秒总预算。模块缺失/工厂失败/契约不符/后端异常一律 `503`

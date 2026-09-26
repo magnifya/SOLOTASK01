@@ -26,6 +26,10 @@ Fault injection is driven by a JSON file named by ``FAKE_KMS_FAULTS``:
       "wrap_not_callable": true,    # declare wrap_key but break the method
       "wrap_fail": true,            # wrap_key() raises a backend fault
       "wrap_short": true            # wrap_key() returns a malformed short blob
+      "declare_rewrap_key": true,   # capabilities.operations gains "rewrap_key"
+      "rewrap_not_callable": true,  # declare rewrap_key but break the method
+      "rewrap_fail": true,          # rewrap_key() raises a backend fault
+      "rewrap_short": true          # rewrap_key() returns a malformed blob
     }
 
 Materials are stored base64-wrapped with a static prefix so nothing here ever
@@ -147,6 +151,10 @@ class FakeKmsProvider:
             # Contract-violation injection: declares "wrap_key" without a
             # callable method.
             self.wrap_key = True
+        if _faults().get("rewrap_not_callable"):
+            # Contract-violation injection: declares "rewrap_key" without a
+            # callable method.
+            self.rewrap_key = True
 
     @property
     def capabilities(self):
@@ -163,6 +171,8 @@ class FakeKmsProvider:
             operations.append("unwrap_key")
         if _faults().get("declare_wrap_key"):
             operations.append("wrap_key")
+        if _faults().get("declare_rewrap_key"):
+            operations.append("rewrap_key")
         return {
             "algorithms": ["AES256", "RSA2048"],
             "operations": operations,
@@ -384,6 +394,100 @@ class FakeKmsProvider:
             )
             wrapped = private_key.public_key().encrypt(data_key, oaep)
             return wrapped, None
+        raise RuntimeError("handle is not a supported algorithm")
+
+    def rewrap_key(self, src, dst, envelope):
+        """Optional native DEK re-wrap (declared via ``declare_rewrap_key``).
+
+        Implements the provider contract: argument ``ValueError``/
+        ``TypeError`` rules, ``ProviderInvalidMaterial`` on an authentication
+        failure, ``ProviderUnavailable``-normalized plain exceptions for an
+        unknown/algorithm-mismatched handle or a backend fault, and a success
+        return of ``(wrapped_key, wrap_nonce)`` with the exact envelope
+        shapes for the TARGET algorithm (48-byte AES-256-GCM blob + 12-byte
+        nonce for AES256; 256-byte RSA-OAEP-SHA256 blob + None for RSA2048).
+        The envelope is authenticated (wrapped DEK and content GCM tag)
+        inside the provider before the same DEK is re-wrapped.
+        """
+        if not isinstance(src, str) or not src:
+            raise ValueError("rewrap_key requires a non-empty src handle")
+        if not isinstance(dst, str) or not dst:
+            raise ValueError("rewrap_key requires a non-empty dst handle")
+        if not isinstance(envelope, bytes):
+            raise TypeError("rewrap_key envelope must be bytes")
+        if not envelope:
+            raise ValueError("rewrap_key envelope must be non-empty")
+        _check_fault("rewrap_key")
+        if _faults().get("rewrap_fail"):
+            raise RuntimeError("backend failure in rewrap_key")
+        from keymgr.envelope import decode_envelope_bytes
+        from keymgr.provider import ProviderInvalidMaterial
+
+        # Structural validation: EnvelopeError is a ValueError subclass.
+        opened = decode_envelope_bytes(envelope)
+        with _lock:
+            state = _load_state()
+            src_entry = state["handles"].get(src)
+            dst_entry = state["handles"].get(dst)
+        if src_entry is None or dst_entry is None:
+            raise RuntimeError("unknown handle")
+        if _faults().get("rewrap_short"):
+            # Contract-violation injection: a malformed, short wrapped key.
+            return b"short", None
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        src_algorithm = src_entry.get("algorithm")
+        dst_algorithm = dst_entry.get("algorithm")
+        if src_algorithm != opened.algorithm:
+            raise RuntimeError("src handle algorithm does not match envelope")
+        src_material = _unwrap(src_entry["material"])
+        dst_material = _unwrap(dst_entry["material"])
+        oaep = padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        )
+        if src_algorithm == "AES256":
+            kek = base64.b64decode(src_material.encode("ascii"), validate=True)
+            try:
+                dek = AESGCM(kek).decrypt(
+                    opened.wrap_nonce, opened.wrapped_key, None
+                )
+            except Exception as exc:
+                raise ProviderInvalidMaterial(
+                    "wrapped_key cannot be authenticated"
+                ) from exc
+        else:
+            private_key = serialization.load_pem_private_key(
+                src_material.encode("utf-8"), password=None
+            )
+            try:
+                dek = private_key.decrypt(opened.wrapped_key, oaep)
+            except ValueError as exc:
+                raise ProviderInvalidMaterial(
+                    "wrapped_key cannot be authenticated"
+                ) from exc
+        if len(dek) != 32:
+            raise ProviderInvalidMaterial(
+                "unwrapped data key must be 32 bytes"
+            )
+        try:
+            AESGCM(dek).decrypt(
+                opened.nonce, opened.ciphertext + opened.tag, opened.aad
+            )
+        except Exception as exc:
+            raise ProviderInvalidMaterial(
+                "envelope cannot be authenticated"
+            ) from exc
+        if dst_algorithm == "AES256":
+            kek = base64.b64decode(dst_material.encode("ascii"), validate=True)
+            nonce = os.urandom(12)
+            return AESGCM(kek).encrypt(nonce, dek, None), nonce
+        if dst_algorithm == "RSA2048":
+            private_key = serialization.load_pem_private_key(
+                dst_material.encode("utf-8"), password=None
+            )
+            return private_key.public_key().encrypt(dek, oaep), None
         raise RuntimeError("handle is not a supported algorithm")
 
     def delete(self, handle):

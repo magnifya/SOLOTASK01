@@ -456,6 +456,22 @@ class NativeWrap(NamedTuple):
     handle: str
 
 
+class NativeRewrap(NamedTuple):
+    """A source/target version pair whose DEK must be re-wrapped natively.
+
+    Returned by :meth:`KeyStore.rewrap_native_binding` when both versions
+    are owned by the same ``provider_id`` and that provider declares the
+    ``rewrap_key`` operation: the caller passes this provider and the two
+    handles to ``envelope.rewrap_envelope_native`` instead of exporting
+    either KEK, so the data key, the KEK private material and the plaintext
+    never enter the service process.
+    """
+
+    provider: object
+    source_handle: str
+    target_handle: str
+
+
 class KeyStore:
     """File-backed key store with one JSON file per key."""
 
@@ -4082,6 +4098,29 @@ class KeyStore:
             if source_ver.is_revoked or target_ver.is_revoked:
                 return self.REWRAP_REVOKED, record, source_ver, target_ver
             return self.REWRAP_OK, record, source_ver, target_ver
+
+    @_provider_session
+    def rewrap_native_binding(self, source_ver, target_ver):
+        """Resolve the KMS/HSM-native rewrap binding for two versions.
+
+        Returns a :class:`NativeRewrap` when BOTH versions are owned by the
+        same ``provider_id`` and that provider declares the ``rewrap_key``
+        operation; returns ``None`` otherwise (the caller then takes the
+        ordinary export path, resolving each KEK with crypto_material). A
+        record owned by an inactive provider raises ProviderUnavailable
+        (503), never a silent fallback. No material is exported and no
+        audit event is written here.
+        """
+        if source_ver.provider_id != target_ver.provider_id:
+            return None
+        provider = self._provider_for(source_ver.provider_id)
+        if not provider_mod.declares_rewrap_key(provider):
+            return None
+        return NativeRewrap(
+            provider=provider,
+            source_handle=source_ver.handle,
+            target_handle=target_ver.handle,
+        )
 
     # -- sign / verify ------------------------------------------------------
     # Outcomes shared by sign_message and verification_key: the version

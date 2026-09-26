@@ -1899,7 +1899,12 @@ def make_handler(
             Success rewraps the SAME authenticated data key under the target
             version: nonce, tag, ciphertext, aad and key_id bytes are carried
             over unchanged and the answer is
-            ``200 {"format","envelope"}``. The data key, plaintext, handles
+            ``200 {"format","envelope"}``. When both versions share one
+            provider_id and that provider declares the optional
+            ``rewrap_key`` operation, the rewrap runs inside the KMS/HSM (no
+            export_material; the DEK, KEK private keys and plaintext never
+            enter this process); otherwise the export path rewraps in memory.
+            The data key, plaintext, handles
             and material never enter a response, the ledger or any file.
             """
             action = audit_mod.ACTION_REWRAP
@@ -2007,46 +2012,72 @@ def make_handler(
                     "target_version is the envelope's current key version",
                 )
                 return
-            # Step 2: export each KEK (one crypto_material call per distinct
-            # version). Provider/material faults propagate to do_POST's fixed
-            # 503 and are deliberately NOT audited; nothing has been written.
-            src_status, _r1, _src_ver, source_kek = store.crypto_material(
-                key_id, tenant_id, source_ver.version
-            )
-            if src_status == store.CRYPTO_NOT_FOUND:
-                self._reject_crypto(
-                    tenant_id, key_id, action, 404, "key not found"
+            # Step 2: resolve the KEKs. When both versions share one
+            # provider_id and that provider declares rewrap_key, the rewrap
+            # happens INSIDE the KMS/HSM (no export_material, no DEK/KEK
+            # private key/plaintext in this process); otherwise each KEK is
+            # exported (one crypto_material call per distinct version) and
+            # the rewrap runs in memory. Provider/material faults propagate
+            # to do_POST's fixed 503 and are deliberately NOT audited;
+            # nothing has been written.
+            binding = store.rewrap_native_binding(source_ver, target_ver)
+            if binding is not None:
+                # KMS/HSM-native rewrap on the bound provider inside the
+                # ordinary provider-call gate. An authentication failure is
+                # a 400 naming the envelope (not audited); any provider fault
+                # or malformed result is the fixed 503 (caught at dispatch)
+                # and is never audited.
+                try:
+                    with provider_mod.provider_call():
+                        new_token = envelope.rewrap_envelope_native(
+                            opened, token, binding.provider,
+                            binding.source_handle, binding.target_handle,
+                            target_version=target_ver.version,
+                            target_algorithm=target_ver.algorithm,
+                        )
+                except ProviderInvalidMaterial:
+                    self._bad_request(
+                        "field envelope is tampered or cannot be authenticated"
+                    )
+                    return
+            else:
+                src_status, _r1, _src_ver, source_kek = store.crypto_material(
+                    key_id, tenant_id, source_ver.version
                 )
-                return
-            if src_status == store.CRYPTO_REVOKED:
-                self._reject_crypto(
-                    tenant_id, key_id, action, 409, "key is revoked"
+                if src_status == store.CRYPTO_NOT_FOUND:
+                    self._reject_crypto(
+                        tenant_id, key_id, action, 404, "key not found"
+                    )
+                    return
+                if src_status == store.CRYPTO_REVOKED:
+                    self._reject_crypto(
+                        tenant_id, key_id, action, 409, "key is revoked"
+                    )
+                    return
+                tgt_status, _r2, _tgt_ver, target_kek = store.crypto_material(
+                    key_id, tenant_id, target_ver.version
                 )
-                return
-            tgt_status, _r2, _tgt_ver, target_kek = store.crypto_material(
-                key_id, tenant_id, target_ver.version
-            )
-            if tgt_status == store.CRYPTO_NOT_FOUND:
-                self._reject_crypto(
-                    tenant_id, key_id, action, 404, "key not found"
-                )
-                return
-            if tgt_status == store.CRYPTO_REVOKED:
-                self._reject_crypto(
-                    tenant_id, key_id, action, 409, "key is revoked"
-                )
-                return
-            try:
-                new_token = envelope.rewrap_envelope(
-                    opened, source_kek,
-                    target_version=target_ver.version,
-                    target_algorithm=target_ver.algorithm,
-                    target_kek=target_kek,
-                )
-            except envelope.EnvelopeError as exc:
-                # The source envelope did not authenticate: 400, no event.
-                self._bad_request(str(exc))
-                return
+                if tgt_status == store.CRYPTO_NOT_FOUND:
+                    self._reject_crypto(
+                        tenant_id, key_id, action, 404, "key not found"
+                    )
+                    return
+                if tgt_status == store.CRYPTO_REVOKED:
+                    self._reject_crypto(
+                        tenant_id, key_id, action, 409, "key is revoked"
+                    )
+                    return
+                try:
+                    new_token = envelope.rewrap_envelope(
+                        opened, source_kek,
+                        target_version=target_ver.version,
+                        target_algorithm=target_ver.algorithm,
+                        target_kek=target_kek,
+                    )
+                except envelope.EnvelopeError as exc:
+                    # The source envelope did not authenticate: 400, no event.
+                    self._bad_request(str(exc))
+                    return
             if not self._record_attempt(
                 tenant_id, key_id, action, audit_mod.OUTCOME_SUCCESS
             ):
