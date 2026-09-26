@@ -43,6 +43,7 @@ _BACKUP_PATH = "/v1/backup"
 _RESTORE_PATH = "/v1/restore"
 _KEY_PATH_RE = re.compile(r"^/v1/keys/([^/]+)$")
 _ROTATE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/rotate$")
+_MIGRATE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/migrate$")
 _REVOKE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/revoke$")
 _EXPORT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/export$")
 _ENCRYPT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/encrypt$")
@@ -254,6 +255,8 @@ def make_handler(
                 action = audit_mod.ACTION_ROTATE
             elif kind == "encrypt":
                 action = audit_mod.ACTION_ENCRYPT
+            elif kind == "migrate":
+                action = audit_mod.ACTION_MIGRATE
             else:
                 action = audit_mod.ACTION_IMPORT
             audit_key_id = (
@@ -750,6 +753,11 @@ def make_handler(
                     self._rotate_key(rotate_match.group(1), parts, operator)
                     return
 
+                migrate_match = _MIGRATE_PATH_RE.match(path)
+                if migrate_match is not None:
+                    self._migrate_key(migrate_match.group(1), parts, operator)
+                    return
+
                 revoke_match = _REVOKE_PATH_RE.match(path)
                 if revoke_match is not None:
                     self._revoke_key(revoke_match.group(1), parts, operator)
@@ -938,6 +946,93 @@ def make_handler(
                     )
                 # The success event committed in the same outbox transaction.
                 return 201, record.to_rotate_response()
+
+            self._idempotent_guard(
+                parts.path, tenant_id, operator, payload, idem_key, execute
+            )
+
+        def _migrate_key(self, key_id: str, parts, operator: str) -> None:
+            # POST /v1/keys/{key_id}/migrate: re-home every version of the
+            # key onto the ready provider of the chain. The Idempotency-Key
+            # is validated before the body is read; every parse/parameter
+            # failure before the key is bound is a side-effect-free 400 (no
+            # audit event, operation record, key change or provider handle).
+            idem_key = self._idempotency_key()
+            if idem_key is None:
+                return
+            payload = self._read_json_object(audit=False)
+            if payload is None:
+                return
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                # The body must itself carry a non-empty tenant_id.
+                self._bad_request("field tenant_id must be a non-empty string")
+                return
+            tenant_id = self._tenant(parts, payload, audit=False)
+            if tenant_id is None:
+                return
+            if self._bad_key_id(key_id, audit=False):
+                return
+            # The body carries ONLY tenant_id: any other field is a
+            # side-effect-free 400 before the key is bound.
+            for field in sorted(payload):
+                if field != "tenant_id":
+                    self._bad_request("unknown field: %s" % field)
+                    return
+
+            def execute(operation, mirror=None):
+                # The operation kind and the exact key_id rule are durable
+                # before the authorization check, so even a 403 terminal can
+                # be replayed verbatim after a crash from context alone.
+                operation_store.update_details(
+                    operation, {"kind": "migrate", "key_id": key_id},
+                )
+                if mirror is not None:
+                    # Kind/action/write set land in the mirror BEFORE the
+                    # policy check and provider call.
+                    mirror.describe(
+                        {"kind": "migrate", "write_set": [key_id]}
+                    )
+                # Authorization follows validation and precedes existence; a
+                # denial is a bound terminal 403 whose single rejection event
+                # is named after the operation_id.
+                if not policy_store.is_allowed(
+                    tenant_id, audit_mod.ACTION_MIGRATE, operator
+                ):
+                    return self._idempotent_rejection(
+                        operation, tenant_id, key_id,
+                        audit_mod.ACTION_MIGRATE, 403,
+                        "action not permitted by policy",
+                    )
+
+                def stage_success(committed_record):
+                    # Runs after the key file landed, before the commit-point
+                    # ledger append: the exact 200 body is durable with the
+                    # event, independent of later provider/object state.
+                    body = committed_record.to_migrate_response()
+                    body["operation_id"] = operation.operation_id
+                    operation_store.stage_terminal(operation, 200, body)
+
+                status, record = store.migrate(
+                    key_id, tenant_id,
+                    event_id=operation.operation_id,
+                    lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
+                    pre_commit=stage_success,
+                    mirror=mirror,
+                )
+                if status == store.MIGRATE_NOT_FOUND:
+                    return self._idempotent_rejection(
+                        operation, tenant_id, key_id,
+                        audit_mod.ACTION_MIGRATE, 404, "key not found",
+                    )
+                if status == store.MIGRATE_ALREADY:
+                    return self._idempotent_rejection(
+                        operation, tenant_id, key_id,
+                        audit_mod.ACTION_MIGRATE, 409,
+                        "all versions are already on the ready provider",
+                    )
+                # The success event committed in the same outbox transaction.
+                return 200, record.to_migrate_response()
 
             self._idempotent_guard(
                 parts.path, tenant_id, operator, payload, idem_key, execute
@@ -2511,6 +2606,8 @@ def _resolve_committed_operation(store, policy_store, record, event):
             if status == 409:
                 if kind == "restore":
                     return "backup target already contains this data"
+                if kind == "migrate":
+                    return "all versions are already on the ready provider"
                 return "key_id already exists for this tenant"
             if kind == "restore":
                 return "tenant backup not found"
@@ -2625,6 +2722,13 @@ def _resolve_committed_operation(store, policy_store, record, event):
             body = key.to_create_response()
             body["operation_id"] = op_id
             return 201, body
+    if kind == "migrate":
+        key_id = event.key_id or details.get("key_id")
+        key = store.get(key_id, tenant_id) if is_valid_key_id(key_id) else None
+        if key is not None:
+            body = key.to_migrate_response()
+            body["operation_id"] = op_id
+            return 200, body
     if kind == "restore":
         return (
             201,

@@ -3,7 +3,7 @@
 一个多租户密钥管理服务，同时提供 HTTP API 与命令行入口。支持 AES256 / RSA2048
 密钥的生成、版本化轮换、吊销、加密导出/导入、租户级加密备份/恢复、按租户的
 操作者策略、只追加的审计账，以及可插拔的 KMS/HSM 提供者。HTTP 信封加密、
-轮换/导入/恢复是幂等操作：同一 `Idempotency-Key` 的重试只重放原结果，进程
+轮换/导入/恢复/迁移是幂等操作：同一 `Idempotency-Key` 的重试只重放原结果，进程
 在任一步骤崩溃后重启都能据 `operation_id` 判定是否已耐久并一致收尾。
 （CLI `encrypt` 保持旧的非幂等行为，不携带 `Idempotency-Key`。）私钥只保存
 在服务端，任何响应与审计投影都不含私钥、句柄或包装材料。
@@ -84,6 +84,19 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `{items:[{key_id, version, algorithm, public_key}, ...], operation_id}`，
   items 严格按请求序；各 key 沿用单键 rotate 语义，整批原子提交（共享一把
   per-key 锁顺序、单一 provision/snapshot 记账、单条提交事件）。
+- `POST /v1/keys/{key_id}/migrate`，body 仅 `{tenant_id}`（任何多余字段
+  `400`），需 `Idempotency-Key`。把该密钥的**全部版本**迁移到主备链当前
+  ready 项：每个版本由其登记提供者导出、导入 ready 项，版本号、算法、
+  公钥、时间、current 与吊销状态保持不变。`200` →
+  `{key_id, provider_id, versions, operation_id}`，键序固定，
+  `provider_id` 为 ready 项，`versions` 为升序正整数数组。全部版本已在
+  ready 项为绑定后 `409`；策略按 `migrate` 动作拒绝 `403`；未知/跨租户
+  `404`；源提供者缺失、不健康、材料不符或超时均 `503`（文案固定
+  `key management provider is unavailable`）。提交前失败删除全部新句柄
+  且旧记录保持可用；提交后旧句柄删除失败不影响成功应答，遗留句柄由
+  `migration-cleanups/` 在重启时幂等清理。事件
+  `event_id=operation_id, action=migrate, key_id=K`。明文密钥材料仅驻
+  内存，材料与句柄绝不进入响应、审计或错误。
 - `GET /v1/keys/{key_id}/versions/{version}` 与
   `GET /v1/keys/{key_id}/current` →
   `{key_id, version, created_at, algorithm, public_key}`；version 须为正整数。
@@ -256,10 +269,11 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 
 ## 幂等操作
 
-- HTTP 的 rotate/import/restore/batch-rotate/encrypt（CLI：
-  `rotate`/`import`/`restore`/`batch-rotate`；CLI `encrypt` 维持非幂等、
-  无此头）必须携带**单一** `Idempotency-Key` 头（前四个 CLI 必填
-  `--idempotency-key`），值为 1–128 个 `[A-Za-z0-9._~-]` 字符。缺失、为空、
+- HTTP 的 rotate/import/restore/batch-rotate/encrypt/migrate（CLI：
+  `rotate`/`import`/`restore`/`batch-rotate`/`migrate`；CLI `encrypt`
+  维持非幂等、无此头）必须携带**单一** `Idempotency-Key` 头（这些 CLI
+  子命令必填 `--idempotency-key`），值为 1–128 个 `[A-Za-z0-9._~-]`
+  字符。缺失、为空、
   重复、非法一律 `400`（CLI `2`），且该校验先于请求体读取与一切业务：不写
   审计、操作记录、密钥或提供者句柄。
 - 键全局唯一，绑定记录 `operation_id`(UUID4)、租户、操作者、路径、规范化体
@@ -272,7 +286,8 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   体给出已有 `operation_id`。绑定前的导入/恢复解密无副作用：口令错误 `400`
   不占用该键。
 - 状态：`pending`/`succeeded`/`failed`/`conflict`/`timed_out`。变更类成功为
-  `201` succeeded，只读 encrypt 成功为 `200` succeeded；同租户冲突为 `409`
+  `201` succeeded（迁移成功为 `200`），只读 encrypt 成功为 `200`
+  succeeded；同租户冲突为 `409`
   conflict；`403/404/400` 与提供者/账本失败为 failed（保留原状态码）。并发
   同键仅一个执行，其余等待；等待超 5 秒返回 `503` timed_out（CLI `1`），等待
   方不写任何东西。
@@ -291,8 +306,8 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   时保持 `pending`（信封无法在无请求的情况下重建，故绝不臆造终态），由同键
   HTTP 重试在同一 `operation_id` 下恰好再执行一次。不重复记账（账本按
   event_id 去重），不误判。
-- **operation 工件镜像**：rotate/import/restore/batch-rotate 以及 HTTP
-  encrypt 在幂等键绑定记录耐久**之后**、首次调用提供者**之前**，原子创建
+- **operation 工件镜像**：rotate/import/restore/batch-rotate/migrate 以及
+  HTTP encrypt 在幂等键绑定记录耐久**之后**、首次调用提供者**之前**，原子创建
   `operation-artifacts/<operation_id>.json`（0600、temp 文件 fsync 后 rename；
   非幂等入口与未绑定请求不创建该目录；CLI `encrypt` 为非幂等入口不创建）。
   镜像是一次尝试全部耐久工件的交叉索引，记录租户、操作者、路径、规范化请求
@@ -326,7 +341,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `{tenant_id, deleted:true}`。
 - 规则元素 `{subject, actions, effect}`：`subject` 为区分大小写的非空字符串；
   `actions` 为非空数组，取值
-  `create/read/rotate/revoke/import/export/encrypt/decrypt/audit/list`，单条内
+  `create/read/rotate/revoke/import/export/encrypt/decrypt/audit/list/migrate`，单条内
   重复去重；`effect` 为 `allow`/`deny`；未知字段、类型错误、同
   subject+effect+无序动作集的重复规则均 `400`；`rules:[]` 合法（全拒绝）。
 - 执行：管理动作 policy_* 免检；租户无策略时全部允许；有策略时匹配规则中
@@ -338,7 +353,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 
 - 事件字段 `{event_id, tenant_id, action, key_id, outcome, timestamp}`；
   `action` 为 `create/read/rotate/batch_rotate/revoke/import/export/
-  encrypt/decrypt/audit/list/tenant_conflict/policy_read/policy_update/
+  encrypt/decrypt/audit/list/migrate/tenant_conflict/policy_read/policy_update/
   policy_delete`，`outcome` 为 `success/rejected`。信封加密/解密事件只含
   元数据（无 plaintext、aad、envelope、数据密钥或私钥）；幂等 HTTP encrypt
   每个终态至多一条 `event_id=operation_id,action=encrypt` 事件（成功 200 与
@@ -347,7 +362,9 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   成功写对应 action 的 success 事件。备份记 `export`、恢复记 `import`，两者
   `key_id` 均为 null；恢复的所有事件（含成功）`key_id` 为 null；批量轮换整批
   至多一条 `batch_rotate` 事件，成功与拒绝终态的 `key_id` 均为 null，可按
-  `action=batch_rotate` 筛选。
+  `action=batch_rotate` 筛选。迁移每个终态至多一条
+  `event_id=operation_id,action=migrate` 事件，成功与绑定后拒绝的
+  `key_id` 均为被迁移的密钥。
 - `GET /v1/audit`：单一租户来源；可选 `key_id`(UUID4)、`action`、
   `limit`(1–1000，默认 100)、`cursor`。→ `{events, next_cursor}`，按
   (timestamp, event_id) 升序；游标为 HMAC 签名令牌，绑定租户/筛选/快照，
@@ -381,6 +398,8 @@ python -m keymgr rotate   --tenant-id t --key-id <id> --algorithm AES256 \
 python -m keymgr batch-rotate --tenant-id t --operator alice \
                           --idempotency-key batch-0001 \
                           --items '[{"key_id":"<id1>","algorithm":"AES256"},{"key_id":"<id2>","algorithm":"RSA2048"}]'
+python -m keymgr migrate  --tenant-id t --key-id <id> --operator alice \
+                          --idempotency-key migrate-0001
 python -m keymgr revoke   --tenant-id t --key-id <id> --reason r --operator alice
 python -m keymgr status   --tenant-id t --key-id <id> --operator alice
 # 导出/导入、备份/恢复
@@ -431,7 +450,9 @@ python -m keymgr provider reconnect --operator alice
   动”以已提交的 `provider-state.json` 为准（`provider_id` 为 `local`），
   旧记录接管等门控不会因此导入任何 module:factory 提供者。
 - 轮换/导出/导入/恢复必须命中记录登记的 provider：记录属于未激活提供者，或
-  导入/恢复来源块与当前提供者不符，均 `503`，不静默切换。
+  导入/恢复来源块与当前提供者不符，均 `503`，不静默切换。迁移是唯一的跨
+  提供者读取入口：源提供者须为当前 ready 项、内建 `local` 或链中项并经健
+  康探活，否则 `503`。
 - 启动时安全扫描旧记录：仅当本地提供者活动时，把裸 `private_material`/空句
   柄的旧版本校验并包装为本地对象，先包装后原子重写，失败保持原文件字节不
   变（新建句柄随即释放，不影响启动）；配置了外部提供者时启动与普通读取既不
@@ -451,12 +472,17 @@ python -m keymgr provider reconnect --operator alice
   轮换另在 `batch-rotations/<event_id>.json` 耐久记录每个 key 轮换前的整文件
   字节（snapshot），未提交时据此把整组文件还原；snapshot 缺失则整组保留等待下
   次启动，绝不猜测改写。
+- 迁移在提交前把被替换的旧句柄记入 `migration-cleanups/<event_id>.json`
+  （0600，原子写）；提交后幂等删除旧句柄，删除失败或崩溃留下的文件在下次
+  启动按账本事件结算：migrate 成功事件已入帐则重试删除至清空后移除文件，
+  未提交（无事件或拒绝终态）则直接丢弃文件（旧句柄仍归记录所有，绝不误
+  删）。
 - 旧 restore 记录可能没有 provision journal：未提交回滚时以 `_restore` 标记
   的密钥文件列出整组句柄；提供者不可达或任一句柄删除失败时，保留整组密钥文件、
   策略文件与标记，下一次启动重试，全部句柄确认删除后才移除整组文件。
 - 私钥与口令只存在于口令加密的包内或经提供者包装后的记录中；游标 HMAC 密钥
   存于 `audit.secret`(0600)。材料不会出现在任何响应、审计投影或错误信息中。
-- rotate/import/restore/batch-rotate 另有 0600 的 operation 工件镜像
+- rotate/import/restore/batch-rotate/migrate 另有 0600 的 operation 工件镜像
   `operation-artifacts/<operation_id>.json`：绑定后、调用提供者前创建，交叉
   关联 `operations/<id>.json`、`provisions/<id>.json`、restore 标记（含空
   restore 标记）或 batch snapshot，记录租户/操作者/路径/规范请求/动作/写集/

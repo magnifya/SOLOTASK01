@@ -24,6 +24,7 @@ from .audit import AuditEvent, AuditLog, InvalidCursor, LedgerError
 from .provider import (
     LOCAL_PROVIDER_ID,
     ProviderIdentityMismatch,
+    ProviderInvalidMaterial,
     ProviderReconnectPending,
     ProviderUnavailable,
 )
@@ -295,6 +296,18 @@ class KeyRecord:
             "public_key": self.current.public_key,
         }
 
+    def to_migrate_response(self) -> dict:
+        """Body of POST .../migrate (200). Never contains private material.
+
+        ``provider_id`` is the ready provider every version now lives on;
+        ``versions`` is the ascending list of migrated version numbers.
+        """
+        return {
+            "key_id": self.key_id,
+            "provider_id": self.versions[0].provider_id,
+            "versions": [ver.version for ver in self.versions],
+        }
+
     def to_status_response(self) -> dict:
         """Body of GET .../status (200) and POST .../revoke (200).
 
@@ -386,6 +399,12 @@ class KeyStore:
         # resolved later by the RestoreCoordinator, which reaps their
         # journals itself.
         self._recover_provisions()
+        # ... and finally settle the OLD handles of provider migrations: a
+        # migration that committed but crashed before its post-commit cleanup
+        # finished leaves a cleanup file whose listed handles are orphans to
+        # delete; a leftover file of an uncommitted migration is discarded
+        # untouched (its handles still belong to the record).
+        self._recover_migration_cleanups()
 
     # -- provider helpers --------------------------------------------------
     @staticmethod
@@ -1012,6 +1031,7 @@ class KeyStore:
                 audit_mod.ACTION_DECRYPT,
                 audit_mod.ACTION_AUDIT,
                 audit_mod.ACTION_LIST,
+                audit_mod.ACTION_MIGRATE,
             )
         ):
             event = self.audit.new_event(
@@ -1921,6 +1941,382 @@ class KeyStore:
                 except OSError:
                     pass
         return record
+
+    # -- provider-chain migration ------------------------------------------
+    # A migration re-homes EVERY version of one key onto the currently active
+    # (ready) provider: each version owned by another provider is exported by
+    # its owning provider and imported into the ready one, preserving the
+    # version number, algorithm, public key, timestamps, current pointer and
+    # revocation state. Crash safety mirrors rotate: a provision journal
+    # records every freshly minted handle before the commit point, and the
+    # single migrate audit event (named after the operation_id) is the commit
+    # point of the same outbox transaction. The handles a committed migration
+    # REPLACED are recorded in a durable cleanup file (see
+    # _write_migration_cleanup) so a crash after the commit can never orphan
+    # them; their deletion is post-commit housekeeping that never fails the
+    # request.
+    MIGRATE_DONE = "migrated"
+    MIGRATE_NOT_FOUND = "not_found"
+    MIGRATE_ALREADY = "already"
+    _MIGRATION_CLEANUP_DIR = "migration-cleanups"
+
+    def _migration_cleanup_path(self, cleanup_id: str) -> str:
+        return os.path.join(
+            self.data_dir, self._MIGRATION_CLEANUP_DIR, cleanup_id + ".json"
+        )
+
+    def _write_migration_cleanup(self, cleanup_id: str, handles) -> None:
+        """Durably record the old handles a migration replaces (0600).
+
+        Written BEFORE the migration's commit point so a crash afterwards
+        still knows which backend objects the committed record no longer
+        owns; rewritten with the survivors when a post-commit delete fails
+        and removed once every old handle is gone.
+        """
+        directory = os.path.join(self.data_dir, self._MIGRATION_CLEANUP_DIR)
+        os.makedirs(directory, exist_ok=True)
+        payload = {
+            "event_id": cleanup_id,
+            "handles": [
+                {"provider_id": provider_id, "handle": handle}
+                for provider_id, handle in handles
+            ],
+        }
+        self._write_atomic(self._migration_cleanup_path(cleanup_id), payload)
+
+    def _discard_migration_cleanup(self, cleanup_id: str) -> bool:
+        """Remove a migration cleanup file; True when none remains."""
+        try:
+            os.unlink(self._migration_cleanup_path(cleanup_id))
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+
+    def _delete_migrated_handle(self, provider_id: str, handle: str) -> bool:
+        """Delete one old handle a committed migration replaced.
+
+        The owning provider is usually NOT the active one (that is why the
+        version was migrated), so resolution follows the migration source
+        rules (the built-in local provider, or a chain member) rather than
+        the active-only ``_provider_for``. An unresolvable/unhealthy provider
+        or a failed delete reports False so the cleanup file is kept for the
+        next open. Deletes stay idempotent.
+        """
+        try:
+            provider = provider_mod.migration_source(provider_id)
+        except ProviderUnavailable:
+            return False
+        try:
+            provider.delete(handle)
+        except Exception:
+            return False
+        return True
+
+    def _recover_migration_cleanups(self) -> None:
+        """Settle old-handle cleanup files left by interrupted migrations.
+
+        Resolution is driven by the ledger event named after the file (the
+        migration's operation/event id):
+
+        * a durable ``migrate`` success event means the migration committed:
+          every listed old handle is an orphan and is deleted idempotently,
+          the file rewritten with any survivors and removed once empty;
+        * no event (or a durable rejected terminal) means the migration
+          rolled back: the old handles still belong to the record, so the
+          file is discarded without touching any handle;
+        * an unreadable ledger, a corrupt file, an id collision or a failed
+          delete keeps the whole file for the next open.
+        """
+        directory = os.path.join(self.data_dir, self._MIGRATION_CLEANUP_DIR)
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            cleanup_id = name[:-5]
+            try:
+                if uuid.UUID(cleanup_id).version != 4:
+                    continue
+            except (ValueError, AttributeError):
+                continue
+            path = os.path.join(directory, name)
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(data, dict) or data.get("event_id") != cleanup_id:
+                continue
+            handles = []
+            malformed = False
+            for entry in data.get("handles") or []:
+                if not isinstance(entry, dict):
+                    malformed = True
+                    break
+                provider_id = entry.get("provider_id")
+                handle = entry.get("handle")
+                if not (
+                    isinstance(provider_id, str)
+                    and provider_id
+                    and isinstance(handle, str)
+                    and handle
+                ):
+                    malformed = True
+                    break
+                handles.append((provider_id, handle))
+            if malformed:
+                continue
+            try:
+                event = self.audit.get_event(cleanup_id)
+            except LedgerError:
+                # Cannot decide right now; leave the file for a later open.
+                continue
+            if event is None or event.outcome != audit_mod.OUTCOME_SUCCESS:
+                # Never committed (or a bound rejection): the migration
+                # rolled back and the old handles are still owned by the
+                # record; the file is stale housekeeping.
+                self._discard_migration_cleanup(cleanup_id)
+                continue
+            if event.action != audit_mod.ACTION_MIGRATE:
+                # A same-id success of another operation is an id collision:
+                # neither delete nor discard is provable -- park the file.
+                continue
+            remaining = [
+                (provider_id, handle)
+                for provider_id, handle in handles
+                if not self._delete_migrated_handle(provider_id, handle)
+            ]
+            if remaining:
+                try:
+                    self._write_migration_cleanup(cleanup_id, remaining)
+                except OSError:
+                    pass
+            else:
+                self._discard_migration_cleanup(cleanup_id)
+
+    @_provider_session
+    def migrate(
+        self,
+        key_id: str,
+        tenant_id: str,
+        event_id: Optional[str] = None,
+        lock_timeout: Optional[float] = None,
+        pre_commit=None,
+        mirror=None,
+    ) -> tuple:
+        """Re-home every version of one key onto the ready provider.
+
+        Returns ``(status, record)``: MIGRATE_DONE with the migrated record,
+        MIGRATE_NOT_FOUND for an unknown or foreign key (existence never
+        leaks), or MIGRATE_ALREADY when every version is already owned by the
+        ready provider (the caller answers 409; nothing was touched). Each
+        version owned by another provider is exported by that provider and
+        imported into the ready one; version numbers, algorithms, public
+        keys, timestamps, the current pointer and the revocation state are
+        preserved exactly. Raw material exists only in memory inside this
+        call; only the ready provider's fresh triples are persisted.
+
+        A source provider that is missing from the configuration, unhealthy,
+        or that exports material the ready provider refuses (or whose public
+        key contradicts the record) raises ProviderUnavailable -- the fixed
+        503 contract. A pre-commit failure deletes every minted handle and
+        leaves the old record (and its handles) fully usable; the commit
+        itself is the same outbox transaction as rotate, with the migrate
+        event named after ``event_id`` (the operation_id). After the commit,
+        deleting the replaced handles is best-effort housekeeping: survivors
+        stay in the durable cleanup file and are retried at startup, so the
+        committed request still answers success.
+        """
+        if not _KEY_ID_RE.fullmatch(key_id):
+            return self.MIGRATE_NOT_FOUND, None
+        path = self._path_for(key_id)
+        with self.key_locks(key_id, timeout=lock_timeout):
+            record = self._read_record(path)
+            if record is None or record.tenant_id != tenant_id:
+                return self.MIGRATE_NOT_FOUND, None
+            # Never migrate a file that still owes crash recovery.
+            self._ensure_settled(record)
+            target = self._provider()
+            if all(
+                ver.provider_id == target.provider_id
+                for ver in record.versions
+            ):
+                return self.MIGRATE_ALREADY, record
+            # Mint the committing event and its provision journal *before* the
+            # first provider call: a crash after the ready provider mints a
+            # handle but before the commit point is reaped at the next open
+            # exactly like a rotation (event absent -> handle deleted, key
+            # file left at its prior content).
+            event = self.audit.new_event(
+                tenant_id, audit_mod.ACTION_MIGRATE, key_id,
+                audit_mod.OUTCOME_SUCCESS, event_id=event_id,
+            )
+            journal_id, journal_path = self._new_provision_journal(
+                event.event_id, event.tenant_id, event.action
+            )
+            minted = []  # (provider, handle) minted on the ready provider
+            old_handles = []  # (provider_id, handle) replaced by the commit
+            try:
+                if mirror is not None:
+                    try:
+                        mirror.provision(journal_id)
+                    except OSError as exc:
+                        # Mirror tie-in failed with only an EMPTY journal and
+                        # before any provider call: scrub the journal and
+                        # strand the bound op pending for a same-id retry.
+                        self.drop_provision_journal(journal_id)
+                        from .artifacts import ArtifactStrandUnavailable
+
+                        raise ArtifactStrandUnavailable(str(exc), 500)
+                previous = record.to_json()
+                new_versions = []
+                sources = {}  # provider_id -> resolved migration source
+                for ver in record.versions:
+                    if ver.provider_id == target.provider_id:
+                        new_versions.append(ver)
+                        continue
+                    source = sources.get(ver.provider_id)
+                    if source is None:
+                        source = provider_mod.migration_source(
+                            ver.provider_id, target
+                        )
+                        sources[ver.provider_id] = source
+                    exported = source.export_material(ver.handle)
+                    try:
+                        triple = target.import_material(
+                            ver.algorithm,
+                            ver.public_key,
+                            exported.encrypted_material,
+                        )
+                    except ProviderInvalidMaterial as exc:
+                        # Material our own provider exported must import
+                        # cleanly; a refusal is a backend/material mismatch
+                        # (503), never a client 400.
+                        raise ProviderUnavailable(
+                            "the ready provider refused material exported "
+                            "from the owning provider"
+                        ) from exc
+                    if (
+                        ver.public_key is not None
+                        and triple.public_key is not None
+                        and triple.public_key != ver.public_key
+                    ):
+                        raise ProviderUnavailable(
+                            "migrated material does not match the recorded "
+                            "public key"
+                        )
+                    self._append_provision(
+                        journal_path, target.provider_id, triple.handle
+                    )
+                    if mirror is not None:
+                        mirror.add_handle(target.provider_id, triple.handle)
+                    minted.append((target, triple.handle))
+                    old_handles.append((ver.provider_id, ver.handle))
+                    new_versions.append(
+                        VersionRecord(
+                            version=ver.version,
+                            created_at=ver.created_at,
+                            algorithm=ver.algorithm,
+                            public_key=ver.public_key,
+                            provider_id=target.provider_id,
+                            handle=triple.handle,
+                            encrypted_material=triple.encrypted_material,
+                        )
+                    )
+                # The replaced handles must remain deletable after the commit
+                # even if this process dies: record them durably BEFORE the
+                # commit point. A pre-commit rollback removes the file again
+                # (the old handles then still belong to the record).
+                self._write_migration_cleanup(event.event_id, old_handles)
+                record.versions = new_versions
+                if mirror is not None:
+                    # The key file is about to land: the write set is staged.
+                    mirror.phase(PHASE_STAGED)
+                self._commit_mutation(
+                    path, record, event, previous,
+                    provider=target,
+                    new_handles=[handle for _owner, handle in minted],
+                    journal_id=journal_id,
+                    pre_commit=pre_commit,
+                )
+            except BaseException as exc:
+                from .artifacts import ArtifactStrandUnavailable
+
+                if isinstance(exc, ArtifactStrandUnavailable):
+                    # mirror.provision failed before any provider call with
+                    # only an empty journal, already dropped: keep the bound
+                    # op pending for a same-id retry (no rollback evidence).
+                    raise
+                if isinstance(exc, ProviderReconnectPending):
+                    # No effective provider progress is provable (the gate
+                    # wait timed out): reconcile anything minted, then keep
+                    # the operation PENDING for a same-id continuation.
+                    try:
+                        self._release_handles(minted)
+                        self.rollback_provision_journal(journal_id)
+                    except Exception:
+                        pass
+                    self._discard_migration_cleanup(event.event_id)
+                    if mirror is not None:
+                        try:
+                            mirror.reset_for_pending_retry()
+                        except OSError:
+                            pass
+                    raise
+                # Provider fault, material mismatch or ledger/write failure:
+                # the migration never committed. Delete every minted handle
+                # and reconcile the durable journal (idempotent deletes); the
+                # old record and its handles stay fully usable. A cleanup
+                # failure keeps the journal for the next open and turns the
+                # answer into 503 rather than hiding an orphaned object.
+                cleaned = self._release_handles(minted)
+                if not self.rollback_provision_journal(journal_id):
+                    cleaned = False
+                # The old handles still belong to the (restored) record, so
+                # the cleanup file must not survive a rolled-back migration.
+                # A leftover is harmless (startup discards it without
+                # touching handles), hence best-effort only.
+                self._discard_migration_cleanup(event.event_id)
+                if not cleaned:
+                    raise ProviderUnavailable(
+                        "could not delete a handle provisioned by a failed "
+                        "migration; cleanup will be retried at startup"
+                    ) from exc
+                if mirror is not None:
+                    # Full rollback verified by the journal reconciliation.
+                    try:
+                        mirror.phase(PHASE_ROLLED_BACK)
+                    except OSError:
+                        pass
+                raise
+            # Committed: the new handles are owned by the record and the
+            # durable success event makes the provision journal obsolete.
+            self.drop_provision_journal(journal_id)
+            if mirror is not None:
+                try:
+                    mirror.phase(PHASE_COMMITTED)
+                except OSError:
+                    pass
+            # Post-commit housekeeping: delete the replaced handles. The
+            # request already committed, so a delete failure never fails it
+            # -- the survivors stay in the durable cleanup file and are
+            # retried at startup.
+            remaining = []
+            for provider_id, handle in old_handles:
+                if not self._delete_migrated_handle(provider_id, handle):
+                    remaining.append((provider_id, handle))
+            try:
+                if remaining:
+                    self._write_migration_cleanup(event.event_id, remaining)
+                else:
+                    self._discard_migration_cleanup(event.event_id)
+            except OSError:
+                pass
+            return self.MIGRATE_DONE, record
 
     # -- atomic batch rotation --------------------------------------------
     # A batch rotates 1-100 existing keys of one tenant as one logical

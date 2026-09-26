@@ -2400,6 +2400,51 @@ def get_local_provider() -> "LocalProvider":
     return _LOCAL_SINGLETON
 
 
+def migration_source(provider_id, active=None):
+    """Resolve the provider owning a record version for a migration export.
+
+    A migration must read material from the provider a version is registered
+    with even when that provider is NOT the active (ready) one -- that is the
+    point of the operation. ``active`` is the already-captured ready provider
+    (its id short-circuits the lookup); with ``active=None`` every id is
+    resolved from the configuration. The built-in local provider is always
+    resolvable (its state lives in the data directory); any other id must be
+    built by one ``KEYMGR_PROVIDER_CHAIN`` entry. The resolved provider is
+    configured against the bound data directory and health-probed (bounded by
+    the one-second single-probe limit) before it is returned.
+
+    Raises :class:`ProviderUnavailable` -- the fixed 503 contract -- when no
+    configured entry owns the id (provider missing) or the owning provider is
+    unhealthy; it never activates, installs or commits anything.
+    """
+    if not isinstance(provider_id, str) or not provider_id:
+        raise ProviderUnavailable("record version names no owning provider")
+    if active is not None and provider_id == active.provider_id:
+        return active
+    if provider_id == LOCAL_PROVIDER_ID:
+        candidate = get_local_provider()
+    else:
+        specs = _chain_specs()
+        if specs is None:
+            raise ProviderUnavailable(
+                "record provider %r is not the active provider and no "
+                "provider chain is configured" % provider_id
+            )
+        try:
+            spec = _chain_member(provider_id, specs)
+        except ProviderSwitchoverInvalid as exc:
+            raise ProviderUnavailable(
+                "record provider %r is not in the configured provider chain"
+                % provider_id
+            ) from exc
+        candidate = _build_spec(spec)
+    if not _healthy_within(candidate, _Budget(HEALTH_PROBE_SECONDS)):
+        raise ProviderUnavailable(
+            "migration source provider %r is unhealthy" % provider_id
+        )
+    return candidate
+
+
 def reset_for_tests() -> None:
     """Forget the cached provider (tests only)."""
     global _provider, _configured_dir, _active_state

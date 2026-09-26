@@ -101,6 +101,7 @@ _KIND_ACTIONS = {
     "import": "import",
     "restore": "import",
     "encrypt": "encrypt",
+    "migrate": "migrate",
 }
 
 

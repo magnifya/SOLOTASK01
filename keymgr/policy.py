@@ -45,6 +45,7 @@ POLICY_ACTIONS = (
     "decrypt",
     "audit",
     "list",
+    "migrate",
 )
 EFFECTS = ("allow", "deny")
 _POLICY_DIR = "policies"
