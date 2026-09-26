@@ -74,7 +74,8 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `list/success`，`key_id` 均为 null；存储/账本失败 `500`。
 - `POST /v1/keys/{key_id}/rotate`，body `{tenant_id, algorithm}`，需
   `Idempotency-Key`。`201` → `{key_id, version, algorithm, public_key,
-  operation_id}`，版本严格递增、只追加。
+  operation_id}`，版本严格递增、只追加；轮换产生的新版本一律为 **active**
+  （轮换不会继承被吊销旧版本的状态，也不改变其它版本）。
 - `POST /v1/keys/batch-rotate`，body
   `{tenant_id, items:[{key_id, algorithm}, ...]}`，需 `Idempotency-Key`。
   `items` 限 1–100 项，`key_id` 为不重复小写 UUID4，`algorithm` 仅
@@ -102,16 +103,35 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 - `GET /v1/keys/{key_id}/versions/{version}` 与
   `GET /v1/keys/{key_id}/current` →
   `{key_id, version, created_at, algorithm, public_key}`；version 须为正整数。
+- `POST /v1/keys/{key_id}/versions/{version}/revoke`（无 CLI、非幂等键），
+  正文**仅** `{tenant_id, reason, operator}` 且三项均为非空字符串；吊销**单个
+  版本**，不动其它版本与整 key。策略动作新增 `revoke_version`：拒权 `403` 并记
+  一条 `revoke_version/rejected`（带 key_id）；未知/跨租户 key 或未知版本
+  `404`（记 rejected、带 key_id，不泄露存在性）；**整 key 已吊销时优先返回
+  `409`**（绝不以版本级事实覆盖整键的 reason/operator/revoked_at，记 rejected）；
+  存储/账本失败 `500`，写账失败回滚键文件。`200` 键序固定
+  `key_id,version,status,reason,operator,revoked_at`。首次吊销记录 UTC 时间；
+  重复或并发吊销幂等——保留首次 reason/operator/revoked_at，且**只记一次**
+  `revoke_version/success`（重复调用不写第二条事件）。正文解析失败、多余字段、
+  三字段缺失/非串/空串、version 非正整数等参数错误均 `400` 指出字段且**不记账**
+  （身份来源 tenant_id 缺失/冲突与 key_id 非法仍按既有约定记 `tenant_conflict`）。
+- `GET /v1/keys/{key_id}/versions/{version}/status`：沿用 `read` 授权与审计
+  （成功记 `read/success`，拒权 `403`，未知/跨租户 key/版本 `404`）。`200`
+  键序同上，active 版本后三项为 null；version 参数非法 `400`；整 key 已吊销时
+  `409`（整键吊销优先）。
 - `POST /v1/keys/{key_id}/revoke`，body `{tenant_id, reason, operator}` →
   `{key_id, status, reason, operator, revoked_at}`；重复/并发吊销幂等，保留
-  首次值。
+  首次值。整 key 吊销后**所有**版本（含旧版本）一律不可用于
+  encrypt/decrypt/rewrap/sign/verify，并优先于任何版本级吊销。
 - `GET /v1/keys/{key_id}/status`：字段同 revoke；active 时后三项为 null。
 - `POST /v1/keys/{key_id}/export`，body `{tenant_id, passphrase}` →
   `{format:"keymgr-export-v1", bundle}`，bundle 为不透明 base64（scrypt +
   AES-256-GCM，`format` 作为 AAD）。
 - `POST /v1/keys/import`，body `{tenant_id, passphrase, bundle}`，需
   `Idempotency-Key`。`201` → `{key_id, algorithm, public_key, operation_id}`，
-  保留原 key_id、全部版本、label、current 与吊销状态。同租户已有 key_id 为
+  保留原 key_id、全部版本、label、current、整 key 吊销状态以及**每个版本各自的
+  吊销状态**（status/reason/operator/revoked_at；旧包缺这些字段时该版本视为
+  active）。同租户已有 key_id 为
   `409`，key_id 被其它租户占用为 `404`；口令/篡改/格式错误为 `400` 且不占用
   幂等键。
 - `POST /v1/keys/{key_id}/encrypt`，需单一 `Idempotency-Key` 头，body
@@ -386,7 +406,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `{tenant_id, deleted:true}`。
 - 规则元素 `{subject, actions, effect}`：`subject` 为区分大小写的非空字符串；
   `actions` 为非空数组，取值
-  `create/read/rotate/revoke/import/export/migrate/encrypt/decrypt/
+  `create/read/rotate/revoke/revoke_version/import/export/migrate/encrypt/decrypt/
   rewrap/sign/verify/audit/list`，单条内重复去重；`effect` 为 `allow`/`deny`；未知字段、类型错误、同
   subject+effect+无序动作集的重复规则均 `400`；`rules:[]` 合法（全拒绝）。
 - 执行：管理动作 policy_* 免检；租户无策略时全部允许；有策略时匹配规则中
@@ -397,9 +417,12 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 ## 审计
 
 - 事件字段 `{event_id, tenant_id, action, key_id, outcome, timestamp}`；
-  `action` 为 `create/read/rotate/batch_rotate/revoke/import/export/
+  `action` 为 `create/read/rotate/batch_rotate/revoke/revoke_version/import/export/
   migrate/encrypt/decrypt/rewrap/sign/verify/audit/list/tenant_conflict/
   policy_read/policy_update/policy_delete`，`outcome` 为 `success/rejected`。
+  版本级吊销只记一条 `revoke_version/success`（首次吊销随 outbox 提交；重复/
+  并发吊销保留首次值且不写第二条事件），403/404/409 业务拒绝记同名 rejected，
+  均带 key_id；参数 `400` 不记账。
   信封加密/解密/重包装事件只含元数据（无 plaintext、aad、envelope、数据密钥或私钥）；
   签名/验签事件同样只含元数据（无 message、signature、私钥或句柄），成功记
   `sign`/`verify` 的 success、业务拒绝记同名 rejected，均携带当时 key_id；
@@ -504,9 +527,12 @@ python -m keymgr provider reconnect --operator alice
   "key management provider is unavailable"，绝不回退；导入材料不符算法（AES
   非 32 字节、RSA 公私钥不匹配等）为 `400`，错误只指名字段。
 - 本地提供者用 `local.dek`(0600) 以 AES-256-GCM 包装材料，句柄与包装材料登
-  记在 `local-registry.json`(0600)；密钥文件每个版本只存
-  `{provider_id, handle, encrypted_material}` 三元组，导出包/备份包版本额外
-  带 `provider` 来源块，旧 `keymgr-export-v1` 包无来源块时按本地处理。
+  记在 `local-registry.json`(0600)；密钥文件每个版本存
+  `{provider_id, handle, encrypted_material}` 三元组及版本级吊销四元
+  `{status, reason, operator, revoked_at}`（缺省/缺键为 active、后三项
+  null），导出包/备份包版本同样在原键之后带这四个字段并额外带 `provider`
+  来源块，旧 `keymgr-export-v1` 包无来源块时按本地处理、无吊销字段时该版本
+  视为 active。
 - `KEYMGR_PROVIDER_CHAIN` 为主备链：逗号分隔的 `local`/`module:factory`
   项，项唯一且建厂所得 `provider_id` 唯一（重复即整链不可用）。首次激活
   选首个健康项；活动实例不健康时按上节规则故障转移到首个健康备项，主项

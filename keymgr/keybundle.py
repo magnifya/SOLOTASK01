@@ -243,13 +243,76 @@ def validate_version(ver, where: str) -> dict:
             "field %s.private_material must be a non-empty string" % where
         )
     provider = validate_provider_block(ver.get("provider"), where)
+    revocation = validate_version_revocation(ver, where)
     return {
         "version": number,
         "created_at": created_at,
         "algorithm": algorithm,
         "public_key": public_key,
         "private_material": private_material,
+        "status": revocation["status"],
+        "reason": revocation["reason"],
+        "operator": revocation["operator"],
+        "revoked_at": revocation["revoked_at"],
         "provider": provider,
+    }
+
+
+def validate_version_revocation(data: dict, where: str) -> dict:
+    """Validate one version's status/reason/operator/revoked_at.
+
+    The four fields follow the version's original keys in an export or
+    backup. A bundle emitted before per-version revocation existed carries
+    none of them and the version is treated as active (so older bundles keep
+    importing). When present, ``status`` must be ``active`` or ``revoked``:
+    a revoked version requires all three facts to be non-empty strings, while
+    an active version's facts must all be null (or absent). Returns the
+    cleaned quartet.
+    """
+    if "status" not in data:
+        # Legacy version block: every revocation field is absent.
+        return {
+            "status": "active",
+            "reason": None,
+            "operator": None,
+            "revoked_at": None,
+        }
+    status = data.get("status")
+    if status not in ("active", "revoked"):
+        raise InvalidBundle(
+            "field %s.status must be 'active' or 'revoked'" % where
+        )
+    reason = data.get("reason")
+    operator = data.get("operator")
+    revoked_at = data.get("revoked_at")
+    if status == "revoked":
+        for name, value in (
+            ("reason", reason),
+            ("operator", operator),
+            ("revoked_at", revoked_at),
+        ):
+            if not isinstance(value, str) or not value:
+                raise InvalidBundle(
+                    "field %s.%s must be a non-empty string for a revoked "
+                    "version" % (where, name)
+                )
+    else:
+        for name, value in (
+            ("reason", reason),
+            ("operator", operator),
+            ("revoked_at", revoked_at),
+        ):
+            if value is not None:
+                raise InvalidBundle(
+                    "field %s.%s must be null for an active version"
+                    % (where, name)
+                )
+        reason = operator = revoked_at = None
+    return {
+        "status": status,
+        "reason": reason,
+        "operator": operator,
+        "revoked_at": revoked_at,
     }
 
 

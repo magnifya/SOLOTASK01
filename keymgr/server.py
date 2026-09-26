@@ -61,6 +61,12 @@ _DECRYPT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/decrypt$")
 _REWRAP_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/rewrap$")
 _STATUS_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/status$")
 _VERSION_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/versions/([^/]+)$")
+_VERSION_STATUS_PATH_RE = re.compile(
+    r"^/v1/keys/([^/]+)/versions/([^/]+)/status$"
+)
+_VERSION_REVOKE_PATH_RE = re.compile(
+    r"^/v1/keys/([^/]+)/versions/([^/]+)/revoke$"
+)
 _CURRENT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/current$")
 _POSITIVE_INT_RE = re.compile(r"[0-9]+")
 _MISSING = object()
@@ -790,6 +796,15 @@ def make_handler(
                     self._revoke_key(revoke_match.group(1), parts, operator)
                     return
 
+                version_revoke_match = _VERSION_REVOKE_PATH_RE.match(path)
+                if version_revoke_match is not None:
+                    self._revoke_version(
+                        version_revoke_match.group(1),
+                        version_revoke_match.group(2),
+                        parts, operator,
+                    )
+                    return
+
                 export_match = _EXPORT_PATH_RE.match(path)
                 if export_match is not None:
                     self._export_key(export_match.group(1), parts, operator)
@@ -1172,6 +1187,107 @@ def make_handler(
                 self._send_json(404, {"error": "key not found"})
                 return
             self._send_json(200, record.to_status_response())
+
+        def _revoke_version(self, key_id, raw_version, parts, operator):
+            """POST /v1/keys/{key_id}/versions/{version}/revoke.
+
+            The body is exactly ``{tenant_id, reason, operator}`` with three
+            non-empty strings; the body ``operator`` is the operator recorded
+            on the revoked version, while the X-Operator-Id header stays the
+            policy subject. A malformed body or an unknown field, and a bad
+            version parameter, are plain 400s that write no event (only a bad
+            tenant source and a malformed key_id follow the existing identity
+            rule and record the invisible tenant_conflict). Authorization is
+            the new ``revoke_version`` action; a denial is 403 with one
+            revoke_version/rejected event carrying key_id. An unknown or
+            cross-tenant key or version is 404; a whole-key revocation
+            outranks a version revoke and answers 409. The first UTC
+            revocation wins: repeated/concurrent calls return the first
+            reason/operator/revoked_at and append no second event. A storage
+            or ledger failure rolls the file back and answers 500.
+            """
+            payload = self._read_json_object(parse_conflict=False)
+            if payload is None:
+                return
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                # A missing/empty tenant source is an identity failure: keep
+                # the existing tenant_conflict convention.
+                if not self._record_conflict():
+                    return
+                self._bad_request("field tenant_id must be a non-empty string")
+                return
+            tenant_id = self._tenant(parts, payload)
+            if tenant_id is None:
+                return
+            if self._bad_key_id(key_id, audit=False):
+                return
+            # _parse_version sends the field-naming 400 itself; like the
+            # other parameter failures it writes no audit event.
+            version = self._parse_version(raw_version)
+            if version is None:
+                return
+            extra = [
+                field
+                for field in payload
+                if field not in ("tenant_id", "reason", "operator")
+            ]
+            if extra:
+                self._bad_request(
+                    "field %s is not accepted by this endpoint" % extra[0]
+                )
+                return
+            for field in ("reason", "operator"):
+                value = payload.get(field)
+                if not isinstance(value, str) or not value:
+                    self._bad_request(
+                        "field %s must be a non-empty string" % field
+                        if value is not None
+                        else "missing required field: %s" % field
+                    )
+                    return
+            if not self._enforce(
+                tenant_id, key_id, audit_mod.ACTION_REVOKE_VERSION, operator
+            ):
+                return
+            try:
+                status, record, ver = store.revoke_version(
+                    key_id, tenant_id, version,
+                    payload["reason"], payload["operator"],
+                )
+            except (LedgerError, OSError) as exc:
+                # The outbox transaction already restored the prior file;
+                # surface only the fixed, detail-free text.
+                self._server_error(exc)
+                return
+            if status == store.VERSION_REVOKE_KEY_NOT_FOUND:
+                if not self._record_attempt(
+                    tenant_id, key_id, audit_mod.ACTION_REVOKE_VERSION,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._send_json(404, {"error": "key not found"})
+                return
+            if status == store.VERSION_REVOKE_VERSION_NOT_FOUND:
+                if not self._record_attempt(
+                    tenant_id, key_id, audit_mod.ACTION_REVOKE_VERSION,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._send_json(404, {"error": "version not found"})
+                return
+            if status == store.VERSION_REVOKE_KEY_REVOKED:
+                if not self._record_attempt(
+                    tenant_id, key_id, audit_mod.ACTION_REVOKE_VERSION,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._send_json(409, {"error": "key is revoked"})
+                return
+            # A first transition committed its single revoke_version/success
+            # event inside the outbox transaction; an idempotent repeat
+            # appended nothing. Either way no second event is written.
+            self._send_json(200, ver.to_version_status_response(key_id))
 
         def _export_key(self, key_id: str, parts, operator: str) -> None:
             """POST /v1/keys/{key_id}/export.
@@ -2538,6 +2654,15 @@ def make_handler(
                 return
 
             try:
+                version_status_match = _VERSION_STATUS_PATH_RE.match(path)
+                if version_status_match is not None:
+                    self._get_version_status(
+                        version_status_match.group(1),
+                        version_status_match.group(2),
+                        parts, operator,
+                    )
+                    return
+
                 version_match = _VERSION_PATH_RE.match(path)
                 if version_match is not None:
                     self._get_version(
@@ -2636,6 +2761,57 @@ def make_handler(
                 return
             _record, ver = result
             self._send_json(200, ver.to_version_response(key_id))
+
+        def _get_version_status(self, key_id: str, raw_version: str, parts,
+                               operator: str) -> None:
+            """GET /v1/keys/{key_id}/versions/{version}/status.
+
+            Authorized as ``read`` like the other key/version reads. A bad
+            key/version parameter is a 400 naming the field (with a rejected
+            read event, like GET .../versions/{v}); an unknown or
+            cross-tenant key/version is an indistinct 404. A successful read
+            is ``200`` with keys in order
+            ``key_id,version,status,reason,operator,revoked_at``; an active
+            version carries null for the three revocation fields.
+            """
+            tenant_id = self._tenant(parts)
+            if tenant_id is None:
+                return
+            if self._bad_key_id(key_id):
+                return
+            # Read conventions (GET .../versions/{v}): a bad version is a
+            # 400 naming the field with one read/rejected event, sent once.
+            if not _POSITIVE_INT_RE.fullmatch(raw_version) or int(
+                raw_version
+            ) < 1:
+                self._reject_read(
+                    tenant_id, key_id, 400,
+                    "field version must be a positive integer",
+                )
+                return
+            version = int(raw_version)
+            if not self._enforce(
+                tenant_id, key_id, audit_mod.ACTION_READ, operator
+            ):
+                return
+            result = store.get_version(key_id, tenant_id, version)
+            if result is None:
+                self._reject_read(
+                    tenant_id, key_id, 404, "version not found"
+                )
+                return
+            record, ver = result
+            if record.status == "revoked":
+                # Whole-key revocation outranks a version state: the version
+                # status read defers to it with a 409, like a version revoke.
+                self._reject_read(tenant_id, key_id, 409, "key is revoked")
+                return
+            if not self._record_attempt(
+                tenant_id, key_id, audit_mod.ACTION_READ,
+                audit_mod.OUTCOME_SUCCESS,
+            ):
+                return
+            self._send_json(200, ver.to_version_status_response(key_id))
 
         def _get_current(self, key_id: str, parts, operator: str) -> None:
             tenant_id = self._tenant(parts)
