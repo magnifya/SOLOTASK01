@@ -1363,7 +1363,10 @@ def make_handler(
             Returns ``(tenant_id, payload)`` or None after the response was
             sent. Follows the export endpoint's rules: body/tenant failures
             are invisible tenant_conflict events, and field errors after the
-            tenant is known are tenant-visible rejected attempts.
+            tenant is known are tenant-visible rejected attempts. Under a
+            VALID tenant a malformed key_id is a plain parameter 400 naming
+            key_id with no audit event (no tenant_conflict), exactly like
+            rewrap/sign/verify.
             """
             payload = self._read_json_object()
             if payload is None:
@@ -1377,7 +1380,7 @@ def make_handler(
             tenant_id = self._tenant(parts, payload)
             if tenant_id is None:
                 return None
-            if self._bad_key_id(key_id):
+            if self._bad_key_id(key_id, audit=False):
                 return None
             return tenant_id, payload
 
@@ -1674,7 +1677,13 @@ def make_handler(
             Body ``{tenant_id, envelope, aad?}``. The envelope names its own
             key_id and version; both must match the request, the AAD must
             match the sealed one, and any tampering is a 400 naming the
-            field. The plaintext leaves only inside the response body.
+            field. The plaintext leaves only inside the response body. When
+            the version's owning provider declares the optional
+            ``unwrap_key`` operation the data key is unwrapped inside the
+            KMS/HSM (no export, no KEK private key in this process);
+            otherwise the export-based path unwraps in memory. A malformed
+            provider result or backend failure is the fixed 503 (no audit
+            event); an authentication failure is a 400 naming ``envelope``.
             """
             action = audit_mod.ACTION_DECRYPT
             base = self._crypto_request_base(key_id, parts, action)
@@ -1708,7 +1717,7 @@ def make_handler(
                 return
             if not self._enforce(tenant_id, key_id, action, operator):
                 return
-            status, record, ver, kek = store.crypto_material(
+            status, record, ver = store.resolve_crypto_version(
                 key_id, tenant_id, opened.version
             )
             if status == store.CRYPTO_NOT_FOUND:
@@ -1734,7 +1743,8 @@ def make_handler(
                 )
                 return
             try:
-                plaintext = envelope.open_envelope(opened, kek)
+                dek = store.unwrap_envelope_dek(ver, opened)
+                plaintext = envelope.decrypt_with_dek(opened, dek)
             except envelope.EnvelopeError as exc:
                 self._reject_crypto(
                     tenant_id, key_id, action, 400, str(exc)

@@ -119,8 +119,14 @@ def _wrap_dek(algorithm: str, kek) -> tuple:
     return dek, sealed, wrap_nonce
 
 
-def _unwrap_dek(opened: "OpenedEnvelope", kek) -> bytes:
-    """Recover the DEK from the envelope using the KEK."""
+def unwrap_dek(opened: "OpenedEnvelope", kek) -> bytes:
+    """Recover the DEK from an opened envelope using an in-process KEK.
+
+    The legacy (non-native) path: the caller first exports and loads the
+    owning version's raw KEK material. A wrong key version, a modified
+    wrapped key/nonce or failed RSA unpadding all fail as one field-naming
+    authentication error.
+    """
     try:
         if opened.algorithm == _AES256:
             if not isinstance(kek, (bytes, bytearray)) or len(kek) != _KEY_LEN:
@@ -150,6 +156,29 @@ def _unwrap_dek(opened: "OpenedEnvelope", kek) -> bytes:
     raise EnvelopeError(
         "field envelope is tampered or cannot be authenticated"
     )
+
+
+def decrypt_with_dek(opened: "OpenedEnvelope", dek: bytes) -> bytes:
+    """Decrypt the payload with an already recovered 32-byte data key.
+
+    Shared by the legacy path (the KEK was exported and the DEK unwrapped
+    in process) and the native KMS/HSM path (the provider's ``unwrap_key``
+    returned the DEK): only the content AES-256-GCM tag is checked here. A
+    modified nonce/tag/ciphertext or a wrong data key fails as the one
+    field-naming authentication error.
+    """
+    try:
+        sealed = opened.ciphertext + opened.tag
+        return AESGCM(dek).decrypt(opened.nonce, sealed, opened.aad)
+    except InvalidTag as exc:
+        raise EnvelopeError(
+            "field envelope is tampered or cannot be authenticated"
+        ) from exc
+    except ValueError as exc:
+        # A malformed (non-32-byte) data key lands here.
+        raise EnvelopeError(
+            "field envelope is tampered or cannot be authenticated"
+        ) from exc
 
 
 def encode_envelope(
@@ -319,14 +348,7 @@ def open_envelope(opened: OpenedEnvelope, kek) -> bytes:
     failed RSA unpadding all fail as one field-naming authentication error;
     the caller separately checks that the request AAD equals the envelope AAD.
     """
-    dek = _unwrap_dek(opened, kek)
-    try:
-        sealed = opened.ciphertext + opened.tag
-        return AESGCM(dek).decrypt(opened.nonce, sealed, opened.aad)
-    except InvalidTag as exc:
-        raise EnvelopeError(
-            "field envelope is tampered or cannot be authenticated"
-        ) from exc
+    return decrypt_with_dek(opened, unwrap_dek(opened, kek))
 
 
 def rewrap_envelope(
@@ -348,7 +370,7 @@ def rewrap_envelope(
     data key itself exists only in process memory for the duration of the
     call and never enters the returned token in the clear.
     """
-    dek = _unwrap_dek(opened, source_kek)
+    dek = unwrap_dek(opened, source_kek)
     try:
         AESGCM(dek).decrypt(
             opened.nonce, opened.ciphertext + opened.tag, opened.aad

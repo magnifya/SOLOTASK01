@@ -1430,8 +1430,8 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 return 1
             return _fail("field tenant_id must be a non-empty string", 2)
         if not is_valid_key_id(args.key_id):
-            if not _conflict(store):
-                return 1
+            # A malformed key_id under a valid tenant is a plain parameter
+            # error: no tenant_conflict is recorded.
             return _fail("field key_id must be a UUID4", 2)
         aad = b""
         if args.aad is not None:
@@ -1458,7 +1458,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
         if not allowed(audit_mod.ACTION_DECRYPT):
             return _deny(store, args.tenant_id, args.key_id,
                          audit_mod.ACTION_DECRYPT)
-        status, record, ver, kek = store.crypto_material(
+        status, record, ver = store.resolve_crypto_version(
             args.key_id, args.tenant_id, opened.version
         )
         if status == store.CRYPTO_NOT_FOUND:
@@ -1484,7 +1484,8 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 "field aad does not match the envelope",
             )
         try:
-            plaintext = envelope.open_envelope(opened, kek)
+            dek = store.unwrap_envelope_dek(ver, opened)
+            plaintext = envelope.decrypt_with_dek(opened, dek)
         except envelope.EnvelopeError as exc:
             return _crypto_reject(
                 store, args.tenant_id, args.key_id,

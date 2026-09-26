@@ -244,17 +244,20 @@ def validate_version(ver, where: str) -> dict:
         )
     provider = validate_provider_block(ver.get("provider"), where)
     revocation = validate_version_revocation(ver, where)
+    # The version object key order is fixed and shared by export and backup:
+    # version, created_at, algorithm, public_key, private_material, provider,
+    # status, reason, operator, revoked_at.
     return {
         "version": number,
         "created_at": created_at,
         "algorithm": algorithm,
         "public_key": public_key,
         "private_material": private_material,
+        "provider": provider,
         "status": revocation["status"],
         "reason": revocation["reason"],
         "operator": revocation["operator"],
         "revoked_at": revocation["revoked_at"],
-        "provider": provider,
     }
 
 

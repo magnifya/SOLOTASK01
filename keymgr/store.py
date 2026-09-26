@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Iterator, List, NamedTuple, Optional, Tuple
 
 from . import audit as audit_mod
+from . import envelope as envelope_mod
 from . import keybundle
 from . import provider as provider_mod
 from . import signing as signing_mod
@@ -3820,6 +3821,54 @@ class KeyStore:
         )
 
     @_provider_session
+    def resolve_crypto_version(
+        self,
+        key_id: str,
+        tenant_id: str,
+        version: Optional[int] = None,
+        lock_timeout: Optional[float] = None,
+    ) -> tuple:
+        """Resolve the committed version an envelope crypto call acts on.
+
+        Returns ``(status, record, ver)`` with the CRYPTO_* semantics of
+        :meth:`crypto_material`, but never exports material and never
+        contacts the owning provider for key material: the read runs under
+        the key locks over the committed projection and adopts a raw legacy
+        record exactly like export. Nothing is persisted and no audit event
+        is written here.
+        """
+        if not is_valid_key_id(key_id):
+            return self.CRYPTO_NOT_FOUND, None, None
+        path = self._path_for(key_id)
+        with self.key_locks(key_id, timeout=lock_timeout):
+            on_disk = self._read_record(path)
+            if on_disk is None or on_disk.tenant_id != tenant_id:
+                return self.CRYPTO_NOT_FOUND, None, None
+            # Never crypto against an uncommitted current: project only the
+            # durable state (the view, not the file, is trimmed).
+            record = self._committed_record(on_disk)
+            if record is None:
+                return self.CRYPTO_NOT_FOUND, None, None
+            # Adopt a raw legacy record now, under the key locks and only
+            # while the local provider is active (same rule as export).
+            self._take_over_legacy(record)
+            if record.status == "revoked":
+                return self.CRYPTO_REVOKED, record, None
+            if version is None:
+                ver = record.current
+            else:
+                ver = record.get_version(version)
+                if ver is None:
+                    return self.CRYPTO_NOT_FOUND, record, None
+            # A revoked version refuses crypto even while the key as a whole
+            # stays active (older/current version revocation). The check
+            # precedes every provider contact, so no KMS/HSM is ever called
+            # for a revoked version.
+            if ver.is_revoked:
+                return self.CRYPTO_REVOKED, record, ver
+            return self.CRYPTO_OK, record, ver
+
+    @_provider_session
     def crypto_material(
         self,
         key_id: str,
@@ -3845,39 +3894,52 @@ class KeyStore:
         before the provider is touched. The idempotent encrypt uses it so a
         contended key answers 503/timed_out with zero side effects.
         """
-        if not is_valid_key_id(key_id):
-            return self.CRYPTO_NOT_FOUND, None, None, None
-        path = self._path_for(key_id)
-        with self.key_locks(key_id, timeout=lock_timeout):
-            on_disk = self._read_record(path)
-            if on_disk is None or on_disk.tenant_id != tenant_id:
-                return self.CRYPTO_NOT_FOUND, None, None, None
-            # Never crypto against an uncommitted current: project only the
-            # durable state (the view, not the file, is trimmed).
-            record = self._committed_record(on_disk)
-            if record is None:
-                return self.CRYPTO_NOT_FOUND, None, None, None
-            # Adopt a raw legacy record now, under the key locks and only
-            # while the local provider is active (same rule as export).
-            self._take_over_legacy(record)
-            if record.status == "revoked":
-                return self.CRYPTO_REVOKED, record, None, None
-            if version is None:
-                ver = record.current
-            else:
-                ver = record.get_version(version)
-                if ver is None:
-                    return self.CRYPTO_NOT_FOUND, record, None, None
-            # A revoked version refuses crypto even while the key as a whole
-            # stays active (older/current version revocation). The check
-            # precedes every provider contact, so no KMS/HSM is ever called
-            # for a revoked version.
-            if ver.is_revoked:
-                return self.CRYPTO_REVOKED, record, ver, None
-            provider = self._provider_for(ver.provider_id)
-            exported = provider.export_material(ver.handle)
-            kek = self._kek_for_version(ver, exported.encrypted_material)
-            return self.CRYPTO_OK, record, ver, kek
+        status, record, ver = self.resolve_crypto_version(
+            key_id, tenant_id, version, lock_timeout=lock_timeout
+        )
+        if status != self.CRYPTO_OK:
+            return status, record, ver, None
+        provider = self._provider_for(ver.provider_id)
+        exported = provider.export_material(ver.handle)
+        kek = self._kek_for_version(ver, exported.encrypted_material)
+        return self.CRYPTO_OK, record, ver, kek
+
+    @_provider_session
+    def unwrap_envelope_dek(self, ver: VersionRecord, opened) -> bytes:
+        """Recover an opened envelope's data key via the owning provider.
+
+        ``ver`` is the committed version the envelope names (the caller has
+        already checked the envelope algorithm against it). When the owning
+        provider declares the optional ``unwrap_key`` operation the DEK is
+        unwrapped inside the KMS/HSM: ``export_material`` is NEVER called
+        and no KEK private key enters this process. A provider that does not
+        declare it keeps the legacy path: the material is exported and the
+        DEK unwrapped in memory. An authentication failure of the wrapped
+        key surfaces as :class:`envelope_mod.EnvelopeError` (the 400 naming
+        ``envelope``); a malformed provider result (not 32-byte bytes), an
+        inactive provider or any backend failure is ProviderUnavailable (the
+        fixed 503). Nothing is persisted and no audit event is written here.
+        """
+        provider = self._provider_for(ver.provider_id)
+        if provider_mod.declares_unwrap_key(provider):
+            try:
+                dek = provider.unwrap_key(
+                    ver.handle, opened.wrapped_key, opened.wrap_nonce
+                )
+            except ProviderInvalidMaterial as exc:
+                # The wrapped DEK did not authenticate: the same field-naming
+                # 400 the in-memory unwrap produces.
+                raise envelope_mod.EnvelopeError(
+                    "field envelope is tampered or cannot be authenticated"
+                ) from exc
+            if not isinstance(dek, bytes) or len(dek) != 32:
+                raise ProviderUnavailable(
+                    "provider returned a malformed data key"
+                )
+            return dek
+        exported = provider.export_material(ver.handle)
+        kek = self._kek_for_version(ver, exported.encrypted_material)
+        return envelope_mod.unwrap_dek(opened, kek)
 
     # Outcomes of rewrap_versions, which resolves two versions of one key in
     # a single locked read: OK / not found / revoked (same semantics as
@@ -4128,15 +4190,15 @@ class KeyStore:
             "algorithm": ver.algorithm,
             "public_key": ver.public_key,
             "private_material": exported.encrypted_material,
-            "status": ver.status,
-            "reason": ver.reason,
-            "operator": ver.operator,
-            "revoked_at": ver.revoked_at,
             "provider": {
                 "provider_id": ver.provider_id,
                 "handle": ver.handle,
                 "encrypted_material": ver.encrypted_material,
             },
+            "status": ver.status,
+            "reason": ver.reason,
+            "operator": ver.operator,
+            "revoked_at": ver.revoked_at,
         }
 
     def export_payload(self, record: KeyRecord) -> dict:

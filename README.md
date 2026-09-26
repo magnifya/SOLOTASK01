@@ -158,9 +158,16 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 - `POST /v1/keys/{key_id}/decrypt`，body `{tenant_id, envelope, aad?}`，接
   受 `keymgr-envelope-v1`。`200` → `{plaintext}`（base64）。信封内 key_id
   必须与路径一致；缺字段、非法 base64、篡改、AAD 不符为 `400` 且错误指明
-  字段；未知或跨租户的 key/version 为 `404`；吊销版本（含旧版本）为 `409`；
-  提供者不可用为 `503`，沿用固定脱敏文案。私钥、数据密钥只存在于进程内存，
-  绝不进入响应或审计。
+  字段；合法租户下非法 key_id 为 `400` 且**不记** `tenant_conflict`；未知
+  或跨租户的 key/version 为 `404`；吊销版本（含旧版本）为 `409`。版本的
+  提供者声明 `unwrap_key` 时走 KMS/HSM 原生解包：在五秒门限内调用绑定提
+  供者的 `unwrap_key(handle, wrapped_key, wrap_nonce)`，绝不调用
+  `export_material`，KEK 私钥不进入服务进程，再以返回的 32 字节数据密钥
+  解密内容；包装密钥认证失败（GCM tag/OAEP 填充失败）为指出 envelope 的
+  `400`（与内存路径同一错误），返回值畸形或提供者异常/故障为固定文案
+  `503` 且不记审计。未声明 `unwrap_key` 的提供者沿用导出 KEK 在内存解包
+  的旧路径。私钥、数据密钥只存在于进程内存（原生路径下数据密钥短暂存
+  在），绝不进入响应或审计。
 - `POST /v1/keys/{key_id}/rewrap`，**非幂等**（无需
   `Idempotency-Key`），body 仅
   `{tenant_id, envelope, target_version?, aad?}`；`envelope`、`aad` 为
@@ -519,7 +526,16 @@ python -m keymgr provider reconnect --operator alice
   `ValueError`、message 非 bytes 抛 `TypeError`、未知/非 RSA 句柄或后端故
   障抛 `ProviderUnavailable`，成功返回 256 字节 RSASSA-PKCS1-v1_5/SHA-256
   签名；声明而无该方法（或方法不可调用）即契约不符。本地提供者已实现并声
-  明 `sign`。另可实现可选 `health()`（无参、返回 `bool`）：缺少视为健康，非
+  明 `sign`。另可声明 `unwrap_key`：声明即须实现
+  `unwrap_key(handle: str, wrapped_key: bytes, wrap_nonce: bytes|None=None) -> bytes`
+  ——handle 非非空 str 抛 `ValueError`；wrapped_key 非 bytes、非 null 的
+  wrap_nonce 非 bytes 抛 `TypeError`；wrapped_key 为空、AES256 的
+  wrap_nonce 非 12 字节、RSA2048 的 wrap_nonce 非 null 抛 `ValueError`；
+  未知句柄、句柄算法不符或后端故障抛 `ProviderUnavailable`；包装密钥认证
+  失败抛 `ProviderInvalidMaterial`；成功返回 32 字节数据密钥。声明而无
+  可调用方法即契约不符；返回值非 32 字节 bytes 由服务按 503 处理。本地
+  提供者已实现并声明 `unwrap_key`。另可实现可选 `health()`（无参、返回
+  `bool`）：缺少视为健康，非
   `bool`/抛异常视为不可用。普通 provider 调用路径上单次探活至多等 1
   秒（超时按一次失败、迟到结果作废），且一次调用的全部探活/等待共用不
   可重置的 5 秒总预算。模块缺失/工厂失败/契约不符/后端异常一律 `503`
@@ -530,9 +546,10 @@ python -m keymgr provider reconnect --operator alice
   记在 `local-registry.json`(0600)；密钥文件每个版本存
   `{provider_id, handle, encrypted_material}` 三元组及版本级吊销四元
   `{status, reason, operator, revoked_at}`（缺省/缺键为 active、后三项
-  null），导出包/备份包版本同样在原键之后带这四个字段并额外带 `provider`
-  来源块，旧 `keymgr-export-v1` 包无来源块时按本地处理、无吊销字段时该版本
-  视为 active。
+  null）。导出包/备份包的版本对象键序固定为
+  `version,created_at,algorithm,public_key,private_material,provider,status,reason,operator,revoked_at`
+  （`provider` 为来源块）；旧 `keymgr-export-v1` 包无来源块时按本地处理、
+  无吊销字段时该版本视为 active。
 - `KEYMGR_PROVIDER_CHAIN` 为主备链：逗号分隔的 `local`/`module:factory`
   项，项唯一且建厂所得 `provider_id` 唯一（重复即整链不可用）。首次激活
   选首个健康项；活动实例不健康时按上节规则故障转移到首个健康备项，主项
