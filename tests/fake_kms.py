@@ -22,6 +22,10 @@ Fault injection is driven by a JSON file named by ``FAKE_KMS_FAULTS``:
       "unwrap_not_callable": true,  # declare unwrap_key but break the method
       "unwrap_fail": true,          # unwrap_key() raises a backend fault
       "unwrap_short": true          # unwrap_key() returns a malformed short DEK
+      "declare_wrap_key": true,     # capabilities.operations gains "wrap_key"
+      "wrap_not_callable": true,    # declare wrap_key but break the method
+      "wrap_fail": true,            # wrap_key() raises a backend fault
+      "wrap_short": true            # wrap_key() returns a malformed short wrap
     }
 
 Materials are stored base64-wrapped with a static prefix so nothing here ever
@@ -139,6 +143,10 @@ class FakeKmsProvider:
             # Contract-violation injection: declares "unwrap_key" without a
             # callable method.
             self.unwrap_key = True
+        if _faults().get("wrap_not_callable"):
+            # Contract-violation injection: declares "wrap_key" without a
+            # callable method.
+            self.wrap_key = True
 
     @property
     def capabilities(self):
@@ -153,6 +161,8 @@ class FakeKmsProvider:
             operations.append("sign")
         if _faults().get("declare_unwrap_key"):
             operations.append("unwrap_key")
+        if _faults().get("declare_wrap_key"):
+            operations.append("wrap_key")
         return {
             "algorithms": ["AES256", "RSA2048"],
             "operations": operations,
@@ -326,6 +336,51 @@ class FakeKmsProvider:
                 "unwrapped data key must be 32 bytes"
             )
         return dek
+
+    def wrap_key(self, handle, data_key):
+        """Optional native DEK wrap (declared via ``declare_wrap_key``).
+
+        Implements the provider contract: argument ``ValueError``/
+        ``TypeError`` rules, ``(wrapped_key, wrap_nonce)`` in that order,
+        backend faults as plain exceptions (the service normalizes them to
+        ProviderUnavailable).
+        """
+        if not isinstance(handle, str) or not handle:
+            raise ValueError("wrap_key requires a non-empty handle string")
+        if not isinstance(data_key, bytes):
+            raise TypeError("wrap_key data_key must be bytes")
+        if len(data_key) != 32:
+            raise ValueError("wrap_key data_key must be 32 bytes")
+        _check_fault("wrap_key")
+        if _faults().get("wrap_fail"):
+            raise RuntimeError("backend failure in wrap_key")
+        with _lock:
+            state = _load_state()
+            entry = state["handles"].get(handle)
+        if entry is None:
+            raise RuntimeError("unknown handle")
+        if _faults().get("wrap_short"):
+            # Contract-violation injection: a malformed, short wrapped key.
+            return b"short", None
+        algorithm = entry.get("algorithm")
+        material = _unwrap(entry["material"])
+        if algorithm == "AES256":
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+            kek = base64.b64decode(material.encode("ascii"), validate=True)
+            wrap_nonce = os.urandom(12)
+            return AESGCM(kek).encrypt(wrap_nonce, data_key, None), wrap_nonce
+        if algorithm == "RSA2048":
+            private_key = serialization.load_pem_private_key(
+                material.encode("utf-8"), password=None
+            )
+            oaep = padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            )
+            return private_key.public_key().encrypt(data_key, oaep), None
+        raise RuntimeError("handle is not a supported algorithm")
 
     def delete(self, handle):
         _check_fault("delete")

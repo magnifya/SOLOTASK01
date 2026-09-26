@@ -171,7 +171,14 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   对 `GET operation` 隐藏 http_status/response（含信封），同键重启或重试在
   同一 `operation_id` 下恰好再执行一次并原样重放；事件耐久后严格重放首次
   结果。绑定只持久化明文/AAD 的不透明键控承诺，明文、AAD、数据/私钥、句柄
-  与后端异常绝不进入响应、审计或任何文件。
+  与后端异常绝不进入响应、审计或任何文件。当版本的绑定提供者声明
+  `wrap_key` 时走 KMS/HSM 原生路径：在五秒门限内生成 32 字节数据密钥并调
+  用绑定提供者的 `wrap_key(handle, data_key)` 包装，绝不调用
+  `export_material`，KEK 私钥不进入服务进程，信封仍是
+  `keymgr-envelope-v1`；提供者异常或结果结构/类型/长度不符为固定文案
+  `503`（体键序 `error,operation_id`），不记审计且操作保持 pending，同
+  键重试复用 `operation_id`，provider_id 恢复后至多继续一次。未声明者沿
+  用导出 KEK 在内存中包装的旧路径。
 - `POST /v1/keys/{key_id}/decrypt`，body `{tenant_id, envelope, aad?}`，接
   受 `keymgr-envelope-v1`。`200` → `{plaintext}`（base64）。信封内 key_id
   必须与路径一致；缺字段、非法 base64、篡改、AAD 不符为 `400` 且错误指明
@@ -556,7 +563,21 @@ python -m keymgr provider reconnect --operator alice
   即契约不符。声明者的 decrypt 在五秒门限内调用绑定提供者的
   `unwrap_key`，绝不调用 `export_material` 且不加载 KEK 私钥（认证失败
   400 指出 envelope，异常/故障固定 503 且不记审计）；未声明者沿用导出
-  路径。本地提供者已实现并声明 `unwrap_key`。另可实现可选 `health()`（无参、返回 `bool`）：缺少视为健康，非
+  路径。本地提供者已实现并声明 `unwrap_key`。`capabilities.operations`
+  还可另含 `wrap_key`：声明即须实现
+  `wrap_key(handle: str, data_key: bytes) -> tuple[bytes, bytes | None]`
+  ——在 KMS/HSM 内包装 32 字节数据密钥并返回 `(wrapped_key, wrap_nonce)`
+  （顺序固定）；handle 非非空 str 抛 `ValueError`，data_key 非 bytes 抛
+  `TypeError`、非 32 字节抛 `ValueError`，未知句柄/算法不符或后端故障抛
+  `ProviderUnavailable`；AES256 返回 48 字节 wrapped_key 与 12 字节
+  wrap_nonce，RSA2048 返回 256 字节 wrapped_key 与 null wrap_nonce；声明
+  而无可调用方法，或返回结构/类型/长度不符，均视为提供者不可用。声明者
+  的幂等 encrypt 在五秒门限内生成 32 字节 DEK 并调用绑定提供者的
+  `wrap_key`，绝不调用 `export_material` 且不加载 KEK 私钥，信封格式不
+  变；异常或非法结果为固定 503（体键序 `error,operation_id`），不记审
+  计且操作保持 pending，重试复用 operation_id，provider_id 恢复后至多
+  继续一次；未声明者沿用导出路径。本地提供者已实现并声明 `wrap_key`。
+  另可实现可选 `health()`（无参、返回 `bool`）：缺少视为健康，非
   `bool`/抛异常视为不可用。普通 provider 调用路径上单次探活至多等 1
   秒（超时按一次失败、迟到结果作废），且一次调用的全部探活/等待共用不
   可重置的 5 秒总预算。模块缺失/工厂失败/契约不符/后端异常一律 `503`

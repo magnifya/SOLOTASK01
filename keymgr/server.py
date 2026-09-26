@@ -24,6 +24,7 @@ from .crypto import SUPPORTED_ALGORITHMS
 from .operations import OperationStore
 from .policy import PolicyError, PolicyStore, validate_rules
 from .provider import (
+    ProviderError,
     ProviderInvalidMaterial,
     ProviderReconnectPending,
     ProviderSwitchoverInvalid,
@@ -35,6 +36,7 @@ from .store import (
     KeyStore,
     LockTimeout,
     NativeUnwrap,
+    NativeWrap,
     is_valid_key_id,
     validate_batch_items,
 )
@@ -1484,6 +1486,18 @@ def make_handler(
             key, the KEK, the plaintext, the AAD or any backend material. The
             plaintext/AAD never enter the operation or mirror records either:
             the binding stores only an HMAC commitment of them.
+
+            When the version's bound provider declares the optional
+            ``wrap_key`` operation, the data key is wrapped INSIDE the
+            KMS/HSM (``wrap_key(handle, data_key)`` on the bound provider
+            within the ordinary five-second provider-call gate):
+            ``export_material`` is never called and the KEK private key never
+            enters this process. A provider exception or a malformed wrap
+            result is the fixed 503 with body keys ``error,operation_id``,
+            writes no audit event and leaves the operation pending, so a
+            retry reuses the operation_id and continues at most once once
+            the provider_id is active again. A provider that does not
+            declare ``wrap_key`` keeps the export-based path.
             """
             action = audit_mod.ACTION_ENCRYPT
             # Header first, before the body or any tenant/audit/provider work.
@@ -1566,10 +1580,13 @@ def make_handler(
                     )
                 # Read-only resolve of the committed KEK under the per-key
                 # locks. A contended key waits up to 5 s then fails as
-                # timed_out (503) with no event/handle/envelope.
-                status, _record, ver, kek = store.crypto_material(
+                # timed_out (503) with no event/handle/envelope. When the
+                # bound provider declares wrap_key the resolve returns a
+                # NativeWrap pair instead of exportable KEK material.
+                status, _record, ver, material = store.crypto_material(
                     key_id, tenant_id, version,
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
+                    native_wrap=True,
                 )
                 if status == store.CRYPTO_NOT_FOUND:
                     # Unknown key/version and cross-tenant access are
@@ -1583,14 +1600,41 @@ def make_handler(
                         operation, tenant_id, key_id, action, 409,
                         "key is revoked",
                     )
-                token = envelope.encode_envelope(
-                    key_id=key_id,
-                    version=ver.version,
-                    algorithm=ver.algorithm,
-                    kek=kek,
-                    plaintext=raw_plaintext,
-                    aad=aad,
-                )
+                if isinstance(material, NativeWrap):
+                    # KMS/HSM-native DEK wrap on the bound provider inside
+                    # the ordinary five-second provider-call gate: the DEK
+                    # is generated here, export_material is never called and
+                    # the KEK private key never enters this process. Any
+                    # provider exception or malformed result keeps the
+                    # operation PENDING (the fixed 503, no audit event), so
+                    # a retry under the same Idempotency-Key reuses the
+                    # operation_id and seals exactly once.
+                    try:
+                        with provider_mod.provider_call():
+                            token = envelope.encode_envelope_native(
+                                key_id=key_id,
+                                version=ver.version,
+                                algorithm=ver.algorithm,
+                                provider=material.provider,
+                                handle=material.handle,
+                                plaintext=raw_plaintext,
+                                aad=aad,
+                            )
+                    except ProviderReconnectPending:
+                        raise
+                    except ProviderError as exc:
+                        raise ProviderReconnectPending(
+                            "native DEK wrap could not complete"
+                        ) from exc
+                else:
+                    token = envelope.encode_envelope(
+                        key_id=key_id,
+                        version=ver.version,
+                        algorithm=ver.algorithm,
+                        kek=material,
+                        plaintext=raw_plaintext,
+                        aad=aad,
+                    )
                 body = {
                     "format": envelope.FORMAT,
                     "envelope": token,

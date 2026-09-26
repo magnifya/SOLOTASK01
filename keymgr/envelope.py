@@ -152,24 +152,23 @@ def _unwrap_dek(opened: "OpenedEnvelope", kek) -> bytes:
     )
 
 
-def encode_envelope(
+def _build_envelope_token(
     *,
     key_id: str,
     version: int,
     algorithm: str,
-    kek,
+    dek: bytes,
+    wrapped_key: bytes,
+    wrap_nonce,
     plaintext: bytes,
-    aad: Optional[bytes] = None,
+    aad: bytes,
 ) -> str:
-    """Seal plaintext under a fresh data key wrapped by the KEK.
+    """Seal plaintext under ``dek`` and assemble the envelope token.
 
-    Returns the opaque base64 envelope token. The KEK is the raw 32-byte key
-    for AES256 or a loaded 2048-bit RSA private key for RSA2048 (its public
-    component wraps the DEK).
+    The DEK has ALREADY been wrapped by the KEK (in-process or natively in a
+    KMS/HSM); this only performs the content encryption and the fixed-shape
+    payload serialization shared by both wrap paths.
     """
-    if aad is None:
-        aad = b""
-    dek, wrapped_key, wrap_nonce = _wrap_dek(algorithm, kek)
     nonce = os.urandom(_NONCE_LEN)
     sealed = AESGCM(dek).encrypt(nonce, plaintext, aad)
     ciphertext, tag = sealed[:-_TAG_LEN], sealed[-_TAG_LEN:]
@@ -193,6 +192,111 @@ def encode_envelope(
         payload, separators=(",", ":"), sort_keys=True
     ).encode("utf-8")
     return b64_encode(raw)
+
+
+def encode_envelope(
+    *,
+    key_id: str,
+    version: int,
+    algorithm: str,
+    kek,
+    plaintext: bytes,
+    aad: Optional[bytes] = None,
+) -> str:
+    """Seal plaintext under a fresh data key wrapped by the KEK.
+
+    Returns the opaque base64 envelope token. The KEK is the raw 32-byte key
+    for AES256 or a loaded 2048-bit RSA private key for RSA2048 (its public
+    component wraps the DEK).
+    """
+    if aad is None:
+        aad = b""
+    dek, wrapped_key, wrap_nonce = _wrap_dek(algorithm, kek)
+    return _build_envelope_token(
+        key_id=key_id,
+        version=version,
+        algorithm=algorithm,
+        dek=dek,
+        wrapped_key=wrapped_key,
+        wrap_nonce=wrap_nonce,
+        plaintext=plaintext,
+        aad=aad,
+    )
+
+
+def encode_envelope_native(
+    *,
+    key_id: str,
+    version: int,
+    algorithm: str,
+    provider,
+    handle: str,
+    plaintext: bytes,
+    aad: Optional[bytes] = None,
+) -> str:
+    """Seal plaintext with a DEK wrapped by a KMS/HSM-native ``wrap_key``.
+
+    A fresh 32-byte data key is generated here and wrapped INSIDE the
+    provider by its bound KEK: the service never calls ``export_material``
+    and never loads the KEK private material into this process. The
+    provider returns ``(wrapped_key, wrap_nonce)``; the content is then
+    encrypted here with the data key and the ordinary
+    ``keymgr-envelope-v1`` token is assembled, so a native envelope is
+    byte-compatible with the export-based one.
+
+    Must be called inside the ordinary provider-call gate. Provider error
+    mapping follows the provider contract: an unknown/algorithm-mismatched
+    handle or any backend failure raises ``ProviderUnavailable`` (the fixed
+    503, no audit event); an unexpected ``ValueError``/``TypeError`` from the
+    provider for a valid call, or a result whose structure, type or length
+    does not match the version algorithm, is a contract violation and is
+    normalized to ``ProviderUnavailable``.
+    """
+    from .provider import ProviderUnavailable
+
+    if aad is None:
+        aad = b""
+    dek = os.urandom(_KEY_LEN)
+    try:
+        wrapped_key, wrap_nonce = provider.wrap_key(handle, dek)
+    except ProviderUnavailable:
+        raise
+    except (ValueError, TypeError) as exc:
+        # A conforming provider cannot raise these for a non-empty handle and
+        # a 32-byte data key: treat it as a backend/contract fault.
+        raise ProviderUnavailable(
+            "provider wrap_key raised a contract violation"
+        ) from exc
+    if not isinstance(wrapped_key, bytes):
+        raise ProviderUnavailable(
+            "provider returned a non-bytes wrapped key from wrap_key"
+        )
+    if algorithm == _AES256:
+        if len(wrapped_key) != _KEY_LEN + _TAG_LEN or not isinstance(
+            wrap_nonce, bytes
+        ) or len(wrap_nonce) != _NONCE_LEN:
+            raise ProviderUnavailable(
+                "provider returned a malformed AES256 wrap from wrap_key"
+            )
+    elif algorithm == _RSA2048:
+        if len(wrapped_key) != _RSA_WRAP_LEN or wrap_nonce is not None:
+            raise ProviderUnavailable(
+                "provider returned a malformed RSA2048 wrap from wrap_key"
+            )
+    else:
+        raise ProviderUnavailable(
+            "unsupported algorithm for envelope: %r" % (algorithm,)
+        )
+    return _build_envelope_token(
+        key_id=key_id,
+        version=version,
+        algorithm=algorithm,
+        dek=dek,
+        wrapped_key=wrapped_key,
+        wrap_nonce=wrap_nonce,
+        plaintext=plaintext,
+        aad=aad,
+    )
 
 
 def _require_str(obj: dict, name: str) -> str:
