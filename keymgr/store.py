@@ -442,6 +442,20 @@ class NativeUnwrap(NamedTuple):
     handle: str
 
 
+class NativeWrap(NamedTuple):
+    """A resolved version whose DEK must be wrapped natively.
+
+    Returned by :meth:`KeyStore.crypto_material` in ``native_wrap`` mode
+    when the version's owning provider declares the ``wrap_key`` operation:
+    the caller generates the DEK and passes this provider/handle pair to
+    ``envelope.seal_envelope_native`` instead of receiving exportable KEK
+    material, so private KEK material never enters the service process.
+    """
+
+    provider: object
+    handle: str
+
+
 class KeyStore:
     """File-backed key store with one JSON file per key."""
 
@@ -3924,6 +3938,7 @@ class KeyStore:
         version: Optional[int] = None,
         lock_timeout: Optional[float] = None,
         native_unwrap: bool = False,
+        native_wrap: bool = False,
     ) -> tuple:
         """Resolve a version's key-encryption key for envelope crypto.
 
@@ -3944,6 +3959,14 @@ class KeyStore:
         a :class:`NativeUnwrap` ``(provider, handle)`` pair that the caller
         hands to ``envelope.open_envelope_native``. Providers that do not
         declare the operation take the ordinary export path.
+
+        Symmetrically, when ``native_wrap`` is True and the version's owning
+        provider declares the ``wrap_key`` operation, the fourth tuple
+        element is a :class:`NativeWrap` ``(provider, handle)`` pair that the
+        encrypt caller hands to ``envelope.seal_envelope_native``: the caller
+        generates the DEK and has it wrapped inside the provider, with no
+        ``export_material`` call and no KEK private key loaded here. Providers
+        that do not declare the operation take the ordinary export path.
 
         With a finite ``lock_timeout`` the per-key in-process and fcntl locks
         share one deadline and a wait beyond it raises :class:`LockTimeout`
@@ -3990,6 +4013,17 @@ class KeyStore:
                     record,
                     ver,
                     NativeUnwrap(provider=provider, handle=ver.handle),
+                )
+            if native_wrap and provider_mod.declares_wrap_key(provider):
+                # Native DEK wrap: bind the provider/handle only. The caller
+                # generates the DEK and has it wrapped inside the provider;
+                # export_material is never invoked and the KEK private key is
+                # never loaded here.
+                return (
+                    self.CRYPTO_OK,
+                    record,
+                    ver,
+                    NativeWrap(provider=provider, handle=ver.handle),
                 )
             exported = provider.export_material(ver.handle)
             kek = self._kek_for_version(ver, exported.encrypted_material)

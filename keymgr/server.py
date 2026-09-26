@@ -35,6 +35,7 @@ from .store import (
     KeyStore,
     LockTimeout,
     NativeUnwrap,
+    NativeWrap,
     is_valid_key_id,
     validate_batch_items,
 )
@@ -1566,10 +1567,14 @@ def make_handler(
                     )
                 # Read-only resolve of the committed KEK under the per-key
                 # locks. A contended key waits up to 5 s then fails as
-                # timed_out (503) with no event/handle/envelope.
-                status, _record, ver, kek = store.crypto_material(
+                # timed_out (503) with no event/handle/envelope. When the
+                # owning provider declares native ``wrap_key`` the resolve
+                # binds provider/handle only (no export); otherwise it yields
+                # exportable KEK material for the in-process path.
+                status, _record, ver, material = store.crypto_material(
                     key_id, tenant_id, version,
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
+                    native_wrap=True,
                 )
                 if status == store.CRYPTO_NOT_FOUND:
                     # Unknown key/version and cross-tenant access are
@@ -1583,14 +1588,44 @@ def make_handler(
                         operation, tenant_id, key_id, action, 409,
                         "key is revoked",
                     )
-                token = envelope.encode_envelope(
-                    key_id=key_id,
-                    version=ver.version,
-                    algorithm=ver.algorithm,
-                    kek=kek,
-                    plaintext=raw_plaintext,
-                    aad=aad,
-                )
+                if isinstance(material, NativeWrap):
+                    # KMS/HSM-native DEK wrap: the 32-byte DEK is generated
+                    # inside the envelope seal and wrapped by the bound
+                    # provider within an ordinary five-second provider-call
+                    # gate. export_material is never called and the KEK
+                    # private key never enters this process. A backend fault,
+                    # a gate timeout or a malformed wrap result makes no
+                    # audit event and leaves the operation PENDING (mirror
+                    # reset, fixed 503); an identical retry reuses this
+                    # operation_id and continues exactly once once the bound
+                    # provider_id is healthy again.
+                    try:
+                        with provider_mod.provider_call():
+                            token = envelope.seal_envelope_native(
+                                key_id=key_id,
+                                version=ver.version,
+                                algorithm=ver.algorithm,
+                                provider=material.provider,
+                                handle=material.handle,
+                                plaintext=raw_plaintext,
+                                aad=aad,
+                            )
+                    except ProviderReconnectPending:
+                        raise
+                    except ProviderUnavailable as exc:
+                        raise ProviderReconnectPending(
+                            "native wrap_key failed; keeping the bound "
+                            "encrypt pending for one retry"
+                        ) from exc
+                else:
+                    token = envelope.encode_envelope(
+                        key_id=key_id,
+                        version=ver.version,
+                        algorithm=ver.algorithm,
+                        kek=material,
+                        plaintext=raw_plaintext,
+                        aad=aad,
+                    )
                 body = {
                     "format": envelope.FORMAT,
                     "envelope": token,

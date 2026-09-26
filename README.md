@@ -163,11 +163,17 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   内含 key_id、version、算法、nonce/tag、密文及**包装后的数据密钥**：每次
   新绑定生成新的 256 位数据密钥，以 AES-256-GCM 加密明文；AES256 版本用
   AES-GCM 包装数据密钥，RSA2048 版本用 RSA-OAEP-SHA256 包装（重放返回首次
-  信封，不再生成新数据密钥、不再调用提供者）。绑定后错误体仅
+  信封，不再生成新数据密钥、不再调用提供者）。版本的绑定提供者声明
+  `wrap_key` 时走 KMS/HSM 原生路径：服务在五秒总门限内自行生成 32 字节
+  DEK 并调用绑定提供者的 `wrap_key(handle, data_key)` 取回
+  `(wrapped_key, wrap_nonce)`，绝不调用 `export_material`、不加载 KEK 私
+  钥，再构造既有信封；未声明者沿用导出 KEK 在内存中包装的旧路径。绑定后错误体仅
   `{"error","operation_id"}`：授权拒绝 `403`、未知/跨租户 key 或未知版本
   `404`、吊销版本（含旧版本）`409`、提供者不可用 `503`（文案固定
   `key management provider is unavailable`）；等待同 key 锁超过 5 秒为
-  `503` timed_out（等待方不写任何东西）。事件耐久前崩溃保持 `pending` 且
+  `503` timed_out（等待方不写任何东西）。原生 `wrap_key` 路径的提供者异常
+  或非法结果固定 `503`：不记审计、操作保持 `pending`，重试复用同一
+  `operation_id`，绑定 `provider_id` 恢复后至多继续一次。事件耐久前崩溃保持 `pending` 且
   对 `GET operation` 隐藏 http_status/response（含信封），同键重启或重试在
   同一 `operation_id` 下恰好再执行一次并原样重放；事件耐久后严格重放首次
   结果。绑定只持久化明文/AAD 的不透明键控承诺，明文、AAD、数据/私钥、句柄
@@ -556,7 +562,20 @@ python -m keymgr provider reconnect --operator alice
   即契约不符。声明者的 decrypt 在五秒门限内调用绑定提供者的
   `unwrap_key`，绝不调用 `export_material` 且不加载 KEK 私钥（认证失败
   400 指出 envelope，异常/故障固定 503 且不记审计）；未声明者沿用导出
-  路径。本地提供者已实现并声明 `unwrap_key`。另可实现可选 `health()`（无参、返回 `bool`）：缺少视为健康，非
+  路径。本地提供者已实现并声明 `unwrap_key`。`capabilities.operations`
+  还可另含 `wrap_key`：声明即须实现
+  `wrap_key(handle: str, data_key: bytes) -> tuple[bytes, bytes | None]`
+  ——在 KMS/HSM 内用句柄的 KEK 包装 32 字节 DEK 并按序返回
+  `(wrapped_key, wrap_nonce)`；handle 非非空 str 抛 `ValueError`，
+  data_key 非 bytes 抛 `TypeError`、非 32 字节抛 `ValueError`，未知句柄/
+  算法不符或后端故障抛 `ProviderUnavailable`；AES256 成功须返回 48 字节
+  wrapped_key 与 12 字节 wrap_nonce，RSA2048 须返回 256 字节 wrapped_key
+  与 None；声明而无可调用方法，或返回结构/类型/长度不符，均为提供者不
+  可用。声明者的 encrypt 在五秒总门限内自行生成 32 字节 DEK 并调用绑定
+  提供者的 `wrap_key`，绝不调用 `export_material` 且不加载 KEK 私钥，再
+  构造既有信封；异常或非法结果固定 `503`（不记审计、操作保持 pending，
+  重试复用 operation_id，provider_id 恢复后至多继续一次）；未声明者沿用
+  导出旧路径。本地提供者已实现并声明 `wrap_key`。另可实现可选 `health()`（无参、返回 `bool`）：缺少视为健康，非
   `bool`/抛异常视为不可用。普通 provider 调用路径上单次探活至多等 1
   秒（超时按一次失败、迟到结果作废），且一次调用的全部探活/等待共用不
   可重置的 5 秒总预算。模块缺失/工厂失败/契约不符/后端异常一律 `503`

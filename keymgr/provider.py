@@ -106,6 +106,35 @@ event). A provider that does NOT declare ``unwrap_key`` keeps the
 export-based decrypt path. The built-in local provider declares and
 implements ``unwrap_key``.
 
+Native DEK wrap (optional)
+--------------------------
+``capabilities["operations"]`` MAY additionally list ``"wrap_key"``.
+Declaring it makes
+``wrap_key(handle: str, data_key: bytes) -> tuple[bytes, bytes | None]``
+contractual: a provider that declares the operation without a callable
+``wrap_key`` method fails the contract (and a declared-but-non-callable
+``wrap_key`` attribute is invalid too). The method wraps a 32-byte
+``keymgr-envelope-v1`` data key inside the KMS/HSM under the handle's KEK and
+returns ``(wrapped_key, wrap_nonce)``; the KEK's private material never
+crosses the boundary. A handle that is not a non-empty string raises
+``ValueError``; a non-bytes ``data_key`` raises ``TypeError`` and a
+``data_key`` that is not exactly 32 bytes raises ``ValueError``; an unknown
+handle, a handle whose algorithm does not fit the request, or any backend
+failure raises :class:`ProviderUnavailable`. A success MUST return
+``(wrapped_key, wrap_nonce)`` with the exact envelope shapes: an AES256 KEK
+returns a 48-byte ``wrapped_key`` (AES-256-GCM of the 32-byte DEK plus its
+16-byte tag) and a 12-byte ``wrap_nonce``; an RSA2048 KEK returns a
+256-byte ``wrapped_key`` (RSA-OAEP-SHA256) and a null ``wrap_nonce``. When a
+version's owning provider declares ``wrap_key``, the service's encrypt path
+generates the 32-byte DEK and calls it on the bound provider inside the
+ordinary five-second provider-call gate, never calls ``export_material`` and
+never loads the KEK private key into the service process; it then builds the
+ordinary envelope around the returned wrapped material. Any provider fault or
+a result that is not a two-tuple of bytes-or-null of the required lengths is a
+contract failure: the fixed 503 (no audit event). A provider that does NOT
+declare ``wrap_key`` keeps the export-based encrypt path. The built-in local
+provider declares and implements ``wrap_key``.
+
 The factory named by ``KEYMGR_PROVIDER=module:factory`` is imported lazily on
 first use and called with no arguments. A missing module/factory, a factory
 raising, or a returned object failing the contract all raise
@@ -162,6 +191,11 @@ OP_SIGN = "sign"
 #: it implements ``unwrap_key(handle, wrapped_key, wrap_nonce=None)``; it is
 #: never part of the required five.
 OP_UNWRAP_KEY = "unwrap_key"
+#: Optional operation: KMS/HSM-native wrapping of a
+#: ``keymgr-envelope-v1`` data key. A provider lists it in
+#: ``capabilities["operations"]`` only when it implements
+#: ``wrap_key(handle, data_key)``; it is never part of the required five.
+OP_WRAP_KEY = "wrap_key"
 
 _DEK_NAME = "local.dek"
 _REGISTRY_NAME = "local-registry.json"
@@ -171,6 +205,10 @@ _WRAP_PREFIX = "pev1."
 _NONCE_LEN = 12
 #: Byte length of an unwrapped ``keymgr-envelope-v1`` data key.
 _DEK_LEN = 32
+#: Byte length of an AES-256-GCM wrapped data key (32-byte DEK + 16-byte tag).
+_AES_WRAP_LEN = _DEK_LEN + 16
+#: Byte length of an RSA-OAEP-SHA256 wrapped data key for a 2048-bit KEK.
+_RSA_WRAP_LEN = 256
 #: RSA-OAEP-SHA256 parameters of the envelope ``RSA-OAEP-SHA256`` wrap scheme.
 _OAEP = padding.OAEP(
     mgf=padding.MGF1(algorithm=hashes.SHA256()),
@@ -322,6 +360,21 @@ class KeyProvider:
         """
         raise NotImplementedError
 
+    def wrap_key(self, handle: str, data_key: bytes) -> Tuple[bytes, Optional[bytes]]:
+        """Optional KMS/HSM-native wrap of an envelope data key.
+
+        Contractual only when ``capabilities["operations"]`` declares
+        ``"wrap_key"``; then this MUST be implemented: ``handle`` must be a
+        non-empty string (``ValueError`` otherwise), ``data_key`` must be
+        bytes (``TypeError`` otherwise) and exactly 32 bytes (``ValueError``
+        otherwise), an unknown or algorithm-mismatched handle and any backend
+        failure raise :class:`ProviderUnavailable`, and a success returns
+        ``(wrapped_key, wrap_nonce)`` -- a 48-byte wrapped key plus a 12-byte
+        nonce for an AES256 KEK, or a 256-byte wrapped key plus ``None`` for
+        an RSA2048 KEK. Private material never crosses the provider boundary.
+        """
+        raise NotImplementedError
+
     def health(self) -> bool:
         """Optional KMS/HSM readiness probe.
 
@@ -393,6 +446,15 @@ def _validate_external(obj) -> None:
         raise ProviderUnavailable(
             "provider %r declares the unwrap_key operation without a "
             "callable unwrap_key() method" % provider_id
+        )
+    # ``wrap_key`` is optional under the same rule: declaring it makes a
+    # callable wrap_key() method contractual.
+    if OP_WRAP_KEY in operations and not callable(
+        getattr(obj, "wrap_key", None)
+    ):
+        raise ProviderUnavailable(
+            "provider %r declares the wrap_key operation without a "
+            "callable wrap_key() method" % provider_id
         )
     configure = getattr(obj, "configure", None)
     if configure is not None and not callable(configure):
@@ -545,6 +607,53 @@ class _SafeProvider:
             )
         return result
 
+    def wrap_key(self, handle: str, data_key: bytes):
+        """KMS/HSM-native DEK wrap, with the error contract enforced.
+
+        Only invoked when the provider declared ``wrap_key`` (contract
+        validation guarantees a callable method then). The boundary argument
+        rules are enforced here too: a bad handle is a ``ValueError`` and a
+        non-bytes or non-32-byte ``data_key`` is a ``TypeError``/
+        ``ValueError``, exactly as the contract requires of the method
+        itself. ``ValueError``/``TypeError``/:class:`ProviderError` from the
+        provider pass through unchanged; any other exception is a backend
+        fault normalized to :class:`ProviderUnavailable`. A result that is not
+        a two-element tuple of ``(bytes, bytes | None)`` is a contract
+        failure; the algorithm-specific lengths (48/12 for AES256,
+        256/None for RSA2048) are enforced by the envelope caller, which is
+        the only layer that knows the handle's algorithm.
+        """
+        if not isinstance(handle, str) or not handle:
+            raise ValueError("wrap_key requires a non-empty handle string")
+        if not isinstance(data_key, bytes):
+            raise TypeError("wrap_key data_key must be bytes")
+        if len(data_key) != _DEK_LEN:
+            raise ValueError("wrap_key data_key must be 32 bytes")
+        if not callable(getattr(self._inner, "wrap_key", None)):
+            raise ProviderUnavailable(
+                "provider %r declares wrap_key without a callable "
+                "wrap_key() method" % self.provider_id
+            )
+        try:
+            result = self._inner.wrap_key(handle, data_key)
+        except (ValueError, TypeError, ProviderError):
+            raise
+        except Exception as exc:
+            raise ProviderUnavailable(
+                "provider %r operation wrap_key failed" % self.provider_id
+            ) from exc
+        if (
+            not isinstance(result, tuple)
+            or len(result) != 2
+            or not isinstance(result[0], bytes)
+            or not result[0]
+            or (result[1] is not None and not isinstance(result[1], bytes))
+        ):
+            raise ProviderUnavailable(
+                "provider returned a malformed wrap result from wrap_key"
+            )
+        return result
+
     def health(self) -> bool:
         """Optional readiness probe normalized to a bool.
 
@@ -603,6 +712,25 @@ def declares_unwrap_key(provider) -> bool:
     return OP_UNWRAP_KEY in operations
 
 
+def declares_wrap_key(provider) -> bool:
+    """Whether a bound provider declares the optional ``wrap_key`` operation.
+
+    Declaration is purely by ``capabilities["operations"]`` containing
+    ``"wrap_key"``: a declaring external provider was contract-validated to
+    have a callable ``wrap_key`` method, and the built-in local provider
+    always declares and implements it. Anything else (including a provider
+    whose capabilities are not a mapping) keeps the export-based encrypt
+    path.
+    """
+    caps = getattr(provider, "capabilities", None)
+    if not isinstance(caps, dict):
+        return False
+    operations = caps.get("operations")
+    if not isinstance(operations, (list, tuple)):
+        return False
+    return OP_WRAP_KEY in operations
+
+
 class LocalProvider(KeyProvider):
     """Built-in software provider.
 
@@ -619,10 +747,10 @@ class LocalProvider(KeyProvider):
     capabilities = {
         "algorithms": tuple(SUPPORTED_ALGORITHMS),
         # The local provider declares and implements the optional native
-        # ``sign`` and ``unwrap_key`` operations: signing and DEK unwrapping
-        # happen inside the provider and the unwrapped private key never
-        # crosses the boundary.
-        "operations": OPERATIONS + (OP_SIGN, OP_UNWRAP_KEY),
+        # ``sign``, ``unwrap_key`` and ``wrap_key`` operations: signing and
+        # native DEK wrapping/unwrapping happen inside the provider and the
+        # unwrapped private key never crosses the boundary.
+        "operations": OPERATIONS + (OP_SIGN, OP_UNWRAP_KEY, OP_WRAP_KEY),
     }
 
     def __init__(self) -> None:
@@ -1012,6 +1140,56 @@ class LocalProvider(KeyProvider):
                 "unwrapped data key must be 32 bytes"
             )
         return dek
+
+    def wrap_key(self, handle: str, data_key: bytes):
+        """Wrap a 32-byte data key under a registered handle, in-provider.
+
+        The wrapped KEK material is unwrapped inside the provider and never
+        returned: only the ``(wrapped_key, wrap_nonce)`` pair crosses the
+        boundary -- AES256 yields a 48-byte AES-256-GCM sealed key and a
+        12-byte nonce, RSA2048 a 256-byte RSA-OAEP-SHA256 sealed key and
+        ``None``. A handle that is not a non-empty string is a ``ValueError``;
+        a non-bytes ``data_key`` a ``TypeError`` and a non-32-byte one a
+        ``ValueError``; an unknown handle (or corrupt stored material) is
+        :class:`ProviderUnavailable`.
+        """
+        if not isinstance(handle, str) or not handle:
+            raise ValueError("wrap_key requires a non-empty handle string")
+        if not isinstance(data_key, bytes):
+            raise TypeError("wrap_key data_key must be bytes")
+        if len(data_key) != _DEK_LEN:
+            raise ValueError("wrap_key data_key must be 32 bytes")
+        self._require_configured()
+        with self._lock:
+            meta = self._registry.get(handle)
+            if meta is None:
+                raise ProviderUnavailable("unknown handle")
+            algorithm = meta.get("algorithm")
+            raw = self._unwrap_locked(meta.get("wrapped"))
+        if algorithm == "AES256":
+            try:
+                kek = base64.b64decode(raw.encode("ascii"), validate=True)
+            except (ValueError, TypeError) as exc:
+                raise ProviderUnavailable(
+                    "stored local material is corrupt"
+                ) from exc
+            if len(kek) != 32:
+                raise ProviderUnavailable("stored local material is corrupt")
+            wrap_nonce = os.urandom(_NONCE_LEN)
+            wrapped = AESGCM(kek).encrypt(wrap_nonce, data_key, None)
+            return wrapped, wrap_nonce
+        if algorithm == "RSA2048":
+            try:
+                private_key = signing_mod.load_rsa_private_key(raw)
+            except signing_mod.SigningError as exc:
+                raise ProviderUnavailable(
+                    "stored local material is corrupt"
+                ) from exc
+            wrapped = private_key.public_key().encrypt(data_key, _OAEP)
+            return wrapped, None
+        raise ProviderUnavailable(
+            "handle does not belong to a supported algorithm"
+        )
 
 
 # -- module:factory loading -------------------------------------------------

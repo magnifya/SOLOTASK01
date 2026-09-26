@@ -335,6 +335,102 @@ def _decrypt_content(opened: OpenedEnvelope, dek: bytes) -> bytes:
     return AESGCM(dek).decrypt(opened.nonce, sealed, opened.aad)
 
 
+def seal_envelope_native(
+    *,
+    key_id: str,
+    version: int,
+    algorithm: str,
+    provider,
+    handle: str,
+    plaintext: bytes,
+    aad: Optional[bytes] = None,
+) -> str:
+    """Seal via a KMS/HSM-native ``wrap_key`` provider operation.
+
+    The fresh 32-byte DEK is generated HERE and then wrapped INSIDE the
+    provider by the handle's KEK: the service never calls
+    ``export_material`` and never loads the KEK private material into this
+    process. The provider returns ``(wrapped_key, wrap_nonce)`` and the
+    content is then sealed here with the ephemeral DEK, producing the same
+    ``keymgr-envelope-v1`` token as :func:`encode_envelope` (byte-compatible
+    shape, key order and schemes) -- only the DEK wrapping differs.
+
+    The result is validated as a two-tuple of the exact algorithm shapes
+    (48/12 for AES256, 256/None for RSA2048): a non-tuple, wrong arity,
+    wrong types or wrong lengths are contract failures normalized to
+    ``ProviderUnavailable`` (the fixed 503), as is any
+    ``ValueError``/``TypeError``/backend exception from the provider.
+    """
+    from .provider import ProviderUnavailable
+
+    if aad is None:
+        aad = b""
+    dek = os.urandom(_KEY_LEN)
+    try:
+        result = provider.wrap_key(handle, dek)
+    except ProviderUnavailable:
+        raise
+    except Exception as exc:
+        # A conforming provider answers a valid handle/32-byte-DEK call with
+        # either the pair or ProviderUnavailable; any other exception
+        # (including a residual ValueError/TypeError or a backend fault the
+        # adapter did not normalize) is a contract/backend failure -> 503.
+        raise ProviderUnavailable(
+            "provider wrap_key raised a contract violation"
+        ) from exc
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise ProviderUnavailable(
+            "provider returned a malformed result from wrap_key"
+        )
+    wrapped_key, wrap_nonce = result
+    expected_len = _KEY_LEN + _TAG_LEN if algorithm == _AES256 else _RSA_WRAP_LEN
+    if (
+        not isinstance(wrapped_key, bytes)
+        or len(wrapped_key) != expected_len
+    ):
+        raise ProviderUnavailable(
+            "provider returned a malformed wrapped_key from wrap_key"
+        )
+    if algorithm == _AES256:
+        if not isinstance(wrap_nonce, bytes) or len(wrap_nonce) != _NONCE_LEN:
+            raise ProviderUnavailable(
+                "provider returned a malformed wrap_nonce from wrap_key"
+            )
+        wrap = WRAP_AES_GCM
+    elif algorithm == _RSA2048:
+        if wrap_nonce is not None:
+            raise ProviderUnavailable(
+                "provider returned a non-null wrap_nonce for RSA2048"
+            )
+        wrap = WRAP_RSA_OAEP_SHA256
+    else:
+        raise ProviderUnavailable(
+            "unsupported algorithm for envelope: %r" % algorithm
+        )
+    nonce = os.urandom(_NONCE_LEN)
+    sealed = AESGCM(dek).encrypt(nonce, plaintext, aad)
+    ciphertext, tag = sealed[:-_TAG_LEN], sealed[-_TAG_LEN:]
+    payload = {
+        "format": FORMAT,
+        "key_id": key_id,
+        "version": version,
+        "algorithm": algorithm,
+        "enc": ENC_AES_GCM,
+        "wrap": wrap,
+        "nonce": b64_encode(nonce),
+        "tag": b64_encode(tag),
+        "ciphertext": b64_encode(ciphertext),
+        "wrapped_key": b64_encode(wrapped_key),
+        "aad": b64_encode(aad),
+    }
+    if wrap_nonce is not None:
+        payload["wrap_nonce"] = b64_encode(wrap_nonce)
+    raw = json.dumps(
+        payload, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return b64_encode(raw)
+
+
 def open_envelope_native(opened: OpenedEnvelope, provider, handle: str) -> bytes:
     """Decrypt via a KMS/HSM-native ``unwrap_key`` provider operation.
 
