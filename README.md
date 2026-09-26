@@ -419,7 +419,18 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   被篡改或条件变化为 `400`。查询成功不记账，被策略拒绝才记一条
   `audit/rejected`（key_id null）。
 - 账本为数据目录 `audit.log`（每行一个 JSON，只追加，进程内锁 +
-  `audit.log.lock` fcntl 串行并 fsync，seq 单调）。变更走 outbox 事务：密钥
+  `audit.log.lock` fcntl 串行并 fsync，seq 单调）。账本带防篡改链：首次加载在
+  锁内校验全部旧行（键序 `event_id,tenant_id,action,key_id,outcome,timestamp,seq`，
+  类型分别为 str、str|null、str、str|null、str、str、正 int，seq 从 1 连续、
+  `event_id` 唯一；空行、坏 JSON、未知键即损坏），随后原子创建 0600 的
+  `audit-anchor.json`（临时文件 fsync 后 rename；紧凑 UTF-8 JSON、非 ASCII
+  原样、无末行，键序 `schema_version,legacy_bytes,legacy_mac`，值为 1、旧日志
+  字节数、`HMAC-SHA256(audit.secret, "legacy\0"+原始字节)` 的 64 位小写 hex）。
+  之后每行追加 `prev_mac,mac` 两键（首行 `prev_mac` 为 `legacy_mac`，其后取前一
+  行 `mac`；`mac` 为前八键按同口径编码的 HMAC-SHA256 小写 hex），紧凑 JSON 并
+  换行。每次读写在锁内验证锚点、前缀与全链；校验失败抛 LedgerError，不跳过、
+  不重签，HTTP 固定 `500` `{"error":"audit ledger is unavailable"}`，CLI 同体
+  退出 `1`，均零副作用。变更走 outbox 事务：密钥
   /策略文件先携带待提交事件原子落盘 → 耐久追加账本（提交点）→ 清标记；账本
   失败回滚文件并删除本次新建句柄，返回 `500`（CLI `1`）；崩溃后启动按标记/
   event_id 幂等补记或回滚，不重不漏。恢复是多文件 outbox（标记带

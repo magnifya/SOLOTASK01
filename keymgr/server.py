@@ -65,6 +65,16 @@ _CURRENT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/current$")
 _POSITIVE_INT_RE = re.compile(r"[0-9]+")
 _MISSING = object()
 
+# Fixed, detail-free ledger failure text: corruption or I/O specifics never
+# leak into a response (or into a persisted operation record replayed later).
+LEDGER_UNAVAILABLE = "audit ledger is unavailable"
+
+
+def _ledger_failure_text(exc: Exception) -> str:
+    if isinstance(exc, LedgerError):
+        return LEDGER_UNAVAILABLE
+    return "audit ledger failure: %s" % exc
+
 
 def make_handler(
     store: KeyStore,
@@ -91,9 +101,10 @@ def make_handler(
             self._send_json(400, {"error": message})
 
         def _server_error(self, exc: Exception) -> None:
-            # A ledger write failure aborts the request with 500; mutations
-            # have already rolled back their key-file change by this point.
-            self._send_json(500, {"error": "audit ledger failure: %s" % exc})
+            # A ledger write/verification failure aborts the request with a
+            # fixed 500; mutations have already rolled back their key-file
+            # change by this point and no corruption detail leaks.
+            self._send_json(500, {"error": "audit ledger is unavailable"})
 
         def _provider_unavailable(self, exc: Exception) -> None:
             # A KMS/HSM backend failure is a 503 with a generic message: the
@@ -452,7 +463,7 @@ def make_handler(
                     return
                 except (OSError, LedgerError) as persist_exc:
                     body = {
-                        "error": "audit ledger failure: %s" % persist_exc,
+                        "error": _ledger_failure_text(persist_exc),
                         "operation_id": op_id,
                     }
                     operation_store.finish(
@@ -499,7 +510,7 @@ def make_handler(
                     return
                 except (OSError, LedgerError) as persist_exc:
                     body = {
-                        "error": "audit ledger failure: %s" % persist_exc,
+                        "error": _ledger_failure_text(persist_exc),
                         "operation_id": op_id,
                     }
                     operation_store.finish(
@@ -521,9 +532,9 @@ def make_handler(
                 )
                 self._send_json(500, body)
                 return
-            except LedgerError as exc:
+            except LedgerError:
                 body = {
-                    "error": "audit ledger failure: %s" % exc,
+                    "error": LEDGER_UNAVAILABLE,
                     "operation_id": op_id,
                 }
                 operation_store.finish(

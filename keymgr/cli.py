@@ -284,7 +284,13 @@ def _fail(message: str, exit_code: int) -> int:
 
 
 def _ledger_fail(exc: Exception) -> int:
-    return _fail("audit ledger failure: %s" % exc, 1)
+    return _fail("audit ledger is unavailable", 1)
+
+
+def _ledger_failure_text(exc: Exception) -> str:
+    if isinstance(exc, LedgerError):
+        return "audit ledger is unavailable"
+    return "audit ledger failure: %s" % exc
 
 
 def _attempt(store, tenant_id, key_id, action, outcome) -> bool:
@@ -652,7 +658,7 @@ def _idempotent_run_body(op_store, store, artifact_store, executor, operation,
             return _emit_operation_result(http_status, body_err)
         except (OSError, LedgerError) as persist_exc:
             body_err = {
-                "error": "audit ledger failure: %s" % persist_exc,
+                "error": _ledger_failure_text(persist_exc),
                 "operation_id": op_id,
             }
             op_store.finish(
@@ -686,7 +692,7 @@ def _idempotent_run_body(op_store, store, artifact_store, executor, operation,
             return _emit_operation_result(http_status, body_err)
         except (OSError, LedgerError) as persist_exc:
             body_err = {
-                "error": "audit ledger failure: %s" % persist_exc,
+                "error": _ledger_failure_text(persist_exc),
                 "operation_id": op_id,
             }
             op_store.finish(
@@ -703,9 +709,9 @@ def _idempotent_run_body(op_store, store, artifact_store, executor, operation,
         }
         op_store.finish(operation, operations_mod.STATUS_FAILED, 500, body_err)
         return _emit_operation_result(500, body_err)
-    except LedgerError as exc:
+    except LedgerError:
         body_err = {
-            "error": "audit ledger failure: %s" % exc,
+            "error": "audit ledger is unavailable",
             "operation_id": op_id,
         }
         op_store.finish(operation, operations_mod.STATUS_FAILED, 500, body_err)
