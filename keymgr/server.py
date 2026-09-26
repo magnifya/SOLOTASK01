@@ -34,6 +34,7 @@ from .store import (
     KeyAlreadyMigrated,
     KeyStore,
     LockTimeout,
+    NativeUnwrap,
     is_valid_key_id,
     validate_batch_items,
 )
@@ -1363,7 +1364,10 @@ def make_handler(
             Returns ``(tenant_id, payload)`` or None after the response was
             sent. Follows the export endpoint's rules: body/tenant failures
             are invisible tenant_conflict events, and field errors after the
-            tenant is known are tenant-visible rejected attempts.
+            tenant is known are tenant-visible rejected attempts. A malformed
+            ``key_id`` is a parameter error answered as a plain, unaudited
+            400 (it is a malformed value, not an existence probe), exactly
+            like the other crypto endpoints.
             """
             payload = self._read_json_object()
             if payload is None:
@@ -1377,7 +1381,7 @@ def make_handler(
             tenant_id = self._tenant(parts, payload)
             if tenant_id is None:
                 return None
-            if self._bad_key_id(key_id):
+            if self._bad_key_id(key_id, audit=False):
                 return None
             return tenant_id, payload
 
@@ -1708,8 +1712,13 @@ def make_handler(
                 return
             if not self._enforce(tenant_id, key_id, action, operator):
                 return
-            status, record, ver, kek = store.crypto_material(
-                key_id, tenant_id, opened.version
+            # Native DEK unwrap is requested by the provider, not the
+            # request: when the bound provider declares unwrap_key the
+            # resolve returns a NativeUnwrap pair and the KEK private
+            # material never enters this process; otherwise the ordinary
+            # export path yields a KEK object.
+            status, record, ver, material = store.crypto_material(
+                key_id, tenant_id, opened.version, native_unwrap=True
             )
             if status == store.CRYPTO_NOT_FOUND:
                 self._reject_crypto(
@@ -1734,7 +1743,24 @@ def make_handler(
                 )
                 return
             try:
-                plaintext = envelope.open_envelope(opened, kek)
+                if isinstance(material, NativeUnwrap):
+                    # KMS/HSM-native DEK unwrap on the bound provider inside
+                    # the ordinary provider-call gate. An authentication
+                    # failure is a 400 naming the envelope; any provider
+                    # fault or malformed result is the fixed 503 (caught at
+                    # dispatch) and is never audited.
+                    with provider_mod.provider_call():
+                        plaintext = envelope.open_envelope_native(
+                            opened, material.provider, material.handle
+                        )
+                else:
+                    plaintext = envelope.open_envelope(opened, material)
+            except ProviderInvalidMaterial:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 400,
+                    "field envelope is tampered or cannot be authenticated",
+                )
+                return
             except envelope.EnvelopeError as exc:
                 self._reject_crypto(
                     tenant_id, key_id, action, 400, str(exc)

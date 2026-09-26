@@ -244,17 +244,19 @@ def validate_version(ver, where: str) -> dict:
         )
     provider = validate_provider_block(ver.get("provider"), where)
     revocation = validate_version_revocation(ver, where)
+    # Fixed key order for one projected/validated version: identity, material,
+    # provenance, then revocation facts.
     return {
         "version": number,
         "created_at": created_at,
         "algorithm": algorithm,
         "public_key": public_key,
         "private_material": private_material,
+        "provider": provider,
         "status": revocation["status"],
         "reason": revocation["reason"],
         "operator": revocation["operator"],
         "revoked_at": revocation["revoked_at"],
-        "provider": provider,
     }
 
 

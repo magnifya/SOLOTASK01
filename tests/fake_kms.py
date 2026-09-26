@@ -17,7 +17,11 @@ Fault injection is driven by a JSON file named by ``FAKE_KMS_FAULTS``:
       "declare_sign": true,         # capabilities.operations gains "sign"
       "sign_not_callable": true,    # declare sign but break the method (contract)
       "sign_short": true,           # sign() returns a malformed short value
-      "sign_tamper": true           # sign() returns a flipped-byte signature
+      "sign_tamper": true,          # sign() returns a flipped-byte signature
+      "declare_unwrap_key": true,   # capabilities.operations gains "unwrap_key"
+      "unwrap_not_callable": true,  # declare unwrap_key but break the method
+      "unwrap_fail": true,          # unwrap_key() raises a backend fault
+      "unwrap_short": true          # unwrap_key() returns a malformed short DEK
     }
 
 Materials are stored base64-wrapped with a static prefix so nothing here ever
@@ -131,6 +135,10 @@ class FakeKmsProvider:
             # Contract-violation injection: the provider declares "sign" in
             # its capabilities but the attribute is not a callable method.
             self.sign = True
+        if _faults().get("unwrap_not_callable"):
+            # Contract-violation injection: declares "unwrap_key" without a
+            # callable method.
+            self.unwrap_key = True
 
     @property
     def capabilities(self):
@@ -143,6 +151,8 @@ class FakeKmsProvider:
         ]
         if _faults().get("declare_sign"):
             operations.append("sign")
+        if _faults().get("declare_unwrap_key"):
+            operations.append("unwrap_key")
         return {
             "algorithms": ["AES256", "RSA2048"],
             "operations": operations,
@@ -244,6 +254,78 @@ class FakeKmsProvider:
             tampered[0] ^= 0x01
             return bytes(tampered)
         return signature
+
+    def unwrap_key(self, handle, wrapped_key, wrap_nonce=None):
+        """Optional native DEK unwrap (declared via ``declare_unwrap_key``).
+
+        Implements the provider contract: argument ``ValueError``/
+        ``TypeError`` rules, ``ProviderInvalidMaterial`` on an authentication
+        failure, backend faults as plain exceptions (the service normalizes
+        them to ProviderUnavailable).
+        """
+        if not isinstance(handle, str) or not handle:
+            raise ValueError("unwrap_key requires a non-empty handle string")
+        if not isinstance(wrapped_key, bytes):
+            raise TypeError("unwrap_key wrapped_key must be bytes")
+        if wrap_nonce is not None and not isinstance(wrap_nonce, bytes):
+            raise TypeError("unwrap_key wrap_nonce must be bytes or None")
+        if not wrapped_key:
+            raise ValueError("unwrap_key wrapped_key must be non-empty")
+        _check_fault("unwrap_key")
+        if _faults().get("unwrap_fail"):
+            raise RuntimeError("backend failure in unwrap_key")
+        with _lock:
+            state = _load_state()
+            entry = state["handles"].get(handle)
+        if entry is None:
+            raise RuntimeError("unknown handle")
+        if _faults().get("unwrap_short"):
+            # Contract-violation injection: a malformed, short data key.
+            return b"short"
+        from keymgr.provider import ProviderInvalidMaterial
+
+        algorithm = entry.get("algorithm")
+        material = _unwrap(entry["material"])
+        if algorithm == "AES256":
+            if wrap_nonce is None or len(wrap_nonce) != 12:
+                raise ValueError(
+                    "unwrap_key wrap_nonce must be 12 bytes for AES256"
+                )
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+            kek = base64.b64decode(material.encode("ascii"), validate=True)
+            try:
+                dek = AESGCM(kek).decrypt(wrap_nonce, wrapped_key, None)
+            except Exception as exc:
+                raise ProviderInvalidMaterial(
+                    "wrapped_key cannot be authenticated"
+                ) from exc
+        elif algorithm == "RSA2048":
+            if wrap_nonce is not None:
+                raise ValueError(
+                    "unwrap_key wrap_nonce must be null for RSA2048"
+                )
+            private_key = serialization.load_pem_private_key(
+                material.encode("utf-8"), password=None
+            )
+            oaep = padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            )
+            try:
+                dek = private_key.decrypt(wrapped_key, oaep)
+            except ValueError as exc:
+                raise ProviderInvalidMaterial(
+                    "wrapped_key cannot be authenticated"
+                ) from exc
+        else:
+            raise RuntimeError("handle is not a supported algorithm")
+        if len(dek) != 32:
+            raise ProviderInvalidMaterial(
+                "unwrapped data key must be 32 bytes"
+            )
+        return dek
 
     def delete(self, handle):
         _check_fault("delete")

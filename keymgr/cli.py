@@ -29,6 +29,7 @@ from .store import (
     KeyAlreadyMigrated,
     KeyStore,
     LockTimeout,
+    NativeUnwrap,
     is_valid_key_id,
     validate_batch_items,
 )
@@ -1430,8 +1431,9 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 return 1
             return _fail("field tenant_id must be a non-empty string", 2)
         if not is_valid_key_id(args.key_id):
-            if not _conflict(store):
-                return 1
+            # A malformed key_id is a parameter error: exit 2 with no audit
+            # event, exactly like the HTTP decrypt endpoint (a malformed
+            # value cannot probe existence).
             return _fail("field key_id must be a UUID4", 2)
         aad = b""
         if args.aad is not None:
@@ -1458,8 +1460,8 @@ def _run(argv: Optional[List[str]] = None) -> int:
         if not allowed(audit_mod.ACTION_DECRYPT):
             return _deny(store, args.tenant_id, args.key_id,
                          audit_mod.ACTION_DECRYPT)
-        status, record, ver, kek = store.crypto_material(
-            args.key_id, args.tenant_id, opened.version
+        status, record, ver, material = store.crypto_material(
+            args.key_id, args.tenant_id, opened.version, native_unwrap=True
         )
         if status == store.CRYPTO_NOT_FOUND:
             return _crypto_reject(
@@ -1484,7 +1486,26 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 "field aad does not match the envelope",
             )
         try:
-            plaintext = envelope.open_envelope(opened, kek)
+            if isinstance(material, NativeUnwrap):
+                # KMS/HSM-native DEK unwrap on the bound provider: no
+                # export_material, no KEK private key in this process. An
+                # authentication failure exits 2 naming the envelope; a
+                # provider fault is the fixed exit-1 text at main() and is
+                # never audited.
+                from . import provider as provider_mod
+
+                with provider_mod.provider_call():
+                    plaintext = envelope.open_envelope_native(
+                        opened, material.provider, material.handle
+                    )
+            else:
+                plaintext = envelope.open_envelope(opened, material)
+        except ProviderInvalidMaterial:
+            return _crypto_reject(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_DECRYPT, 400,
+                "field envelope is tampered or cannot be authenticated",
+            )
         except envelope.EnvelopeError as exc:
             return _crypto_reject(
                 store, args.tenant_id, args.key_id,

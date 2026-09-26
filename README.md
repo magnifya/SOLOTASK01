@@ -126,7 +126,10 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 - `GET /v1/keys/{key_id}/status`：字段同 revoke；active 时后三项为 null。
 - `POST /v1/keys/{key_id}/export`，body `{tenant_id, passphrase}` →
   `{format:"keymgr-export-v1", bundle}`，bundle 为不透明 base64（scrypt +
-  AES-256-GCM，`format` 作为 AAD）。
+  AES-256-GCM，`format` 作为 AAD）。导出包/备份包的每个版本对象键序固定
+  `version,created_at,algorithm,public_key,private_material,provider,status,
+  reason,operator,revoked_at`（旧包无 `provider` 来源块时按本地处理，无
+  吊销字段时该版本视为 active）。
 - `POST /v1/keys/import`，body `{tenant_id, passphrase, bundle}`，需
   `Idempotency-Key`。`201` → `{key_id, algorithm, public_key, operation_id}`，
   保留原 key_id、全部版本、label、current、整 key 吊销状态以及**每个版本各自的
@@ -159,8 +162,16 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   受 `keymgr-envelope-v1`。`200` → `{plaintext}`（base64）。信封内 key_id
   必须与路径一致；缺字段、非法 base64、篡改、AAD 不符为 `400` 且错误指明
   字段；未知或跨租户的 key/version 为 `404`；吊销版本（含旧版本）为 `409`；
-  提供者不可用为 `503`，沿用固定脱敏文案。私钥、数据密钥只存在于进程内存，
-  绝不进入响应或审计。
+  提供者不可用为 `503`，沿用固定脱敏文案。合法租户下非法 `key_id` 为无审计
+  的 `400`（不记 `tenant_conflict`，畸形值不构成存在性探测；仅租户来源本身
+  缺失/冲突时照旧记 `tenant_conflict`）。当版本的绑定提供者声明
+  `unwrap_key` 时走 KMS/HSM 原生路径：在五秒门限内调用绑定提供者的
+  `unwrap_key(handle, wrapped_key, wrap_nonce)` 解包数据密钥，绝不调用
+  `export_material`，KEK 私钥不进入服务进程，再在进程内用解出的数据密钥
+  认证并解密密文；包装密钥认证失败为指出 envelope 的 `400`，提供者异常/
+  故障或结果非 32 字节为固定文案 `503` 且不记审计。未声明者沿用导出 KEK
+  在内存中解密的旧路径。私钥、数据密钥只存在于进程内存，绝不进入响应或
+  审计。
 - `POST /v1/keys/{key_id}/rewrap`，**非幂等**（无需
   `Idempotency-Key`），body 仅
   `{tenant_id, envelope, target_version?, aad?}`；`envelope`、`aad` 为
@@ -519,7 +530,18 @@ python -m keymgr provider reconnect --operator alice
   `ValueError`、message 非 bytes 抛 `TypeError`、未知/非 RSA 句柄或后端故
   障抛 `ProviderUnavailable`，成功返回 256 字节 RSASSA-PKCS1-v1_5/SHA-256
   签名；声明而无该方法（或方法不可调用）即契约不符。本地提供者已实现并声
-  明 `sign`。另可实现可选 `health()`（无参、返回 `bool`）：缺少视为健康，非
+  明 `sign`。`capabilities.operations` 还可另含 `unwrap_key`：声明即须实现
+  `unwrap_key(handle: str, wrapped_key: bytes, wrap_nonce: bytes | None = None) -> bytes`
+  ——在 KMS/HSM 内解包 `keymgr-envelope-v1` 的数据密钥并返回 32 字节 DEK；
+  handle 非非空 str 抛 `ValueError`，wrapped_key 非 bytes 或非 null 的
+  wrap_nonce 非 bytes 抛 `TypeError`，wrapped_key 为空、AES256 的 wrap_nonce
+  非 12 字节或 RSA2048 的 wrap_nonce 非 null 抛 `ValueError`，未知句柄/
+  算法不符或后端故障抛 `ProviderUnavailable`，包装密钥认证失败抛
+  `ProviderInvalidMaterial`，成功返回 32 字节 bytes；声明而无可调用方法
+  即契约不符。声明者的 decrypt 在五秒门限内调用绑定提供者的
+  `unwrap_key`，绝不调用 `export_material` 且不加载 KEK 私钥（认证失败
+  400 指出 envelope，异常/故障固定 503 且不记审计）；未声明者沿用导出
+  路径。本地提供者已实现并声明 `unwrap_key`。另可实现可选 `health()`（无参、返回 `bool`）：缺少视为健康，非
   `bool`/抛异常视为不可用。普通 provider 调用路径上单次探活至多等 1
   秒（超时按一次失败、迟到结果作废），且一次调用的全部探活/等待共用不
   可重置的 5 秒总预算。模块缺失/工厂失败/契约不符/后端异常一律 `503`

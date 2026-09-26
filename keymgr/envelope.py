@@ -329,6 +329,54 @@ def open_envelope(opened: OpenedEnvelope, kek) -> bytes:
         ) from exc
 
 
+def _decrypt_content(opened: OpenedEnvelope, dek: bytes) -> bytes:
+    """Decrypt the payload with an already-recovered 32-byte data key."""
+    sealed = opened.ciphertext + opened.tag
+    return AESGCM(dek).decrypt(opened.nonce, sealed, opened.aad)
+
+
+def open_envelope_native(opened: OpenedEnvelope, provider, handle: str) -> bytes:
+    """Decrypt via a KMS/HSM-native ``unwrap_key`` provider operation.
+
+    The data key is unwrapped INSIDE the provider by its bound KEK: the
+    service never calls ``export_material`` and never loads the KEK private
+    material into this process. The provider returns the 32-byte DEK and the
+    payload is then authenticated/decrypted here.
+
+    Provider error mapping follows the provider contract unchanged: an
+    authentication failure raises ``ProviderInvalidMaterial`` (surfaced as a
+    400 naming the envelope); an unknown/algorithm-mismatched handle or any
+    backend failure raises ``ProviderUnavailable`` (the fixed 503, no audit
+    event); an unexpected ``ValueError``/``TypeError`` from the provider is a
+    contract violation and is normalized to ``ProviderUnavailable``. A failed
+    content authentication raises :class:`EnvelopeError`.
+    """
+    from .provider import (
+        ProviderInvalidMaterial,
+        ProviderUnavailable,
+    )
+
+    try:
+        dek = provider.unwrap_key(
+            handle, opened.wrapped_key, opened.wrap_nonce
+        )
+    except (ProviderInvalidMaterial, ProviderUnavailable):
+        raise
+    except (ValueError, TypeError) as exc:
+        # A conforming provider cannot raise these for a structurally valid
+        # envelope: treat it as a backend/contract fault, never a 400 path
+        # with provider text.
+        raise ProviderUnavailable(
+            "provider unwrap_key raised a contract violation"
+        ) from exc
+    try:
+        return _decrypt_content(opened, dek)
+    except InvalidTag as exc:
+        raise EnvelopeError(
+            "field envelope is tampered or cannot be authenticated"
+        ) from exc
+
+
 def rewrap_envelope(
     opened: OpenedEnvelope,
     source_kek,

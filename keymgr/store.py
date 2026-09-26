@@ -397,6 +397,20 @@ def _provider_session(func):
     return wrapper
 
 
+class NativeUnwrap(NamedTuple):
+    """A resolved version whose DEK must be unwrapped natively.
+
+    Returned by :meth:`KeyStore.crypto_material` in ``native_unwrap`` mode
+    when the version's owning provider declares the ``unwrap_key`` operation:
+    the caller passes this provider/handle pair to
+    ``envelope.open_envelope_native`` instead of receiving exportable KEK
+    material, so private KEK material never enters the service process.
+    """
+
+    provider: object
+    handle: str
+
+
 class KeyStore:
     """File-backed key store with one JSON file per key."""
 
@@ -3826,6 +3840,7 @@ class KeyStore:
         tenant_id: str,
         version: Optional[int] = None,
         lock_timeout: Optional[float] = None,
+        native_unwrap: bool = False,
     ) -> tuple:
         """Resolve a version's key-encryption key for envelope crypto.
 
@@ -3839,6 +3854,13 @@ class KeyStore:
         the owning provider for the material -- a record owned by an inactive
         provider raises ProviderUnavailable (503), never a silent fallback.
         Nothing is persisted and no audit event is written here.
+
+        When ``native_unwrap`` is True and the version's owning provider
+        declares the ``unwrap_key`` operation, no material is exported and no
+        private key is loaded into this process: the fourth tuple element is
+        a :class:`NativeUnwrap` ``(provider, handle)`` pair that the caller
+        hands to ``envelope.open_envelope_native``. Providers that do not
+        declare the operation take the ordinary export path.
 
         With a finite ``lock_timeout`` the per-key in-process and fcntl locks
         share one deadline and a wait beyond it raises :class:`LockTimeout`
@@ -3875,6 +3897,17 @@ class KeyStore:
             if ver.is_revoked:
                 return self.CRYPTO_REVOKED, record, ver, None
             provider = self._provider_for(ver.provider_id)
+            if native_unwrap and provider_mod.declares_unwrap_key(provider):
+                # Native DEK unwrap: bind the provider/handle only. The DEK
+                # never enters this process except transiently inside the
+                # provider boundary call; export_material is never invoked
+                # and the KEK private key is never loaded here.
+                return (
+                    self.CRYPTO_OK,
+                    record,
+                    ver,
+                    NativeUnwrap(provider=provider, handle=ver.handle),
+                )
             exported = provider.export_material(ver.handle)
             kek = self._kek_for_version(ver, exported.encrypted_material)
             return self.CRYPTO_OK, record, ver, kek
@@ -4128,15 +4161,15 @@ class KeyStore:
             "algorithm": ver.algorithm,
             "public_key": ver.public_key,
             "private_material": exported.encrypted_material,
-            "status": ver.status,
-            "reason": ver.reason,
-            "operator": ver.operator,
-            "revoked_at": ver.revoked_at,
             "provider": {
                 "provider_id": ver.provider_id,
                 "handle": ver.handle,
                 "encrypted_material": ver.encrypted_material,
             },
+            "status": ver.status,
+            "reason": ver.reason,
+            "operator": ver.operator,
+            "revoked_at": ver.revoked_at,
         }
 
     def export_payload(self, record: KeyRecord) -> dict:
