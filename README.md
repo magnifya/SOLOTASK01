@@ -72,15 +72,29 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   绑定租户/筛选/limit/可见快照），篡改、过期、跨租户或筛选不符均 `400`；并发
   变更使旧游标失效而非重漏。策略拒绝 `403` 记一条 `list/rejected`，成功记一条
   `list/success`，`key_id` 均为 null；存储/账本失败 `500`。
-- `POST /v1/keys/{key_id}/rotate`，body `{tenant_id, algorithm}`，需
-  `Idempotency-Key`。`201` → `{key_id, version, algorithm, public_key,
-  operation_id}`，版本严格递增、只追加；轮换产生的新版本一律为 **active**
-  （轮换不会继承被吊销旧版本的状态，也不改变其它版本）。
-- `POST /v1/keys/batch-rotate`，body
-  `{tenant_id, items:[{key_id, algorithm}, ...]}`，需 `Idempotency-Key`。
-  `items` 限 1–100 项，`key_id` 为不重复小写 UUID4，`algorithm` 仅
-  AES256/RSA2048；任一非法 `400` 且在幂等键绑定**之前**零副作用（不写审计、
-  操作、密钥或句柄）。按 `rotate` 授权：策略拒绝 `403`；任一 `key_id` 未知
+- `POST /v1/keys/{key_id}/rotate`，body 仅 `{tenant_id, algorithm,
+  expected_version?}`，需 `Idempotency-Key`。多余字段、或
+  `expected_version` 非正整数（bool 也不算）均在幂等键绑定**之前**
+  `400` 指出字段且零副作用。`expected_version` 是可选乐观并发前置条
+  件：在 per-key 锁下基于已提交 `current_version` 判断，比较与轮换原
+  子、且在提供者调用之前；不等则绑定后 `409`（体仅
+  `error,operation_id`，状态 conflict，记一条 `rotate/rejected`），
+  不铸句柄、不改文件；并发请求仅一个能通过同一版本。缺省沿用旧语义。
+  `expected_version` 参与幂等绑定的规范化请求体。`201` →
+  `{key_id, version, algorithm, public_key, operation_id}`，版本严格
+  递增、只追加；轮换产生的新版本一律为 **active**（轮换不会继承被吊
+  销旧版本的状态，也不改变其它版本）。
+- `POST /v1/keys/batch-rotate`，body 仅
+  `{tenant_id, items:[{key_id, algorithm, expected_version?}, ...]}`，
+  需 `Idempotency-Key`。`items` 限 1–100 项，`key_id` 为不重复小写
+  UUID4，`algorithm` 仅 AES256/RSA2048；每项可另带正整数
+  `expected_version`（bool 不算）作为该项的乐观并发前置条件。任一非
+  法或多余字段（含项内多余字段）`400` 且在幂等键绑定**之前**零副作
+  用（不写审计、操作、密钥或句柄）。全部项在持有全部 per-key 锁时按
+  同一已提交视图比较：任一 `expected_version` 不等则整批绑定后
+  `409`（体仅 `error,operation_id`，状态 conflict，记一条
+  `batch_rotate/rejected`，`key_id` 为 null），不铸句柄、不改文件。
+  按 `rotate` 授权：策略拒绝 `403`；任一 `key_id` 未知
   或属于其它租户则整批 `404`（不泄露跨租户存在性），皆零变更。`201` →
   `{items:[{key_id, version, algorithm, public_key}, ...], operation_id}`，
   items 严格按请求序；各 key 沿用单键 rotate 语义，整批原子提交（共享一把
@@ -487,12 +501,13 @@ python -m keymgr list     --tenant-id t --operator alice \
 python -m keymgr current  --tenant-id t --key-id <id> --operator alice
 python -m keymgr version  --tenant-id t --key-id <id> --version 1 --operator alice
 python -m keymgr rotate   --tenant-id t --key-id <id> --algorithm AES256 \
-                          --operator alice --idempotency-key rotate-0001
+                          --operator alice --idempotency-key rotate-0001 \
+                          [--expected-version 1]
 python -m keymgr migrate  --tenant-id t --key-id <id> --operator alice \
                           --idempotency-key migrate-0001
 python -m keymgr batch-rotate --tenant-id t --operator alice \
                           --idempotency-key batch-0001 \
-                          --items '[{"key_id":"<id1>","algorithm":"AES256"},{"key_id":"<id2>","algorithm":"RSA2048"}]'
+                          --items '[{"key_id":"<id1>","algorithm":"AES256","expected_version":1},{"key_id":"<id2>","algorithm":"RSA2048"}]'
 python -m keymgr revoke   --tenant-id t --key-id <id> --reason r --operator alice
 python -m keymgr status   --tenant-id t --key-id <id> --operator alice
 # 导出/导入、备份/恢复

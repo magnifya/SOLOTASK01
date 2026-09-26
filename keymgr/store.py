@@ -54,15 +54,21 @@ BATCH_MIN_ITEMS = 1
 BATCH_MAX_ITEMS = 100
 
 
-def validate_batch_items(raw) -> Tuple[Optional[List[Tuple[str, str]]], Optional[str]]:
+def validate_batch_items(
+    raw,
+) -> Tuple[Optional[List[Tuple[str, str, Optional[int]]]], Optional[str]]:
     """Validate a batch-rotate items array (shared by HTTP and CLI).
 
-    Returns ``(items, None)`` with ``items`` a list of ``(key_id, algorithm)``
-    pairs in request order, or ``(None, message)`` naming the offending field.
-    ``items`` must be a list of 1-100 objects whose ``key_id`` values are
-    unique canonical lowercase UUID4s and whose ``algorithm`` values are
-    AES256/RSA2048. The check is side-effect free and runs before the
-    Idempotency-Key is bound.
+    Returns ``(items, None)`` with ``items`` a list of
+    ``(key_id, algorithm, expected_version)`` triples in request order
+    (``expected_version`` is None when the item omits the optional
+    optimistic-concurrency precondition), or ``(None, message)`` naming the
+    offending field. ``items`` must be a list of 1-100 objects whose
+    ``key_id`` values are unique canonical lowercase UUID4s, whose
+    ``algorithm`` values are AES256/RSA2048 and whose optional
+    ``expected_version`` is a positive integer (a JSON bool is rejected).
+    Every other field is rejected as unexpected. The check is side-effect
+    free and runs before the Idempotency-Key is bound.
     """
     from .crypto import SUPPORTED_ALGORITHMS
 
@@ -73,11 +79,21 @@ def validate_batch_items(raw) -> Tuple[Optional[List[Tuple[str, str]]], Optional
             "field items must be an array of %d to %d items"
             % (BATCH_MIN_ITEMS, BATCH_MAX_ITEMS)
         )
-    items: List[Tuple[str, str]] = []
+    items: List[Tuple[str, str, Optional[int]]] = []
     seen = set()
     for index, element in enumerate(raw):
         if not isinstance(element, dict):
             return None, "field items[%d] must be an object" % index
+        extra = [
+            field
+            for field in element
+            if field not in ("key_id", "algorithm", "expected_version")
+        ]
+        if extra:
+            return None, (
+                "field items[%d].%s is not accepted by this endpoint"
+                % (index, extra[0])
+            )
         key_id = element.get("key_id")
         if not is_valid_key_id(key_id):
             return None, "field items[%d].key_id must be a UUID4" % index
@@ -92,7 +108,22 @@ def validate_batch_items(raw) -> Tuple[Optional[List[Tuple[str, str]]], Optional
                 "field items[%d].algorithm must be one of: %s"
                 % (index, ", ".join(SUPPORTED_ALGORITHMS))
             )
-        items.append((key_id, algorithm))
+        expected_version = None
+        if "expected_version" in element:
+            raw_expected = element["expected_version"]
+            # bool is a subclass of int: reject it explicitly so only real
+            # positive integers pass.
+            if (
+                not isinstance(raw_expected, int)
+                or isinstance(raw_expected, bool)
+                or raw_expected < 1
+            ):
+                return None, (
+                    "field items[%d].expected_version must be a positive "
+                    "integer" % index
+                )
+            expected_version = raw_expected
+        items.append((key_id, algorithm, expected_version))
     return items, None
 
 
@@ -1907,6 +1938,11 @@ class KeyStore:
                 return None
             return self._committed_record(record)
 
+    # An optimistic-concurrency precondition (expected_version) disagreed with
+    # the committed current_version: rotate returns this sentinel instead of a
+    # record, before any provider call, handle, file change or audit event.
+    ROTATE_VERSION_CONFLICT = "version_conflict"
+
     @_provider_session
     def rotate(
         self,
@@ -1917,6 +1953,7 @@ class KeyStore:
         lock_timeout: Optional[float] = None,
         pre_commit=None,
         mirror=None,
+        expected_version: Optional[int] = None,
     ) -> Optional[KeyRecord]:
         """Append a new version with fresh material.
 
@@ -1929,6 +1966,15 @@ class KeyStore:
         retried/crashed rotation dedupes on one id) and ``lock_timeout``: if
         the per-key lock cannot be taken within it, :class:`LockTimeout` is
         raised before any provider call or write.
+
+        ``expected_version`` is an optional optimistic-concurrency
+        precondition: when given, the committed ``current_version`` read under
+        the per-key locks must equal it, or the rotation refuses with the
+        :attr:`ROTATE_VERSION_CONFLICT` sentinel BEFORE the provider is
+        resolved or called -- no handle is minted, no file changes and no
+        event is appended. The comparison and the rotation are atomic under
+        the same locks, so of concurrent rotations carrying the same expected
+        version exactly one can pass.
         """
         if not _KEY_ID_RE.fullmatch(key_id):
             return None
@@ -1941,6 +1987,14 @@ class KeyStore:
             # overwrite its preserved marker/rollback basis and interleave a
             # single-key rotate with batch recovery.
             self._ensure_settled(record)
+            if (
+                expected_version is not None
+                and record.current_version != expected_version
+            ):
+                # The precondition compares against the committed current
+                # version under the held locks, before the provider is even
+                # resolved: zero handles, zero file writes, zero events.
+                return self.ROTATE_VERSION_CONFLICT
             # A version is rotated on the provider that owns the record;
             # switching providers mid-key is refused (503), never silently
             # migrated.
@@ -2607,6 +2661,10 @@ class KeyStore:
     #     restored even when this frame no longer holds them.
     BATCH_ROTATED = "rotated"
     BATCH_NOT_FOUND = "not_found"
+    # An optimistic-concurrency precondition (expected_version) disagreed with
+    # the committed current_version of one key: the whole batch failed before
+    # any journal, snapshot, handle or file write existed.
+    BATCH_VERSION_CONFLICT = "version_conflict"
     _BATCH_DIR = "batch-rotations"
 
     def _batch_snapshot_path(self, snapshot_id: str) -> str:
@@ -2693,6 +2751,7 @@ class KeyStore:
         lock_timeout: Optional[float] = None,
         pre_commit=None,
         mirror=None,
+        expected_versions: Optional[dict] = None,
     ) -> Tuple[str, object]:
         """Atomically append one fresh version to many keys.
 
@@ -2706,6 +2765,13 @@ class KeyStore:
         batch and a single rotate never interleave on a shared key; a wait
         beyond ``lock_timeout`` raises :class:`LockTimeout` before the
         journal, event or any handle exists.
+
+        ``expected_versions`` maps a key_id to an optional optimistic-
+        concurrency precondition. With every lock held, ALL items are compared
+        against the SAME committed view before anything is provisioned: one
+        mismatch fails the whole batch as
+        ``(BATCH_VERSION_CONFLICT, offending_key_id)`` -- no journal,
+        snapshot, handle, file change or event exists at that point.
 
         Every key keeps the rotate semantics of ``KeyStore.rotate`` (fresh
         material on the provider that owns the record, strictly increasing
@@ -2733,6 +2799,23 @@ class KeyStore:
                 # preserved retry basis.
                 self._ensure_settled(record)
                 records[key_id] = record
+
+            if expected_versions:
+                # Every record is loaded and settled, so ALL preconditions
+                # compare against the SAME committed view while every lock is
+                # still held -- before the provider is even resolved. One
+                # mismatch fails the whole batch here: no journal, snapshot,
+                # provider call, handle or file write exists at this point.
+                for key_id, _algorithm in ordered:
+                    expected = expected_versions.get(key_id)
+                    if (
+                        expected is not None
+                        and records[key_id].current_version != expected
+                    ):
+                        return self.BATCH_VERSION_CONFLICT, key_id
+
+            for key_id, _ in ordered:
+                record = records[key_id]
                 path = self._path_for(key_id)
                 # Capture the file's exact pre-batch bytes under the held
                 # locks: an uncommitted rollback restores these byte-for-byte.

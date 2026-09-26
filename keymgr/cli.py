@@ -51,6 +51,20 @@ def _positive_int(value: str) -> int:
     return ivalue
 
 
+def _expected_version(value: str) -> int:
+    """argparse type: a positive integer expected_version (digits only)."""
+    if not re.fullmatch(r"[0-9]+", value):
+        raise argparse.ArgumentTypeError(
+            "field expected_version must be a positive integer"
+        )
+    ivalue = int(value)
+    if ivalue < 1:
+        raise argparse.ArgumentTypeError(
+            "field expected_version must be a positive integer"
+        )
+    return ivalue
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the CLI argument parser."""
     parser = argparse.ArgumentParser(
@@ -84,6 +98,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_rotate.add_argument("--algorithm", required=True,
                           help="one of: %s" % ", ".join(SUPPORTED_ALGORITHMS))
     p_rotate.add_argument(
+        "--expected-version", dest="expected_version", default=None,
+        type=_expected_version,
+        help="optional optimistic-concurrency precondition: the committed "
+             "current_version must equal N or the rotation is refused (409)",
+    )
+    p_rotate.add_argument(
         "--idempotency-key", required=True,
         help="1-128 chars A-Za-z0-9._~- ; retries reuse the result",
     )
@@ -104,7 +124,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_batch_rotate.add_argument(
         "--items", required=True,
-        help='JSON array of {"key_id","algorithm"} items (1-100, unique ids)',
+        help='JSON array of {"key_id","algorithm","expected_version"?} items '
+             "(1-100, unique ids)",
     )
     p_batch_rotate.add_argument(
         "--idempotency-key", required=True,
@@ -900,6 +921,10 @@ def _run(argv: Optional[List[str]] = None) -> int:
             "tenant_id": args.tenant_id,
             "algorithm": args.algorithm,
         }
+        if args.expected_version is not None:
+            # The optional optimistic-concurrency precondition is part of the
+            # canonical idempotency binding.
+            body["expected_version"] = args.expected_version
         path = "/v1/keys/%s/rotate" % args.key_id
 
         def execute(operation, mirror=None):
@@ -935,7 +960,18 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                 pre_commit=stage_success,
                 mirror=mirror,
+                expected_version=args.expected_version,
             )
+            if record == store.ROTATE_VERSION_CONFLICT:
+                # The precondition disagreed with the committed
+                # current_version: a bound terminal 409 (CLI 3) with one
+                # rejected rotate event; nothing was provisioned.
+                return _terminal_rejection(
+                    op_store, store, operation,
+                    args.tenant_id, args.key_id,
+                    audit_mod.ACTION_ROTATE, 409,
+                    "current_version does not match expected_version",
+                )
             if record is None:
                 return _terminal_rejection(
                     op_store, store, operation,
@@ -1056,6 +1092,14 @@ def _run(argv: Optional[List[str]] = None) -> int:
         items, message = validate_batch_items(raw_items)
         if message is not None:
             return _fail(message, 2)
+        # The validator returns (key_id, algorithm, expected_version)
+        # triples; the store takes the pair list plus a precondition map.
+        pairs = [(key_id, algorithm) for key_id, algorithm, _ in items]
+        expected_versions = {
+            key_id: expected
+            for key_id, _, expected in items
+            if expected is not None
+        }
 
         body = {"tenant_id": args.tenant_id, "items": raw_items}
         path = "/v1/keys/batch-rotate"
@@ -1068,8 +1112,16 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 {
                     "kind": "batch_rotate",
                     "items": [
-                        {"key_id": key_id, "algorithm": algorithm}
-                        for key_id, algorithm in items
+                        {
+                            "key_id": key_id,
+                            "algorithm": algorithm,
+                            **(
+                                {"expected_version": expected}
+                                if expected is not None
+                                else {}
+                            ),
+                        }
+                        for key_id, algorithm, expected in items
                     ],
                 },
             )
@@ -1077,7 +1129,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 mirror.describe(
                     {
                         "kind": "batch_rotate",
-                        "write_set": [key_id for key_id, _ in items],
+                        "write_set": [key_id for key_id, _, _ in items],
                     }
                 )
             # Authorization follows rotate; the rejection event is a single
@@ -1104,19 +1156,30 @@ def _run(argv: Optional[List[str]] = None) -> int:
                                 "algorithm": records_by_id[key_id].current.algorithm,
                                 "public_key": records_by_id[key_id].current.public_key,
                             }
-                            for key_id, _ in items
+                            for key_id, _, _ in items
                         ],
                         "operation_id": operation.operation_id,
                     },
                 )
 
             status, result = store.batch_rotate(
-                args.tenant_id, items,
+                args.tenant_id, pairs,
                 event_id=operation.operation_id,
                 lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                 pre_commit=stage_success,
                 mirror=mirror,
+                expected_versions=expected_versions or None,
             )
+            if status == store.BATCH_VERSION_CONFLICT:
+                # One item's expected_version disagreed with the committed
+                # view: the WHOLE batch is a bound terminal 409 (CLI 3) with
+                # one rejected batch_rotate event (key_id null), zero changes.
+                return _terminal_rejection(
+                    op_store, store, operation,
+                    args.tenant_id, None,
+                    audit_mod.ACTION_BATCH_ROTATE, 409,
+                    "current_version does not match expected_version",
+                )
             if status == store.BATCH_NOT_FOUND:
                 return _terminal_rejection(
                     op_store, store, operation,

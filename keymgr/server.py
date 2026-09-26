@@ -949,6 +949,16 @@ def make_handler(
                 return
             if self._bad_key_id(key_id, audit=False):
                 return
+            extra = [
+                field
+                for field in payload
+                if field not in ("tenant_id", "algorithm", "expected_version")
+            ]
+            if extra:
+                self._bad_request(
+                    "field %s is not accepted by this endpoint" % extra[0]
+                )
+                return
             if not isinstance(payload.get("algorithm"), str):
                 self._bad_request("missing required field: algorithm")
                 return
@@ -959,6 +969,21 @@ def make_handler(
                     % (algorithm, ", ".join(SUPPORTED_ALGORITHMS))
                 )
                 return
+            expected_version = None
+            if "expected_version" in payload:
+                raw_expected = payload["expected_version"]
+                # bool is a subclass of int: reject it explicitly so only
+                # real positive integers pass.
+                if (
+                    not isinstance(raw_expected, int)
+                    or isinstance(raw_expected, bool)
+                    or raw_expected < 1
+                ):
+                    self._bad_request(
+                        "field expected_version must be a positive integer"
+                    )
+                    return
+                expected_version = raw_expected
 
             def execute(operation, mirror=None):
                 # The operation kind and the exact key_id rule are durable
@@ -1001,7 +1026,17 @@ def make_handler(
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                     pre_commit=stage_success,
                     mirror=mirror,
+                    expected_version=expected_version,
                 )
+                if record == store.ROTATE_VERSION_CONFLICT:
+                    # The optimistic-concurrency precondition disagreed with
+                    # the committed current_version: a bound terminal 409 with
+                    # one rejected rotate event; nothing was provisioned.
+                    return self._idempotent_rejection(
+                        operation, tenant_id, key_id,
+                        audit_mod.ACTION_ROTATE, 409,
+                        "current_version does not match expected_version",
+                    )
                 if record is None:
                     return self._idempotent_rejection(
                         operation, tenant_id, key_id,
@@ -1049,10 +1084,26 @@ def make_handler(
             tenant_id = self._tenant(parts, payload, audit=False)
             if tenant_id is None:
                 return
+            extra = [
+                field for field in payload if field not in ("tenant_id", "items")
+            ]
+            if extra:
+                self._bad_request(
+                    "field %s is not accepted by this endpoint" % extra[0]
+                )
+                return
             items, error = self._parse_batch_items(payload.get("items"))
             if error is not None:
                 self._bad_request(error)
                 return
+            # The validator returns (key_id, algorithm, expected_version)
+            # triples; the store takes the pair list plus a precondition map.
+            pairs = [(key_id, algorithm) for key_id, algorithm, _ in items]
+            expected_versions = {
+                key_id: expected
+                for key_id, _, expected in items
+                if expected is not None
+            }
 
             def execute(operation, mirror=None):
                 # Kind and the exact request-order item set are durable before
@@ -1063,8 +1114,16 @@ def make_handler(
                     {
                         "kind": "batch_rotate",
                         "items": [
-                            {"key_id": key_id, "algorithm": algorithm}
-                            for key_id, algorithm in items
+                            {
+                                "key_id": key_id,
+                                "algorithm": algorithm,
+                                **(
+                                    {"expected_version": expected}
+                                    if expected is not None
+                                    else {}
+                                ),
+                            }
+                            for key_id, algorithm, expected in items
                         ],
                     },
                 )
@@ -1074,7 +1133,7 @@ def make_handler(
                     mirror.describe(
                         {
                             "kind": "batch_rotate",
-                            "write_set": [key_id for key_id, _ in items],
+                            "write_set": [key_id for key_id, _, _ in items],
                         }
                     )
                 # Authorization follows rotate and precedes existence; a
@@ -1100,7 +1159,7 @@ def make_handler(
                             "algorithm": records_by_id[key_id].current.algorithm,
                             "public_key": records_by_id[key_id].current.public_key,
                         }
-                        for key_id, _ in items
+                        for key_id, _, _ in items
                     ]
                     operation_store.stage_terminal(
                         operation,
@@ -1112,12 +1171,22 @@ def make_handler(
                     )
 
                 status, result = store.batch_rotate(
-                    tenant_id, items,
+                    tenant_id, pairs,
                     event_id=operation.operation_id,
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                     pre_commit=stage_success,
                     mirror=mirror,
+                    expected_versions=expected_versions or None,
                 )
+                if status == store.BATCH_VERSION_CONFLICT:
+                    # One item's expected_version disagreed with the committed
+                    # current_version of the shared view: the WHOLE batch is a
+                    # bound terminal 409 (key_id null) with zero changes.
+                    return self._idempotent_rejection(
+                        operation, tenant_id, None,
+                        audit_mod.ACTION_BATCH_ROTATE, 409,
+                        "current_version does not match expected_version",
+                    )
                 if status == store.BATCH_NOT_FOUND:
                     # Any unknown/foreign key_id fails the whole batch with no
                     # change; the answer is identical to a missing key so
@@ -3246,6 +3315,8 @@ def _resolve_committed_operation(store, policy_store, record, event):
                     return "backup target already contains this data"
                 if kind == "migrate":
                     return "key is already managed by the ready provider"
+                if kind in ("rotate", "batch_rotate"):
+                    return "current_version does not match expected_version"
                 return "key_id already exists for this tenant"
             if kind == "restore":
                 return "tenant backup not found"
