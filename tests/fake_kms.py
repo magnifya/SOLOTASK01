@@ -14,6 +14,7 @@ Fault injection is driven by a JSON file named by ``FAKE_KMS_FAULTS``:
       "health_nonbool": "yes",      # health() returns a non-bool (unavailable)
       "health_sleep": 6.0,          # health() blocks past the reconnect budget
       "provider_id": "fakekms-alt"  # override the factory's provider_id
+      "declare_sign": true,         # capabilities.operations gains "sign"
     }
 
 Materials are stored base64-wrapped with a static prefix so nothing here ever
@@ -109,22 +110,26 @@ def _unwrap(blob):
 
 
 class FakeKmsProvider:
-    capabilities = {
-        "algorithms": ["AES256", "RSA2048"],
-        "operations": [
-            "generate",
-            "rotate",
-            "import_material",
-            "export_material",
-            "delete",
-        ],
-    }
-
     def __init__(self):
         # The id can be overridden per process (FAKE_KMS_PROVIDER_ID) so a
         # reconnect can install a provider carrying a different provider_id,
         # exercising the pending-operation displacement rule.
         self.provider_id = os.environ.get("FAKE_KMS_PROVIDER_ID", PROVIDER_ID)
+
+    @property
+    def capabilities(self):
+        operations = [
+            "generate",
+            "rotate",
+            "import_material",
+            "export_material",
+            "delete",
+        ]
+        # The optional native-signing operation is declared only when the
+        # faults file asks for it, so both provider shapes can be exercised.
+        if _faults().get("declare_sign"):
+            operations.append("sign")
+        return {"algorithms": ["AES256", "RSA2048"], "operations": operations}
 
     def configure(self, data_dir):
         _check_fault("configure")
@@ -198,6 +203,28 @@ class FakeKmsProvider:
             if handle in state["handles"]:
                 del state["handles"][handle]
                 _save_state(state)
+
+    def sign(self, handle, message):
+        """Optional native signing, declared via the declare_sign fault."""
+        if not isinstance(handle, str) or not handle:
+            raise ValueError("sign requires a non-empty handle")
+        if not isinstance(message, bytes):
+            raise TypeError("sign message must be bytes")
+        _check_fault("sign")
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        with _lock:
+            state = _load_state()
+            entry = state["handles"].get(handle)
+        if entry is None:
+            raise RuntimeError("unknown handle")
+        if entry["algorithm"] != "RSA2048":
+            raise RuntimeError("handle is not an RSA2048 key")
+        private_key = serialization.load_pem_private_key(
+            _unwrap(entry["material"]).encode("utf-8"), password=None
+        )
+        return private_key.sign(message, padding.PKCS1v15(), hashes.SHA256())
 
 
 def make_provider():

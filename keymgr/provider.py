@@ -55,6 +55,16 @@ A provider instance exposes:
 * ``import_material(algorithm, public_key, material)`` -> the same triple;
 * ``export_material(handle)`` -> ``{"public_key", "encrypted_material"}``;
 * ``delete(handle)`` -> ``None``, idempotent;
+* ``sign(handle, message)`` -> ``bytes``, *optional*. Declared by listing
+  ``"sign"`` in ``capabilities.operations``; a declaration without the
+  method is a contract failure. ``handle`` must be a non-empty string
+  (``ValueError`` otherwise) and ``message`` must be ``bytes``
+  (``TypeError`` otherwise); an unknown or non-RSA handle and any backend
+  failure raise :class:`ProviderUnavailable`. Success returns the 256-byte
+  RSASSA-PKCS1-v1_5/SHA-256 signature, computed inside the KMS/HSM: the
+  service never calls ``export_material`` nor loads the private key on
+  this path, and verifies the returned signature against the version's
+  public key before releasing it;
 * ``health()`` -> ``bool``, *optional*. A missing method is treated as ready;
   a method that raises or returns anything but a real bool reports unavailable.
   The probe's own text never leaves the process.
@@ -84,8 +94,8 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
     fcntl = None
 
 from cryptography.exceptions import UnsupportedAlgorithm
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .crypto import SUPPORTED_ALGORITHMS, generate_key
@@ -105,6 +115,10 @@ OPERATIONS = (
     OP_EXPORT_MATERIAL,
     OP_DELETE,
 )
+#: Optional operation: a provider declaring ``sign`` in its capabilities
+#: must implement ``sign(handle, message) -> bytes`` (see the module
+#: docstring); declaring it without the method is a contract failure.
+OP_SIGN = "sign"
 
 _DEK_NAME = "local.dek"
 _REGISTRY_NAME = "local-registry.json"
@@ -224,6 +238,18 @@ class KeyProvider:
     def delete(self, handle: str) -> None:
         raise NotImplementedError
 
+    def sign(self, handle: str, message: bytes) -> bytes:
+        """Optional native KMS/HSM signing (declare ``sign`` to enable).
+
+        ``handle`` must be a non-empty string (``ValueError`` otherwise)
+        and ``message`` must be ``bytes`` (``TypeError`` otherwise); an
+        unknown or non-RSA handle and any backend failure raise
+        :class:`ProviderUnavailable`. Success returns the 256-byte
+        RSASSA-PKCS1-v1_5/SHA-256 signature without the private key ever
+        leaving the backend.
+        """
+        raise NotImplementedError
+
     def health(self) -> bool:
         """Optional KMS/HSM readiness probe.
 
@@ -280,6 +306,13 @@ def _validate_external(obj) -> None:
                 "provider %r is missing a callable %s() operation"
                 % (provider_id, name)
             )
+    # sign is optional, but declaring it without the method is a contract
+    # failure like any other missing operation.
+    if OP_SIGN in operations and not callable(getattr(obj, OP_SIGN, None)):
+        raise ProviderUnavailable(
+            "provider %r declares sign but has no callable sign() operation"
+            % provider_id
+        )
     configure = getattr(obj, "configure", None)
     if configure is not None and not callable(configure):
         raise ProviderUnavailable(
@@ -367,6 +400,13 @@ class _SafeProvider:
         # (the caller may retry, and delete must remain idempotent).
         self._call("delete", handle)
 
+    def sign(self, handle: str, message: bytes) -> bytes:
+        # Only reachable when the provider declared sign (the contract check
+        # then guaranteed a callable method). Any backend fault normalizes to
+        # ProviderUnavailable; the shape of the result is validated by the
+        # caller before the signature is released.
+        return self._call("sign", handle, message)
+
     def health(self) -> bool:
         """Optional readiness probe normalized to a bool.
 
@@ -403,7 +443,7 @@ class LocalProvider(KeyProvider):
     provider_id = LOCAL_PROVIDER_ID
     capabilities = {
         "algorithms": tuple(SUPPORTED_ALGORITHMS),
-        "operations": OPERATIONS,
+        "operations": OPERATIONS + (OP_SIGN,),
     }
 
     def __init__(self) -> None:
@@ -683,6 +723,37 @@ class LocalProvider(KeyProvider):
             if handle in self._registry:
                 del self._registry[handle]
                 self._persist_registry_locked()
+
+    def sign(self, handle: str, message: bytes) -> bytes:
+        """Sign ``message`` with the registered RSA2048 handle.
+
+        Follows the optional native-signing contract: a non-string/empty
+        handle is a ``ValueError``, a non-bytes message a ``TypeError``,
+        and an unknown or non-RSA handle (or corrupt stored material) is
+        :class:`ProviderUnavailable`. The private key is unwrapped only
+        inside this call and never persisted or returned.
+        """
+        if not isinstance(handle, str) or not handle:
+            raise ValueError("sign requires a non-empty handle")
+        if not isinstance(message, bytes):
+            raise TypeError("sign message must be bytes")
+        self._require_configured()
+        with self._lock:
+            meta = self._registry.get(handle)
+            if meta is None:
+                raise ProviderUnavailable("unknown handle")
+            if meta.get("algorithm") != "RSA2048":
+                raise ProviderUnavailable("handle is not an RSA2048 key")
+            raw = self._unwrap_locked(meta.get("wrapped"))
+        try:
+            private_key = serialization.load_pem_private_key(
+                raw.encode("utf-8"), password=None
+            )
+        except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
+            raise ProviderUnavailable(
+                "stored local material is corrupt"
+            ) from exc
+        return private_key.sign(message, padding.PKCS1v15(), hashes.SHA256())
 
 
 # -- module:factory loading -------------------------------------------------
