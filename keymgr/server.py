@@ -61,6 +61,8 @@ _SIGN_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/sign$")
 _VERIFY_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/verify$")
 _MIGRATE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/migrate$")
 _DECRYPT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/decrypt$")
+_WRAP_KEY_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/wrap-key$")
+_UNWRAP_KEY_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/unwrap-key$")
 _REWRAP_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/rewrap$")
 _STATUS_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/status$")
 _VERSION_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/versions/([^/]+)$")
@@ -840,6 +842,20 @@ def make_handler(
                 decrypt_match = _DECRYPT_PATH_RE.match(path)
                 if decrypt_match is not None:
                     self._decrypt_key(decrypt_match.group(1), parts, operator)
+                    return
+
+                wrap_key_match = _WRAP_KEY_PATH_RE.match(path)
+                if wrap_key_match is not None:
+                    self._wrap_data_key(
+                        wrap_key_match.group(1), parts, operator
+                    )
+                    return
+
+                unwrap_key_match = _UNWRAP_KEY_PATH_RE.match(path)
+                if unwrap_key_match is not None:
+                    self._unwrap_data_key(
+                        unwrap_key_match.group(1), parts, operator
+                    )
                     return
 
                 rewrap_match = _REWRAP_PATH_RE.match(path)
@@ -1891,6 +1907,370 @@ def make_handler(
                 return
             self._send_json(
                 200, {"plaintext": envelope.b64_encode(plaintext)}
+            )
+
+        # -- standalone DEK wrap / unwrap -----------------------------------
+        # A data key is always 32 bytes. The wrapped-key shapes follow the
+        # version algorithm: an AES256 KEK wraps it with AES-256-GCM (a 48-byte
+        # ciphertext with a 12-byte nonce) and an RSA2048 KEK with
+        # RSA-OAEP-SHA256 (a 256-byte ciphertext, no nonce).
+        _DEK_KEY_BYTES = 32
+        _AES_WRAP_BYTES = 48
+        _WRAP_NONCE_BYTES = 12
+        _RSA_WRAP_BYTES = 256
+
+        def _dek_request_base(self, key_id, parts, accepted_fields):
+            """Shared parse/validate prelude for wrap-key and unwrap-key.
+
+            Mirrors rewrap: an unparseable/non-object body is a plain 400 with
+            no event, while a missing/conflicting tenant SOURCE still records
+            the invisible tenant_conflict. Every other body problem -- an
+            extra/missing field, a malformed key_id, a non-positive-integer
+            version or bad base64 -- is a 400 naming the field written to no
+            ledger. Returns ``(tenant_id, version, payload)`` or None after
+            the response was sent.
+            """
+            payload = self._read_json_object(parse_conflict=False)
+            if payload is None:
+                return None
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                if not self._record_conflict():
+                    return None
+                self._bad_request("field tenant_id must be a non-empty string")
+                return None
+            tenant_id = self._tenant(parts, payload)
+            if tenant_id is None:
+                return None
+            # A malformed key_id is parameter validation on these endpoints:
+            # a 400 naming the field with no event (the tenant source itself
+            # was valid).
+            if self._bad_key_id(key_id, audit=False):
+                return None
+            extra = [f for f in payload if f not in accepted_fields]
+            if extra:
+                self._bad_request(
+                    "field %s is not accepted by this endpoint" % extra[0]
+                )
+                return None
+            version = payload.get("version")
+            if version is not None and (
+                not isinstance(version, int)
+                or isinstance(version, bool)
+                or version < 1
+            ):
+                self._bad_request(
+                    "field version must be a positive integer"
+                )
+                return None
+            return tenant_id, version, payload
+
+        def _wrap_data_key(self, key_id: str, parts, operator: str) -> None:
+            """POST /v1/keys/{key_id}/wrap-key (non-idempotent).
+
+            Body is exactly ``{tenant_id, version?, data_key}``; ``data_key``
+            is padded standard base64 decoding to exactly 32 bytes and
+            ``version`` defaults to current. Wraps the caller-supplied data
+            key under the resolved version's KEK: when the version's bound
+            provider declares the optional ``wrap_key`` operation the wrap
+            happens inside the KMS/HSM within the five-second gate (the
+            service generates no KEK and never calls ``export_material``);
+            otherwise the KEK is exported and the wrap runs in memory.
+            Success is ``200`` with the fixed key order
+            ``key_id, version, algorithm, wrapped_key, wrap_nonce`` -- a
+            48-byte wrapped key plus a 12-byte nonce for AES256, a 256-byte
+            wrapped key plus null for RSA2048. Body/key-set/UUID4/version/
+            base64/length errors are a 400 naming the field with no audit; a
+            policy denial is 403, an unknown/cross-tenant key or version is
+            404 and a revoked key/version is 409 (each a rejected event
+            carrying key_id); a provider fault/contract failure/gate timeout
+            is the fixed 503 with no audit; a ledger failure is 500. The data
+            key never touches disk, the audit ledger or an error; the wrapped
+            pair is returned only in the success body.
+            """
+            action = audit_mod.ACTION_WRAP_KEY
+            base = self._dek_request_base(
+                key_id, parts, {"tenant_id", "version", "data_key"}
+            )
+            if base is None:
+                return
+            tenant_id, version, payload = base
+            data_key_text = payload.get("data_key")
+            if not isinstance(data_key_text, str):
+                self._bad_request(
+                    "field data_key must be a base64 string"
+                    if "data_key" in payload
+                    else "missing required field: data_key"
+                )
+                return
+            try:
+                data_key = envelope.b64_decode_field(
+                    data_key_text, "data_key"
+                )
+            except envelope.EnvelopeError as exc:
+                self._bad_request(str(exc))
+                return
+            if len(data_key) != self._DEK_KEY_BYTES:
+                self._bad_request(
+                    "field data_key must decode to exactly 32 bytes"
+                )
+                return
+            if not self._enforce(tenant_id, key_id, action, operator):
+                return
+            # Resolve the committed version without contacting a provider so
+            # the 404/409 answers never depend on a KMS/HSM being reachable.
+            status, ver = store.crypto_version(key_id, tenant_id, version)
+            if status == store.VERSION_NOT_FOUND:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 404, "key not found"
+                )
+                return
+            if status == store.VERSION_REVOKED:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 409, "key is revoked"
+                )
+                return
+            # Native wrap binds provider/handle only; otherwise the KEK is
+            # exported for the in-memory path. A provider fault/contract
+            # failure/gate timeout propagates to do_POST's fixed 503 and is
+            # never audited.
+            status, _record, bound_ver, material = store.crypto_material(
+                key_id, tenant_id, ver.version, native_wrap=True
+            )
+            if status == store.CRYPTO_NOT_FOUND:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 404, "key not found"
+                )
+                return
+            if status == store.CRYPTO_REVOKED:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 409, "key is revoked"
+                )
+                return
+            if isinstance(material, NativeWrap):
+                with provider_mod.provider_call():
+                    wrapped_key, wrap_nonce = envelope.wrap_data_key_native(
+                        provider=material.provider,
+                        handle=material.handle,
+                        algorithm=bound_ver.algorithm,
+                        data_key=data_key,
+                    )
+            else:
+                wrapped_key, wrap_nonce = envelope.wrap_data_key(
+                    bound_ver.algorithm, material, data_key
+                )
+            # The data key exists only in memory; the success event records
+            # metadata only and the wrapped pair is released only after the
+            # single event is durable.
+            if not self._record_attempt(
+                tenant_id, key_id, action, audit_mod.OUTCOME_SUCCESS
+            ):
+                return
+            self._send_json(
+                200,
+                {
+                    "key_id": key_id,
+                    "version": bound_ver.version,
+                    "algorithm": bound_ver.algorithm,
+                    "wrapped_key": envelope.b64_encode(wrapped_key),
+                    "wrap_nonce": (
+                        None
+                        if wrap_nonce is None
+                        else envelope.b64_encode(wrap_nonce)
+                    ),
+                },
+            )
+
+        def _unwrap_data_key(self, key_id: str, parts, operator: str) -> None:
+            """POST /v1/keys/{key_id}/unwrap-key (non-idempotent).
+
+            Body is exactly
+            ``{tenant_id, version?, wrapped_key, wrap_nonce?}``; the byte
+            fields are padded standard base64 and ``version`` defaults to
+            current. Unwraps the data key with the resolved version's KEK:
+            when the bound provider declares the optional ``unwrap_key``
+            operation the unwrap happens inside the KMS/HSM within the
+            five-second gate (the service never calls ``export_material`` and
+            no KEK private material enters this process); otherwise the KEK is
+            exported and the unwrap runs in memory. Success is
+            ``200 {"data_key": <base64 32 bytes>}`` -- the only body allowed
+            to carry a data key. Body/key-set/UUID4/version/base64 and the
+            self-describing wrapped-field shape (48+12 vs 256+null) are all
+            validated as PARAMETERS before authorization: a 400 naming the
+            field with no audit and no provider contact. A wrapped key whose
+            valid shape disagrees with the resolved version algorithm is the
+            same parameter 400. A wrapped key that fails AUTHENTICATION after
+            authorization is a rejected business attempt -- a 400 naming
+            wrapped_key with one unwrap_key/rejected event carrying key_id
+            (the decrypt precedent); a policy denial is 403, an
+            unknown/cross-tenant key or version is 404 and a revoked
+            key/version is 409 (each a rejected event carrying key_id); a
+            provider fault/contract failure/gate timeout is the fixed 503
+            with no audit; a ledger failure is 500.
+            """
+            action = audit_mod.ACTION_UNWRAP_KEY
+            base = self._dek_request_base(
+                key_id, parts,
+                {"tenant_id", "version", "wrapped_key", "wrap_nonce"},
+            )
+            if base is None:
+                return
+            tenant_id, version, payload = base
+            wrapped_text = payload.get("wrapped_key")
+            if not isinstance(wrapped_text, str) or not wrapped_text:
+                self._bad_request(
+                    "field wrapped_key must be a non-empty base64 string"
+                    if "wrapped_key" in payload
+                    else "missing required field: wrapped_key"
+                )
+                return
+            try:
+                wrapped_key = envelope.b64_decode_field(
+                    wrapped_text, "wrapped_key"
+                )
+            except envelope.EnvelopeError as exc:
+                self._bad_request(str(exc))
+                return
+            nonce_text = payload.get("wrap_nonce")
+            wrap_nonce = None
+            if nonce_text is not None:
+                if not isinstance(nonce_text, str):
+                    self._bad_request(
+                        "field wrap_nonce must be a base64 string or null"
+                    )
+                    return
+                try:
+                    wrap_nonce = envelope.b64_decode_field(
+                        nonce_text, "wrap_nonce"
+                    )
+                except envelope.EnvelopeError as exc:
+                    self._bad_request(str(exc))
+                    return
+            # The wrapped-field shape is self-describing (48-byte wrapped key
+            # plus a 12-byte nonce implies an AES256 KEK; a 256-byte wrapped
+            # key plus null nonce implies RSA2048), so it is validated as a
+            # PARAMETER before authorization, exactly like the base64/length
+            # checks: no audit and no provider contact. Any other combination
+            # is a 400 naming the offending field.
+            if (
+                len(wrapped_key) == self._AES_WRAP_BYTES
+                and wrap_nonce is not None
+                and len(wrap_nonce) == self._WRAP_NONCE_BYTES
+            ):
+                shape_algorithm = "AES256"
+            elif (
+                len(wrapped_key) == self._RSA_WRAP_BYTES
+                and wrap_nonce is None
+            ):
+                shape_algorithm = "RSA2048"
+            else:
+                # Name the offending field precisely: a present non-12-byte
+                # nonce is a wrap_nonce error; a 256-byte wrapped key with any
+                # non-null nonce is the RSA null-nonce error; a null/12-byte
+                # nonce paired with a non-48/non-256 wrapped key is a
+                # wrapped_key length error.
+                if wrap_nonce is not None and (
+                    len(wrap_nonce) != self._WRAP_NONCE_BYTES
+                ):
+                    self._bad_request(
+                        "field wrap_nonce must decode to exactly 12 bytes "
+                        "for an AES256 key version"
+                    )
+                    return
+                if (
+                    len(wrapped_key) == self._RSA_WRAP_BYTES
+                    and wrap_nonce is not None
+                ):
+                    self._bad_request(
+                        "field wrap_nonce must be absent or null for an "
+                        "RSA2048 key version"
+                    )
+                    return
+                self._bad_request(
+                    "field wrapped_key length does not match a valid wrapped "
+                    "data key (48 bytes for AES256, 256 bytes for RSA2048)"
+                )
+                return
+            if not self._enforce(tenant_id, key_id, action, operator):
+                return
+            # Provider-free committed-version resolution: 404/409 are
+            # answerable while a KMS/HSM is down.
+            status, ver = store.crypto_version(key_id, tenant_id, version)
+            if status == store.VERSION_NOT_FOUND:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 404, "key not found"
+                )
+                return
+            if status == store.VERSION_REVOKED:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 409, "key is revoked"
+                )
+                return
+            # The request's wrapped-field shape must agree with the resolved
+            # version algorithm. This is a parameter/shape 400 (not an
+            # authentication failure), written to no ledger and contacting no
+            # provider.
+            if ver.algorithm != shape_algorithm:
+                self._bad_request(
+                    "field wrapped_key does not match the key version "
+                    "algorithm"
+                )
+                return
+            status, _record, bound_ver, material = store.crypto_material(
+                key_id, tenant_id, ver.version, native_unwrap=True
+            )
+            if status == store.CRYPTO_NOT_FOUND:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 404, "key not found"
+                )
+                return
+            if status == store.CRYPTO_REVOKED:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 409, "key is revoked"
+                )
+                return
+            try:
+                if isinstance(material, NativeUnwrap):
+                    with provider_mod.provider_call():
+                        data_key = envelope.unwrap_data_key_native(
+                            provider=material.provider,
+                            handle=material.handle,
+                            wrapped_key=wrapped_key,
+                            wrap_nonce=wrap_nonce,
+                        )
+                else:
+                    data_key = envelope.unwrap_data_key(
+                        bound_ver.algorithm, material,
+                        wrapped_key, wrap_nonce,
+                    )
+            except ProviderInvalidMaterial:
+                # An authentication failure is a rejected business attempt
+                # (like a tampered decrypt envelope): a 400 naming
+                # wrapped_key with one unwrap_key/rejected event carrying
+                # key_id. A malformed-shape request was already refused as a
+                # parameter 400 above, before any provider contact.
+                self._reject_crypto(
+                    tenant_id, key_id, action, 400,
+                    "field wrapped_key is tampered or cannot be authenticated",
+                )
+                return
+            except envelope.EnvelopeError as exc:
+                # The export path authenticates against an already-resolved,
+                # validated KEK, so an EnvelopeError here is an authentication
+                # failure: same rejected 400 naming wrapped_key.
+                self._reject_crypto(
+                    tenant_id, key_id, action, 400, str(exc)
+                )
+                return
+            # A ProviderUnavailable (backend fault/contract/gate timeout)
+            # propagates to do_POST's fixed 503 with no audit. The recovered
+            # data key is returned only in this success body.
+            if not self._record_attempt(
+                tenant_id, key_id, action, audit_mod.OUTCOME_SUCCESS
+            ):
+                return
+            self._send_json(
+                200, {"data_key": envelope.b64_encode(data_key)}
             )
 
         def _rewrap_key(self, key_id: str, parts, operator: str) -> None:

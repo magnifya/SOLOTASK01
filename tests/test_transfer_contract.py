@@ -186,21 +186,28 @@ def test_local_transfer_roundtrip(tmp_path):
     # An inbound blob a peer sealed FOR local (source "peer", target local).
     inbound = p._transfer_seal(data, "peer", "local", "AES256", None, raw)
     out = local.transfer_in("peer", inbound)
-    # The built-in local provider returns the same named triple its other
-    # operations yield; its (handle, public_key, material) fields are all set.
-    assert isinstance(out, p.MaterialTriple)
-    assert out.public_key is None and out.handle and out.encrypted_material
+    # The built-in local provider returns the externally visible triple as a
+    # dict with the fixed key order handle, public_key, encrypted_material.
+    assert isinstance(out, dict)
+    assert list(out.keys()) == [
+        "handle", "public_key", "encrypted_material"
+    ]
+    assert out["public_key"] is None
+    assert out["handle"] and out["encrypted_material"]
 
 
 def test_safe_provider_transfer_in_fixed_key_order():
-    # An external provider's dict must arrive with the exact fixed order
-    # handle, public_key, encrypted_material (the _Stub already does).
+    # An external provider's dict must arrive (and be re-emitted) with the
+    # exact fixed order handle, public_key, encrypted_material.
     safe = p._SafeProvider(_Stub(_ops("transfer_out", "transfer_in")))
     triple = safe.transfer_in("peer", b"x")
-    assert isinstance(triple, p.MaterialTriple)
-    assert triple.handle == "h"
-    assert triple.public_key is None
-    assert triple.encrypted_material == "m"
+    assert isinstance(triple, dict)
+    assert list(triple.keys()) == [
+        "handle", "public_key", "encrypted_material"
+    ]
+    assert triple["handle"] == "h"
+    assert triple["public_key"] is None
+    assert triple["encrypted_material"] == "m"
 
 
 def test_transfer_blob_is_endpoint_bound(tmp_path):

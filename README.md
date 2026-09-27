@@ -211,6 +211,47 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   故障或结果非 32 字节为固定文案 `503` 且不记审计。未声明者沿用导出 KEK
   在内存中解密的旧路径。私钥、数据密钥只存在于进程内存，绝不进入响应或
   审计。
+- `POST /v1/keys/{key_id}/wrap-key`，**非幂等**（无需
+  `Idempotency-Key`），body 仅 `{tenant_id,version?,data_key}`；`data_key`
+  为标准带填充 base64 且须恰好解码为 32 字节，`version` 缺省为 current
+  （须正整数）。把调用方自带的数据密钥用该版本的 KEK 包装：版本的绑定提
+  供者声明可选 `wrap_key` 时走 KMS/HSM 原生路径——服务在五秒总门限内调用
+  绑定提供者的 `wrap_key(handle, data_key)`，绝不调用 `export_material`、
+  不加载 KEK 私钥；未声明者沿用导出 KEK 在内存中包装。`200` 键序固定
+  `key_id,version,algorithm,wrapped_key,wrap_nonce`：AES256 的
+  wrapped_key 为 48 字节、wrap_nonce 为 12 字节，RSA2048 的 wrapped_key 为
+  256 字节、wrap_nonce 为 null（字节字段均为带填充 base64）。正文结构/
+  键集、UUID4 key_id、正整数 version、base64/长度非法均在授权前 `400` 指
+  出具体字段且**不记账**（仅 tenant 来源缺失/冲突照旧记
+  `tenant_conflict`）；策略动作新增 `wrap_key`，拒权 `403`，未知/跨租户
+  key/版本 `404`，吊销 key/版本 `409`——业务拒绝记一条带 key_id 的
+  `wrap_key/rejected`；成功记 `wrap_key/success`（带 key_id）。提供者故
+  障/契约不符/门限超时固定 `503`（文案固定 `key management provider is
+  unavailable`）且不记审计；账本失败 `500`。无 CLI。数据密钥只驻留内存，
+  绝不落盘、不入审计或错误；包装材料只在成功响应中返回。
+- `POST /v1/keys/{key_id}/unwrap-key`，**非幂等**（无需
+  `Idempotency-Key`），body 仅
+  `{tenant_id,version?,wrapped_key,wrap_nonce?}`；字节字段为标准带填充
+  base64，`version` 缺省为 current（须正整数）。包装字段须符合该版本算法
+  约束：AES256 的 wrapped_key 为 48 字节、wrap_nonce 为 12 字节，RSA2048
+  的 wrapped_key 为 256 字节、wrap_nonce 必须缺省或 null。用该版本 KEK
+  解包数据密钥：绑定提供者声明可选 `unwrap_key` 时走 KMS/HSM 原生路径
+  ——在五秒门限内调用 `unwrap_key(handle, wrapped_key, wrap_nonce)`，绝
+  不调用 `export_material`，KEK 私钥不进入服务进程；未声明者沿用导出 KEK
+  在内存中解包。`200` 仅返 `{data_key}`（带填充 base64 的 32 字节，这是
+  唯一允许在成功体中返回数据密钥的端点）。正文结构/键集、UUID4、正整数
+  version、base64 非法，以及包装字段形状非法（形状自描述：48 字节 wrapped
+  +12 字节 nonce 即 AES256，256 字节 wrapped+null nonce 即 RSA2048，其它任
+  何组合皆非法）均在授权前 `400` 指出具体字段且**不记账**（仅 tenant 来源
+  缺失/冲突照旧记 `tenant_conflict`）；形状合法但与所解析版本算法不符，为
+  授权后的 `400`（不记账，同 rewrap 的算法不符）。包装密钥**认证失败**为
+  授权后的 `400` 指明 `wrapped_key`，并记一条带 key_id 的
+  `unwrap_key/rejected`（同 decrypt 的认证失败语义）。策略动作新增
+  `unwrap_key`，拒权 `403`，未知/跨租户 key/版本 `404`，吊销 `409`
+  ——业务拒绝记一条带 key_id 的 `unwrap_key/rejected`；成功记
+  `unwrap_key/success`（带 key_id）。提供者故障/契约不符（含结果非 32
+  字节）/门限超时固定 `503` 且不记审计；账本失败 `500`。无 CLI。数据密钥
+  绝不落盘、不入审计或错误，仅可在解包成功体中返回。
 - `POST /v1/keys/{key_id}/rewrap`，**非幂等**（无需
   `Idempotency-Key`），body 仅
   `{tenant_id, envelope, target_version?, aad?}`；`envelope`、`aad` 为
@@ -465,7 +506,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 - 规则元素 `{subject, actions, effect}`：`subject` 为区分大小写的非空字符串；
   `actions` 为非空数组，取值
   `create/read/rotate/revoke/revoke_version/import/export/migrate/encrypt/decrypt/
-  rewrap/sign/verify/audit/list`，单条内重复去重；`effect` 为 `allow`/`deny`；未知字段、类型错误、同
+  rewrap/wrap_key/unwrap_key/sign/verify/audit/list`，单条内重复去重；`effect` 为 `allow`/`deny`；未知字段、类型错误、同
   subject+effect+无序动作集的重复规则均 `400`；`rules:[]` 合法（全拒绝）。
 - 执行：管理动作 policy_* 免检；租户无策略时全部允许；有策略时匹配规则中
   deny 优先于 allow，无匹配则拒绝 → `403`，并记一条原动作名、
@@ -476,7 +517,8 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 
 - 事件字段 `{event_id, tenant_id, action, key_id, outcome, timestamp}`；
   `action` 为 `create/read/rotate/batch_rotate/revoke/revoke_version/import/export/
-  migrate/encrypt/decrypt/rewrap/sign/verify/audit/list/tenant_conflict/
+  migrate/encrypt/decrypt/rewrap/wrap_key/unwrap_key/sign/verify/audit/list/
+  tenant_conflict/
   policy_read/policy_update/policy_delete`，`outcome` 为 `success/rejected`。
   版本级吊销只记一条 `revoke_version/success`（首次吊销随 outbox 提交；重复/
   并发吊销保留首次值且不写第二条事件），403/404/409 业务拒绝记同名 rejected，
@@ -486,7 +528,13 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `sign`/`verify` 的 success、业务拒绝记同名 rejected，均携带当时 key_id；
   重包装成功记 `rewrap/success`、拒权/业务拒绝记 `rewrap/rejected`，均带
   key_id，正文 `400`（含算法不符与认证失败）与提供者故障的 `503` 都不记账；
-  sign 的正文 `400` 与提供者故障 `503` 同样不记账。幂等 HTTP encrypt
+  sign 的正文 `400` 与提供者故障 `503` 同样不记账。DEK 包装/解包成功分别记
+  `wrap_key/success`、`unwrap_key/success`，拒权（403）/未知跨租户（404）/
+  吊销（409）记同名 `wrap_key/rejected`、`unwrap_key/rejected`，均带 key_id；
+  两者的正文/键集/UUID4/正整数 version/base64/长度 `400` 一律不记账，提供者
+  故障/门限超时的 `503` 也不记账；解包的包装密钥**认证失败**为授权后的 `400`
+  指明 wrapped_key，并记一条带 key_id 的 `unwrap_key/rejected`（同 decrypt 认
+  证失败）；事件只含元数据，数据密钥绝不入审计。幂等 HTTP encrypt
   每个终态至多一条 `event_id=operation_id,action=encrypt` 事件（成功 200 与
   绑定后拒绝都随操作重放，绝不重复记账），非幂等 CLI/decrypt 每次请求各记一
   条；策略拒绝写一条对应 `encrypt`/`decrypt` 的 rejected 事件（携带 key_id），

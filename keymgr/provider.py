@@ -918,7 +918,7 @@ class _SafeProvider:
             )
         return result
 
-    def transfer_in(self, source_provider_id: str, blob: bytes) -> MaterialTriple:
+    def transfer_in(self, source_provider_id: str, blob: bytes) -> dict:
         """Direct migration import half, with the error contract enforced.
 
         Only invoked for the declared pair. A non-``str``
@@ -930,7 +930,9 @@ class _SafeProvider:
         non-empty string, ``public_key`` null or a string (the migrate layer
         additionally requires it to equal the version's recorded public
         key) -- anything else is a contract failure surfaced as
-        :class:`ProviderUnavailable`, never a 400.
+        :class:`ProviderUnavailable`, never a 400. On success the triple is
+        returned as a ``dict`` with that fixed key order (never a tuple or
+        named tuple).
         """
         if not isinstance(source_provider_id, str):
             raise TypeError(
@@ -980,9 +982,11 @@ class _SafeProvider:
             raise ProviderUnavailable(
                 "provider returned an invalid public_key from transfer_in"
             )
-        return MaterialTriple(
-            handle=handle, public_key=public_key, encrypted_material=material
-        )
+        return {
+            "handle": handle,
+            "public_key": public_key,
+            "encrypted_material": material,
+        }
 
     def health(self) -> bool:
         """Optional readiness probe normalized to a bool.
@@ -1878,19 +1882,19 @@ class LocalProvider(KeyProvider):
             raw,
         )
 
-    def transfer_in(self, source_provider_id: str, blob: bytes) -> MaterialTriple:
+    def transfer_in(self, source_provider_id: str, blob: bytes) -> dict:
         """Open a peer's transfer blob and adopt its key under THIS provider.
 
         The blob is authenticated (GCM tag plus AAD binding the source id,
-        the local provider id and the algorithm) INSIDE the provider; only the
-        fixed triple (a :class:`MaterialTriple`, the same shape the other local
-        operations return -- an external provider's dict triple is normalized
-        by :class:`_SafeProvider`) is returned, never the raw material. A
-        non-``str``/empty ``source_provider_id`` is a ``TypeError``/
-        ``ValueError`` and a non-``bytes``/empty ``blob`` a ``TypeError``/
-        ``ValueError``; an unknown peer, a blob that does not authenticate or
-        whose material does not fit the algorithm, and any backend fault are
-        :class:`ProviderUnavailable`.
+        the local provider id and the algorithm) INSIDE the provider; only a
+        fixed-order dict ``{"handle", "public_key", "encrypted_material"}``
+        (the externally visible triple shape -- an external provider's dict is
+        normalized by :class:`_SafeProvider`) is returned, never the raw
+        material. A non-``str``/empty ``source_provider_id`` is a
+        ``TypeError``/``ValueError`` and a non-``bytes``/empty ``blob`` a
+        ``TypeError``/``ValueError``; an unknown peer, a blob that does not
+        authenticate or whose material does not fit the algorithm, and any
+        backend fault are :class:`ProviderUnavailable`.
         """
         if not isinstance(source_provider_id, str):
             raise TypeError(
@@ -1908,10 +1912,14 @@ class LocalProvider(KeyProvider):
         algorithm, public_key, raw = _transfer_open(
             self._data_dir, blob, source_provider_id, LOCAL_PROVIDER_ID
         )
-        # The key order of the externally visible dict is handle, public_key,
-        # encrypted_material; internally the local provider returns the same
-        # MaterialTriple named tuple its other operations return.
-        return self._adopt(algorithm, public_key, raw)
+        triple = self._adopt(algorithm, public_key, raw)
+        # The externally visible result is a dict with the fixed key order
+        # handle, public_key, encrypted_material (never a MaterialTriple).
+        return {
+            "handle": triple.handle,
+            "public_key": triple.public_key,
+            "encrypted_material": triple.encrypted_material,
+        }
 
 
 # -- module:factory loading -------------------------------------------------

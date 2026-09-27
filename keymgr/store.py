@@ -1165,6 +1165,8 @@ class KeyStore:
                 audit_mod.ACTION_ENCRYPT,
                 audit_mod.ACTION_DECRYPT,
                 audit_mod.ACTION_REWRAP,
+                audit_mod.ACTION_WRAP_KEY,
+                audit_mod.ACTION_UNWRAP_KEY,
                 audit_mod.ACTION_SIGN,
                 audit_mod.ACTION_VERIFY,
                 audit_mod.ACTION_AUDIT,
@@ -2461,7 +2463,20 @@ class KeyStore:
                         blob = None
                         try:
                             blob = source.transfer_out(ver.handle, target_id)
-                            triple = ready.transfer_in(ver.provider_id, blob)
+                            # transfer_in returns a fixed-key-order dict;
+                            # normalize it at the boundary to the same
+                            # MaterialTriple shape import_material yields so the
+                            # provision/commit code below is path-independent.
+                            transferred = ready.transfer_in(
+                                ver.provider_id, blob
+                            )
+                            triple = provider_mod.MaterialTriple(
+                                handle=transferred["handle"],
+                                public_key=transferred["public_key"],
+                                encrypted_material=(
+                                    transferred["encrypted_material"]
+                                ),
+                            )
                         except Exception as exc:
                             # Unknown handle/peer, a backend fault, an
                             # authentication/algorithm/public-key mismatch, an
@@ -4170,6 +4185,51 @@ class KeyStore:
             exported = provider.export_material(ver.handle)
             kek = self._kek_for_version(ver, exported.encrypted_material)
             return self.CRYPTO_OK, record, ver, kek
+
+    # Outcomes of a provider-free crypto version resolution: OK / not found /
+    # revoked (same semantics as CRYPTO_*).
+    VERSION_OK = "ok"
+    VERSION_NOT_FOUND = "not_found"
+    VERSION_REVOKED = "revoked"
+
+    def crypto_version(
+        self,
+        key_id: str,
+        tenant_id: str,
+        version: Optional[int] = None,
+    ) -> tuple:
+        """Resolve a usable version for a data-key wrap/unwrap, no provider.
+
+        Returns ``(status, ver)`` with the same not-found/revoked semantics as
+        :meth:`crypto_material`: an unknown key, a foreign tenant and an
+        unknown version are indistinguishable VERSION_NOT_FOUND results, and
+        a revoked whole key or a revoked version is VERSION_REVOKED. The read
+        runs under the per-key locks over the committed projection and adopts
+        a raw legacy record exactly like export, but deliberately opens NO
+        provider session and contacts/probes no KMS/HSM, so the 404/409
+        answers of the wrap-key/unwrap-key endpoints are reachable even while
+        a provider is down. The caller then resolves the bound provider and
+        the KEK/native pair inside its own five-second provider-call gate.
+        """
+        if not is_valid_key_id(key_id):
+            return self.VERSION_NOT_FOUND, None
+        path = self._path_for(key_id)
+        with self.key_locks(key_id):
+            on_disk = self._read_record(path)
+            if on_disk is None or on_disk.tenant_id != tenant_id:
+                return self.VERSION_NOT_FOUND, None
+            record = self._committed_record(on_disk)
+            if record is None:
+                return self.VERSION_NOT_FOUND, None
+            self._take_over_legacy(record)
+            if record.status == "revoked":
+                return self.VERSION_REVOKED, None
+            ver = record.current if version is None else record.get_version(version)
+            if ver is None:
+                return self.VERSION_NOT_FOUND, None
+            if ver.is_revoked:
+                return self.VERSION_REVOKED, ver
+            return self.VERSION_OK, ver
 
     # Outcomes of rewrap_versions, which resolves two versions of one key in
     # a single locked read: OK / not found / revoked (same semantics as

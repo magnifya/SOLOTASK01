@@ -46,6 +46,8 @@ POLICY_ACTIONS = (
     "encrypt",
     "decrypt",
     "rewrap",
+    "wrap_key",
+    "unwrap_key",
     "sign",
     "verify",
     "audit",
