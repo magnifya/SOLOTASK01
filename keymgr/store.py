@@ -24,9 +24,11 @@ from .artifacts import PHASE_COMMITTED, PHASE_ROLLED_BACK, PHASE_STAGED
 from .audit import AuditEvent, AuditLog, InvalidCursor, LedgerError
 from .provider import (
     LOCAL_PROVIDER_ID,
+    ProviderError,
     ProviderIdentityMismatch,
     ProviderInvalidMaterial,
     ProviderReconnectPending,
+    ProviderTransferFailed,
     ProviderUnavailable,
 )
 
@@ -470,6 +472,50 @@ class NativeRewrap(NamedTuple):
     provider: object
     source_handle: str
     target_handle: str
+
+
+def _require_transfer_triple(transferred, ver) -> "provider_mod.MaterialTriple":
+    """Validate a ``transfer_in`` result against the migrated version.
+
+    The provider layer already enforces the contract on external providers;
+    this is the service-side belt: the result must carry a non-empty string
+    handle and encrypted_material, a null or string public_key, and a
+    public_key equal to the version's recorded one (None for AES256, the
+    PEM for RSA2048). Anything else is corrupted backend state on the
+    transfer path -- a :class:`ProviderTransferFailed` (the fixed 503 with
+    no audit event), never a field-level error.
+    """
+    handle = (
+        transferred.get("handle") if isinstance(transferred, dict)
+        else None
+    )
+    material = (
+        transferred.get("encrypted_material")
+        if isinstance(transferred, dict)
+        else None
+    )
+    public_key = (
+        transferred.get("public_key") if isinstance(transferred, dict) else None
+    )
+    if not isinstance(handle, str) or not handle:
+        raise ProviderTransferFailed(
+            "provider returned an empty handle from transfer_in"
+        )
+    if not isinstance(material, str) or not material:
+        raise ProviderTransferFailed(
+            "provider returned empty encrypted_material from transfer_in"
+        )
+    if public_key is not None and not isinstance(public_key, str):
+        raise ProviderTransferFailed(
+            "provider returned an invalid public_key from transfer_in"
+        )
+    if public_key != ver.public_key:
+        raise ProviderTransferFailed(
+            "transferred public key does not match the record"
+        )
+    return provider_mod.MaterialTriple(
+        handle=handle, public_key=public_key, encrypted_material=material
+    )
 
 
 class KeyStore:
@@ -2339,6 +2385,14 @@ class KeyStore:
         ``(provider_id, handle, encrypted_material)`` triples change. Raw key
         material exists only between the source export and the target import
         and is never persisted, audited or returned.
+
+        A version whose owning provider AND the ready target both declare
+        the ``transfer_out``/``transfer_in`` operations moves by native
+        ciphertext transfer instead: the material crosses as an opaque
+        sealed blob, ``export_material`` is never called and plaintext never
+        enters the service. A transfer failure raises
+        :class:`ProviderTransferFailed` -- the same fixed 503, but the
+        failed attempt records no audit event.
         """
         if not is_valid_key_id(key_id):
             return None
@@ -2350,6 +2404,7 @@ class KeyStore:
             self._ensure_settled(record)
             ready = provider_mod.get_provider()
             target_id = ready.provider_id
+            transfer_ready = provider_mod.declares_transfer(ready)
             moving = [
                 ver for ver in record.versions
                 if ver.provider_id != target_id
@@ -2397,27 +2452,52 @@ class KeyStore:
                         raise ArtifactStrandUnavailable(str(exc), 500)
                 for ver in moving:
                     source = peer_for(ver.provider_id)
-                    exported = source.export_material(ver.handle)
-                    # The exported public part must agree with the recorded
-                    # one (None for AES256, the PEM for RSA2048); a
-                    # disagreement is corrupted backend state, a 503 rather
-                    # than a field-level 400.
-                    if exported.public_key != ver.public_key:
-                        raise ProviderUnavailable(
-                            "exported public key does not match the record"
-                        )
-                    try:
-                        triple = ready.import_material(
-                            ver.algorithm,
-                            ver.public_key,
-                            exported.encrypted_material,
-                        )
-                    except ProviderInvalidMaterial as exc:
-                        # Material that does not fit the target algorithm is a
-                        # provider failure for a migrate (503), never a 400.
-                        raise ProviderUnavailable(
-                            "migrated material does not match the key algorithm"
-                        ) from exc
+                    if transfer_ready and provider_mod.declares_transfer(
+                        source
+                    ):
+                        # Native ciphertext transfer: the version's material
+                        # crosses as an opaque sealed blob -- export_material
+                        # is never called and plaintext never enters the
+                        # service. The blob lives only in this frame and is
+                        # never persisted. Any transfer failure is the fixed
+                        # 503 with no audit event (ProviderTransferFailed);
+                        # a gate timeout stays the pending-retry signal.
+                        try:
+                            blob = source.transfer_out(ver.handle, target_id)
+                            transferred = ready.transfer_in(
+                                ver.provider_id, blob
+                            )
+                        except ProviderReconnectPending:
+                            raise
+                        except ProviderError as exc:
+                            raise ProviderTransferFailed(
+                                "ciphertext transfer between providers failed"
+                            ) from exc
+                        triple = _require_transfer_triple(transferred, ver)
+                    else:
+                        exported = source.export_material(ver.handle)
+                        # The exported public part must agree with the recorded
+                        # one (None for AES256, the PEM for RSA2048); a
+                        # disagreement is corrupted backend state, a 503 rather
+                        # than a field-level 400.
+                        if exported.public_key != ver.public_key:
+                            raise ProviderUnavailable(
+                                "exported public key does not match the record"
+                            )
+                        try:
+                            triple = ready.import_material(
+                                ver.algorithm,
+                                ver.public_key,
+                                exported.encrypted_material,
+                            )
+                        except ProviderInvalidMaterial as exc:
+                            # Material that does not fit the target
+                            # algorithm is a provider failure for a migrate
+                            # (503), never a 400.
+                            raise ProviderUnavailable(
+                                "migrated material does not match the key "
+                                "algorithm"
+                            ) from exc
                     try:
                         self._append_provision(
                             journal_path, target_id, triple.handle
@@ -2489,7 +2569,14 @@ class KeyStore:
                     cleaned = False
                 if not cleaned:
                     # Keep the migration snapshot: startup rollback restores
-                    # the old record and reaps every new handle.
+                    # the old record and reaps every new handle. A failed
+                    # ciphertext transfer keeps its no-audit flavor.
+                    if isinstance(exc, ProviderTransferFailed):
+                        raise ProviderTransferFailed(
+                            "could not delete a handle provisioned by a "
+                            "failed migration; cleanup will be retried at "
+                            "startup"
+                        ) from exc
                     raise ProviderUnavailable(
                         "could not delete a handle provisioned by a failed "
                         "migration; cleanup will be retried at startup"

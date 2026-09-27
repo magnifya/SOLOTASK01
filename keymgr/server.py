@@ -27,6 +27,7 @@ from .provider import (
     ProviderInvalidMaterial,
     ProviderReconnectPending,
     ProviderSwitchoverInvalid,
+    ProviderTransferFailed,
     ProviderUnavailable,
 )
 from .store import (
@@ -1747,6 +1748,17 @@ def make_handler(
                         operation, tenant_id, key_id,
                         audit_mod.ACTION_MIGRATE, 409,
                         "key is already managed by the ready provider",
+                    )
+                except ProviderTransferFailed:
+                    # The native ciphertext-transfer path failed: the store
+                    # already deleted every new handle and kept the old
+                    # record (an unconfirmed delete leaves its artifact for
+                    # the startup sweep). The terminal is the fixed 503 with
+                    # NO audit event; the operation finishes failed and
+                    # replays this exact body.
+                    return (
+                        503,
+                        {"error": "key management provider is unavailable"},
                     )
                 except LockTimeout:
                     # A contended key waits past the five-second budget: the

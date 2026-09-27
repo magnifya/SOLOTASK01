@@ -167,6 +167,40 @@ is the fixed 503 (no audit event). Anything else keeps the export-based
 rewrap path. The built-in local provider declares and implements
 ``rewrap_key``.
 
+Native ciphertext transfer (optional)
+-------------------------------------
+``capabilities["operations"]`` MAY additionally list ``"transfer_out"`` and
+``"transfer_in"`` -- always together: declaring exactly one of them (or
+declaring one without a callable method) fails the contract. Declaring both
+makes ``transfer_out(handle: str, target_provider_id: str) -> bytes`` and
+``transfer_in(source_provider_id: str, blob: bytes) -> dict`` contractual.
+``transfer_out`` seals the handle's key material into an opaque transfer
+blob addressed to the named target provider and returns it; the raw
+material never crosses the boundary unwrapped. ``transfer_in`` opens a blob
+produced by the named source provider, adopts the material and returns
+``{"handle", "public_key", "encrypted_material"}`` with exactly that key
+order -- the same triple shape as ``import_material``. For both methods a
+string argument that is not a string raises ``TypeError`` and an empty
+string raises ``ValueError``; a ``blob`` that is not bytes raises
+``TypeError`` and an empty blob raises ``ValueError``. An unknown handle or
+peer and any backend failure raise :class:`ProviderUnavailable`; an
+authentication, algorithm or public-key mismatch raises
+:class:`ProviderInvalidMaterial`. A successful ``transfer_out`` MUST return
+non-empty bytes; a successful ``transfer_in`` MUST return the fixed-order
+triple with a non-empty string handle and encrypted_material and a null or
+string public_key -- anything else is a contract failure treated as
+:class:`ProviderUnavailable`. When a migrated version's owning provider AND
+the ready target both declare the transfer operations, the service's
+migrate path moves that version through ``transfer_out``/``transfer_in``
+inside the ordinary five-second provider-call gate, never calls
+``export_material`` and never lets plaintext key material or the transfer
+blob touch the disk; a transfer failure is the fixed 503 and records no
+audit event. Any other version keeps the export/import path. The built-in
+local provider declares and implements both operations, sealing blobs as
+``ktr1.`` AES-256-GCM under a key derived from the target provider id (the
+shared :func:`seal_transfer_blob`/:func:`open_transfer_blob` format, so
+independent providers can interoperate).
+
 The factory named by ``KEYMGR_PROVIDER=module:factory`` is imported lazily on
 first use and called with no arguments. A missing module/factory, a factory
 raising, or a returned object failing the contract all raise
@@ -176,6 +210,7 @@ never falls back to the local provider.
 
 import base64
 import errno
+import hashlib
 import importlib
 import json
 import os
@@ -234,6 +269,14 @@ OP_WRAP_KEY = "wrap_key"
 #: ``rewrap_key(src, dst, envelope)``; it is never part of the required
 #: five.
 OP_REWRAP_KEY = "rewrap_key"
+#: Optional operation pair: KMS/HSM-native ciphertext transfer of a key
+#: between providers. A provider lists ``transfer_out`` and ``transfer_in``
+#: in ``capabilities["operations"]`` only together and only when it
+#: implements ``transfer_out(handle, target_provider_id)`` and
+#: ``transfer_in(source_provider_id, blob)``; declaring exactly one of them
+#: fails the contract. They are never part of the required five.
+OP_TRANSFER_OUT = "transfer_out"
+OP_TRANSFER_IN = "transfer_in"
 
 _DEK_NAME = "local.dek"
 _REGISTRY_NAME = "local-registry.json"
@@ -276,6 +319,18 @@ class ProviderInvalidMaterial(ProviderError):
     """
 
 
+class ProviderTransferFailed(ProviderUnavailable):
+    """A migrate's native ciphertext-transfer step failed.
+
+    A specialization of :class:`ProviderUnavailable` raised only by the
+    whole-key migrate when the ``transfer_out``/``transfer_in`` path was
+    used: the service answers the same fixed ``503`` as any provider fault
+    but records NO audit event for the failed attempt (the operation still
+    terminates failed and replays the stored 503 verbatim). The message is
+    logged server-side only; it never carries a handle, a blob or material.
+    """
+
+
 class ProviderSwitchoverInvalid(ProviderError):
     """A switchover request names no usable chain target.
 
@@ -307,6 +362,95 @@ def _b64e(raw: bytes) -> str:
 
 def _b64d(text: str) -> bytes:
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+#: Prefix for a sealed ciphertext-transfer blob; never reused for another
+#: encoding so transfer blobs are self-describing in transit.
+_TRANSFER_BLOB_PREFIX = "ktr1."
+
+
+def _transfer_kek(peer_provider_id: str) -> bytes:
+    """Derive the transfer wrap key a provider pair shares for one direction.
+
+    The key is bound to the TARGET provider id, so a blob sealed for one
+    provider cannot be authenticated by another (a wrong peer is an
+    authentication failure, not a misdelivery).
+    """
+    return hashlib.sha256(
+        b"keymgr-transfer-v1\x00" + peer_provider_id.encode("utf-8")
+    ).digest()
+
+
+def seal_transfer_blob(
+    target_provider_id: str,
+    algorithm: str,
+    public_key: Optional[str],
+    material: str,
+) -> bytes:
+    """Seal raw key material into an opaque ``ktr1.`` transfer blob.
+
+    The payload (algorithm, public key and raw material) is wrapped with
+    AES-256-GCM under the key derived from ``target_provider_id``; only the
+    addressed provider can authenticate and open the blob. The blob exists
+    only in memory between ``transfer_out`` and ``transfer_in`` and is never
+    persisted by the service.
+    """
+    payload = json.dumps(
+        {
+            "algorithm": algorithm,
+            "public_key": public_key,
+            "material": material,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    nonce = os.urandom(_NONCE_LEN)
+    sealed = AESGCM(_transfer_kek(target_provider_id)).encrypt(
+        nonce, payload, None
+    )
+    return (
+        _TRANSFER_BLOB_PREFIX + _b64e(nonce) + "." + _b64e(sealed)
+    ).encode("ascii")
+
+
+def open_transfer_blob(own_provider_id: str, blob: bytes):
+    """Open a ``ktr1.`` transfer blob addressed to ``own_provider_id``.
+
+    Returns ``(algorithm, public_key, material)``. Any structural or
+    authentication failure -- a malformed blob, a tampered payload or a blob
+    sealed for a different provider -- raises
+    :class:`ProviderInvalidMaterial`; the blob's algorithm must be a
+    supported one and its material a non-empty string.
+    """
+    try:
+        text = blob.decode("ascii")
+        if not text.startswith(_TRANSFER_BLOB_PREFIX):
+            raise ValueError("bad prefix")
+        nonce_b, sealed_b = text[len(_TRANSFER_BLOB_PREFIX):].split(".", 1)
+        nonce = _b64d(nonce_b)
+        sealed = _b64d(sealed_b)
+        payload = AESGCM(_transfer_kek(own_provider_id)).decrypt(
+            nonce, sealed, None
+        )
+        data = json.loads(payload.decode("utf-8"))
+    except Exception as exc:
+        raise ProviderInvalidMaterial(
+            "transfer blob cannot be authenticated"
+        ) from exc
+    if not isinstance(data, dict):
+        raise ProviderInvalidMaterial("transfer blob cannot be authenticated")
+    algorithm = data.get("algorithm")
+    public_key = data.get("public_key")
+    material = data.get("material")
+    if (
+        algorithm not in SUPPORTED_ALGORITHMS
+        or not isinstance(material, str)
+        or not material
+        or (public_key is not None and not isinstance(public_key, str))
+    ):
+        raise ProviderInvalidMaterial(
+            "transfer blob does not match a supported algorithm"
+        )
+    return algorithm, public_key, material
 
 
 def _require_triple(result, operation: str) -> MaterialTriple:
@@ -435,6 +579,40 @@ class KeyProvider:
         """
         raise NotImplementedError
 
+    def transfer_out(self, handle: str, target_provider_id: str) -> bytes:
+        """Optional KMS/HSM-native ciphertext export for a migration.
+
+        Contractual only when ``capabilities["operations"]`` declares
+        ``transfer_out`` (which requires declaring ``transfer_in`` too);
+        then this MUST be implemented: ``handle`` and
+        ``target_provider_id`` must be strings (``TypeError`` otherwise) and
+        non-empty (``ValueError`` otherwise), an unknown handle or peer and
+        any backend failure raise :class:`ProviderUnavailable`, and a
+        success returns the handle's key material sealed as a non-empty
+        opaque transfer blob addressed to the named target provider. Raw
+        material never crosses the boundary unwrapped.
+        """
+        raise NotImplementedError
+
+    def transfer_in(self, source_provider_id: str, blob: bytes) -> dict:
+        """Optional KMS/HSM-native ciphertext import for a migration.
+
+        Contractual only when ``capabilities["operations"]`` declares
+        ``transfer_in`` (which requires declaring ``transfer_out`` too);
+        then this MUST be implemented: ``source_provider_id`` must be a
+        string (``TypeError`` otherwise) and non-empty (``ValueError``
+        otherwise), ``blob`` must be bytes (``TypeError`` otherwise) and
+        non-empty (``ValueError`` otherwise), an unknown peer and any
+        backend failure raise :class:`ProviderUnavailable`, an
+        authentication, algorithm or public-key mismatch raises
+        :class:`ProviderInvalidMaterial`, and a success returns
+        ``{"handle", "public_key", "encrypted_material"}`` with exactly that
+        key order -- a non-empty string handle and encrypted_material and a
+        null or string public_key matching the transferred key. Raw material
+        never crosses the boundary unwrapped.
+        """
+        raise NotImplementedError
+
     def health(self) -> bool:
         """Optional KMS/HSM readiness probe.
 
@@ -525,6 +703,31 @@ def _validate_external(obj) -> None:
             "provider %r declares the rewrap_key operation without a "
             "callable rewrap_key() method" % provider_id
         )
+    # ``transfer_out``/``transfer_in`` are optional but atomic: a provider
+    # declares both or neither, and declaring makes both methods
+    # contractual. Declaring exactly one -- or one without a callable
+    # method -- fails the contract.
+    transfer_declared = [
+        op for op in (OP_TRANSFER_OUT, OP_TRANSFER_IN) if op in operations
+    ]
+    if len(transfer_declared) == 1:
+        raise ProviderUnavailable(
+            "provider %r declares %s without %s: ciphertext transfer "
+            "requires both operations"
+            % (
+                provider_id,
+                transfer_declared[0],
+                OP_TRANSFER_IN
+                if transfer_declared[0] == OP_TRANSFER_OUT
+                else OP_TRANSFER_OUT,
+            )
+        )
+    for name in transfer_declared:
+        if not callable(getattr(obj, name, None)):
+            raise ProviderUnavailable(
+                "provider %r declares the %s operation without a callable "
+                "%s() method" % (provider_id, name, name)
+            )
     configure = getattr(obj, "configure", None)
     if configure is not None and not callable(configure):
         raise ProviderUnavailable(
@@ -776,6 +979,117 @@ class _SafeProvider:
             )
         return result
 
+    def transfer_out(self, handle: str, target_provider_id: str) -> bytes:
+        """KMS/HSM-native ciphertext export, with the error contract enforced.
+
+        Only invoked when the provider declared ``transfer_out`` (contract
+        validation guarantees a callable method then). The boundary argument
+        rules are enforced here too, so a provider cannot silently accept a
+        malformed call: a non-string argument is a ``TypeError`` and an
+        empty string a ``ValueError``, exactly as the contract requires of
+        the method itself. ``ValueError``/``TypeError``/
+        :class:`ProviderError` from the provider pass through unchanged; any
+        other exception is a backend fault normalized to
+        :class:`ProviderUnavailable`, and a result that is not non-empty
+        bytes is a contract failure, never passed on.
+        """
+        if not isinstance(handle, str):
+            raise TypeError("transfer_out handle must be a string")
+        if not handle:
+            raise ValueError("transfer_out handle must be non-empty")
+        if not isinstance(target_provider_id, str):
+            raise TypeError("transfer_out target_provider_id must be a string")
+        if not target_provider_id:
+            raise ValueError(
+                "transfer_out target_provider_id must be non-empty"
+            )
+        if not callable(getattr(self._inner, "transfer_out", None)):
+            raise ProviderUnavailable(
+                "provider %r declares transfer_out without a callable "
+                "transfer_out() method" % self.provider_id
+            )
+        try:
+            result = self._inner.transfer_out(handle, target_provider_id)
+        except (ValueError, TypeError, ProviderError):
+            raise
+        except Exception as exc:
+            raise ProviderUnavailable(
+                "provider %r operation transfer_out failed" % self.provider_id
+            ) from exc
+        if not isinstance(result, bytes) or not result:
+            raise ProviderUnavailable(
+                "provider returned a malformed blob from transfer_out"
+            )
+        return result
+
+    def transfer_in(self, source_provider_id: str, blob: bytes) -> dict:
+        """KMS/HSM-native ciphertext import, with the error contract enforced.
+
+        Only invoked when the provider declared ``transfer_in`` (contract
+        validation guarantees a callable method then). The boundary argument
+        rules are enforced here too: a non-string ``source_provider_id`` is
+        a ``TypeError`` and an empty string a ``ValueError``; a non-bytes
+        ``blob`` is a ``TypeError`` and an empty blob a ``ValueError``,
+        exactly as the contract requires of the method itself.
+        ``ValueError``/``TypeError``/:class:`ProviderError` from the
+        provider pass through unchanged (an authentication failure surfaces
+        as :class:`ProviderInvalidMaterial`); any other exception is a
+        backend fault normalized to :class:`ProviderUnavailable`. A result
+        that is not the fixed-order ``handle, public_key,
+        encrypted_material`` triple with a non-empty string handle and
+        encrypted_material and a null or string public_key is a contract
+        failure, never passed on.
+        """
+        if not isinstance(source_provider_id, str):
+            raise TypeError("transfer_in source_provider_id must be a string")
+        if not source_provider_id:
+            raise ValueError("transfer_in source_provider_id must be non-empty")
+        if not isinstance(blob, bytes):
+            raise TypeError("transfer_in blob must be bytes")
+        if not blob:
+            raise ValueError("transfer_in blob must be non-empty")
+        if not callable(getattr(self._inner, "transfer_in", None)):
+            raise ProviderUnavailable(
+                "provider %r declares transfer_in without a callable "
+                "transfer_in() method" % self.provider_id
+            )
+        try:
+            result = self._inner.transfer_in(source_provider_id, blob)
+        except (ValueError, TypeError, ProviderError):
+            raise
+        except Exception as exc:
+            raise ProviderUnavailable(
+                "provider %r operation transfer_in failed" % self.provider_id
+            ) from exc
+        if not isinstance(result, dict) or list(result.keys()) != [
+            "handle",
+            "public_key",
+            "encrypted_material",
+        ]:
+            raise ProviderUnavailable(
+                "provider returned a malformed result from transfer_in"
+            )
+        handle = result["handle"]
+        public_key = result["public_key"]
+        material = result["encrypted_material"]
+        if not isinstance(handle, str) or not handle:
+            raise ProviderUnavailable(
+                "provider returned an empty handle from transfer_in"
+            )
+        if not isinstance(material, str) or not material:
+            raise ProviderUnavailable(
+                "provider returned empty encrypted_material from transfer_in"
+            )
+        if public_key is not None and not isinstance(public_key, str):
+            raise ProviderUnavailable(
+                "provider returned an invalid public_key from transfer_in"
+            )
+        return {
+            "handle": handle,
+            "public_key": public_key,
+            "encrypted_material": material,
+        }
+
     def health(self) -> bool:
         """Optional readiness probe normalized to a bool.
 
@@ -872,6 +1186,25 @@ def declares_rewrap_key(provider) -> bool:
     return OP_REWRAP_KEY in operations
 
 
+def declares_transfer(provider) -> bool:
+    """Whether a bound provider declares the ciphertext-transfer operations.
+
+    Declaration is purely by ``capabilities["operations"]`` containing BOTH
+    ``"transfer_out"`` and ``"transfer_in"``: a declaring external provider
+    was contract-validated to have callable methods for both, and the
+    built-in local provider always declares and implements them. Anything
+    else (including a provider declaring exactly one of the pair, or whose
+    capabilities are not a mapping) keeps the export/import migrate path.
+    """
+    caps = getattr(provider, "capabilities", None)
+    if not isinstance(caps, dict):
+        return False
+    operations = caps.get("operations")
+    if not isinstance(operations, (list, tuple)):
+        return False
+    return OP_TRANSFER_OUT in operations and OP_TRANSFER_IN in operations
+
+
 class LocalProvider(KeyProvider):
     """Built-in software provider.
 
@@ -888,15 +1221,18 @@ class LocalProvider(KeyProvider):
     capabilities = {
         "algorithms": tuple(SUPPORTED_ALGORITHMS),
         # The local provider declares and implements the optional native
-        # ``sign``, ``unwrap_key``, ``wrap_key`` and ``rewrap_key``
-        # operations: signing and native DEK wrapping/unwrapping/rewrapping
-        # happen inside the provider and the unwrapped private key never
-        # crosses the boundary.
+        # ``sign``, ``unwrap_key``, ``wrap_key``, ``rewrap_key`` and
+        # ciphertext-transfer operations: signing, native DEK
+        # wrapping/unwrapping/rewrapping and cross-provider transfers happen
+        # inside the provider and the unwrapped private key never crosses
+        # the boundary.
         "operations": OPERATIONS + (
             OP_SIGN,
             OP_UNWRAP_KEY,
             OP_WRAP_KEY,
             OP_REWRAP_KEY,
+            OP_TRANSFER_OUT,
+            OP_TRANSFER_IN,
         ),
     }
 
@@ -1427,6 +1763,79 @@ class LocalProvider(KeyProvider):
                 "envelope content cannot be authenticated"
             ) from exc
         return self._wrap_dek_material(dst_algorithm, dst_raw, dek)
+
+    # -- native ciphertext transfer -----------------------------------------
+    def transfer_out(self, handle: str, target_provider_id: str) -> bytes:
+        """Seal a registered handle's material into a transfer blob.
+
+        The wrapped material is unwrapped inside the provider and re-sealed
+        as a ``ktr1.`` blob addressed to ``target_provider_id``; only the
+        opaque blob crosses the boundary. A non-string argument is a
+        ``TypeError``, an empty string a ``ValueError``; an unknown handle
+        (or corrupt stored material) is :class:`ProviderUnavailable`.
+        """
+        if not isinstance(handle, str):
+            raise TypeError("transfer_out handle must be a string")
+        if not handle:
+            raise ValueError("transfer_out handle must be non-empty")
+        if not isinstance(target_provider_id, str):
+            raise TypeError("transfer_out target_provider_id must be a string")
+        if not target_provider_id:
+            raise ValueError(
+                "transfer_out target_provider_id must be non-empty"
+            )
+        self._require_configured()
+        with self._lock:
+            meta = self._registry.get(handle)
+            if meta is None:
+                raise ProviderUnavailable("unknown handle")
+            algorithm = meta.get("algorithm")
+            raw = self._unwrap_locked(meta.get("wrapped"))
+        public_key = None
+        if algorithm == "RSA2048":
+            try:
+                private_key = serialization.load_pem_private_key(
+                    raw.encode("utf-8"), password=None
+                )
+            except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
+                raise ProviderUnavailable(
+                    "stored local material is corrupt"
+                ) from exc
+            public_key = self._public_pem(private_key)
+        return seal_transfer_blob(
+            target_provider_id, algorithm, public_key, raw
+        )
+
+    def transfer_in(self, source_provider_id: str, blob: bytes) -> dict:
+        """Adopt material from a transfer blob sealed for this provider.
+
+        The blob is authenticated and opened inside the provider and the
+        material adopted exactly as ``import_material`` would; only the
+        fixed-order ``handle, public_key, encrypted_material`` triple
+        crosses the boundary. A non-string ``source_provider_id`` or a
+        non-bytes ``blob`` is a ``TypeError``; an empty string or empty blob
+        is a ``ValueError``; a blob that fails authentication, names an
+        unsupported algorithm or carries material/public_key that do not
+        match is :class:`ProviderInvalidMaterial`; a backend failure is
+        :class:`ProviderUnavailable`.
+        """
+        if not isinstance(source_provider_id, str):
+            raise TypeError("transfer_in source_provider_id must be a string")
+        if not source_provider_id:
+            raise ValueError("transfer_in source_provider_id must be non-empty")
+        if not isinstance(blob, bytes):
+            raise TypeError("transfer_in blob must be bytes")
+        if not blob:
+            raise ValueError("transfer_in blob must be non-empty")
+        algorithm, public_key, material = open_transfer_blob(
+            self.provider_id, blob
+        )
+        triple = self._adopt(algorithm, public_key, material)
+        return {
+            "handle": triple.handle,
+            "public_key": triple.public_key,
+            "encrypted_material": triple.encrypted_material,
+        }
 
 
 # -- module:factory loading -------------------------------------------------

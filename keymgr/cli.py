@@ -21,6 +21,7 @@ from .provider import (
     ProviderInvalidMaterial,
     ProviderReconnectPending,
     ProviderSwitchoverInvalid,
+    ProviderTransferFailed,
     ProviderUnavailable,
 )
 from .server import _resolve_committed_operation, serve
@@ -1042,6 +1043,15 @@ def _run(argv: Optional[List[str]] = None) -> int:
                     args.tenant_id, args.key_id,
                     audit_mod.ACTION_MIGRATE, 409,
                     "key is already managed by the ready provider",
+                )
+            except ProviderTransferFailed:
+                # The native ciphertext-transfer path failed: new handles
+                # were rolled back and the old record kept. The terminal is
+                # the fixed 503 (CLI exit 1) with NO audit event; the
+                # operation finishes failed and replays this exact body.
+                return (
+                    503,
+                    {"error": "key management provider is unavailable"},
                 )
             except LockTimeout:
                 # The migrate endpoint answers every timeout with the fixed

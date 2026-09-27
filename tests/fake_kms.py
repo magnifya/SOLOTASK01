@@ -30,6 +30,13 @@ Fault injection is driven by a JSON file named by ``FAKE_KMS_FAULTS``:
       "rewrap_not_callable": true,  # declare rewrap_key but break the method
       "rewrap_fail": true,          # rewrap_key() raises a backend fault
       "rewrap_short": true          # rewrap_key() returns a malformed short blob
+      "declare_transfer": true,     # operations gains transfer_out+transfer_in
+      "declare_transfer_out": true, # ...only transfer_out (contract violation)
+      "declare_transfer_in": true,  # ...only transfer_in (contract violation)
+      "transfer_not_callable": true,# declare both but break the methods
+      "transfer_fail": true,        # transfer_out/in raise a backend fault
+      "transfer_short": true        # transfer_out() returns an empty blob /
+                                    # transfer_in() returns a malformed triple
     }
 
 Materials are stored base64-wrapped with a static prefix so nothing here ever
@@ -155,6 +162,11 @@ class FakeKmsProvider:
             # Contract-violation injection: declares "rewrap_key" without a
             # callable method.
             self.rewrap_key = True
+        if _faults().get("transfer_not_callable"):
+            # Contract-violation injection: declares the transfer operations
+            # without callable methods.
+            self.transfer_out = True
+            self.transfer_in = True
 
     @property
     def capabilities(self):
@@ -173,6 +185,12 @@ class FakeKmsProvider:
             operations.append("wrap_key")
         if _faults().get("declare_rewrap_key"):
             operations.append("rewrap_key")
+        if _faults().get("declare_transfer"):
+            operations.extend(["transfer_out", "transfer_in"])
+        if _faults().get("declare_transfer_out"):
+            operations.append("transfer_out")
+        if _faults().get("declare_transfer_in"):
+            operations.append("transfer_in")
         return {
             "algorithms": ["AES256", "RSA2048"],
             "operations": operations,
@@ -493,6 +511,77 @@ class FakeKmsProvider:
             )
             return private_key.public_key().encrypt(dek, oaep), None
         raise RuntimeError("handle is not a supported algorithm")
+
+    def transfer_out(self, handle, target_provider_id):
+        """Optional native ciphertext transfer-out (declared via
+        ``declare_transfer``).
+
+        Implements the provider contract: argument ``TypeError``/
+        ``ValueError`` rules, a non-empty ``ktr1.`` blob sealed for the
+        target provider on success (the shared keymgr.provider blob format),
+        and plain exceptions for an unknown handle or a backend fault (the
+        service normalizes them to ProviderUnavailable).
+        """
+        if not isinstance(handle, str):
+            raise TypeError("transfer_out handle must be a string")
+        if not handle:
+            raise ValueError("transfer_out handle must be non-empty")
+        if not isinstance(target_provider_id, str):
+            raise TypeError("transfer_out target_provider_id must be a string")
+        if not target_provider_id:
+            raise ValueError(
+                "transfer_out target_provider_id must be non-empty"
+            )
+        _check_fault("transfer_out")
+        if _faults().get("transfer_fail"):
+            raise RuntimeError("backend failure in transfer_out")
+        with _lock:
+            state = _load_state()
+            entry = state["handles"].get(handle)
+        if entry is None:
+            raise RuntimeError("unknown handle")
+        if _faults().get("transfer_short"):
+            # Contract-violation injection: an empty transfer blob.
+            return b""
+        from keymgr.provider import seal_transfer_blob
+
+        return seal_transfer_blob(
+            target_provider_id,
+            entry["algorithm"],
+            entry.get("public_key"),
+            _unwrap(entry["material"]),
+        )
+
+    def transfer_in(self, source_provider_id, blob):
+        """Optional native ciphertext transfer-in (declared via
+        ``declare_transfer``).
+
+        Implements the provider contract: argument ``TypeError``/
+        ``ValueError`` rules, ProviderInvalidMaterial on an authentication
+        or algorithm failure, plain exceptions for a backend fault, and the
+        fixed-order ``handle, public_key, encrypted_material`` triple on
+        success.
+        """
+        if not isinstance(source_provider_id, str):
+            raise TypeError("transfer_in source_provider_id must be a string")
+        if not source_provider_id:
+            raise ValueError("transfer_in source_provider_id must be non-empty")
+        if not isinstance(blob, bytes):
+            raise TypeError("transfer_in blob must be bytes")
+        if not blob:
+            raise ValueError("transfer_in blob must be non-empty")
+        _check_fault("transfer_in")
+        if _faults().get("transfer_fail"):
+            raise RuntimeError("backend failure in transfer_in")
+        from keymgr.provider import open_transfer_blob
+
+        algorithm, public_key, material = open_transfer_blob(
+            self.provider_id, blob
+        )
+        if _faults().get("transfer_short"):
+            # Contract-violation injection: a malformed transfer triple.
+            return {"handle": "short"}
+        return self._mint(algorithm, public_key, material)
 
     def delete(self, handle):
         _check_fault("delete")

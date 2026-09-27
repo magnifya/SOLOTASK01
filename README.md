@@ -114,6 +114,17 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   成功重放并由重启清理，崩溃/重试绝不重复迁移或重复记账（每操作至多
   一条 `event_id=operation_id,action=migrate,key_id=K` 事件）。明文
   密钥材料只在导出与导入之间驻留内存，绝不进入响应、审计或错误。
+  版本的所属提供者与 ready 项均声明 `transfer_out`/`transfer_in` 时，
+  该版本改走密文转移：`transfer_out(handle, target_provider_id)` 产出
+  非空 bytes 的转移 blob，`transfer_in(source_provider_id, blob)` 返回
+  键序固定 `handle,public_key,encrypted_material` 的三元组（handle 与
+  encrypted_material 为非空 str，public_key 为 null 或 str 且须等于该
+  版本原值，非法返回一律按提供者不可用处理）；此路径禁止调用
+  `export_material`，失败同样固定 `503` 但不记审计，提交前删除全部新
+  句柄并保留旧记录（删除未确认须留工件待重启清理），成功仅替换提供
+  者三元组并写唯一 migrate 事件，提交后清理失败仍按成功重放 `200`；
+  转移 blob 与明文密钥不得落盘，句柄不得进入响应、审计或错误，仅按
+  既有契约写入密钥文件或恢复工件。
 - `GET /v1/keys/{key_id}/versions/{version}` 与
   `GET /v1/keys/{key_id}/current` →
   `{key_id, version, created_at, algorithm, public_key}`；version 须为正整数。
@@ -598,7 +609,27 @@ python -m keymgr provider reconnect --operator alice
   rewrap 端点在五秒门限内调用绑定提供者的 `rewrap_key`，绝不调用
   `export_material`，DEK、KEK 私钥与明文不进入服务进程（认证失败 400
   指出 envelope，异常/故障固定 503 且不记审计）；否则沿用导出旧路径。
-  本地提供者已实现并声明 `rewrap_key`。另可实现可选 `health()`（无参、返回 `bool`）：缺少视为健康，非
+  本地提供者已实现并声明 `rewrap_key`。`capabilities.operations`
+  还可另含 `transfer_out` 与 `transfer_in`：两者必须同时声明且均有可调
+  用方法，只声明其一或声明而无可调用方法即契约不符。声明即须实现
+  `transfer_out(handle: str, target_provider_id: str) -> bytes` 与
+  `transfer_in(source_provider_id: str, blob: bytes) -> dict`——前者把
+  句柄的密钥材料封装为发给目标提供者的密文转移 blob 并返回非空
+  bytes，后者打开来源提供者的 blob 并按键序固定
+  `handle,public_key,encrypted_material` 返回与 import_material 相同的
+  三元组（handle 与 encrypted_material 为非空 str，public_key 为 null
+  或 str 且等于被转移密钥的原值）；各字符串参数非 str 抛 `TypeError`、
+  空串抛 `ValueError`，blob 非 bytes 抛 `TypeError`、为空抛
+  `ValueError`，未知句柄/对端或后端故障抛 `ProviderUnavailable`，认
+  证、算法或公钥不符抛 `ProviderInvalidMaterial`；返回不符上述形状一
+  律视为提供者不可用。版本的所属提供者与 ready 项双方均声明时，
+  migrate 对该版本走密文转移路径：在五秒门限内调用
+  `transfer_out`/`transfer_in`，绝不调用 `export_material`，明文密钥
+  与转移 blob 不落盘、不进入服务进程持久状态；转移失败固定 `503` 且
+  不记审计；任一方未声明则该版本沿用导出/导入旧路径。本地提供者已实
+  现并声明 `transfer_out`/`transfer_in`（blob 为 `ktr1.` 前缀、以目标
+  provider_id 派生密钥的 AES-256-GCM 密封格式，独立提供者借此互
+  通）。另可实现可选 `health()`（无参、返回 `bool`）：缺少视为健康，非
   `bool`/抛异常视为不可用。普通 provider 调用路径上单次探活至多等 1
   秒（超时按一次失败、迟到结果作废），且一次调用的全部探活/等待共用不
   可重置的 5 秒总预算。模块缺失/工厂失败/契约不符/后端异常一律 `503`
