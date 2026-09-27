@@ -24,6 +24,7 @@ from .artifacts import PHASE_COMMITTED, PHASE_ROLLED_BACK, PHASE_STAGED
 from .audit import AuditEvent, AuditLog, InvalidCursor, LedgerError
 from .provider import (
     LOCAL_PROVIDER_ID,
+    ProviderError,
     ProviderIdentityMismatch,
     ProviderInvalidMaterial,
     ProviderReconnectPending,
@@ -167,6 +168,32 @@ class KeyAlreadyMigrated(Exception):
     Raised by :meth:`KeyStore.migrate` after the idempotency key is bound:
     no provider call is made, no journal/handle/event is written, and the
     caller turns it into the bound conflict terminal.
+    """
+
+
+class MigrationTransferRetry(ProviderReconnectPending):
+    """A direct ciphertext-transfer migrate failed BEFORE its commit point.
+
+    On the ``transfer_out``/``transfer_in`` path every pre-commit failure (an
+    unknown handle/peer, a backend fault, an authentication/algorithm/public
+    key mismatch) is handled like a never-started provider call: the freshly
+    minted handles are deleted, the old record is left authoritative, NO
+    audit event is written and the operation stays PENDING -- a same-key
+    retry (after the scene is clean, or after a restart when a handle delete
+    could not be confirmed) continues under the same operation_id. Like its
+    base class it surfaces as the fixed 503 with the generic provider text.
+    """
+
+
+class MigrationTransferParked(MigrationTransferRetry):
+    """A direct-transfer attempt whose rollback could not be fully confirmed.
+
+    New-handle deletion (or its journal removal) could not be verified, so the
+    migration snapshot, provision journal and mirror are deliberately RETAINED
+    for startup reconciliation. Like :class:`MigrationTransferRetry` the
+    operation stays PENDING behind the fixed 503 with NO audit event, but the
+    request layer must NOT reset the mirror (the surviving evidence is the
+    restart's rollback index).
     """
 
 
@@ -2385,6 +2412,19 @@ class KeyStore:
                     peer_cache[provider_id] = self._migration_peer(provider_id)
                 return peer_cache[provider_id]
 
+            # The material path is decided INSIDE the attempt's try block:
+            # resolving a source peer can itself fail (an entry that cannot be
+            # built or is unhealthy), and that failure keeps the established
+            # legacy 503 semantics. Only once EVERY distinct source peer is
+            # resolved and, together with the ready provider, declares the
+            # transfer_out/transfer_in pair does the whole move take the
+            # direct ciphertext-transfer path; otherwise it uses the legacy
+            # export/import path.
+            target_transfers = provider_mod.declares_transfer_pair(ready)
+            distinct_sources = {ver.provider_id for ver in moving}
+            transfer_path = False
+            source_peers = {}
+
             try:
                 if mirror is not None:
                     try:
@@ -2395,29 +2435,79 @@ class KeyStore:
                         from .artifacts import ArtifactStrandUnavailable
 
                         raise ArtifactStrandUnavailable(str(exc), 500)
-                for ver in moving:
-                    source = peer_for(ver.provider_id)
-                    exported = source.export_material(ver.handle)
-                    # The exported public part must agree with the recorded
-                    # one (None for AES256, the PEM for RSA2048); a
-                    # disagreement is corrupted backend state, a 503 rather
-                    # than a field-level 400.
-                    if exported.public_key != ver.public_key:
-                        raise ProviderUnavailable(
-                            "exported public key does not match the record"
-                        )
+                for pid in distinct_sources:
+                    source_peers[pid] = peer_for(pid)
+                transfer_path = target_transfers and all(
+                    provider_mod.declares_transfer_pair(peer)
+                    for peer in source_peers.values()
+                )
+                if transfer_path and mirror is not None:
+                    # Record the path choice durably BEFORE the first transfer
+                    # call so a crashed, fully-rolled-back transfer attempt
+                    # stays PENDING (a same-id request takes it over) instead
+                    # of being finalized as the legacy failed(500).
                     try:
-                        triple = ready.import_material(
-                            ver.algorithm,
-                            ver.public_key,
-                            exported.encrypted_material,
-                        )
-                    except ProviderInvalidMaterial as exc:
-                        # Material that does not fit the target algorithm is a
-                        # provider failure for a migrate (503), never a 400.
-                        raise ProviderUnavailable(
-                            "migrated material does not match the key algorithm"
-                        ) from exc
+                        mirror.note_transfer_path()
+                    except OSError as exc:
+                        from .artifacts import ArtifactStrandUnavailable
+
+                        raise ArtifactStrandUnavailable(str(exc), 500) from exc
+                for ver in moving:
+                    source = source_peers[ver.provider_id]
+                    if transfer_path:
+                        # Direct ciphertext transfer. The blob exists only in
+                        # memory between the two provider calls; it is never
+                        # persisted, audited or put in a response/error.
+                        blob = None
+                        try:
+                            blob = source.transfer_out(ver.handle, target_id)
+                            triple = ready.transfer_in(ver.provider_id, blob)
+                        except Exception as exc:
+                            # Unknown handle/peer, a backend fault, an
+                            # authentication/algorithm/public-key mismatch, an
+                            # illegal result, or a non-conformant provider
+                            # raising ValueError/TypeError for the service's
+                            # valid arguments: all are the fixed no-audit 503
+                            # with the operation kept pending, never a
+                            # field-level 400 or a 500.
+                            raise MigrationTransferRetry(
+                                "direct material transfer failed"
+                            ) from exc
+                        finally:
+                            # The blob is ephemeral: drop the reference as
+                            # soon as the target ingested it (or the attempt
+                            # failed); it must never linger to be logged.
+                            blob = None
+                        # The returned public part must be EXACTLY the recorded
+                        # one (null for AES256, the PEM for RSA2048); anything
+                        # else is an illegal return -> the same fixed 503.
+                        if triple.public_key != ver.public_key:
+                            raise MigrationTransferRetry(
+                                "transferred public key does not match the record"
+                            )
+                    else:
+                        exported = source.export_material(ver.handle)
+                        # The exported public part must agree with the recorded
+                        # one (None for AES256, the PEM for RSA2048); a
+                        # disagreement is corrupted backend state, a 503 rather
+                        # than a field-level 400.
+                        if exported.public_key != ver.public_key:
+                            raise ProviderUnavailable(
+                                "exported public key does not match the record"
+                            )
+                        try:
+                            triple = ready.import_material(
+                                ver.algorithm,
+                                ver.public_key,
+                                exported.encrypted_material,
+                            )
+                        except ProviderInvalidMaterial as exc:
+                            # Material that does not fit the target algorithm is a
+                            # provider failure for a migrate (503), never a 400.
+                            raise ProviderUnavailable(
+                                "migrated material does not match the key "
+                                "algorithm"
+                            ) from exc
                     try:
                         self._append_provision(
                             journal_path, target_id, triple.handle
@@ -2464,6 +2554,42 @@ class KeyStore:
 
                 if isinstance(exc, ArtifactStrandUnavailable):
                     raise
+                if transfer_path and isinstance(exc, ProviderError):
+                    # Direct ciphertext-transfer path: a pre-commit provider
+                    # failure (an unknown handle/peer, a backend fault, an
+                    # authentication/algorithm/public-key mismatch, a gate
+                    # timeout) NEVER books an audit event. Delete every NEW
+                    # handle, leave the old record authoritative (the key file
+                    # is not rewritten before the commit point) and keep the
+                    # operation PENDING behind the fixed 503; the blob existed
+                    # only in memory.
+                    cleaned = True
+                    for handle in new_handles:
+                        try:
+                            ready.delete(handle)
+                        except Exception:
+                            cleaned = False
+                    if not self.rollback_provision_journal(journal_id):
+                        cleaned = False
+                    if not cleaned:
+                        # A handle delete could not be confirmed: retain the
+                        # migration snapshot, provision journal and mirror as
+                        # the evidence a restart reconciles, and keep the
+                        # operation PENDING (no event). The mirror must NOT be
+                        # reset, so the parked subclass is used.
+                        raise MigrationTransferParked(
+                            "direct material transfer cleanup is unconfirmed; "
+                            "it will be retried after restart"
+                        ) from exc
+                    self._discard_file(self._migration_path(event.event_id))
+                    if mirror is not None:
+                        try:
+                            mirror.reset_for_pending_retry()
+                        except OSError:
+                            pass
+                    raise MigrationTransferRetry(
+                        "direct material transfer failed before commit"
+                    ) from exc
                 if isinstance(exc, ProviderReconnectPending) and not new_handles:
                     # No provider work was effectively made (gate/budget
                     # timeout, a displaced owning id, or a peer probe that

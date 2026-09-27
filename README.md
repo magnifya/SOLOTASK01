@@ -101,19 +101,38 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   per-key 锁顺序、单一 provision/snapshot 记账、单条提交事件）。
 - `POST /v1/keys/{key_id}/migrate`，body 仅 `{"tenant_id": T}`，需
   `Idempotency-Key` 与操作者头。把主备链中该键**全部版本**从各自当前
-  绑定的提供者导出、导入此刻 **ready** 的链项并就地重绑键文件：版本号、
+  绑定的提供者**迁移**、导入此刻 **ready** 的链项并就地重绑键文件：版本号、
   算法、公钥、各版本时间、`current` 与吊销状态保持不变，仅替换每版的
-  `provider_id/handle/encrypted_material`。各版本由其原提供者导出；
-  ready 项缺失/不健康、材料与算法/公钥不符或共用 5 秒门限超时，一律
-  固定 `503`（`error` 为 `key management provider is unavailable`）。
+  `provider_id/handle/encrypted_material`。材料默认各版本由其原提供者导
+  出；当双方都成对声明 `transfer_out`/`transfer_in` 时改走下述密文转移
+  路径。ready 项缺失/不健康、材料与算法/公钥不符或共用 5 秒门限超时，
+  一律固定 `503`（`error` 为 `key management provider is
+  unavailable`）——旧导出路径的 `503` 记一条 rejected 事件，密文转移路
+  径的 `503` 不记审计（见下）。
   绑定后策略拒绝 `403`、未知/跨租户键 `404`；所有版本已在 ready 项上时
   `409`（绑定后才判定，不铸句柄、不写事件）。成功 `200`，键序固定
   `key_id,provider_id,versions,operation_id`，`versions` 为升序正整数
   数组；绑定后错误体仅 `{"error","operation_id"}`。提交前失败删除全部
   新句柄并恢复旧键文件；提交点之后才幂等删除原句柄——删除失败仍按
   成功重放并由重启清理，崩溃/重试绝不重复迁移或重复记账（每操作至多
-  一条 `event_id=operation_id,action=migrate,key_id=K` 事件）。明文
-  密钥材料只在导出与导入之间驻留内存，绝不进入响应、审计或错误。
+  一条 `event_id=operation_id,action=migrate,key_id=K` 事件）。**密文
+  转移路径**：当某迁移涉及的源提供者与 ready 提供者双方都在
+  `capabilities.operations` 同时声明可选的 `transfer_out` 与
+  `transfer_in`（二者必须成对声明，只声明其一律契约不符）时，整次迁移
+  必走该路径——服务调用源端 `transfer_out(handle, target_provider_id)`
+  取回不透明密文 BLOB，再调用 ready 端
+  `transfer_in(source_provider_id, blob)`，**绝不调用
+  `export_material`**，明文密钥不进入服务进程；任一方未成对声明则整次
+  迁移沿用导出/导入旧路径。该路径下任何提交前失败（未知句柄/对端、后
+  端故障、认证/算法/公钥不符、门限超时，或对端返回非法）一律固定
+  `503` 且**不记审计**：操作保持 `pending`，删除已铸新句柄、保留旧记
+  录（键文件提交前不重写）；新句柄删除未能确认时保留迁移快照、provision
+  journal 与工件镜像待重启回滚，操作仍 `pending`；故障排除后以同一
+  `Idempotency-Key` 在同一 `operation_id` 下继续恰好一次。成功只替换提
+  供者三元组并写唯一一条 migrate 事件；提交点之后才幂等删除原句柄，提交
+  后清理失败仍按成功 `200` 重放并由重启清理。明文密钥材料与转移 BLOB
+  只驻留内存、绝不落盘，绝不进入响应、审计或错误；句柄不得入响应、审
+  计、错误，仅按既有契约写入密钥文件或恢复工件。
 - `GET /v1/keys/{key_id}/versions/{version}` 与
   `GET /v1/keys/{key_id}/current` →
   `{key_id, version, created_at, algorithm, public_key}`；version 须为正整数。
@@ -598,7 +617,30 @@ python -m keymgr provider reconnect --operator alice
   rewrap 端点在五秒门限内调用绑定提供者的 `rewrap_key`，绝不调用
   `export_material`，DEK、KEK 私钥与明文不进入服务进程（认证失败 400
   指出 envelope，异常/故障固定 503 且不记审计）；否则沿用导出旧路径。
-  本地提供者已实现并声明 `rewrap_key`。另可实现可选 `health()`（无参、返回 `bool`）：缺少视为健康，非
+  本地提供者已实现并声明 `rewrap_key`。`capabilities.operations` 还可另
+  含一对 `transfer_out`、`transfer_in`（专供提供者链的整键 migrate）：
+  二者**必须成对声明**，只声明其一律契约不符；成对声明即须同时实现可
+  调用的
+  `transfer_out(handle: str, target_provider_id: str) -> bytes` 与
+  `transfer_in(source_provider_id: str, blob: bytes) -> dict`。
+  `transfer_out` 把句柄的密钥材料封成不透明密文 BLOB 交予命名对端，明
+  文不跨出提供者边界；`transfer_in` 解开对端 BLOB 并在本端铸入新句柄。
+  各字符串参数（`handle`/`target_provider_id`/`source_provider_id`）非
+  `str` 抛 `TypeError`、空串抛 `ValueError`；`blob` 非 `bytes` 抛
+  `TypeError`、为空抛 `ValueError`；未知句柄/未知或被拒对端、后端故障
+  抛 `ProviderUnavailable`；BLOB 认证失败、算法不符或公钥不符抛
+  `ProviderInvalidMaterial`。`transfer_out` 成功须返回非空 `bytes`；
+  `transfer_in` 成功须返回**键序固定**为
+  `handle,public_key,encrypted_material` 的对象——`handle` 与
+  `encrypted_material` 为非空 str、`public_key` 为 null（AES256）或非
+  空 str（RSA2048，且等于 BLOB 携带的原公钥）；非对象、键集/键序/类型
+  不符、首末非非空 str 或 `public_key` 类型非法等任何非法返回一律视为
+  `ProviderUnavailable`。migrate 涉及的源与 ready 提供者双方都成对声明
+  时整次迁移必走此路径，服务**绝不调用 `export_material`**，明文密钥
+  与 BLOB 只在两端提供者之间以内存传递、绝不落盘；否则沿用导出旧路径。
+  在 migrate 中该路径的任何提供者失败/认证不符/非法返回都固定 `503`
+  且不记审计（操作保持 pending，见 migrate 端点）。本地提供者已实现并
+  成对声明 `transfer_out`/`transfer_in`。另可实现可选 `health()`（无参、返回 `bool`）：缺少视为健康，非
   `bool`/抛异常视为不可用。普通 provider 调用路径上单次探活至多等 1
   秒（超时按一次失败、迟到结果作废），且一次调用的全部探活/等待共用不
   可重置的 5 秒总预算。模块缺失/工厂失败/契约不符/后端异常一律 `503`

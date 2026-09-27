@@ -29,6 +29,7 @@ from .store import (
     KeyAlreadyMigrated,
     KeyStore,
     LockTimeout,
+    MigrationTransferParked,
     NativeUnwrap,
     is_valid_key_id,
     validate_batch_items,
@@ -687,6 +688,17 @@ def _idempotent_run_body(op_store, store, artifact_store, executor, operation,
                 operation, operations_mod.STATUS_FAILED, 500, body_err
             )
             return _emit_operation_result(500, body_err)
+    except MigrationTransferParked:
+        # Direct ciphertext-transfer migrate with unconfirmed pre-commit
+        # cleanup: snapshot/journal/mirror retained for startup, op pending,
+        # no audit event. Fixed 503 (exit 1) without resetting the mirror.
+        return _emit_operation_result(
+            503,
+            {
+                "error": "key management provider is unavailable",
+                "operation_id": op_id,
+            },
+        )
     except ProviderReconnectPending:
         # The provider was never effectively called (gate timeout or a
         # displaced provider_id): the store/restore abort path already removed

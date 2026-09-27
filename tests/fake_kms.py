@@ -29,7 +29,14 @@ Fault injection is driven by a JSON file named by ``FAKE_KMS_FAULTS``:
       "declare_rewrap_key": true,   # capabilities.operations gains "rewrap_key"
       "rewrap_not_callable": true,  # declare rewrap_key but break the method
       "rewrap_fail": true,          # rewrap_key() raises a backend fault
-      "rewrap_short": true          # rewrap_key() returns a malformed short blob
+      "rewrap_short": true,         # rewrap_key() returns a malformed short blob
+      "declare_transfer": true,     # capabilities gains the transfer_out/in pair
+      "transfer_not_callable": true,  # declare pair but break transfer_out
+      "transfer_out_fail": true,    # transfer_out() raises a backend fault
+      "transfer_in_fail": true,     # transfer_in() raises a backend fault
+      "transfer_out_bad_result": true,  # transfer_out() returns non-bytes
+      "transfer_bad_triple": true,  # transfer_in() returns a malformed triple
+      "transfer_pk_mismatch": true  # transfer_in() returns a wrong public_key
     }
 
 Materials are stored base64-wrapped with a static prefix so nothing here ever
@@ -155,6 +162,11 @@ class FakeKmsProvider:
             # Contract-violation injection: declares "rewrap_key" without a
             # callable method.
             self.rewrap_key = True
+        if _faults().get("transfer_not_callable"):
+            # Contract-violation injection: declares the transfer pair but
+            # the transfer_out attribute is not a callable method.
+            self.transfer_out = True
+        self._data_dir = None
 
     @property
     def capabilities(self):
@@ -173,6 +185,9 @@ class FakeKmsProvider:
             operations.append("wrap_key")
         if _faults().get("declare_rewrap_key"):
             operations.append("rewrap_key")
+        if _faults().get("declare_transfer"):
+            # The pair is all-or-nothing.
+            operations.extend(["transfer_out", "transfer_in"])
         return {
             "algorithms": ["AES256", "RSA2048"],
             "operations": operations,
@@ -180,6 +195,7 @@ class FakeKmsProvider:
 
     def configure(self, data_dir):
         _check_fault("configure")
+        self._data_dir = data_dir
 
     def health(self):
         """Optional readiness probe driven by the faults file."""
@@ -493,6 +509,104 @@ class FakeKmsProvider:
             )
             return private_key.public_key().encrypt(dek, oaep), None
         raise RuntimeError("handle is not a supported algorithm")
+
+    def transfer_out(self, handle, target_provider_id):
+        """Optional direct migration export half (declared via
+        ``declare_transfer``).
+
+        Reuses the built-in shared sealed wire format so a fakekms<->local
+        migrate interoperates: raw material is sealed (AES-256-GCM, AAD bound
+        to both endpoint ids and the algorithm) and only the opaque bytes
+        cross this boundary.
+        """
+        if not isinstance(handle, str):
+            raise TypeError("transfer_out handle must be a string")
+        if not handle:
+            raise ValueError("transfer_out requires a non-empty handle string")
+        if not isinstance(target_provider_id, str):
+            raise TypeError(
+                "transfer_out target_provider_id must be a string"
+            )
+        if not target_provider_id:
+            raise ValueError(
+                "transfer_out requires a non-empty target_provider_id string"
+            )
+        _check_fault("transfer_out")
+        if _faults().get("transfer_out_fail"):
+            raise RuntimeError("backend failure in transfer_out")
+        with _lock:
+            state = _load_state()
+            entry = state["handles"].get(handle)
+        if entry is None:
+            raise RuntimeError("unknown handle")
+        if _faults().get("transfer_out_bad_result"):
+            # Contract violation: a non-bytes result.
+            return "not-bytes"
+        from keymgr.provider import _transfer_seal
+
+        return _transfer_seal(
+            self._data_dir,
+            self.provider_id,
+            target_provider_id,
+            entry.get("algorithm"),
+            entry.get("public_key"),
+            _unwrap(entry["material"]),
+        )
+
+    def transfer_in(self, source_provider_id, blob):
+        """Optional direct migration import half (declared via
+        ``declare_transfer``). Opens a peer's sealed blob and mints a fresh
+        fakekms handle for the recovered material, returning the fixed ordered
+        triple."""
+        if not isinstance(source_provider_id, str):
+            raise TypeError(
+                "transfer_in source_provider_id must be a string"
+            )
+        if not source_provider_id:
+            raise ValueError(
+                "transfer_in requires a non-empty source_provider_id string"
+            )
+        if not isinstance(blob, bytes):
+            raise TypeError("transfer_in blob must be bytes")
+        if not blob:
+            raise ValueError("transfer_in blob must be non-empty")
+        _check_fault("transfer_in")
+        if _faults().get("transfer_in_fail"):
+            raise RuntimeError("backend failure in transfer_in")
+        from keymgr.provider import (
+            ProviderInvalidMaterial,
+            _transfer_open,
+        )
+
+        try:
+            algorithm, public_key, raw_material = _transfer_open(
+                self._data_dir, blob, source_provider_id, self.provider_id
+            )
+        except ProviderInvalidMaterial:
+            # An inauthentic/ill-fitting blob is the contract's
+            # ProviderInvalidMaterial (the migrate path surfaces it as the
+            # fixed 503); re-raise unchanged.
+            raise
+        if _faults().get("transfer_bad_triple"):
+            # Contract violation: wrong key set/order. Deliberately returned
+            # WITHOUT minting a backend object, so the rejection orphans
+            # nothing.
+            return {"public_key": public_key, "handle": "unused"}
+        if _faults().get("transfer_pk_mismatch"):
+            # Contract violation: a public_key that does not match the blob.
+            # Again returned without minting.
+            wrong = None if public_key is not None else "not-a-pem"
+            return {
+                "handle": "unused",
+                "public_key": wrong,
+                "encrypted_material": "unused",
+            }
+        result = self._mint(algorithm, public_key, raw_material)
+        return {
+            "handle": result["handle"],
+            "public_key": result["public_key"],
+            "encrypted_material": result["encrypted_material"],
+        }
 
     def delete(self, handle):
         _check_fault("delete")

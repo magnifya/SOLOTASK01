@@ -34,6 +34,7 @@ from .store import (
     KeyAlreadyMigrated,
     KeyStore,
     LockTimeout,
+    MigrationTransferParked,
     NativeUnwrap,
     NativeWrap,
     is_valid_key_id,
@@ -479,6 +480,20 @@ def make_handler(
                     )
                     self._send_json(500, body)
                     return
+            except MigrationTransferParked:
+                # A direct ciphertext-transfer migrate failed before its
+                # commit point and its new-handle cleanup could not be fully
+                # confirmed: the migration snapshot, provision journal and
+                # mirror are deliberately RETAINED for startup. The operation
+                # stays PENDING with NO audit event; only the fixed safe 503
+                # is sent (never resetting the mirror, which is the restart's
+                # rollback index).
+                body = {
+                    "error": "key management provider is unavailable",
+                    "operation_id": op_id,
+                }
+                self._send_json(503, body)
+                return
             except ProviderReconnectPending:
                 # The provider call never effectively started: either it
                 # waited out the shared five-second reconnect gate, or the

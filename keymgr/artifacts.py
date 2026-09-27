@@ -314,6 +314,21 @@ class ArtifactMirror:
             self.descriptor["empty_marker"] = marker_path
             self._persist()
 
+    def note_transfer_path(self) -> None:
+        """Mark a migrate mirror as using the direct ciphertext-transfer path.
+
+        Set durably BEFORE the first ``transfer_out`` provider call. A
+        migrate on this path books NO audit event on a pre-commit failure and
+        must stay PENDING (fixed 503) even after a crash whose scene startup
+        fully rolls back: the flag keeps such an operation parked as a clean
+        bound strand a same-key request can take over under the same
+        operation_id, instead of being finalized failed(500) by the legacy
+        interruption rule.
+        """
+        with self._lock:
+            self.descriptor["migration_transfer"] = True
+            self._persist()
+
     def discard(self) -> bool:
         """Remove the mirror file. Returns True when it no longer exists."""
         return self.artifact_store.discard(self.operation_id)
@@ -655,6 +670,7 @@ class ArtifactStore:
             "snapshot": None,
             "empty_marker": None,
             "policy": False,
+            "migration_transfer": False,
             "created_at": _new_timestamp(),
             "updated_at": None,
         }
@@ -841,8 +857,30 @@ class ArtifactStore:
         # operation_id. A mirror that reached provisioning and was then fully
         # rolled back (provider failure / conflict / ledger failure) is the
         # legacy interruption: drop the mirror so the operation finalizes
-        # failed(500) exactly as before.
+        # failed(500) exactly as before -- EXCEPT a whole-key migrate on the
+        # direct ciphertext-transfer path, whose fixed 503 books no audit
+        # event and whose retry contract keeps the operation PENDING: retain
+        # its (reset-to-bound) mirror as a clean takeover strand instead.
         if self._never_provisioned(descriptor):
+            self._parked.add(operation_id)
+        elif (
+            descriptor.get("kind") == "migrate"
+            and descriptor.get("migration_transfer")
+        ):
+            # A direct-transfer migrate that crashed and was fully rolled back
+            # by the outbox (journal/snapshot gone, old file restored, no
+            # markers). Its fixed 503 never booked an event and its retry
+            # contract keeps it PENDING, so durably reset the descriptor to a
+            # clean bound strand -- exactly as the request-time reset does --
+            # and retain it as the index a same-key request can take over. A
+            # persist failure leaves the current descriptor in place and only
+            # parks the operation; the next open reaches this branch again.
+            try:
+                ArtifactMirror(
+                    self, record, descriptor
+                ).reset_for_pending_retry()
+            except OSError:
+                pass
             self._parked.add(operation_id)
         else:
             self.discard(operation_id)
@@ -949,6 +987,12 @@ class ArtifactStore:
         if empty_marker is not None and not isinstance(empty_marker, str):
             return False
         if not isinstance(descriptor.get("policy"), bool):
+            return False
+        # ``migration_transfer`` was added after the first mirror generation;
+        # a missing key reads as False (old mirrors), an explicitly non-bool
+        # value is an inconsistency.
+        transfer_flag = descriptor.get("migration_transfer", False)
+        if not isinstance(transfer_flag, bool):
             return False
         handles = descriptor.get("handles")
         if not isinstance(handles, list):
