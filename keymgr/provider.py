@@ -1878,19 +1878,19 @@ class LocalProvider(KeyProvider):
             raw,
         )
 
-    def transfer_in(self, source_provider_id: str, blob: bytes) -> MaterialTriple:
+    def transfer_in(self, source_provider_id: str, blob: bytes) -> dict:
         """Open a peer's transfer blob and adopt its key under THIS provider.
 
         The blob is authenticated (GCM tag plus AAD binding the source id,
         the local provider id and the algorithm) INSIDE the provider; only the
-        fixed triple (a :class:`MaterialTriple`, the same shape the other local
-        operations return -- an external provider's dict triple is normalized
-        by :class:`_SafeProvider`) is returned, never the raw material. A
-        non-``str``/empty ``source_provider_id`` is a ``TypeError``/
-        ``ValueError`` and a non-``bytes``/empty ``blob`` a ``TypeError``/
-        ``ValueError``; an unknown peer, a blob that does not authenticate or
-        whose material does not fit the algorithm, and any backend fault are
-        :class:`ProviderUnavailable`.
+        fixed triple dict is returned, in the FIXED key order
+        ``handle, public_key, encrypted_material`` (the same shape an external
+        provider returns through :class:`_SafeProvider`), never the raw
+        material. A non-``str``/empty ``source_provider_id`` is a
+        ``TypeError``/``ValueError`` and a non-``bytes``/empty ``blob`` a
+        ``TypeError``/``ValueError``; an unknown peer, a blob that does not
+        authenticate or whose material does not fit the algorithm, and any
+        backend fault are :class:`ProviderUnavailable`.
         """
         if not isinstance(source_provider_id, str):
             raise TypeError(
@@ -1908,10 +1908,12 @@ class LocalProvider(KeyProvider):
         algorithm, public_key, raw = _transfer_open(
             self._data_dir, blob, source_provider_id, LOCAL_PROVIDER_ID
         )
-        # The key order of the externally visible dict is handle, public_key,
-        # encrypted_material; internally the local provider returns the same
-        # MaterialTriple named tuple its other operations return.
-        return self._adopt(algorithm, public_key, raw)
+        triple = self._adopt(algorithm, public_key, raw)
+        return {
+            "handle": triple.handle,
+            "public_key": triple.public_key,
+            "encrypted_material": triple.encrypted_material,
+        }
 
 
 # -- module:factory loading -------------------------------------------------

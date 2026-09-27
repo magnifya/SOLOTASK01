@@ -186,10 +186,16 @@ def test_local_transfer_roundtrip(tmp_path):
     # An inbound blob a peer sealed FOR local (source "peer", target local).
     inbound = p._transfer_seal(data, "peer", "local", "AES256", None, raw)
     out = local.transfer_in("peer", inbound)
-    # The built-in local provider returns the same named triple its other
-    # operations yield; its (handle, public_key, material) fields are all set.
-    assert isinstance(out, p.MaterialTriple)
-    assert out.public_key is None and out.handle and out.encrypted_material
+    # The built-in local provider returns the fixed-order triple dict
+    # handle, public_key, encrypted_material (the same externally visible
+    # shape an external provider's dict is normalized to).
+    assert isinstance(out, dict)
+    assert list(out.keys()) == [
+        "handle", "public_key", "encrypted_material"
+    ]
+    assert out["public_key"] is None and out["handle"] and out[
+        "encrypted_material"
+    ]
 
 
 def test_safe_provider_transfer_in_fixed_key_order():

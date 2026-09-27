@@ -1165,6 +1165,8 @@ class KeyStore:
                 audit_mod.ACTION_ENCRYPT,
                 audit_mod.ACTION_DECRYPT,
                 audit_mod.ACTION_REWRAP,
+                audit_mod.ACTION_WRAP_KEY,
+                audit_mod.ACTION_UNWRAP_KEY,
                 audit_mod.ACTION_SIGN,
                 audit_mod.ACTION_VERIFY,
                 audit_mod.ACTION_AUDIT,
@@ -2478,6 +2480,16 @@ class KeyStore:
                             # soon as the target ingested it (or the attempt
                             # failed); it must never linger to be logged.
                             blob = None
+                        # The built-in local provider returns the fixed-order
+                        # triple dict directly; an external provider is wrapped
+                        # by _SafeProvider and returns a MaterialTriple.
+                        # Normalize both to the named triple before use.
+                        if isinstance(triple, dict):
+                            triple = provider_mod.MaterialTriple(
+                                handle=triple["handle"],
+                                public_key=triple["public_key"],
+                                encrypted_material=triple["encrypted_material"],
+                            )
                         # The returned public part must be EXACTLY the recorded
                         # one (null for AES256, the PEM for RSA2048); anything
                         # else is an illegal return -> the same fixed 503.

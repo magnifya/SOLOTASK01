@@ -358,6 +358,150 @@ def _decrypt_content(opened: OpenedEnvelope, dek: bytes) -> bytes:
     return AESGCM(dek).decrypt(opened.nonce, sealed, opened.aad)
 
 
+# -- DEK-only wrap/unwrap (the wrap-key/unwrap-key endpoints) -----------------
+def wrap_data_key(algorithm: str, kek, data_key: bytes) -> tuple:
+    """Wrap a caller-supplied 32-byte DEK under the KEK (export path).
+
+    Same wrap schemes as the envelope (AES-256-GCM for AES256,
+    RSA-OAEP-SHA256 for RSA2048); returns ``(wrapped_key, wrap_nonce)`` with
+    the exact shapes (48/12 for AES256, 256/None for RSA2048). The data key
+    itself never leaves process memory.
+    """
+    return _wrap_dek_with(algorithm, kek, data_key)
+
+
+def unwrap_data_key(
+    algorithm: str, kek, wrapped_key: bytes, wrap_nonce: Optional[bytes]
+) -> bytes:
+    """Recover a wrapped DEK with the KEK (export path).
+
+    Same unwrapping as the envelope, but the authentication failure names
+    ``wrapped_key`` (the request field of the unwrap-key endpoint) instead
+    of ``envelope``.
+    """
+    opened = OpenedEnvelope(
+        key_id="",
+        version=1,
+        algorithm=algorithm,
+        enc=ENC_AES_GCM,
+        wrap=WRAP_AES_GCM if algorithm == _AES256 else WRAP_RSA_OAEP_SHA256,
+        nonce=b"",
+        tag=b"",
+        ciphertext=b"",
+        wrapped_key=wrapped_key,
+        wrap_nonce=wrap_nonce,
+        aad=b"",
+    )
+    try:
+        return _unwrap_dek(opened, kek)
+    except EnvelopeError as exc:
+        if "tampered" not in str(exc):
+            # A KEK-shape failure is a server-side material problem, not a
+            # client 400 (the store already surfaces it as 503 upstream).
+            raise
+        raise EnvelopeError(
+            "field wrapped_key is tampered or cannot be authenticated"
+        ) from exc
+
+
+def _validate_wrap_pair(algorithm: str, wrapped_key, wrap_nonce) -> None:
+    """Enforce the algorithm's exact wrap shapes on a provider result."""
+    from .provider import ProviderUnavailable
+
+    expected_len = _KEY_LEN + _TAG_LEN if algorithm == _AES256 else _RSA_WRAP_LEN
+    if (
+        not isinstance(wrapped_key, bytes)
+        or len(wrapped_key) != expected_len
+    ):
+        raise ProviderUnavailable(
+            "provider returned a malformed wrapped_key from wrap_key"
+        )
+    if algorithm == _AES256:
+        if not isinstance(wrap_nonce, bytes) or len(wrap_nonce) != _NONCE_LEN:
+            raise ProviderUnavailable(
+                "provider returned a malformed wrap_nonce from wrap_key"
+            )
+    elif algorithm == _RSA2048:
+        if wrap_nonce is not None:
+            raise ProviderUnavailable(
+                "provider returned a non-null wrap_nonce for RSA2048"
+            )
+    else:
+        raise ProviderUnavailable(
+            "unsupported algorithm for envelope: %r" % algorithm
+        )
+
+
+def native_wrap_data_key(
+    provider, handle: str, algorithm: str, data_key: bytes
+) -> tuple:
+    """Wrap a caller-supplied 32-byte DEK via the provider's ``wrap_key``.
+
+    The DEK is wrapped INSIDE the provider by the handle's KEK: the service
+    never calls ``export_material`` and never loads the KEK private material
+    into this process. The result is validated against the exact algorithm
+    shapes (48/12 for AES256, 256/None for RSA2048); any backend fault,
+    contract violation or malformed result is normalized to
+    ``ProviderUnavailable`` (the fixed 503).
+    """
+    from .provider import ProviderUnavailable
+
+    try:
+        result = provider.wrap_key(handle, data_key)
+    except ProviderUnavailable:
+        raise
+    except Exception as exc:
+        # A conforming provider answers a valid handle/32-byte-DEK call with
+        # either the pair or ProviderUnavailable; any other exception
+        # (including a residual ValueError/TypeError or a backend fault the
+        # adapter did not normalize) is a contract/backend failure -> 503.
+        raise ProviderUnavailable(
+            "provider wrap_key raised a contract violation"
+        ) from exc
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise ProviderUnavailable(
+            "provider returned a malformed result from wrap_key"
+        )
+    wrapped_key, wrap_nonce = result
+    _validate_wrap_pair(algorithm, wrapped_key, wrap_nonce)
+    return wrapped_key, wrap_nonce
+
+
+def native_unwrap_data_key(
+    provider, handle: str, wrapped_key: bytes, wrap_nonce: Optional[bytes]
+) -> bytes:
+    """Recover a wrapped DEK via the provider's ``unwrap_key``.
+
+    The DEK is unwrapped INSIDE the provider by the handle's KEK: the service
+    never calls ``export_material`` and never loads the KEK private material
+    into this process. An authentication failure raises
+    ``ProviderInvalidMaterial`` (surfaced as a 400 naming ``wrapped_key``);
+    a backend fault, a contract violation or a non-32-byte result raises
+    ``ProviderUnavailable`` (the fixed 503, no audit event).
+    """
+    from .provider import (
+        ProviderInvalidMaterial,
+        ProviderUnavailable,
+    )
+
+    try:
+        dek = provider.unwrap_key(handle, wrapped_key, wrap_nonce)
+    except (ProviderInvalidMaterial, ProviderUnavailable):
+        raise
+    except (ValueError, TypeError) as exc:
+        # A conforming provider cannot raise these for a structurally valid
+        # call: treat it as a backend/contract fault, never a 400 path with
+        # provider text.
+        raise ProviderUnavailable(
+            "provider unwrap_key raised a contract violation"
+        ) from exc
+    if not isinstance(dek, bytes) or len(dek) != _KEY_LEN:
+        raise ProviderUnavailable(
+            "provider returned a malformed data key from unwrap_key"
+        )
+    return dek
+
+
 def seal_envelope_native(
     *,
     key_id: str,

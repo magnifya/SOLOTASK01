@@ -238,6 +238,37 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   法、返回结构/类型/长度不符或提供者故障为固定文案 `503` 且不记账。
   其余情形（分属不同提供者或提供者未声明）沿用导出 KEK 在内存中改包
   的旧路径。
+- `POST /v1/keys/{key_id}/wrap-key`，**非幂等**（无需
+  `Idempotency-Key`），body 仅 `{tenant_id, version?, data_key}`；
+  `data_key` 为标准带填充 base64 且解码后恰为 32 字节，`version` 缺省
+  为 current（须正整数）。把调用方给出的数据密钥（DEK）用指定版本的
+  KEK 包装：AES256 版本得 48 字节 `wrapped_key` 与 12 字节
+  `wrap_nonce`，RSA2048 版本得 256 字节 `wrapped_key` 且 `wrap_nonce`
+  为 null。正文、键集、UUID4、base64/长度非法均 `400` 指出字段且**不
+  记账**；仅 tenant 来源缺失/冲突照旧记 `tenant_conflict`。策略动作新
+  增 `wrap_key`，拒权 `403` 并记 `wrap_key/rejected`（带 key_id）；未
+  知/跨租户 key 或未知版本 `404`、吊销 `409`，均记 rejected（带
+  key_id）；提供者故障/违约/超时为固定文案 `503` 且**不记账**；账本失
+  败 `500`。`200` 键序固定
+  `key_id,version,algorithm,wrapped_key,wrap_nonce`（RSA2048 的
+  `wrap_nonce` 为 null），成功记 `wrap_key/success`（带 key_id）。版本的绑定提供者声明
+  `wrap_key` 时走 KMS/HSM 原生路径：在五秒门限内按既有签名调用
+  `wrap_key(handle, data_key)`，绝不调用 `export_material`；否则沿用
+  导出 KEK 在内存中包装。DEK 绝不落盘、入审计或入错误。无 CLI。
+- `POST /v1/keys/{key_id}/unwrap-key`，**非幂等**，body 仅
+  `{tenant_id, version?, wrapped_key, wrap_nonce?}`；字节字段为标准带
+  填充 base64，`version` 缺省 current。按版本算法校验包装形状
+  （AES256：48 字节 `wrapped_key` + 12 字节 `wrap_nonce`；RSA2048：
+  256 字节 `wrapped_key` + `wrap_nonce` 必须缺省/null），不符为 `400`
+  指出字段且不记账。校验、授权、404/409/503/500 规则同 wrap-key（策略
+  动作 `unwrap_key`）。包装认证失败为指出 `wrapped_key` 的 `400`（不
+  记账）。`200` 仅返 `{data_key}`（base64，32 字节），成功记
+  `unwrap_key/success`（带 key_id）。版本的绑定提供者声明
+  `unwrap_key` 时走 KMS/HSM 原生路径：在五秒门限内按既有签名调用
+  `unwrap_key(handle, wrapped_key, wrap_nonce)`，绝不调用
+  `export_material`，KEK 私钥不进入服务进程；否则沿用导出 KEK 在内存
+  中解包。解出的 DEK 只存在于进程内存并随成功响应返回，绝不落盘、入
+  审计或入错误。无 CLI。
 - `POST /v1/keys/{key_id}/sign`，**非幂等**（无需 `Idempotency-Key`），
   body 仅 `{tenant_id, version?, message}`；`message` 为标准 base64（可空），
   `version` 缺省为 current。用 RSASSA-PKCS1-v1_5/SHA-256 **确定性**签名，
@@ -465,7 +496,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 - 规则元素 `{subject, actions, effect}`：`subject` 为区分大小写的非空字符串；
   `actions` 为非空数组，取值
   `create/read/rotate/revoke/revoke_version/import/export/migrate/encrypt/decrypt/
-  rewrap/sign/verify/audit/list`，单条内重复去重；`effect` 为 `allow`/`deny`；未知字段、类型错误、同
+  rewrap/wrap_key/unwrap_key/sign/verify/audit/list`，单条内重复去重；`effect` 为 `allow`/`deny`；未知字段、类型错误、同
   subject+effect+无序动作集的重复规则均 `400`；`rules:[]` 合法（全拒绝）。
 - 执行：管理动作 policy_* 免检；租户无策略时全部允许；有策略时匹配规则中
   deny 优先于 allow，无匹配则拒绝 → `403`，并记一条原动作名、
@@ -476,7 +507,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 
 - 事件字段 `{event_id, tenant_id, action, key_id, outcome, timestamp}`；
   `action` 为 `create/read/rotate/batch_rotate/revoke/revoke_version/import/export/
-  migrate/encrypt/decrypt/rewrap/sign/verify/audit/list/tenant_conflict/
+  migrate/encrypt/decrypt/rewrap/wrap_key/unwrap_key/sign/verify/audit/list/tenant_conflict/
   policy_read/policy_update/policy_delete`，`outcome` 为 `success/rejected`。
   版本级吊销只记一条 `revoke_version/success`（首次吊销随 outbox 提交；重复/
   并发吊销保留首次值且不写第二条事件），403/404/409 业务拒绝记同名 rejected，
@@ -486,7 +517,10 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `sign`/`verify` 的 success、业务拒绝记同名 rejected，均携带当时 key_id；
   重包装成功记 `rewrap/success`、拒权/业务拒绝记 `rewrap/rejected`，均带
   key_id，正文 `400`（含算法不符与认证失败）与提供者故障的 `503` 都不记账；
-  sign 的正文 `400` 与提供者故障 `503` 同样不记账。幂等 HTTP encrypt
+  sign 的正文 `400` 与提供者故障 `503` 同样不记账。DEK 包装/解包成功记
+  `wrap_key`/`unwrap_key` 的 success、拒权/业务拒绝记同名 rejected，均带
+  key_id；其正文 `400`（含包装认证失败）与提供者故障/违约/超时的 `503`
+  都不记账，数据密钥绝不入审计。幂等 HTTP encrypt
   每个终态至多一条 `event_id=operation_id,action=encrypt` 事件（成功 200 与
   绑定后拒绝都随操作重放，绝不重复记账），非幂等 CLI/decrypt 每次请求各记一
   条；策略拒绝写一条对应 `encrypt`/`decrypt` 的 rejected 事件（携带 key_id），
