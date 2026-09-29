@@ -214,7 +214,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="UUID4 operation_id returned by rotate/import/restore",
     )
 
-    p_audit = tenant_parser("audit", help="list a tenant's audit events")
+    # tenant-id/operator are optional at parse time so both
+    # `audit --tenant-id t --operator alice` and the
+    # `audit verify --tenant-id t --operator alice` form parse; presence is
+    # validated in the command dispatch (exit 2), like every other command.
+    p_audit = sub.add_parser("audit", help="list a tenant's audit events")
+    p_audit.add_argument("--tenant-id", default=None)
+    p_audit.add_argument(
+        "--operator", default=None,
+        help="non-empty X-Operator-Id of the caller",
+    )
     p_audit.add_argument("--key-id", default=None,
                          help="filter to one key_id (must be a UUID4)")
     p_audit.add_argument("--action", default=None,
@@ -223,6 +232,19 @@ def build_parser() -> argparse.ArgumentParser:
                          help="page size, 1-1000 (default: %(default)s)")
     p_audit.add_argument("--cursor", default=None,
                          help="pagination cursor from a previous response")
+    audit_sub = p_audit.add_subparsers(dest="audit_command")
+    p_audit_verify = audit_sub.add_parser(
+        "verify",
+        help="verify the integrity of the tenant's persisted audit events",
+    )
+    p_audit_verify.add_argument(
+        "--tenant-id", default=argparse.SUPPRESS,
+        help="tenant whose persisted audit events are verified",
+    )
+    p_audit_verify.add_argument(
+        "--operator", default=argparse.SUPPRESS,
+        help="non-empty X-Operator-Id of the caller",
+    )
 
     p_list = tenant_parser(
         "list", help="list a tenant's keys (one paginated snapshot)"
@@ -1844,6 +1866,23 @@ def _run(argv: Optional[List[str]] = None) -> int:
     if args.command == "audit":
         if not args.tenant_id:
             return _fail("field tenant_id must be a non-empty string", 2)
+        if getattr(args, "audit_command", None) == "verify":
+            # Read-only whole-ledger verification, governed by the same
+            # "audit" policy action as the query; success appends no event
+            # and a denial is the same audit/rejected bookkeeping.
+            if not allowed(audit_mod.ACTION_AUDIT):
+                if not _attempt(
+                    store, args.tenant_id, None,
+                    audit_mod.ACTION_AUDIT, audit_mod.OUTCOME_REJECTED,
+                ):
+                    return 1
+                return _fail("action not permitted by policy", 3)
+            try:
+                result = store.audit.verify(args.tenant_id)
+            except LedgerError as exc:
+                return _ledger_fail(exc)
+            _print(result)
+            return 0
         if args.key_id is not None and not is_valid_key_id(args.key_id):
             return _fail("field key_id must be a UUID4", 2)
         if args.action is not None and args.action not in audit_mod.ACTIONS:

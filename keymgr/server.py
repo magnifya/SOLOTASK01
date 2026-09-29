@@ -49,6 +49,7 @@ from .store import (
 )
 
 _AUDIT_PATH = "/v1/audit"
+_AUDIT_VERIFY_PATH = "/v1/audit/verify"
 _KEYS_PATH = "/v1/keys"
 _POLICY_PATH = "/v1/policy"
 _PROVIDER_STATUS_PATH = "/v1/provider/status"
@@ -3214,6 +3215,15 @@ def make_handler(
                     self._server_error(exc)
                 return
 
+            if path == _AUDIT_VERIFY_PATH:
+                # Read-only whole-ledger verification; failures are 500 and
+                # are never audited themselves.
+                try:
+                    self._get_audit_verify(parts, operator)
+                except LedgerError as exc:
+                    self._server_error(exc)
+                return
+
             if path == _KEYS_PATH:
                 try:
                     self._list_keys(parts, operator)
@@ -3634,6 +3644,57 @@ def make_handler(
                     "next_cursor": page.next_cursor,
                 },
             )
+
+        def _get_audit_verify(self, parts, operator: str) -> None:
+            """GET /v1/audit/verify: read-only whole-ledger verification.
+
+            Tenant comes from exactly one X-Tenant-Id header or one
+            tenant_id query parameter, like the audit query; no other query
+            parameter and no body field is accepted. A successful
+            verification appends no event; a policy denial is recorded with
+            the same audit/rejected bookkeeping as the query.
+            """
+            tenant_id = self._audit_tenant(parts)
+            if tenant_id is None:
+                return
+            qs = parse_qs(parts.query, keep_blank_values=True)
+            for name in qs:
+                if name != "tenant_id":
+                    self._bad_request(
+                        "field %s is not accepted by this endpoint" % name
+                    )
+                    return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                self._bad_request("invalid Content-Length")
+                return
+            if length > 0:
+                raw = self.rfile.read(length)
+                try:
+                    payload = json.loads(raw.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    self._bad_request("request body must be valid JSON")
+                    return
+                if not isinstance(payload, dict):
+                    self._bad_request("request body must be a JSON object")
+                    return
+                if payload:
+                    self._bad_request(
+                        "field %s is not accepted by this endpoint"
+                        % next(iter(payload))
+                    )
+                    return
+
+            # Authorization uses the same "audit" action as the query, so a
+            # rejection is the same audit/rejected event (key_id null).
+            if not self._enforce(
+                tenant_id, None, audit_mod.ACTION_AUDIT, operator
+            ):
+                return
+
+            result = store.audit.verify(tenant_id)
+            self._send_json(200, result)
 
         # -- policy management --------------------------------------------
         def _strict_tenant(self, parts):

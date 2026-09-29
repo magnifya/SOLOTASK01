@@ -313,6 +313,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 - `GET /v1/policy` / `PUT /v1/policy` / `DELETE /v1/policy`：读/替换/删除
   租户策略，见下。
 - `GET /v1/audit`：本租户审计查询，见下。
+- `GET /v1/audit/verify`：只读的审计账完整性核验，见下。
 - `GET /v1/operations/{operation_id}`：查询幂等操作，见下。
 - `GET /v1/provider/status` 与 `POST /v1/provider/reconnect`：KMS/HSM
   健康检查与无中断重连，见下（全局、非租户作用域，不带也不接受
@@ -556,6 +557,20 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   (timestamp, event_id) 升序；游标为 HMAC 签名令牌，绑定租户/筛选/快照，
   被篡改或条件变化为 `400`。查询成功不记账，被策略拒绝才记一条
   `audit/rejected`（key_id null）。
+- `GET /v1/audit/verify`：只读完整性核验。单一非空 `X-Operator-Id`；
+  租户仍按既有规则由单一 `X-Tenant-Id` 头或单一 `tenant_id` 查询参数给出
+  （二者只能取其一，缺失/为空/重复/冲突为 `400`，冲突照旧记
+  `tenant_conflict`）；不接受其他查询参数，请求正文只允许空对象 `{}`，
+  任何多余字段为 `400`。核验在锁内按账本顺序逐条检查锚点、前缀与整条
+  MAC 链（事件字段与键序、序号从 1 连续、`event_id` 全局唯一、
+  `prev_mac`/`mac` 链接），覆盖该租户已落盘的全部事件；绝不跳过、重签或
+  改写账本，也不写新事件。完整（含空账本）返回单行
+  `{"valid":true,"checked_events":N,"last_seq":M}`，其中 `checked_events`
+  为该租户事件数、`last_seq` 为当前账本最后序号（空账本两者皆 0）；任一
+  不符（坏 JSON、键集/类型错、序号断、event_id 重复、锚点/前缀/MAC 不符）
+  一律固定 `500` `{"error":"audit ledger is unavailable"}`，CLI 同体退出
+  `1`。策略拒绝为 `403`（CLI 退出 `3`），沿用审计查询的 `audit/rejected`
+  记账（key_id null）；核验成功不新增事件。
 - 账本为数据目录 `audit.log`（每行一个 JSON，只追加，进程内锁 +
   `audit.log.lock` fcntl 串行并 fsync，seq 单调）。账本带防篡改链：首次加载在
   锁内校验全部旧行（键序 `event_id,tenant_id,action,key_id,outcome,timestamp,seq`，
@@ -616,6 +631,7 @@ python -m keymgr restore  --tenant-id t --passphrase pw --bundle <b> \
                           --operator alice --idempotency-key restore-0001
 # 审计 / 操作 / 策略
 python -m keymgr audit    --tenant-id t --action rotate --limit 100 --operator alice
+python -m keymgr audit verify --tenant-id t --operator alice
 python -m keymgr operation --tenant-id t --operator alice --operation-id <id>
 python -m keymgr policy --operator admin show --tenant-id t
 python -m keymgr policy --operator admin set --tenant-id t --rules '<json>' \

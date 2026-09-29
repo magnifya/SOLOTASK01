@@ -742,3 +742,23 @@ class AuditLog:
         else:
             next_cursor = None
         return AuditPage(events=page, next_cursor=next_cursor)
+
+    def verify(self, tenant_id: str) -> dict:
+        """Read-only integrity verification of one tenant's ledger.
+
+        Re-verifies the anchor, the anchored prefix and the whole MAC chain
+        in ledger order (fields, seq continuity, event_id uniqueness and the
+        MAC links); any corruption raises LedgerError, exactly like a query,
+        and nothing is skipped, re-signed or rewritten. On success returns
+        ``{"valid": True, "checked_events": n, "last_seq": m}`` where
+        ``checked_events`` counts the tenant's own events and ``last_seq`` is
+        the ledger-wide head seq (0 for an empty ledger).
+        """
+        events = self._read_all()
+        checked = sum(1 for event in events if event.tenant_id == tenant_id)
+        last_seq = events[-1].seq if events else 0
+        return {
+            "valid": True,
+            "checked_events": checked,
+            "last_seq": last_seq,
+        }
