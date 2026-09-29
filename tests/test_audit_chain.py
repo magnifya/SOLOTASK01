@@ -422,3 +422,196 @@ def test_cli_ledger_failure_is_fixed_body_exit_1(tmp_path):
     assert proc.returncode == 1
     assert _cli_json(proc) == {"error": "audit ledger is unavailable"}
     assert _key_files(data_dir) == before
+
+
+def _raw_action_count(data_dir, action):
+    path = os.path.join(data_dir, "audit.log")
+    if not os.path.exists(path):
+        return 0
+    with open(path, "rb") as fh:
+        return fh.read().count(('"%s"' % action).encode("utf-8"))
+
+
+def _rewrite_last_line(data_dir, recompute_mac=False, **changes):
+    path = os.path.join(data_dir, "audit.log")
+    with open(path, "rb") as fh:
+        lines = fh.read().decode("utf-8").splitlines()
+    obj = json.loads(lines[-1])
+    obj.update(changes)
+    if recompute_mac:
+        obj["mac"] = _event_mac(data_dir, obj)
+    lines[-1] = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def _last_log_obj(data_dir):
+    with open(os.path.join(data_dir, "audit.log"), encoding="utf-8") as fh:
+        return json.loads(fh.read().splitlines()[-1])
+
+
+def _damage_anchor(data_dir):
+    with open(os.path.join(data_dir, "audit-anchor.json"), "w",
+              encoding="utf-8") as fh:
+        fh.write('{"schema_version":1,"legacy_bytes":0,"legacy_mac":"'
+                 + "0" * 64 + '"}')
+
+
+def test_http_audit_verify_empty_single_multiple_and_tenant_scope(stack):
+    status, body = _call(stack, "GET", "/v1/audit/verify?tenant_id=t1")
+    assert status == 200
+    assert body == {"valid": True, "checked_events": 0, "last_seq": 0}
+    assert not os.path.exists(os.path.join(stack.data_dir, "audit.log"))
+    assert not os.path.exists(os.path.join(stack.data_dir, "audit.secret"))
+    assert not os.path.exists(
+        os.path.join(stack.data_dir, "audit-anchor.json")
+    )
+
+    ledger = AuditLog(stack.data_dir)
+    _append(ledger, "t1-1", tenant="t1")
+    status, body = _call(stack, "GET", "/v1/audit/verify?tenant_id=t1")
+    assert status == 200
+    assert body == {"valid": True, "checked_events": 1, "last_seq": 1}
+
+    _append(ledger, "t2-1", tenant="t2")
+    _append(ledger, "t1-2", tenant="t1")
+    status, body = _call(stack, "GET", "/v1/audit/verify?tenant_id=t1")
+    assert status == 200
+    assert body == {"valid": True, "checked_events": 2, "last_seq": 3}
+    status, body = _call(stack, "GET", "/v1/audit/verify?tenant_id=t3")
+    assert status == 200
+    assert body == {"valid": True, "checked_events": 0, "last_seq": 3}
+    assert _raw_action_count(stack.data_dir, "audit") == 0
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        lambda d: _corrupt_log(d),
+        lambda d: _rewrite_last_line(d, event_id="t1-1", recompute_mac=True),
+        lambda d: _rewrite_last_line(
+            d, seq=_last_log_obj(d)["seq"] + 1,
+            recompute_mac=True,
+        ),
+        _damage_anchor,
+        lambda d: _rewrite_last_line(d, mac="0" * 64),
+    ],
+    ids=["tampered-line", "duplicate-event-id", "seq-gap",
+         "corrupt-anchor", "bad-mac"],
+)
+def test_http_audit_verify_corruption_is_fixed_500(stack, corrupt):
+    ledger = AuditLog(stack.data_dir)
+    _append(ledger, "t1-1", tenant="t1")
+    _append(ledger, "t1-2", tenant="t1")
+
+    corrupt(stack.data_dir)
+    corrupted_log = _log_bytes(stack.data_dir)
+    status, body = _call(stack, "GET", "/v1/audit/verify?tenant_id=t1")
+
+    assert status == 500
+    assert body == {"error": "audit ledger is unavailable"}
+    assert _raw_action_count(stack.data_dir, "audit") == 0
+    assert _log_bytes(stack.data_dir) == corrupted_log
+
+
+def test_http_audit_verify_validation_conflict_and_body_rules(stack):
+    status, body = _call(
+        stack, "GET", "/v1/audit/verify?tenant_id=t2",
+        body={"unexpected": True},
+    )
+    assert status == 400
+    assert "unexpected" in body["error"]
+    assert _raw_action_count(stack.data_dir, "tenant_conflict") == 0
+
+    req = urllib.request.Request(
+        stack.base + "/v1/audit/verify?tenant_id=t2",
+        headers={"X-Operator-Id": "alice", "X-Tenant-Id": "t1"},
+        method="GET",
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        urllib.request.urlopen(req, timeout=20)
+    assert exc_info.value.code == 400
+    assert json.loads(exc_info.value.read())["error"].startswith(
+        "conflicting tenant_id"
+    )
+    assert _raw_action_count(stack.data_dir, "tenant_conflict") == 1
+
+
+def test_http_and_cli_audit_verify_policy_denial_and_success(stack):
+    status, _ = _call(
+        stack, "PUT", "/v1/policy", {"tenant_id": "t1", "rules": []}
+    )
+    assert status == 200
+
+    status, body = _call(stack, "GET", "/v1/audit/verify?tenant_id=t1")
+    assert status == 403
+    assert body == {"error": "action not permitted by policy"}
+
+    proc = _run_cli(
+        stack.data_dir, "audit", "verify",
+        "--tenant-id", "t1", "--operator", "alice",
+    )
+    assert proc.returncode == 3
+    assert _cli_json(proc) == {"error": "action not permitted by policy"}
+    events = AuditLog(stack.data_dir)._read_all()
+    assert [
+        (e.action, e.outcome) for e in events if e.action == "audit"
+    ] == [("audit", "rejected"), ("audit", "rejected")]
+
+    status, _ = _call(
+        stack, "PUT", "/v1/policy",
+        {"rules": [{"subject": "alice", "actions": ["audit"],
+                    "effect": "allow"}], "tenant_id": "t1"},
+    )
+    assert status == 200
+    status, body = _call(stack, "GET", "/v1/audit/verify?tenant_id=t1")
+    assert status == 200
+    assert body == {"valid": True, "checked_events": 4, "last_seq": 4}
+
+    proc = _run_cli(
+        stack.data_dir, "audit", "verify",
+        "--tenant-id", "t1", "--operator", "alice",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == body
+
+
+def test_cli_audit_verify_matches_http_for_valid_and_corrupt_ledger(tmp_path):
+    data_dir = str(tmp_path)
+    proc = _run_cli(
+        data_dir, "audit", "verify",
+        "--tenant-id", "t1", "--operator", "alice",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {
+        "valid": True, "checked_events": 0, "last_seq": 0,
+    }
+    assert not os.path.exists(os.path.join(data_dir, "audit.log"))
+    assert not os.path.exists(os.path.join(data_dir, "audit.secret"))
+    assert not os.path.exists(os.path.join(data_dir, "audit-anchor.json"))
+
+    for args in (
+        ("gen", "--tenant-id", "t1", "--algorithm", "AES256",
+         "--label", "k1", "--operator", "alice"),
+        ("gen", "--tenant-id", "t2", "--algorithm", "AES256",
+         "--label", "k2", "--operator", "alice"),
+    ):
+        proc = _run_cli(data_dir, *args)
+        assert proc.returncode == 0, proc.stderr
+
+    proc = _run_cli(
+        data_dir, "audit", "verify",
+        "--tenant-id", "t1", "--operator", "alice",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {
+        "valid": True, "checked_events": 1, "last_seq": 2,
+    }
+
+    _corrupt_log(data_dir)
+    proc = _run_cli(
+        data_dir, "audit", "verify",
+        "--tenant-id", "t1", "--operator", "alice",
+    )
+    assert proc.returncode == 1
+    assert _cli_json(proc) == {"error": "audit ledger is unavailable"}

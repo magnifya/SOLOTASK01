@@ -261,6 +261,18 @@ class AuditLog:
         self._secret = secret
         return secret
 
+    def _require_signing_secret_locked(self) -> bytes:
+        """Load an existing secret without creating one (read-only verify)."""
+        try:
+            with open(self._secret_path, "rb") as fh:
+                secret = fh.read()
+        except OSError as exc:
+            raise LedgerError("cannot read audit secret: %s" % exc) from exc
+        if not secret:
+            raise LedgerError("audit secret is empty")
+        self._secret = secret
+        return secret
+
     # -- tamper-evident chain ------------------------------------------------
     @staticmethod
     def _dumps_compact(obj: dict) -> str:
@@ -463,7 +475,7 @@ class AuditLog:
 
     def _verify_locked(self, raw: bytes, anchor: dict) -> List[AuditEvent]:
         """Verify anchor, anchored prefix and the full MAC chain."""
-        secret = self._signing_secret_locked()
+        secret = self._require_signing_secret_locked()
         legacy_bytes = anchor["legacy_bytes"]
         if len(raw) < legacy_bytes:
             raise LedgerError("audit log is shorter than its anchored prefix")
@@ -493,6 +505,20 @@ class AuditLog:
                 seq += 1
         self._chain_head = head
         return events
+
+    def _verify_read_only_locked(self) -> List[AuditEvent]:
+        """Verify all durable lines without anchor or secret initialization."""
+        try:
+            with open(self._log_path, "rb") as fh:
+                raw = fh.read()
+        except FileNotFoundError:
+            raw = b""
+        except OSError as exc:
+            raise LedgerError("cannot read audit log: %s" % exc) from exc
+        anchor = self._read_anchor_locked()
+        if anchor is None:
+            return self._parse_legacy(raw)
+        return self._verify_locked(raw, anchor)
 
     # -- reads -------------------------------------------------------------
     def _read_all_locked(self) -> List[AuditEvent]:
@@ -528,6 +554,14 @@ class AuditLog:
             fd = self._locked_file()
             try:
                 return self._read_all_locked()
+            finally:
+                self._unlock_file(fd)
+
+    def _verify_read_only(self) -> List[AuditEvent]:
+        with self._append_lock:
+            fd = self._locked_file()
+            try:
+                return self._verify_read_only_locked()
             finally:
                 self._unlock_file(fd)
 
@@ -623,6 +657,24 @@ class AuditLog:
             if event.event_id == event_id:
                 return event
         return None
+
+    def verify(self, tenant_id: str) -> dict:
+        """Verify the complete ledger and count one tenant's events.
+
+        The MAC chain protects the global ledger, so verification scans every
+        line in ledger order. The reported count is scoped to ``tenant_id``;
+        ``last_seq`` is the sequence at the end of the complete ledger. This
+        path appends no audit event and never skips, resigns or repairs a
+        corrupt line.
+        """
+        events = self._verify_read_only()
+        return {
+            "valid": True,
+            "checked_events": sum(
+                1 for event in events if event.tenant_id == tenant_id
+            ),
+            "last_seq": events[-1].seq if events else 0,
+        }
 
     def commitment(self, message: str) -> str:
         """Keyed, opaque digest of request material that must never be stored.

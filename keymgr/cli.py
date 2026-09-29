@@ -214,7 +214,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="UUID4 operation_id returned by rotate/import/restore",
     )
 
-    p_audit = tenant_parser("audit", help="list a tenant's audit events")
+    audit_common = argparse.ArgumentParser(add_help=False)
+    audit_common.add_argument("--tenant-id", required=True)
+    audit_common.add_argument(
+        "--operator", required=True,
+        help="non-empty X-Operator-Id of the caller",
+    )
+
+    p_audit = sub.add_parser(
+        "audit", help="list a tenant's audit events or verify ledger integrity"
+    )
+    p_audit.add_argument("--tenant-id", default=None)
+    p_audit.add_argument("--operator", default=None)
     p_audit.add_argument("--key-id", default=None,
                          help="filter to one key_id (must be a UUID4)")
     p_audit.add_argument("--action", default=None,
@@ -223,6 +234,11 @@ def build_parser() -> argparse.ArgumentParser:
                          help="page size, 1-1000 (default: %(default)s)")
     p_audit.add_argument("--cursor", default=None,
                          help="pagination cursor from a previous response")
+    audit_sub = p_audit.add_subparsers(dest="audit_command")
+    audit_sub.add_parser(
+        "verify", parents=[audit_common],
+        help="verify the complete audit ledger for this tenant",
+    )
 
     p_list = tenant_parser(
         "list", help="list a tenant's keys (one paginated snapshot)"
@@ -1842,6 +1858,25 @@ def _run(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.command == "audit":
+        if args.audit_command == "verify":
+            if not args.tenant_id:
+                return _fail(
+                    "field tenant_id must be a non-empty string", 2
+                )
+            if not allowed(audit_mod.ACTION_AUDIT):
+                if not _attempt(
+                    store, args.tenant_id, None,
+                    audit_mod.ACTION_AUDIT, audit_mod.OUTCOME_REJECTED,
+                ):
+                    return 1
+                return _fail("action not permitted by policy", 3)
+            try:
+                result = store.audit.verify(args.tenant_id)
+            except LedgerError as exc:
+                return _ledger_fail(exc)
+            _print(result)
+            return 0
+
         if not args.tenant_id:
             return _fail("field tenant_id must be a non-empty string", 2)
         if args.key_id is not None and not is_valid_key_id(args.key_id):

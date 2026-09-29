@@ -49,6 +49,7 @@ from .store import (
 )
 
 _AUDIT_PATH = "/v1/audit"
+_AUDIT_VERIFY_PATH = "/v1/audit/verify"
 _KEYS_PATH = "/v1/keys"
 _POLICY_PATH = "/v1/policy"
 _PROVIDER_STATUS_PATH = "/v1/provider/status"
@@ -3214,6 +3215,13 @@ def make_handler(
                     self._server_error(exc)
                 return
 
+            if path == _AUDIT_VERIFY_PATH:
+                try:
+                    self._get_audit_verify(parts, operator)
+                except LedgerError as exc:
+                    self._server_error(exc)
+                return
+
             if path == _KEYS_PATH:
                 try:
                     self._list_keys(parts, operator)
@@ -3634,6 +3642,44 @@ def make_handler(
                     "next_cursor": page.next_cursor,
                 },
             )
+
+        def _empty_request_body(self) -> bool:
+            """Validate a GET body as absent or an empty JSON object."""
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                self._bad_request("invalid Content-Length")
+                return False
+            raw = self.rfile.read(length) if length > 0 else b""
+            if not raw:
+                return True
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                self._bad_request("request body must be valid JSON")
+                return False
+            if not isinstance(payload, dict):
+                self._bad_request("request body must be a JSON object")
+                return False
+            if payload:
+                extra = next(iter(payload))
+                self._bad_request(
+                    "field %s is not accepted by this endpoint" % extra
+                )
+                return False
+            return True
+
+        def _get_audit_verify(self, parts, operator: str) -> None:
+            tenant_id = self._audit_tenant(parts)
+            if tenant_id is None:
+                return
+            if not self._empty_request_body():
+                return
+            if not self._enforce(
+                tenant_id, None, audit_mod.ACTION_AUDIT, operator
+            ):
+                return
+            self._send_json(200, store.audit.verify(tenant_id))
 
         # -- policy management --------------------------------------------
         def _strict_tenant(self, parts):
