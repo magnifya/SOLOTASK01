@@ -310,6 +310,23 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   tenant 不符 `404` → 同租户 key_id/策略冲突 `409`（绝不覆盖既有策略）→
   多文件原子恢复 `201` → `{tenant_id, key_ids, policy_restored,
   operation_id}`。空包同样成功（`key_ids:[]`、`policy_restored:false`）。
+- `POST /v1/restore/preflight`，body 仅
+  `{tenant_id, passphrase, bundle}`（无需 `Idempotency-Key`，无 CLI
+  入口）：恢复预检，只读、不铸密钥/提供者句柄、不写策略/标记/操作记录，
+  在恢复的同一全局、租户策略与逐 key 锁范围内观察一致视图，并发恢复整体
+  在检查前或检查后。`200` →
+  `{key_ids, policy_restored, ready, conflicts}`，`key_ids` 按 UUID 升序，
+  `policy_restored` 表示包是否携带策略；无冲突时 `ready:true`、
+  `conflicts:[]`，同租户冲突时 `ready:false`，`conflicts` 先列
+  `{"type":"key","key_id":...}`（升序）再列单个 `{"type":"policy"}`；
+  空包恒为 `key_ids:[]、policy_restored:false、ready:true`。口令错误、
+  篡改、格式或内部字段非法统一 `400 {"error":"invalid tenant backup"}`；
+  请求字段与租户来源错误沿用既有 400（`tenant_conflict` 照旧）；按恢复的
+  `import` 动作授权，拒绝为 `403` 并记一条 `import/rejected`（预检成功不
+  新增任何事件）；包属于其他租户或包内 key_id 被其他租户占用为
+  `404 {"error":"tenant backup not found"}`；内部状态无法可靠判断固定
+  `500 {"error":"restore preflight unavailable"}`。预检绝不留下文件、
+  标记、句柄或审计痕迹（仅有的锁 sidecar 除外）。
 - `GET /v1/policy` / `PUT /v1/policy` / `DELETE /v1/policy`：读/替换/删除
   租户策略，见下。
 - `GET /v1/audit` / `GET /v1/audit/verify`：本租户审计查询与完整性核验，见下。

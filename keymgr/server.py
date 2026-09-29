@@ -60,6 +60,7 @@ _IMPORT_PATH = "/v1/keys/import"
 _BATCH_ROTATE_PATH = "/v1/keys/batch-rotate"
 _BACKUP_PATH = "/v1/backup"
 _RESTORE_PATH = "/v1/restore"
+_RESTORE_PREFLIGHT_PATH = "/v1/restore/preflight"
 _KEY_PATH_RE = re.compile(r"^/v1/keys/([^/]+)$")
 _ROTATE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/rotate$")
 _REVOKE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/revoke$")
@@ -895,6 +896,10 @@ def make_handler(
 
                 if path == _RESTORE_PATH:
                     self._restore_tenant(parts, operator)
+                    return
+
+                if path == _RESTORE_PREFLIGHT_PATH:
+                    self._restore_preflight(parts, operator)
                     return
 
                 if path == _PROVIDER_RECONNECT_PATH:
@@ -2992,6 +2997,129 @@ def make_handler(
 
             self._idempotent_guard(
                 parts.path, tenant_id, operator, payload, idem_key, execute
+            )
+
+        def _restore_preflight(self, parts, operator: str) -> None:
+            """POST /v1/restore/preflight.
+
+            A side-effect-free restore dry run: no Idempotency-Key is bound,
+            no key or policy is written, no provider handle is minted and no
+            audit or operation record is left (the sole exception being the
+            single ``import/rejected`` event recorded when the restore's
+            import action is denied). The observation runs under the exact
+            lock range of a restore, so a concurrent restore is seen wholly
+            before or wholly after it.
+
+            Statuses: bad request fields and tenant-source disagreements
+            follow the usual 400 rules (a tenant-source failure still
+            records tenant_conflict); a wrong passphrase, tampered, malformed
+            or internally invalid bundle is the fixed 400
+            ``invalid tenant backup``; policy denial is 403; a bundle sealed
+            for another tenant (or an object occupied by another tenant) is
+            404; any state that cannot be judged reliably is the fixed 500
+            ``restore preflight unavailable``.
+            """
+            payload = self._read_json_object()
+            if payload is None:
+                return
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                if self._record_conflict():
+                    self._bad_request(
+                        "field tenant_id must be a non-empty string"
+                    )
+                return
+            tenant_id = self._tenant(parts, payload)
+            if tenant_id is None:
+                return
+            unknown = set(payload) - {"tenant_id", "passphrase", "bundle"}
+            if unknown:
+                self._bad_request(
+                    "field %s is not accepted by this endpoint"
+                    % sorted(unknown)[0]
+                )
+                return
+            passphrase = payload.get("passphrase")
+            if not isinstance(passphrase, str) or not passphrase:
+                self._bad_request(
+                    "field passphrase must be a non-empty string"
+                )
+                return
+            bundle = payload.get("bundle")
+            if not isinstance(bundle, str) or not bundle:
+                self._bad_request("field bundle must be a non-empty string")
+                return
+            try:
+                decoded = tenantbundle.decode_bundle(bundle, passphrase)
+            except tenantbundle.TenantBundleError:
+                # Wrong passphrase, tampering, format/version or internal
+                # field problems all share one detail-free 400: the failure
+                # never doubles as an existence probe.
+                self._bad_request("invalid tenant backup")
+                return
+            # Authorization uses the restore's import action, in the same
+            # order as /v1/restore (after decrypt, before the in-bundle
+            # tenant and conflict checks). A denial is the only audit event
+            # a preflight ever writes.
+            if not policy_store.is_allowed(
+                tenant_id, audit_mod.ACTION_IMPORT, operator
+            ):
+                try:
+                    store.audit_attempt(
+                        tenant_id, None, audit_mod.ACTION_IMPORT,
+                        audit_mod.OUTCOME_REJECTED,
+                    )
+                except LedgerError:
+                    self._preflight_unavailable()
+                    return
+                self._send_json(
+                    403, {"error": "action not permitted by policy"}
+                )
+                return
+            if decoded["tenant_id"] != tenant_id:
+                self._send_json(
+                    404, {"error": "tenant backup not found"}
+                )
+                return
+            try:
+                view = coordinator.preflight(
+                    tenant_id, decoded,
+                    lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
+                )
+            except (LockTimeout, OSError):
+                self._preflight_unavailable()
+                return
+            if view.foreign is not None:
+                # A bundle key_id or the tenant's policy path occupied by
+                # another tenant answers like a missing object.
+                self._send_json(
+                    404, {"error": "tenant backup not found"}
+                )
+                return
+            conflicts = []
+            for conflict in view.conflicts:
+                if conflict.kind == "key":
+                    conflicts.append(
+                        {"type": "key", "key_id": conflict.key_id}
+                    )
+                else:
+                    conflicts.append({"type": "policy"})
+            self._send_json(
+                200,
+                {
+                    "key_ids": sorted(
+                        key["key_id"] for key in decoded["keys"]
+                    ),
+                    "policy_restored": decoded["policy"] is not None,
+                    "ready": not conflicts,
+                    "conflicts": conflicts,
+                },
+            )
+
+        def _preflight_unavailable(self) -> None:
+            """Fixed 500 for a preflight whose state cannot be judged."""
+            self._send_json(
+                500, {"error": "restore preflight unavailable"}
             )
 
         # -- provider health / reconnect ----------------------------------

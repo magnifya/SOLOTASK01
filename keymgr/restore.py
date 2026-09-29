@@ -86,6 +86,18 @@ class RestoreResult(NamedTuple):
     conflict: Optional[Conflict] = None
 
 
+class PreflightView(NamedTuple):
+    """Read-only restore observation made under the restore lock range.
+
+    ``foreign`` is the first object occupied by another tenant (answered
+    404); ``conflicts`` lists same-tenant occupants, key conflicts in
+    key_id order followed by the policy conflict.
+    """
+
+    foreign: Optional[Conflict] = None
+    conflicts: Optional[List[Conflict]] = None
+
+
 class _PendingGroup:
     """Files sharing one restore marker discovered during recovery."""
 
@@ -560,6 +572,57 @@ class RestoreCoordinator:
             if same_tenant is None:
                 same_tenant = Conflict(kind="policy", owner=tenant_id)
         return same_tenant
+
+    def preflight(
+        self,
+        tenant_id: str,
+        payload: dict,
+        lock_timeout: Optional[float] = None,
+    ) -> PreflightView:
+        """Observe restore conflicts without any side effect.
+
+        Takes the exact same lock range as :meth:`restore` (the in-process
+        and cross-process restore locks, the tenant policy lock and every
+        key lock in sorted order), so a concurrent restore is observed
+        wholly before or wholly after this view. No event, journal,
+        provider handle, file or marker is created: this is a pure read of
+        the committed on-disk state.
+
+        An empty bundle is always ready by contract; a non-empty bundle
+        applies the same policy-occupancy rule as a restore (an existing
+        policy conflicts even when the bundle's policy slot is null).
+        """
+        key_ids = sorted(k["key_id"] for k in payload["keys"])
+        with self._restore_locks(tenant_id, key_ids, lock_timeout):
+            conflicts: List[Conflict] = []
+            foreign: Optional[Conflict] = None
+            for one_key_id in key_ids:
+                existing = self.store.read_raw(one_key_id)
+                if existing is None:
+                    continue
+                if existing.tenant_id != tenant_id:
+                    # A foreign owner wins outright (404) and suppresses the
+                    # same-tenant conflict list, as in _scan_conflicts.
+                    foreign = Conflict(
+                        kind="key",
+                        owner=existing.tenant_id,
+                        key_id=one_key_id,
+                    )
+                    break
+                conflicts.append(
+                    Conflict(kind="key", owner=tenant_id, key_id=one_key_id)
+                )
+            if foreign is None and key_ids:
+                policy_path = self.policy_store.path_for(tenant_id)
+                if os.path.exists(policy_path):
+                    owner = self.policy_store.owner_of_path(policy_path)
+                    if owner is not None and owner != tenant_id:
+                        foreign = Conflict(kind="policy", owner=owner)
+                    else:
+                        conflicts.append(
+                            Conflict(kind="policy", owner=tenant_id)
+                        )
+            return PreflightView(foreign=foreign, conflicts=conflicts)
 
     def _commit_locked(
         self,
