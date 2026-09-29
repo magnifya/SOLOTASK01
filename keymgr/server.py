@@ -74,6 +74,7 @@ _WRAP_KEY_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/wrap-key$")
 _UNWRAP_KEY_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/unwrap-key$")
 _REWRAP_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/rewrap$")
 _STATUS_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/status$")
+_VERSIONS_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/versions$")
 _VERSION_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/versions/([^/]+)$")
 _VERSION_STATUS_PATH_RE = re.compile(
     r"^/v1/keys/([^/]+)/versions/([^/]+)/status$"
@@ -3369,6 +3370,13 @@ def make_handler(
                 return
 
             try:
+                versions_match = _VERSIONS_PATH_RE.match(path)
+                if versions_match is not None:
+                    self._list_versions(
+                        versions_match.group(1), parts, operator
+                    )
+                    return
+
                 version_status_match = _VERSION_STATUS_PATH_RE.match(path)
                 if version_status_match is not None:
                     self._get_version_status(
@@ -3680,6 +3688,82 @@ def make_handler(
                 200,
                 {
                     "items": [r.to_list_response() for r in page.records],
+                    "next_cursor": page.next_cursor,
+                },
+            )
+
+        # -- per-key version history --------------------------------------
+        def _list_versions(self, key_id: str, parts, operator: str) -> None:
+            """GET /v1/keys/{key_id}/versions: the key's full history.
+
+            Every committed version is returned in ascending version order;
+            each item merges the single-version projection with the version
+            revocation state (the whole-key state outranks it) and marks
+            ``current``. The tenant comes from a single source (one header or
+            one query parameter); ``limit`` is 1-1000 (default 100) and
+            ``cursor`` follows the audit HMAC-cursor rules, bound to tenant,
+            key_id, limit and the visible version set/state. Parameter errors
+            (bad key_id, limit or cursor) are a 400 with no audit event, all
+            validated before authorization; only a missing/conflicting tenant
+            source records its usual tenant_conflict. A policy denial is 403
+            with a read/rejected event carrying key_id; an unknown or
+            cross-tenant key is an indistinct 404; a revoked key stays
+            readable; success is 200 with one read/success event.
+            """
+            tenant_id = self._audit_tenant(parts)
+            if tenant_id is None:
+                return
+            if self._bad_key_id(key_id, audit=False):
+                return
+            qs = parse_qs(parts.query, keep_blank_values=True)
+
+            limit = 100
+            values, errored = self._single_param(qs, "limit")
+            if errored:
+                return
+            if values:
+                raw_limit = values[0]
+                if not _POSITIVE_INT_RE.fullmatch(raw_limit):
+                    self._bad_request(
+                        "field limit must be an integer between 1 and 1000"
+                    )
+                    return
+                limit = int(raw_limit)
+                if not 1 <= limit <= 1000:
+                    self._bad_request(
+                        "field limit must be an integer between 1 and 1000"
+                    )
+                    return
+
+            values, errored = self._single_param(qs, "cursor")
+            if errored:
+                return
+            cursor = values[0] if values else None
+
+            if not self._enforce(
+                tenant_id, key_id, audit_mod.ACTION_READ, operator
+            ):
+                return
+
+            try:
+                page = store.versions_page(
+                    key_id, tenant_id, limit=limit, cursor=cursor
+                )
+            except InvalidCursor:
+                self._bad_request("invalid or expired cursor")
+                return
+            if page is None:
+                self._reject_read(tenant_id, key_id, 404, "key not found")
+                return
+            if not self._record_attempt(
+                tenant_id, key_id, audit_mod.ACTION_READ,
+                audit_mod.OUTCOME_SUCCESS,
+            ):
+                return
+            self._send_json(
+                200,
+                {
+                    "items": page.items,
                     "next_cursor": page.next_cursor,
                 },
             )

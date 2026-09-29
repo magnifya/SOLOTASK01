@@ -154,6 +154,18 @@ class KeyListPage(NamedTuple):
     next_cursor: Optional[str]
 
 
+class VersionListPage(NamedTuple):
+    """One page of a key's full version history.
+
+    ``items`` are the merged version projections (version fields plus the
+    effective revocation state and the ``current`` marker); ``next_cursor``
+    is null on the last page.
+    """
+
+    items: List[dict]
+    next_cursor: Optional[str]
+
+
 class LockTimeout(Exception):
     """A guarded key could not be locked within the allowed wait.
 
@@ -434,6 +446,39 @@ class KeyRecord:
             "status": self.status,
             "created_at": self.created_at,
             "public_key": self.current.public_key,
+        }
+
+    def to_version_history_item(self, ver: "VersionRecord") -> dict:
+        """One item of GET .../versions (200). No private material.
+
+        Merges the single-version projection (version, created_at, algorithm,
+        public_key) with the version-status projection (status, reason,
+        operator, revoked_at) and marks ``current``. A whole-key revocation
+        outranks every per-version state: once the key is revoked every item
+        reports the key-level revocation facts, while the history stays
+        readable.
+        """
+        if self.status == "revoked":
+            status = self.status
+            reason = self.reason
+            operator = self.operator
+            revoked_at = self.revoked_at
+        else:
+            status = ver.status
+            reason = ver.reason
+            operator = ver.operator
+            revoked_at = ver.revoked_at
+        return {
+            "key_id": self.key_id,
+            "version": ver.version,
+            "created_at": ver.created_at,
+            "algorithm": ver.algorithm,
+            "public_key": ver.public_key,
+            "status": status,
+            "reason": reason,
+            "operator": operator,
+            "revoked_at": revoked_at,
+            "current": ver.version == self.current_version,
         }
 
 
@@ -4989,6 +5034,117 @@ class KeyStore:
             next_cursor = None
         return KeyListPage(records=page, next_cursor=next_cursor)
 
+    @staticmethod
+    def _version_history_fingerprint(record: "KeyRecord") -> str:
+        """Stable digest of one key's visible version set and state.
+
+        Every projected field of a version-history item is folded in along
+        with the current pointer and the whole-key revocation state, so a
+        rotation, a per-version revocation or a whole-key revocation
+        invalidates any cursor issued against the previous view -- exactly the
+        audit ledger's cursor rule.
+        """
+        digest = hashlib.sha256()
+        digest.update(record.key_id.encode("utf-8"))
+        digest.update(b":current=")
+        digest.update(str(record.current_version).encode("ascii"))
+        digest.update(b":keystatus=")
+        digest.update((record.status or "").encode("utf-8"))
+        digest.update(b":")
+        digest.update((record.reason or "").encode("utf-8"))
+        digest.update(b":")
+        digest.update((record.operator or "").encode("utf-8"))
+        digest.update(b":")
+        digest.update((record.revoked_at or "").encode("utf-8"))
+        digest.update(b"\n")
+        for ver in sorted(record.versions, key=lambda v: v.version):
+            digest.update(str(ver.version).encode("ascii"))
+            digest.update(b":")
+            digest.update(ver.created_at.encode("utf-8"))
+            digest.update(b":")
+            digest.update(ver.algorithm.encode("utf-8"))
+            digest.update(b":")
+            digest.update((ver.public_key or "").encode("utf-8"))
+            digest.update(b":")
+            digest.update((ver.status or "").encode("utf-8"))
+            digest.update(b":")
+            digest.update((ver.reason or "").encode("utf-8"))
+            digest.update(b":")
+            digest.update((ver.operator or "").encode("utf-8"))
+            digest.update(b":")
+            digest.update((ver.revoked_at or "").encode("utf-8"))
+            digest.update(b"\n")
+        digest.update(b"count=%d" % len(record.versions))
+        return digest.hexdigest()
+
+    def versions_page(
+        self,
+        key_id: str,
+        tenant_id: str,
+        limit: int = 100,
+        cursor: Optional[str] = None,
+    ) -> Optional[VersionListPage]:
+        """Return one tenant-isolated, snapshot-bound page of a key's history.
+
+        Committed versions are ordered by version number ascending and merged
+        with their effective revocation state (the whole-key state outranks a
+        per-version state). Cursors follow the audit ledger's rules:
+        HMAC-signed and bound to the tenant, the key_id, the limit and the
+        visible version set/state, so a tampered, cross-tenant, key-mismatched
+        or stale cursor raises InvalidCursor and a concurrent rotation or
+        revocation can never duplicate or skip an item. None means the key is
+        unknown to the tenant or owned by another tenant (existence never
+        leaks); a revoked key stays readable.
+        """
+        record = self.get(key_id, tenant_id)
+        if record is None:
+            return None
+
+        anchor = None
+        fingerprint = None
+        if cursor is not None:
+            payload = self.audit._decode_cursor(cursor)
+            try:
+                if payload.get("t") != tenant_id:
+                    raise InvalidCursor("cursor does not match tenant_id")
+                if payload.get("k") != key_id:
+                    raise InvalidCursor("cursor does not match key_id")
+                if int(payload.get("l", -1)) != limit:
+                    raise InvalidCursor("cursor does not match limit")
+                anchor = int(payload["av"])
+                fingerprint = payload["f"]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise InvalidCursor("malformed cursor") from exc
+
+        visible = sorted(record.versions, key=lambda v: v.version)
+        current_fingerprint = self._version_history_fingerprint(record)
+        if fingerprint is not None and fingerprint != current_fingerprint:
+            raise InvalidCursor("cursor snapshot is no longer valid")
+
+        selected = visible
+        if anchor is not None:
+            selected = [v for v in selected if v.version > anchor]
+
+        page = selected[:limit]
+        if len(selected) > limit and page:
+            last = page[-1]
+            next_cursor = self.audit._encode_cursor(
+                {
+                    "v": 1,
+                    "t": tenant_id,
+                    "k": key_id,
+                    "l": limit,
+                    "av": last.version,
+                    "f": current_fingerprint,
+                }
+            )
+        else:
+            next_cursor = None
+        return VersionListPage(
+            items=[record.to_version_history_item(v) for v in page],
+            next_cursor=next_cursor,
+        )
+
     def backup_entry(self, record: KeyRecord) -> dict:
         """Project a record for a tenant backup payload.
 
@@ -5131,4 +5287,3 @@ class KeyStore:
         finally:
             for lock_cm in reversed(acquired):
                 lock_cm.__exit__(None, None, None)
-
