@@ -75,6 +75,7 @@ _UNWRAP_KEY_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/unwrap-key$")
 _REWRAP_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/rewrap$")
 _STATUS_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/status$")
 _VERSION_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/versions/([^/]+)$")
+_VERSIONS_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/versions$")
 _VERSION_STATUS_PATH_RE = re.compile(
     r"^/v1/keys/([^/]+)/versions/([^/]+)/status$"
 )
@@ -3369,6 +3370,13 @@ def make_handler(
                 return
 
             try:
+                versions_match = _VERSIONS_PATH_RE.match(path)
+                if versions_match is not None:
+                    self._get_versions(
+                        versions_match.group(1), parts, operator
+                    )
+                    return
+
                 version_status_match = _VERSION_STATUS_PATH_RE.match(path)
                 if version_status_match is not None:
                     self._get_version_status(
@@ -3527,6 +3535,97 @@ def make_handler(
             ):
                 return
             self._send_json(200, ver.to_version_status_response(key_id))
+
+        def _get_versions(self, key_id: str, parts, operator: str) -> None:
+            """GET /v1/keys/{key_id}/versions: the key's full history.
+
+            Every committed version is returned in ascending version order;
+            each item merges the single-version read fields with the version
+            status fields and flags ``current``. A whole-key revocation does
+            not hide the history: its revocation facts project onto every
+            item. The single tenant comes from one source (single header or
+            single parameter); ``limit`` is 1-1000 (default 100) and
+            ``cursor`` follows the signed snapshot cursor rules. All
+            parameter failures (including a malformed key_id or cursor) are
+            400s with no audit event -- only a missing/conflicting tenant
+            source records ``tenant_conflict`` as usual -- and validation
+            precedes authorization. A policy denial is 403 with one
+            ``read/rejected`` event carrying the key_id; an unknown or
+            cross-tenant key is an indistinct 404; success is 200 with one
+            ``read/success`` event and ``{items,next_cursor}``.
+            """
+            tenant_id = self._audit_tenant(parts)
+            if tenant_id is None:
+                return
+            if not is_valid_key_id(key_id):
+                self._bad_request("field key_id must be a UUID4")
+                return
+            qs = parse_qs(parts.query, keep_blank_values=True)
+
+            limit = 100
+            values, errored = self._single_param(qs, "limit")
+            if errored:
+                return
+            if values:
+                raw_limit = values[0]
+                if not _POSITIVE_INT_RE.fullmatch(raw_limit):
+                    self._bad_request(
+                        "field limit must be an integer between 1 and 1000"
+                    )
+                    return
+                limit = int(raw_limit)
+                if not 1 <= limit <= 1000:
+                    self._bad_request(
+                        "field limit must be an integer between 1 and 1000"
+                    )
+                    return
+
+            values, errored = self._single_param(qs, "cursor")
+            if errored:
+                return
+            cursor = values[0] if values else None
+            if cursor is not None and not cursor:
+                self._bad_request("field cursor must be a non-empty string")
+                return
+            # A duplicate/empty cursor is rejected above; a tampered or
+            # otherwise undecodable cursor is a parameter 400 as well, so
+            # verify the signature before consulting the policy.
+            if cursor is not None:
+                try:
+                    store.audit._decode_cursor(cursor)
+                except InvalidCursor:
+                    self._bad_request("invalid or expired cursor")
+                    return
+
+            if not self._enforce(
+                tenant_id, key_id, audit_mod.ACTION_READ, operator
+            ):
+                return
+
+            try:
+                page = store.versions_page(
+                    key_id, tenant_id, limit=limit, cursor=cursor
+                )
+            except InvalidCursor:
+                self._bad_request("invalid or expired cursor")
+                return
+            if page is None:
+                self._reject_read(
+                    tenant_id, key_id, 404, "key not found"
+                )
+                return
+            if not self._record_attempt(
+                tenant_id, key_id, audit_mod.ACTION_READ,
+                audit_mod.OUTCOME_SUCCESS,
+            ):
+                return
+            self._send_json(
+                200,
+                {
+                    "items": page.items,
+                    "next_cursor": page.next_cursor,
+                },
+            )
 
         def _get_current(self, key_id: str, parts, operator: str) -> None:
             tenant_id = self._tenant(parts)

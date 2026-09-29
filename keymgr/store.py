@@ -154,6 +154,13 @@ class KeyListPage(NamedTuple):
     next_cursor: Optional[str]
 
 
+class VersionHistoryPage(NamedTuple):
+    """Result of one version-history query: a page of items and next cursor."""
+
+    items: list
+    next_cursor: Optional[str]
+
+
 class LockTimeout(Exception):
     """A guarded key could not be locked within the allowed wait.
 
@@ -435,6 +442,46 @@ class KeyRecord:
             "created_at": self.created_at,
             "public_key": self.current.public_key,
         }
+
+    def to_version_history(self) -> list:
+        """All committed versions as GET .../versions items, ascending.
+
+        Each item merges the single-version read projection (``version``,
+        ``created_at``, ``algorithm``, ``public_key``) with the version
+        status projection (``status``, ``reason``, ``operator``,
+        ``revoked_at``) and flags the current version. A whole-key
+        revocation outranks every per-version state, exactly as it does for
+        the crypto operations: while the key is revoked every item carries
+        the key-level revocation facts, and the history remains readable.
+        No private material, handle or provider id is included.
+        """
+        items = []
+        for ver in sorted(self.versions, key=lambda v: v.version):
+            if self.status == "revoked":
+                status = self.status
+                reason = self.reason
+                operator = self.operator
+                revoked_at = self.revoked_at
+            else:
+                status = ver.status
+                reason = ver.reason
+                operator = ver.operator
+                revoked_at = ver.revoked_at
+            items.append(
+                {
+                    "key_id": self.key_id,
+                    "version": ver.version,
+                    "created_at": ver.created_at,
+                    "algorithm": ver.algorithm,
+                    "public_key": ver.public_key,
+                    "status": status,
+                    "reason": reason,
+                    "operator": operator,
+                    "revoked_at": revoked_at,
+                    "current": ver.version == self.current_version,
+                }
+            )
+        return items
 
 
 def _provider_session(func):
@@ -4989,6 +5036,126 @@ class KeyStore:
             next_cursor = None
         return KeyListPage(records=page, next_cursor=next_cursor)
 
+    @staticmethod
+    def _version_history_fingerprint(record: "KeyRecord", items: list) -> str:
+        """Stable digest identifying one key's visible version history.
+
+        Every projected item field is folded in (including the whole-key
+        status and its revocation facts), so a rotation, a per-version
+        revocation or a whole-key revocation invalidates cursors issued
+        against the previous history -- never a duplicate or a gap.
+        """
+        digest = hashlib.sha256()
+        digest.update(record.key_id.encode("utf-8"))
+        digest.update(b":")
+        digest.update(str(record.current_version).encode("ascii"))
+        digest.update(b":")
+        digest.update(record.status.encode("utf-8"))
+        digest.update(b":")
+        digest.update((record.reason or "").encode("utf-8"))
+        digest.update(b":")
+        digest.update((record.operator or "").encode("utf-8"))
+        digest.update(b":")
+        digest.update((record.revoked_at or "").encode("utf-8"))
+        digest.update(b"\n")
+        for item in items:
+            digest.update(str(item["version"]).encode("ascii"))
+            digest.update(b":")
+            digest.update(item["created_at"].encode("utf-8"))
+            digest.update(b":")
+            digest.update(item["algorithm"].encode("utf-8"))
+            digest.update(b":")
+            digest.update((item["public_key"] or "").encode("utf-8"))
+            digest.update(b":")
+            digest.update(item["status"].encode("utf-8"))
+            digest.update(b":")
+            digest.update((item["reason"] or "").encode("utf-8"))
+            digest.update(b":")
+            digest.update((item["operator"] or "").encode("utf-8"))
+            digest.update(b":")
+            digest.update((item["revoked_at"] or "").encode("utf-8"))
+            digest.update(b":")
+            digest.update(b"1" if item["current"] else b"0")
+            digest.update(b"\n")
+        digest.update(b"count=%d" % len(items))
+        return digest.hexdigest()
+
+    def versions_page(
+        self,
+        key_id: str,
+        tenant_id: str,
+        limit: int = 100,
+        cursor: Optional[str] = None,
+    ) -> Optional[VersionHistoryPage]:
+        """Return one tenant-isolated, snapshot-bound page of a key's history.
+
+        Items are the committed versions of the key in ascending version
+        order, each merging the single-version read and the version status
+        projections and flagging the current version. Cursors follow the
+        audit/key-list rules: HMAC-signed and bound to the tenant, the
+        key_id, the limit and the visible history, so a tampered,
+        cross-tenant, key/limit-mismatched or stale cursor (after a
+        rotation, a version revocation or a whole-key revocation) raises
+        InvalidCursor instead of duplicating or skipping an item.
+
+        Returns None for an unknown key, a cross-tenant access or a key
+        whose committed view is hidden, all indistinguishable.
+        """
+        record = self.get(key_id, tenant_id)
+        if record is None:
+            return None
+
+        anchor = None
+        fingerprint = None
+        if cursor is not None:
+            payload = self.audit._decode_cursor(cursor)
+            try:
+                if payload.get("t") != tenant_id:
+                    raise InvalidCursor("cursor does not match tenant_id")
+                if payload.get("k") != key_id:
+                    raise InvalidCursor("cursor does not match key_id")
+                if int(payload.get("l", -1)) != limit:
+                    raise InvalidCursor("cursor does not match limit")
+                anchor = int(payload["vn"])
+                fingerprint = payload["f"]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise InvalidCursor("malformed cursor") from exc
+            if anchor < 1:
+                raise InvalidCursor("malformed cursor")
+
+        items = record.to_version_history()
+        current_fingerprint = self._version_history_fingerprint(
+            record, items
+        )
+        if fingerprint is not None:
+            if fingerprint != current_fingerprint:
+                raise InvalidCursor("cursor snapshot is no longer valid")
+            if not any(item["version"] == anchor for item in items):
+                raise InvalidCursor("cursor anchor is no longer valid")
+
+        selected = items
+        if anchor is not None:
+            selected = [
+                item for item in selected if item["version"] > anchor
+            ]
+
+        page = selected[:limit]
+        if len(selected) > limit and page:
+            last = page[-1]
+            next_cursor = self.audit._encode_cursor(
+                {
+                    "v": 1,
+                    "t": tenant_id,
+                    "k": key_id,
+                    "l": limit,
+                    "vn": last["version"],
+                    "f": current_fingerprint,
+                }
+            )
+        else:
+            next_cursor = None
+        return VersionHistoryPage(items=page, next_cursor=next_cursor)
+
     def backup_entry(self, record: KeyRecord) -> dict:
         """Project a record for a tenant backup payload.
 
@@ -5131,4 +5298,3 @@ class KeyStore:
         finally:
             for lock_cm in reversed(acquired):
                 lock_cm.__exit__(None, None, None)
-

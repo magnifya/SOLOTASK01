@@ -136,6 +136,22 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 - `GET /v1/keys/{key_id}/versions/{version}` 与
   `GET /v1/keys/{key_id}/current` →
   `{key_id, version, created_at, algorithm, public_key}`；version 须为正整数。
+- `GET /v1/keys/{key_id}/versions`：按版本号从小到大返回该键全部**已提交**
+  版本的完整历史。单一租户来源（单一头或单一 `?tenant_id=`）；可选单值参数
+  `limit`(1–1000，默认 100)、`cursor`，重复/空/非法/越界均 `400` 并指出字段，
+  校验先于授权。`200` → `{items, next_cursor}`，每项键序固定
+  `key_id,version,created_at,algorithm,public_key,status,reason,operator,
+  revoked_at,current`：前五项同单版本读取，中间四项同版本状态查询（active
+  版本后三项为 null），`current` 标出当前版本；整键吊销优先于任何版本级吊
+  销——整键被吊销时历史仍可读（不返回 `409`），每项沿用整键 status 查询口径
+  的 `revoked` 与整键 reason/operator/revoked_at，末页 `next_cursor:null`。
+  游标沿用审计游标规则（HMAC 签名，绑定租户/key_id/limit/发起查询时的可见版
+  本集合与状态），篡改、跨租户、limit 不符、轮换、单版本吊销或整键吊销后旧
+  游标均 `400`，并发变更使旧游标失效而非重漏。`limit`/`cursor`/`key_id` 的
+  非法请求不记账（仅租户来源缺失/冲突照旧记 `tenant_conflict`）；策略拒绝
+  `403` 记一条带 key_id 的 `read/rejected`，成功记一条带 key_id 的
+  `read/success`；未知 key 或跨租户访问统一 `404`，不泄露存在性；存储/账本
+  失败固定 `500` `{"error":"audit ledger is unavailable"}`。
 - `POST /v1/keys/{key_id}/versions/{version}/revoke`（无 CLI、非幂等键），
   正文**仅** `{tenant_id, reason, operator}` 且三项均为非空字符串；吊销**单个
   版本**，不动其它版本与整 key。策略动作新增 `revoke_version`：拒权 `403` 并记
@@ -615,6 +631,8 @@ python -m keymgr list     --tenant-id t --operator alice \
                           [--limit 100] [--cursor <cursor>]
 python -m keymgr current  --tenant-id t --key-id <id> --operator alice
 python -m keymgr version  --tenant-id t --key-id <id> --version 1 --operator alice
+python -m keymgr versions --tenant-id t --key-id <id> --operator alice \
+                          [--limit 100] [--cursor <cursor>]
 python -m keymgr rotate   --tenant-id t --key-id <id> --algorithm AES256 \
                           --operator alice --idempotency-key rotate-0001 \
                           [--expected-version 1]

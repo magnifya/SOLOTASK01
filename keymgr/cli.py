@@ -147,6 +147,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_current = tenant_parser("current", help="show the current key version")
     p_current.add_argument("--key-id", required=True)
 
+    p_versions = tenant_parser(
+        "versions",
+        help="list all committed versions of a key (paginated history)",
+    )
+    p_versions.add_argument("--key-id", required=True)
+    p_versions.add_argument("--limit", type=int, default=100,
+                            help="page size, 1-1000 (default: %(default)s)")
+    p_versions.add_argument("--cursor", default=None,
+                            help="pagination cursor from a previous response")
+
     p_revoke = tenant_parser("revoke", help="revoke a key")
     p_revoke.add_argument("--key-id", required=True)
     p_revoke.add_argument("--reason", required=True)
@@ -1293,6 +1303,53 @@ def _run(argv: Optional[List[str]] = None) -> int:
             return 1
         _record, ver = result
         _print(ver.to_version_response(args.key_id))
+        return 0
+
+    if args.command == "versions":
+        # Parameter validation (exit 2) precedes authorization (exit 3),
+        # and these 400s write no audit event, exactly like the HTTP
+        # endpoint.
+        if not args.tenant_id:
+            return _fail("field tenant_id must be a non-empty string", 2)
+        if not is_valid_key_id(args.key_id):
+            return _fail("field key_id must be a UUID4", 2)
+        if not 1 <= args.limit <= 1000:
+            return _fail(
+                "field limit must be an integer between 1 and 1000", 2
+            )
+        cursor = args.cursor
+        if cursor is not None and not cursor:
+            return _fail("field cursor must be a non-empty string", 2)
+        if not allowed(audit_mod.ACTION_READ):
+            return _deny(store, args.tenant_id, args.key_id,
+                         audit_mod.ACTION_READ)
+        try:
+            page = store.versions_page(
+                args.key_id, args.tenant_id,
+                limit=args.limit, cursor=cursor,
+            )
+        except InvalidCursor:
+            return _fail("invalid or expired cursor", 2)
+        except LedgerError as exc:
+            return _ledger_fail(exc)
+        if page is None:
+            if not _attempt(
+                store, args.tenant_id, args.key_id,
+                audit_mod.ACTION_READ, audit_mod.OUTCOME_REJECTED,
+            ):
+                return 1
+            return _fail("key not found", 4)
+        if not _attempt(
+            store, args.tenant_id, args.key_id,
+            audit_mod.ACTION_READ, audit_mod.OUTCOME_SUCCESS,
+        ):
+            return 1
+        _print(
+            {
+                "items": page.items,
+                "next_cursor": page.next_cursor,
+            }
+        )
         return 0
 
     if args.command == "revoke":
