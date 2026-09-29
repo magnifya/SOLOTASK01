@@ -136,6 +136,8 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 - `GET /v1/keys/{key_id}/versions/{version}` 与
   `GET /v1/keys/{key_id}/current` →
   `{key_id, version, created_at, algorithm, public_key}`；version 须为正整数。
+  未知/跨租户 key 或版本统一 `404`；密钥记录文件存在却损坏或不可读时固定
+  `500` `{"error":"audit ledger is unavailable"}`，不伪装成 `404`。
 - `GET /v1/keys/{key_id}/versions`：按版本号从小到大返回该键全部**已提交**
   版本的完整历史。单一租户来源（单一头或单一 `?tenant_id=`）；可选单值参数
   `limit`(1–1000，默认 100)、`cursor`，重复/空/非法/越界均 `400` 并指出字段，
@@ -151,7 +153,10 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   非法请求不记账（仅租户来源缺失/冲突照旧记 `tenant_conflict`）；策略拒绝
   `403` 记一条带 key_id 的 `read/rejected`，成功记一条带 key_id 的
   `read/success`；未知 key 或跨租户访问统一 `404`，不泄露存在性；存储/账本
-  失败固定 `500` `{"error":"audit ledger is unavailable"}`。
+  失败固定 `500` `{"error":"audit ledger is unavailable"}`；密钥记录文件存在
+  却损坏或不可读同样固定该 `500`，而不是 `404`。CLI 下空、非法（含篡改）、
+  过期或不匹配（租户/key_id/limit/快照不符）的 `--cursor` 都在策略检查前
+  退出 2 且不写拒绝审计。
 - `POST /v1/keys/{key_id}/versions/{version}/revoke`（无 CLI、非幂等键），
   正文**仅** `{tenant_id, reason, operator}` 且三项均为非空字符串；吊销**单个
   版本**，不动其它版本与整 key。策略动作新增 `revoke_version`：拒权 `403` 并记
@@ -345,6 +350,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   标记、句柄或审计痕迹（仅有的锁 sidecar 除外）。
 - `GET /v1/policy` / `PUT /v1/policy` / `DELETE /v1/policy`：读/替换/删除
   租户策略，见下。
+- `POST /v1/policy/check`：按当前策略只读判定一次 subject/action，见下。
 - `GET /v1/audit` / `GET /v1/audit/verify`：本租户审计查询与完整性核验，见下。
 - `GET /v1/operations/{operation_id}`：查询幂等操作，见下。
 - `GET /v1/provider/status` 与 `POST /v1/provider/reconnect`：KMS/HSM
@@ -554,6 +560,24 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   deny 优先于 allow，无匹配则拒绝 → `403`，并记一条原动作名、
   `outcome=rejected`、携带当时已知 `key_id` 的事件（create/解密前的 import/
   audit 查询为 null）。参数校验先于授权，授权先于存在性判断。
+- `POST /v1/policy/check`：在不写入、不生成 revision、不记审计的前提下，
+  按当前策略判定一次授权。沿用 GET policy 的单一非空 `X-Operator-Id` 与
+  单一租户来源（单一头或单一 `?tenant_id=`，冲突照旧记 `tenant_conflict`）；
+  body **仅** `{subject, action}`，二者均为非空字符串，`action` 必须属于上
+  述动作集合；坏 JSON、非对象、字段缺失或多余、`subject` 为空或非字符串、
+  `action` 为空/非字符串/不属于动作集合均为指出字段的 `400` 且不记审计。
+  成功 `200`，键序固定
+  `{tenant_id, subject, action, allowed, effect, reason, rules}`：
+  `allowed` 为布尔值、`effect` 为 `allow`/`deny`；`reason` 取值
+  `no_policy`（租户无策略，允许）、`explicit_allow`（仅命中 allow，显式
+  允许）、`explicit_deny`（命中任一 deny，显式拒绝）、`default_deny`
+  （有策略但无匹配规则，默认拒绝）；`rules` 为按策略原有顺序返回的全部
+  匹配规则（subject 相同且 actions 含该 action），无策略时为 `[]`。策略
+  文件缺失视为无策略；文件存在却损坏或读取失败固定 `500`
+  `{"error":"policy store is unavailable"}`。CLI：
+  `policy --operator <op> check --tenant-id <t> --subject <s> --action <a>`，
+  成功输出同一单行 JSON，参数错误退出 2，策略存储故障在 stderr 输出同一
+  错误体并退出 1。
 
 ## 审计
 
@@ -666,6 +690,8 @@ python -m keymgr policy --operator admin set --tenant-id t --rules '<json>' \
                           [--expected-revision <rev>|none]
 python -m keymgr policy --operator admin delete --tenant-id t \
                           [--expected-revision <rev>|none]
+python -m keymgr policy --operator admin check --tenant-id t \
+                          --subject alice --action read
 # show/set 输出 revision；set/delete 的 --expected-revision 语义同查询参数，
 # 冲突时 stderr 输出与 HTTP 同口径的 409 错误体（exit 3），省略为无条件操作
 # KMS/HSM 健康检查与无中断重连（全局，无 --tenant-id）

@@ -23,8 +23,10 @@ from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
 from .operations import OperationStore
 from .policy import (
+    POLICY_ACTIONS,
     PolicyError,
     PolicyRevisionConflict,
+    PolicyStoreUnavailable,
     PolicyStore,
     revision_for_rules,
     validate_expected_revision,
@@ -52,6 +54,7 @@ _AUDIT_PATH = "/v1/audit"
 _AUDIT_VERIFY_PATH = "/v1/audit/verify"
 _KEYS_PATH = "/v1/keys"
 _POLICY_PATH = "/v1/policy"
+_POLICY_CHECK_PATH = "/v1/policy/check"
 _PROVIDER_STATUS_PATH = "/v1/provider/status"
 _PROVIDER_RECONNECT_PATH = "/v1/provider/reconnect"
 _PROVIDER_SWITCHOVER_PATH = "/v1/provider/switchover"
@@ -901,6 +904,10 @@ def make_handler(
 
                 if path == _RESTORE_PREFLIGHT_PATH:
                     self._restore_preflight(parts, operator)
+                    return
+
+                if path == _POLICY_CHECK_PATH:
+                    self._check_policy(parts)
                     return
 
                 if path == _PROVIDER_RECONNECT_PATH:
@@ -3469,7 +3476,9 @@ def make_handler(
                 tenant_id, key_id, audit_mod.ACTION_READ, operator
             ):
                 return
-            result = store.get_version(key_id, tenant_id, version)
+            result = store.get_version(
+                key_id, tenant_id, version, strict=True
+            )
             if result is None:
                 # Unknown key, unknown version and cross-tenant access are
                 # indistinguishable, all 404.
@@ -3604,7 +3613,8 @@ def make_handler(
 
             try:
                 page = store.versions_page(
-                    key_id, tenant_id, limit=limit, cursor=cursor
+                    key_id, tenant_id, limit=limit, cursor=cursor,
+                    strict=True,
                 )
             except InvalidCursor:
                 self._bad_request("invalid or expired cursor")
@@ -4033,6 +4043,69 @@ def make_handler(
                     "tenant_id": tenant_id,
                     "rules": [r.to_json() for r in rules],
                     "revision": revision_for_rules(rules),
+                },
+            )
+
+        def _check_policy(self, parts) -> None:
+            """POST /v1/policy/check: evaluate one subject/action, read-only.
+
+            Tenant and operator follow the GET policy rules (a source
+            conflict is the usual audited tenant_conflict). The body carries
+            only ``subject`` and ``action``; every body/parameter failure is
+            a 400 naming the field with no audit event. A successful check
+            writes nothing: no audit event, no revision, no file change.
+            """
+            tenant_id = self._strict_tenant(parts)
+            if tenant_id is None:
+                return
+            payload = self._read_json_object(audit=False)
+            if payload is None:
+                return
+            unknown = set(payload) - {"subject", "action"}
+            if unknown:
+                self._bad_request("unknown field: %s" % sorted(unknown)[0])
+                return
+            if "subject" not in payload:
+                self._bad_request("missing required field: subject")
+                return
+            subject = payload["subject"]
+            if not isinstance(subject, str) or not subject:
+                self._bad_request(
+                    "field subject must be a non-empty string"
+                )
+                return
+            if "action" not in payload:
+                self._bad_request("missing required field: action")
+                return
+            action = payload["action"]
+            if not isinstance(action, str) or not action:
+                self._bad_request(
+                    "field action must be a non-empty string"
+                )
+                return
+            if action not in POLICY_ACTIONS:
+                self._bad_request(
+                    "field action has unknown action %r (allowed: %s)"
+                    % (action, ", ".join(POLICY_ACTIONS))
+                )
+                return
+            try:
+                result = policy_store.check(tenant_id, subject, action)
+            except PolicyStoreUnavailable:
+                self._send_json(
+                    500, {"error": "policy store is unavailable"}
+                )
+                return
+            self._send_json(
+                200,
+                {
+                    "tenant_id": tenant_id,
+                    "subject": subject,
+                    "action": action,
+                    "allowed": result["allowed"],
+                    "effect": result["effect"],
+                    "reason": result["reason"],
+                    "rules": [rule.to_json() for rule in result["rules"]],
                 },
             )
 

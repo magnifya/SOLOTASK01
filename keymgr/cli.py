@@ -17,8 +17,10 @@ from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
 from .operations import OperationStore
 from .policy import (
+    POLICY_ACTIONS,
     PolicyError,
     PolicyRevisionConflict,
+    PolicyStoreUnavailable,
     PolicyStore,
     revision_for_rules,
     validate_expected_revision,
@@ -296,6 +298,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional optimistic-concurrency precondition: a revision "
              "from `policy show`, or 'none' to require no existing policy",
     )
+    p_policy_check = policy_sub.add_parser(
+        "check",
+        help="check whether a subject may perform an action under the "
+             "current policy (read-only)",
+    )
+    p_policy_check.add_argument("--tenant-id", required=True)
+    p_policy_check.add_argument("--subject", required=True)
+    p_policy_check.add_argument("--action", required=True)
 
     p_provider = sub.add_parser(
         "provider", help="inspect or reconnect the KMS/HSM provider"
@@ -1286,9 +1296,12 @@ def _run(argv: Optional[List[str]] = None) -> int:
         if not allowed(audit_mod.ACTION_READ):
             return _deny(store, args.tenant_id, args.key_id,
                          audit_mod.ACTION_READ)
-        result = store.get_version(
-            args.key_id, args.tenant_id, args.version
-        )
+        try:
+            result = store.get_version(
+                args.key_id, args.tenant_id, args.version, strict=True
+            )
+        except LedgerError as exc:
+            return _ledger_fail(exc)
         if result is None:
             if not _attempt(
                 store, args.tenant_id, args.key_id,
@@ -1320,18 +1333,37 @@ def _run(argv: Optional[List[str]] = None) -> int:
         cursor = args.cursor
         if cursor is not None and not cursor:
             return _fail("field cursor must be a non-empty string", 2)
+        # Every cursor failure (empty handled above, tampered, expired or
+        # bound to another tenant/key/limit) is a parameter error that must
+        # precede authorization, so it exits 2 and never writes a rejected
+        # read -- including the snapshot checks inside versions_page.
+        prefetched = None
+        if cursor is not None:
+            try:
+                store.audit._decode_cursor(cursor)
+                prefetched = store.versions_page(
+                    args.key_id, args.tenant_id,
+                    limit=args.limit, cursor=cursor, strict=True,
+                )
+            except InvalidCursor:
+                return _fail("invalid or expired cursor", 2)
+            except LedgerError as exc:
+                return _ledger_fail(exc)
         if not allowed(audit_mod.ACTION_READ):
             return _deny(store, args.tenant_id, args.key_id,
                          audit_mod.ACTION_READ)
-        try:
-            page = store.versions_page(
-                args.key_id, args.tenant_id,
-                limit=args.limit, cursor=cursor,
-            )
-        except InvalidCursor:
-            return _fail("invalid or expired cursor", 2)
-        except LedgerError as exc:
-            return _ledger_fail(exc)
+        if prefetched is not None:
+            page = prefetched
+        else:
+            try:
+                page = store.versions_page(
+                    args.key_id, args.tenant_id,
+                    limit=args.limit, cursor=cursor, strict=True,
+                )
+            except InvalidCursor:
+                return _fail("invalid or expired cursor", 2)
+            except LedgerError as exc:
+                return _ledger_fail(exc)
         if page is None:
             if not _attempt(
                 store, args.tenant_id, args.key_id,
@@ -1982,10 +2014,44 @@ def _run(argv: Optional[List[str]] = None) -> int:
 
 
 def _policy_command(args, policies: PolicyStore) -> int:
-    """Handle `policy show|set|delete`; management is exempt from policy."""
+    """Handle `policy show|set|delete|check`; management is read-only."""
     tenant_id = args.tenant_id
     if not tenant_id:
         return _fail("field tenant_id must be a non-empty string", 2)
+
+    if args.policy_command == "check":
+        subject = args.subject
+        if not isinstance(subject, str) or not subject:
+            return _fail(
+                "field subject must be a non-empty string", 2
+            )
+        action = args.action
+        if not isinstance(action, str) or not action:
+            return _fail(
+                "field action must be a non-empty string", 2
+            )
+        if action not in POLICY_ACTIONS:
+            return _fail(
+                "field action has unknown action %r (allowed: %s)"
+                % (action, ", ".join(POLICY_ACTIONS)),
+                2,
+            )
+        try:
+            result = policies.check(tenant_id, subject, action)
+        except PolicyStoreUnavailable:
+            return _fail("policy store is unavailable", 1)
+        _print(
+            {
+                "tenant_id": tenant_id,
+                "subject": subject,
+                "action": action,
+                "allowed": result["allowed"],
+                "effect": result["effect"],
+                "reason": result["reason"],
+                "rules": [rule.to_json() for rule in result["rules"]],
+            }
+        )
+        return 0
 
     if args.policy_command == "show":
         rules = policies.get(tenant_id)

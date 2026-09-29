@@ -75,6 +75,47 @@ class PolicyRevisionConflict(Exception):
         super().__init__("policy revision conflict")
 
 
+class PolicyStoreUnavailable(Exception):
+    """An existing policy document cannot be read or parsed (fixed 500)."""
+
+
+#: Check outcomes, stable reason tokens surfaced by POST /v1/policy/check.
+REASON_NO_POLICY = "no_policy"
+REASON_EXPLICIT_ALLOW = "explicit_allow"
+REASON_EXPLICIT_DENY = "explicit_deny"
+REASON_DEFAULT_DENY = "default_deny"
+
+
+def evaluate_rules(rules, subject: str, action: str) -> dict:
+    """Evaluate one (subject, action) against a non-None rule list.
+
+    Matching keeps the document's original order. Any matching ``deny``
+    wins; with no deny, at least one matching allow permits; otherwise the
+    action is denied by default. Returns the matched rules and the reason
+    token for the decision.
+    """
+    matched = [
+        rule
+        for rule in rules
+        if rule.subject == subject and action in rule.actions
+    ]
+    if any(rule.effect == "deny" for rule in matched):
+        allowed = False
+        reason = REASON_EXPLICIT_DENY
+    elif matched:
+        allowed = True
+        reason = REASON_EXPLICIT_ALLOW
+    else:
+        allowed = False
+        reason = REASON_DEFAULT_DENY
+    return {
+        "allowed": allowed,
+        "effect": "allow" if allowed else "deny",
+        "reason": reason,
+        "rules": matched,
+    }
+
+
 def revision_for_rules(rules) -> str:
     """Compute the opaque, content-addressed revision of a rule list.
 
@@ -416,6 +457,47 @@ class PolicyStore:
         if rules is None:
             return None
         return revision_for_rules(rules)
+
+    def get_strict(self, tenant_id: str) -> Optional[List[Rule]]:
+        """Read rules for a policy check: None only when no file exists.
+
+        Unlike :meth:`get`, a document that exists but cannot be read or
+        parsed is backend corruption: :class:`PolicyStoreUnavailable` is
+        raised so the caller answers a fixed 500 instead of treating the
+        tenant as unrestricted.
+        """
+        path = self._path_for(tenant_id)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            raise PolicyStoreUnavailable(
+                "cannot read policy document"
+            ) from exc
+        try:
+            return [Rule.from_json(rule) for rule in data["rules"]]
+        except (KeyError, TypeError, ValueError, PolicyError) as exc:
+            raise PolicyStoreUnavailable(
+                "cannot parse policy document"
+            ) from exc
+
+    def check(self, tenant_id: str, subject: str, action: str) -> dict:
+        """Evaluate one (subject, action) without any side effect.
+
+        No document allows the action (``no_policy``); otherwise the rules
+        decide. Never writes an audit event, a revision or any file.
+        """
+        rules = self.get_strict(tenant_id)
+        if rules is None:
+            return {
+                "allowed": True,
+                "effect": "allow",
+                "reason": REASON_NO_POLICY,
+                "rules": [],
+            }
+        return evaluate_rules(rules, subject, action)
 
     def _current_state(self, path: str):
         """Return (rules, revision) for an existing document under the lock."""

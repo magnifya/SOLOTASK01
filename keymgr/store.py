@@ -1502,15 +1502,31 @@ class KeyStore:
         with open(path, "rb") as fh:
             return fh.read()
 
-    def _read_record(self, path: str) -> Optional[KeyRecord]:
+    def _read_record(
+        self, path: str, strict: bool = False
+    ) -> Optional[KeyRecord]:
+        """Read one key record.
+
+        By default an unreadable or corrupt file is indistinguishable from a
+        missing key. With ``strict=True`` (the version-history reads) an
+        existing file that cannot be read or parsed raises
+        :class:`LedgerError` instead, so the caller answers the fixed 500
+        rather than hiding the corruption behind a 404.
+        """
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-        except (OSError, ValueError):
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            if strict:
+                raise LedgerError("cannot read key record") from exc
             return None
         try:
             return KeyRecord.from_json(data)
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError) as exc:
+            if strict:
+                raise LedgerError("cannot parse key record") from exc
             return None
 
     @staticmethod
@@ -2024,20 +2040,23 @@ class KeyStore:
                 "key file is awaiting crash recovery"
             )
 
-    def get(self, key_id: str, tenant_id: str) -> Optional[KeyRecord]:
+    def get(
+        self, key_id: str, tenant_id: str, strict: bool = False
+    ) -> Optional[KeyRecord]:
         """Return the record's committed view only when it belongs to tenant.
 
         Unknown key, foreign ownership and a file whose only content is an
         uncommitted transaction all look the same (None), so existence never
         leaks across tenants and an uncommitted current is never exposed. The
         read runs under the key locks so it cannot observe a half-written
-        rotation.
+        rotation. ``strict=True`` raises :class:`LedgerError` on an existing
+        but unreadable/corrupt record instead of hiding it as None.
         """
         if not _KEY_ID_RE.fullmatch(key_id):
             return None
         path = self._path_for(key_id)
         with self.key_locks(key_id):
-            record = self._read_record(path)
+            record = self._read_record(path, strict=strict)
             if record is None or record.tenant_id != tenant_id:
                 # Same result whether the key is missing or owned by another
                 # tenant: never confirm the existence of another tenant's key.
@@ -4067,7 +4086,8 @@ class KeyStore:
         return self.VERSION_REVOKE_OK, record, ver
 
     def get_version(
-        self, key_id: str, tenant_id: str, version: int
+        self, key_id: str, tenant_id: str, version: int,
+        strict: bool = False,
     ) -> Optional[tuple]:
         """Return (record, version_record) over the committed view.
 
@@ -4075,7 +4095,7 @@ class KeyStore:
         belongs to an uncommitted transaction (it then reads as absent, never
         projected).
         """
-        record = self.get(key_id, tenant_id)
+        record = self.get(key_id, tenant_id, strict=strict)
         if record is None:
             return None
         ver = record.get_version(version)
@@ -5086,6 +5106,7 @@ class KeyStore:
         tenant_id: str,
         limit: int = 100,
         cursor: Optional[str] = None,
+        strict: bool = False,
     ) -> Optional[VersionHistoryPage]:
         """Return one tenant-isolated, snapshot-bound page of a key's history.
 
@@ -5101,7 +5122,7 @@ class KeyStore:
         Returns None for an unknown key, a cross-tenant access or a key
         whose committed view is hidden, all indistinguishable.
         """
-        record = self.get(key_id, tenant_id)
+        record = self.get(key_id, tenant_id, strict=strict)
         if record is None:
             return None
 
