@@ -23,7 +23,7 @@ import tempfile
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator, List, Optional
+from typing import Iterator, List, NamedTuple, Optional
 
 from . import audit as audit_mod
 from .audit import AuditEvent, AuditLog, LedgerError
@@ -73,6 +73,21 @@ class PolicyRevisionConflict(Exception):
     def __init__(self, current_revision: Optional[str]) -> None:
         self.current_revision = current_revision
         super().__init__("policy revision conflict")
+
+
+class PolicyDecision(NamedTuple):
+    """The complete result of one explicit policy check."""
+
+    allowed: bool
+    effect: str
+    reason: str
+    matched_rules: List["Rule"]
+
+
+REASON_NO_POLICY = "no_policy"
+REASON_EXPLICIT_ALLOW = "explicit_allow"
+REASON_EXPLICIT_DENY = "explicit_deny"
+REASON_DEFAULT_DENY = "default_deny"
 
 
 def revision_for_rules(rules) -> str:
@@ -304,17 +319,23 @@ class PolicyStore:
                 pass
             raise
 
-    def _read_doc(self, path: str):
-        """Return (tenant_id, rules, pending_event), or None if unreadable."""
+    def _read_doc(self, path: str, strict: bool = False):
+        """Return (tenant_id, rules, pending_event), or None when absent."""
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-        except (OSError, ValueError):
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            if strict:
+                raise LedgerError("cannot read policy document") from exc
             return None
         try:
             rules = [Rule.from_json(r) for r in data["rules"]]
             return data["tenant_id"], rules, data.get("pending_event")
-        except (KeyError, TypeError, ValueError, PolicyError):
+        except (KeyError, TypeError, ValueError, PolicyError) as exc:
+            if strict:
+                raise LedgerError("cannot read policy document") from exc
             return None
 
     def _recover_pending_events(self) -> None:
@@ -409,6 +430,22 @@ class PolicyStore:
         if doc is None:
             return None
         return doc[1]
+
+    def evaluate(self, tenant_id: str, action: str,
+                subject: str) -> PolicyDecision:
+        """Check one action without mutating the document or auditing."""
+        doc = self._read_doc(self._path_for(tenant_id), strict=True)
+        if doc is None:
+            return PolicyDecision(True, "allow", REASON_NO_POLICY, [])
+        matched = [
+            rule for rule in doc[1]
+            if rule.subject == subject and action in rule.actions
+        ]
+        if any(rule.effect == "deny" for rule in matched):
+            return PolicyDecision(False, "deny", REASON_EXPLICIT_DENY, matched)
+        if matched:
+            return PolicyDecision(True, "allow", REASON_EXPLICIT_ALLOW, matched)
+        return PolicyDecision(False, "deny", REASON_DEFAULT_DENY, [])
 
     def get_revision(self, tenant_id: str) -> Optional[str]:
         """Return the tenant's current revision, or None when no document."""

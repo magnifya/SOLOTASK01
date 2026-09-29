@@ -428,6 +428,28 @@ def test_corrupt_ledger_is_fixed_500(stack, tmp_path):
     assert body == {"error": "audit ledger is unavailable"}
 
 
+def test_corrupt_key_record_is_fixed_500_http_and_cli(stack, capsys):
+    client = stack.client
+    kid = _make_key(client)
+    with open(stack.store._path_for(kid), "w", encoding="utf-8") as fh:
+        fh.write("{broken")
+
+    status, body = _history(client, kid)
+    assert status == 500
+    assert body == {"error": "audit ledger is unavailable"}
+
+    capsys.readouterr()
+    rc = cli.main([
+        "--data-dir", stack.data_dir, "versions",
+        "--tenant-id", "t", "--operator", "alice", "--key-id", kid,
+    ])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert json.loads(captured.err) == {
+        "error": "audit ledger is unavailable"
+    }
+
+
 # -- CLI parity ------------------------------------------------------------
 def test_cli_versions_matches_http(stack, capsys):
     client = stack.client
@@ -481,6 +503,7 @@ def test_cli_versions_error_exit_codes(stack, capsys):
     _rotate(client, kid)
     _, body = _history(client, kid, limit=1)
     cursor = body["next_cursor"]
+    _rotate(client, kid)
 
     def run(*extra, key_id=kid, operator="alice"):
         capsys.readouterr()
@@ -498,7 +521,11 @@ def test_cli_versions_error_exit_codes(stack, capsys):
     assert rc == 2
     rc, _ = run("--cursor", "tampered")
     assert rc == 2
+    rc, _ = run("--cursor", "")
+    assert rc == 2
     rc, _ = run("--cursor", cursor, "--limit", "2")
+    assert rc == 2
+    rc, _ = run("--cursor", cursor)
     assert rc == 2
     rc, captured = run(key_id="not-a-uuid")
     assert rc == 2
@@ -509,6 +536,19 @@ def test_cli_versions_error_exit_codes(stack, capsys):
     stack.policies.put(
         "t", [Rule(subject="alice", actions=["read"], effect="deny")]
     )
+    denied_before_cursor_checks = len([
+        e for e in stack.audit._read_all()
+        if e.action == "read" and e.outcome == "rejected"
+    ])
+    rc, _ = run("--cursor", "tampered")
+    assert rc == 2
+    rc, _ = run("--cursor", cursor, "--limit", "2")
+    assert rc == 2
+    assert len([
+        e for e in stack.audit._read_all()
+        if e.action == "read" and e.outcome == "rejected"
+    ]) == denied_before_cursor_checks
+
     rc, captured = run()
     assert rc == 3
     assert json.loads(captured.err)["error"] == (

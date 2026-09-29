@@ -343,8 +343,8 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `404 {"error":"tenant backup not found"}`；内部状态无法可靠判断固定
   `500 {"error":"restore preflight unavailable"}`。预检绝不留下文件、
   标记、句柄或审计痕迹（仅有的锁 sidecar 除外）。
-- `GET /v1/policy` / `PUT /v1/policy` / `DELETE /v1/policy`：读/替换/删除
-  租户策略，见下。
+- `GET /v1/policy` / `PUT /v1/policy` / `DELETE /v1/policy` /
+  `POST /v1/policy/check`：读、替换、删除租户策略，或直接检查一次授权判断，见下。
 - `GET /v1/audit` / `GET /v1/audit/verify`：本租户审计查询与完整性核验，见下。
 - `GET /v1/operations/{operation_id}`：查询幂等操作，见下。
 - `GET /v1/provider/status` 与 `POST /v1/provider/reconnect`：KMS/HSM
@@ -554,6 +554,16 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   deny 优先于 allow，无匹配则拒绝 → `403`，并记一条原动作名、
   `outcome=rejected`、携带当时已知 `key_id` 的事件（create/解密前的 import/
   audit 查询为 null）。参数校验先于授权，授权先于存在性判断。
+- `POST /v1/policy/check`：沿用 GET policy 的单一操作者与单一租户来源（头或查询二选一），
+  请求体只接受 `{subject, action}`；`subject` 必须为非空字符串，`action` 必须属于上面的
+  动作集合，坏 JSON、非对象、缺字段、多字段或类型错误均为无审计 `400`。成功为
+  `200`，键序固定为
+  `{tenant_id,subject,action,allowed,effect,reason,matched_rules}`；
+  `reason` 为 `no_policy`/`explicit_allow`/`explicit_deny`/`default_deny`，
+  `matched_rules` 只含 subject 相同且动作集包含该 action 的规则，并保持策略原顺序。
+  无策略时允许；有策略时任一显式 deny 命中即拒绝，只有显式 allow 命中才允许，无匹配默认拒绝。
+  检查不修改策略、不生成 revision、不写审计；策略文件缺失视为无策略，损坏或读取失败固定为
+  `500 {"error":"policy store is unavailable"}`。
 
 ## 审计
 
@@ -666,8 +676,12 @@ python -m keymgr policy --operator admin set --tenant-id t --rules '<json>' \
                           [--expected-revision <rev>|none]
 python -m keymgr policy --operator admin delete --tenant-id t \
                           [--expected-revision <rev>|none]
+python -m keymgr policy --operator admin check --tenant-id t \
+                          --subject alice --action read
 # show/set 输出 revision；set/delete 的 --expected-revision 语义同查询参数，
 # 冲突时 stderr 输出与 HTTP 同口径的 409 错误体（exit 3），省略为无条件操作
+# check 成功时 stdout 输出与 HTTP 相同的单行 JSON；参数错误 exit 2，
+# 策略存储损坏时 stderr 输出 {"error":"policy store is unavailable"} 并 exit 1
 # KMS/HSM 健康检查与无中断重连（全局，无 --tenant-id）
 python -m keymgr provider status    --operator alice
 python -m keymgr provider reconnect --operator alice

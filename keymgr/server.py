@@ -23,6 +23,7 @@ from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
 from .operations import OperationStore
 from .policy import (
+    POLICY_ACTIONS,
     PolicyError,
     PolicyRevisionConflict,
     PolicyStore,
@@ -52,6 +53,7 @@ _AUDIT_PATH = "/v1/audit"
 _AUDIT_VERIFY_PATH = "/v1/audit/verify"
 _KEYS_PATH = "/v1/keys"
 _POLICY_PATH = "/v1/policy"
+_POLICY_CHECK_PATH = "/v1/policy/check"
 _PROVIDER_STATUS_PATH = "/v1/provider/status"
 _PROVIDER_RECONNECT_PATH = "/v1/provider/reconnect"
 _PROVIDER_SWITCHOVER_PATH = "/v1/provider/switchover"
@@ -85,6 +87,7 @@ _VERSION_REVOKE_PATH_RE = re.compile(
 _CURRENT_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/current$")
 _POSITIVE_INT_RE = re.compile(r"[0-9]+")
 _MISSING = object()
+POLICY_STORE_UNAVAILABLE = "policy store is unavailable"
 
 # Fixed, detail-free ledger failure text: corruption or I/O specifics never
 # leak into a response (or into a persisted operation record replayed later).
@@ -811,6 +814,10 @@ def make_handler(
             if operator is None:
                 return
             try:
+                if path == _POLICY_CHECK_PATH:
+                    self._check_policy(parts)
+                    return
+
                 if path == "/v1/keys":
                     self._create_key(operator)
                     return
@@ -3597,17 +3604,16 @@ def make_handler(
                     self._bad_request("invalid or expired cursor")
                     return
 
-            if not self._enforce(
-                tenant_id, key_id, audit_mod.ACTION_READ, operator
-            ):
-                return
-
             try:
                 page = store.versions_page(
                     key_id, tenant_id, limit=limit, cursor=cursor
                 )
             except InvalidCursor:
                 self._bad_request("invalid or expired cursor")
+                return
+            if not self._enforce(
+                tenant_id, key_id, audit_mod.ACTION_READ, operator
+            ):
                 return
             if page is None:
                 self._reject_read(
@@ -3947,6 +3953,64 @@ def make_handler(
                 fail("field tenant_id must be a non-empty string")
                 return None
             return tenant
+
+        def _check_policy(self, parts) -> None:
+            tenant_id = self._strict_tenant(parts)
+            if tenant_id is None:
+                return
+            payload = self._read_json_object(audit=False)
+            if payload is None:
+                return
+            allowed_fields = {"subject", "action"}
+            unknown = set(payload) - allowed_fields
+            if unknown:
+                self._bad_request("unknown field %s" % sorted(unknown)[0])
+                return
+            for field in ("subject", "action"):
+                if field not in payload:
+                    self._bad_request("missing required field: %s" % field)
+                    return
+            subject = payload["subject"]
+            action = payload["action"]
+            if not isinstance(subject, str):
+                self._bad_request("field subject must be a non-empty string")
+                return
+            if not subject:
+                self._bad_request("field subject must be a non-empty string")
+                return
+            if not isinstance(action, str) or not action:
+                self._bad_request(
+                    "field action must be one of: %s"
+                    % ", ".join(POLICY_ACTIONS)
+                )
+                return
+            if action not in POLICY_ACTIONS:
+                self._bad_request(
+                    "field action must be one of: %s"
+                    % ", ".join(POLICY_ACTIONS)
+                )
+                return
+            try:
+                decision = policy_store.evaluate(tenant_id, action, subject)
+            except LedgerError:
+                self._send_json(
+                    500, {"error": POLICY_STORE_UNAVAILABLE}
+                )
+                return
+            self._send_json(
+                200,
+                {
+                    "tenant_id": tenant_id,
+                    "subject": subject,
+                    "action": action,
+                    "allowed": decision.allowed,
+                    "effect": decision.effect,
+                    "reason": decision.reason,
+                    "matched_rules": [
+                        rule.to_json() for rule in decision.matched_rules
+                    ],
+                },
+            )
 
         def do_PUT(self) -> None:
             parts = urlsplit(self.path)

@@ -5101,9 +5101,18 @@ class KeyStore:
         Returns None for an unknown key, a cross-tenant access or a key
         whose committed view is hidden, all indistinguishable.
         """
-        record = self.get(key_id, tenant_id)
-        if record is None:
+        if not is_valid_key_id(key_id):
             return None
+        path = self._path_for(key_id)
+        with self.key_locks(key_id):
+            record = self._read_record(path)
+            if record is None:
+                if os.path.exists(path):
+                    raise LedgerError("cannot read key record")
+                return None
+            if record.tenant_id != tenant_id:
+                return None
+            record = self._committed_record(record)
 
         anchor = None
         fingerprint = None

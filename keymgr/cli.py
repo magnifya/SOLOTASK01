@@ -17,6 +17,7 @@ from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
 from .operations import OperationStore
 from .policy import (
+    POLICY_ACTIONS,
     PolicyError,
     PolicyRevisionConflict,
     PolicyStore,
@@ -296,6 +297,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional optimistic-concurrency precondition: a revision "
              "from `policy show`, or 'none' to require no existing policy",
     )
+    p_policy_check = policy_sub.add_parser(
+        "check", help="check whether a subject can perform an action"
+    )
+    p_policy_check.add_argument("--tenant-id", required=True)
+    p_policy_check.add_argument("--subject", required=True)
+    p_policy_check.add_argument(
+        "--action", required=True,
+        help="one of: %s" % ", ".join(POLICY_ACTIONS),
+    )
 
     p_provider = sub.add_parser(
         "provider", help="inspect or reconnect the KMS/HSM provider"
@@ -351,6 +361,10 @@ def _fail(message: str, exit_code: int) -> int:
 
 def _ledger_fail(exc: Exception) -> int:
     return _fail("audit ledger is unavailable", 1)
+
+
+def _policy_store_fail(exc: Exception) -> int:
+    return _fail("policy store is unavailable", 1)
 
 
 def _revision_conflict(exc: PolicyRevisionConflict) -> int:
@@ -1320,9 +1334,6 @@ def _run(argv: Optional[List[str]] = None) -> int:
         cursor = args.cursor
         if cursor is not None and not cursor:
             return _fail("field cursor must be a non-empty string", 2)
-        if not allowed(audit_mod.ACTION_READ):
-            return _deny(store, args.tenant_id, args.key_id,
-                         audit_mod.ACTION_READ)
         try:
             page = store.versions_page(
                 args.key_id, args.tenant_id,
@@ -1332,6 +1343,9 @@ def _run(argv: Optional[List[str]] = None) -> int:
             return _fail("invalid or expired cursor", 2)
         except LedgerError as exc:
             return _ledger_fail(exc)
+        if not allowed(audit_mod.ACTION_READ):
+            return _deny(store, args.tenant_id, args.key_id,
+                         audit_mod.ACTION_READ)
         if page is None:
             if not _attempt(
                 store, args.tenant_id, args.key_id,
@@ -1986,6 +2000,42 @@ def _policy_command(args, policies: PolicyStore) -> int:
     tenant_id = args.tenant_id
     if not tenant_id:
         return _fail("field tenant_id must be a non-empty string", 2)
+
+    if args.policy_command == "check":
+        if not isinstance(args.subject, str) or not args.subject:
+            return _fail(
+                "field subject must be a non-empty string", 2
+            )
+        if (
+            not isinstance(args.action, str)
+            or not args.action
+            or args.action not in POLICY_ACTIONS
+        ):
+            return _fail(
+                "field action must be one of: %s"
+                % ", ".join(POLICY_ACTIONS),
+                2,
+            )
+        try:
+            decision = policies.evaluate(
+                tenant_id, args.action, args.subject
+            )
+        except LedgerError:
+            return _policy_store_fail("policy store")
+        _print(
+            {
+                "tenant_id": tenant_id,
+                "subject": args.subject,
+                "action": args.action,
+                "allowed": decision.allowed,
+                "effect": decision.effect,
+                "reason": decision.reason,
+                "matched_rules": [
+                    rule.to_json() for rule in decision.matched_rules
+                ],
+            }
+        )
+        return 0
 
     if args.policy_command == "show":
         rules = policies.get(tenant_id)
