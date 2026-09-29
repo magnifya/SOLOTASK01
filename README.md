@@ -500,9 +500,18 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 ## 策略
 
 - `GET/PUT/DELETE /v1/policy`，租户由单一头或单一参数提供（PUT 也可由 body
-  的 `tenant_id` 提供，来源须一致）。GET → `{tenant_id, rules}`（无策略
-  `404`）；PUT body `{tenant_id, rules}` 整体替换；DELETE 幂等，→
-  `{tenant_id, deleted:true}`。
+  的 `tenant_id` 提供，来源须一致）。GET → `{tenant_id, rules, revision}`
+  （无策略 `404`）；PUT body `{tenant_id, rules}` 整体替换，成功 →
+  `{tenant_id, rules, revision}`；DELETE 幂等，→ `{tenant_id, deleted:true}`。
+  `revision` 为不透明字符串，按规范化规则内容稳定计算：内容不变则不变、
+  内容改变才变化，不反映内部文件结构，且不会取值 `none`。
+- 乐观并发：PUT/DELETE 接受可选查询参数 `expected_revision`，值为先前读到的
+  revision，或 `none` 断言当前尚无策略；省略即无条件操作（旧行为）。比较与
+  变更在同一租户锁内完成，匹配才成功；已有策略却断言不存在、没有策略却给出
+  revision、或 revision 不匹配均为 `409`，错误体只含
+  `{"error":"policy revision conflict","current_revision":<revision|null>}`，
+  规则不变且分别记 `policy_update/rejected`、`policy_delete/rejected`（成功仍记
+  原 success 事件）。参数重复或为空是零副作用 `400`。
 - 规则元素 `{subject, actions, effect}`：`subject` 为区分大小写的非空字符串；
   `actions` 为非空数组，取值
   `create/read/rotate/revoke/revoke_version/import/export/migrate/encrypt/decrypt/
@@ -608,7 +617,13 @@ python -m keymgr restore  --tenant-id t --passphrase pw --bundle <b> \
 # 审计 / 操作 / 策略
 python -m keymgr audit    --tenant-id t --action rotate --limit 100 --operator alice
 python -m keymgr operation --tenant-id t --operator alice --operation-id <id>
-python -m keymgr policy --operator admin set|show|delete --tenant-id t [--rules '<json>']
+python -m keymgr policy --operator admin show --tenant-id t
+python -m keymgr policy --operator admin set --tenant-id t --rules '<json>' \
+                          [--expected-revision <rev>|none]
+python -m keymgr policy --operator admin delete --tenant-id t \
+                          [--expected-revision <rev>|none]
+# show/set 输出 revision；set/delete 的 --expected-revision 语义同查询参数，
+# 冲突时 stderr 输出与 HTTP 同口径的 409 错误体（exit 3），省略为无条件操作
 # KMS/HSM 健康检查与无中断重连（全局，无 --tenant-id）
 python -m keymgr provider status    --operator alice
 python -m keymgr provider reconnect --operator alice

@@ -22,7 +22,14 @@ from .artifacts import (
 from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
 from .operations import OperationStore
-from .policy import PolicyError, PolicyStore, validate_rules
+from .policy import (
+    PolicyError,
+    PolicyRevisionConflict,
+    PolicyStore,
+    revision_for_rules,
+    validate_expected_revision,
+    validate_rules,
+)
 from .provider import (
     ProviderInvalidMaterial,
     ProviderReconnectPending,
@@ -3680,6 +3687,8 @@ def make_handler(
                 self._put_policy(parts)
             except LedgerError as exc:
                 self._server_error(exc)
+            except PolicyRevisionConflict as exc:
+                self._revision_conflict(exc)
 
         def do_DELETE(self) -> None:
             parts = urlsplit(self.path)
@@ -3693,6 +3702,48 @@ def make_handler(
                 self._delete_policy(parts)
             except LedgerError as exc:
                 self._server_error(exc)
+            except PolicyRevisionConflict as exc:
+                self._revision_conflict(exc)
+
+        def _revision_conflict(self, exc: PolicyRevisionConflict) -> None:
+            """Send the fixed 409 body for a failed optimistic precondition."""
+            self._send_json(
+                409,
+                {
+                    "error": "policy revision conflict",
+                    "current_revision": exc.current_revision,
+                },
+            )
+
+        def _expected_revision(self, parts):
+            """Parse the optional expected_revision query parameter.
+
+            Returns None when omitted (unconditional), ``'none'`` or a
+            revision string. A duplicated or empty parameter is a plain 400
+            with zero side effects (no tenant_conflict, no rule change).
+            """
+            values = parse_qs(
+                parts.query, keep_blank_values=True
+            ).get("expected_revision", [])
+            if len(values) > 1:
+                self._bad_request(
+                    "duplicate expected_revision (provide a single "
+                    "expected_revision parameter)"
+                )
+                return _MISSING
+            if not values:
+                return None
+            raw = values[0]
+            if not raw:
+                self._bad_request(
+                    "field expected_revision must be a revision or 'none'"
+                )
+                return _MISSING
+            try:
+                return validate_expected_revision(raw)
+            except PolicyError as exc:
+                self._bad_request(str(exc))
+                return _MISSING
 
         def _get_policy(self, parts) -> None:
             tenant_id = self._strict_tenant(parts)
@@ -3708,6 +3759,7 @@ def make_handler(
                 {
                     "tenant_id": tenant_id,
                     "rules": [r.to_json() for r in rules],
+                    "revision": revision_for_rules(rules),
                 },
             )
 
@@ -3733,12 +3785,18 @@ def make_handler(
             except PolicyError as exc:
                 self._bad_request(str(exc))
                 return
-            policy_store.put(tenant_id, rules)
+            expected = self._expected_revision(parts)
+            if expected is _MISSING:
+                return
+            rules, new_revision = policy_store.put(
+                tenant_id, rules, expected_revision=expected
+            )
             self._send_json(
                 200,
                 {
                     "tenant_id": tenant_id,
                     "rules": [r.to_json() for r in rules],
+                    "revision": new_revision,
                 },
             )
 
@@ -3746,7 +3804,10 @@ def make_handler(
             tenant_id = self._strict_tenant(parts)
             if tenant_id is None:
                 return
-            policy_store.delete(tenant_id)
+            expected = self._expected_revision(parts)
+            if expected is _MISSING:
+                return
+            policy_store.delete(tenant_id, expected_revision=expected)
             self._send_json(200, {"tenant_id": tenant_id, "deleted": True})
 
     return KeyHandler

@@ -16,7 +16,14 @@ from . import tenantbundle
 from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
 from .operations import OperationStore
-from .policy import PolicyError, PolicyStore, validate_rules
+from .policy import (
+    PolicyError,
+    PolicyRevisionConflict,
+    PolicyStore,
+    revision_for_rules,
+    validate_expected_revision,
+    validate_rules,
+)
 from .provider import (
     ProviderInvalidMaterial,
     ProviderReconnectPending,
@@ -249,10 +256,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--rules", required=True,
         help='JSON array of {"subject","actions","effect"} rules',
     )
+    p_policy_set.add_argument(
+        "--expected-revision", dest="expected_revision", default=None,
+        help="optional optimistic-concurrency precondition: a revision "
+             "from `policy show`, or 'none' to require no existing policy",
+    )
     p_policy_delete = policy_sub.add_parser(
         "delete", help="delete a tenant's policy"
     )
     p_policy_delete.add_argument("--tenant-id", required=True)
+    p_policy_delete.add_argument(
+        "--expected-revision", dest="expected_revision", default=None,
+        help="optional optimistic-concurrency precondition: a revision "
+             "from `policy show`, or 'none' to require no existing policy",
+    )
 
     p_provider = sub.add_parser(
         "provider", help="inspect or reconnect the KMS/HSM provider"
@@ -308,6 +325,21 @@ def _fail(message: str, exit_code: int) -> int:
 
 def _ledger_fail(exc: Exception) -> int:
     return _fail("audit ledger is unavailable", 1)
+
+
+def _revision_conflict(exc: PolicyRevisionConflict) -> int:
+    """Report a failed policy precondition (HTTP 409 -> exit code 3)."""
+    print(
+        json.dumps(
+            {
+                "error": "policy revision conflict",
+                "current_revision": exc.current_revision,
+            },
+            separators=(",", ":"),
+        ),
+        file=sys.stderr,
+    )
+    return 3
 
 
 def _ledger_failure_text(exc: Exception) -> str:
@@ -1873,11 +1905,20 @@ def _policy_command(args, policies: PolicyStore) -> int:
             return _ledger_fail(exc)
         _print(
             {"tenant_id": tenant_id,
-             "rules": [r.to_json() for r in rules]}
+             "rules": [r.to_json() for r in rules],
+             "revision": revision_for_rules(rules)}
         )
         return 0
 
     if args.policy_command == "set":
+        expected = None
+        if args.expected_revision is not None:
+            try:
+                expected = validate_expected_revision(
+                    args.expected_revision
+                )
+            except PolicyError as exc:
+                return _fail(str(exc), 2)
         try:
             raw = json.loads(args.rules)
         except ValueError:
@@ -1887,20 +1928,32 @@ def _policy_command(args, policies: PolicyStore) -> int:
         except PolicyError as exc:
             return _fail(str(exc), 2)
         try:
-            policies.put(tenant_id, rules)
+            rules, new_revision = policies.put(
+                tenant_id, rules, expected_revision=expected
+            )
+        except PolicyRevisionConflict as exc:
+            return _revision_conflict(exc)
         except LedgerError as exc:
             return _ledger_fail(exc)
         _print(
             {"tenant_id": tenant_id,
-             "rules": [r.to_json() for r in rules]}
+             "rules": [r.to_json() for r in rules],
+             "revision": new_revision}
         )
         return 0
 
     # policy delete
+    expected = None
+    if args.expected_revision is not None:
+        try:
+            expected = validate_expected_revision(args.expected_revision)
+        except PolicyError as exc:
+            return _fail(str(exc), 2)
     try:
-        policies.delete(tenant_id)
+        policies.delete(tenant_id, expected_revision=expected)
+    except PolicyRevisionConflict as exc:
+        return _revision_conflict(exc)
     except LedgerError as exc:
         return _ledger_fail(exc)
     _print({"tenant_id": tenant_id, "deleted": True})
     return 0
-

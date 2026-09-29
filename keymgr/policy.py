@@ -18,6 +18,7 @@ between is repaired idempotently on the next open.
 import hashlib
 import json
 import os
+import re
 import tempfile
 import threading
 from contextlib import contextmanager
@@ -55,10 +56,60 @@ POLICY_ACTIONS = (
 )
 EFFECTS = ("allow", "deny")
 _POLICY_DIR = "policies"
+#: Query value that asserts the tenant currently has no policy document.
+EXPECTED_NONE = "none"
+#: Opaque revisions are SHA-256 hex digests of the normalized rule content;
+#: that shape can never collide with the ``none`` keyword.
+REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class PolicyError(ValueError):
     """A policy document or rule failed validation (surfaced as 400)."""
+
+
+class PolicyRevisionConflict(Exception):
+    """An expected_revision precondition did not match (surfaced as 409)."""
+
+    def __init__(self, current_revision: Optional[str]) -> None:
+        self.current_revision = current_revision
+        super().__init__("policy revision conflict")
+
+
+def revision_for_rules(rules) -> str:
+    """Compute the opaque, content-addressed revision of a rule list.
+
+    Rules are normalized first (actions sorted, rules ordered by
+    subject/effect/actions), so the same logical document always yields the
+    same revision and any change yields a different one. Nothing about the
+    on-disk layout is reflected in the value.
+    """
+    normalized = [
+        {
+            "subject": rule.subject,
+            "effect": rule.effect,
+            "actions": sorted(rule.actions),
+        }
+        for rule in rules
+    ]
+    normalized.sort(
+        key=lambda item: (item["subject"], item["effect"], item["actions"])
+    )
+    blob = json.dumps(
+        normalized, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def validate_expected_revision(raw) -> str:
+    """Validate an expected_revision precondition value (``none`` or digest)."""
+    if not isinstance(raw, str) or (
+        raw != EXPECTED_NONE and not REVISION_RE.fullmatch(raw)
+    ):
+        raise PolicyError(
+            "field expected_revision must be a revision from a prior read "
+            "or 'none'"
+        )
+    return raw
 
 
 @dataclass(frozen=True)
@@ -359,11 +410,67 @@ class PolicyStore:
             return None
         return doc[1]
 
-    def put(self, tenant_id: str, rules: List[Rule]) -> List[Rule]:
-        """Replace (or create) the tenant's document and audit policy_update."""
+    def get_revision(self, tenant_id: str) -> Optional[str]:
+        """Return the tenant's current revision, or None when no document."""
+        rules = self.get(tenant_id)
+        if rules is None:
+            return None
+        return revision_for_rules(rules)
+
+    def _current_state(self, path: str):
+        """Return (rules, revision) for an existing document under the lock."""
+        doc = self._read_doc(path)
+        if doc is None:
+            # A document we cannot parse cannot supply a current revision;
+            # take the same fixed-500 path as an unreadable put/delete.
+            raise LedgerError("cannot read policy document")
+        rules = doc[1]
+        return rules, revision_for_rules(rules)
+
+    def _check_expected(
+        self, tenant_id: str, action: str,
+        expected: Optional[str], current_revision: Optional[str],
+    ) -> bool:
+        """Compare a precondition inside the tenant lock.
+
+        A mismatch appends one ``<action>/rejected`` event and returns False;
+        the document is never touched. ``expected=None`` always matches.
+        """
+        if expected is None:
+            return True
+        wanted = None if expected == EXPECTED_NONE else expected
+        if wanted == current_revision:
+            return True
+        event = self.audit.new_event(
+            tenant_id, action, None, audit_mod.OUTCOME_REJECTED,
+        )
+        self.audit.append(event)
+        return False
+
+    def put(
+        self, tenant_id: str, rules: List[Rule],
+        expected_revision: Optional[str] = None,
+    ) -> tuple:
+        """Replace (or create) the tenant's document and audit policy_update.
+
+        ``expected_revision`` optionally preconditions the write: ``None`` is
+        unconditional, ``'none'`` requires no existing document and any other
+        value must equal the current revision. The compare and the write run
+        under one tenant lock; a mismatch raises
+        :class:`PolicyRevisionConflict` after recording one rejected event.
+        Returns ``(rules, new_revision)``.
+        """
         with self.tenant_lock(tenant_id):
             path = self._path_for(tenant_id)
             existed = os.path.exists(path)
+            current_revision = None
+            if existed:
+                _, current_revision = self._current_state(path)
+            if not self._check_expected(
+                tenant_id, audit_mod.ACTION_POLICY_UPDATE,
+                expected_revision, current_revision,
+            ):
+                raise PolicyRevisionConflict(current_revision)
             previous = None
             if existed:
                 try:
@@ -378,9 +485,12 @@ class PolicyStore:
                 audit_mod.OUTCOME_SUCCESS,
             )
             self._commit_put(tenant_id, rules, event, existed, previous)
-        return rules
+        return rules, revision_for_rules(rules)
 
-    def delete(self, tenant_id: str) -> None:
+    def delete(
+        self, tenant_id: str,
+        expected_revision: Optional[str] = None,
+    ) -> None:
         """Delete the tenant's document and audit policy_delete.
 
         Tombstone sequence: write a ``.json.del`` marker carrying the event,
@@ -393,6 +503,14 @@ class PolicyStore:
         with self.tenant_lock(tenant_id):
             path = self._path_for(tenant_id)
             existed = os.path.exists(path)
+            current_revision = None
+            if existed:
+                _, current_revision = self._current_state(path)
+            if not self._check_expected(
+                tenant_id, audit_mod.ACTION_POLICY_DELETE,
+                expected_revision, current_revision,
+            ):
+                raise PolicyRevisionConflict(current_revision)
             event = self.audit.new_event(
                 tenant_id, audit_mod.ACTION_POLICY_DELETE, None,
                 audit_mod.OUTCOME_SUCCESS,
