@@ -61,6 +61,18 @@ class PolicyError(ValueError):
     """A policy document or rule failed validation (surfaced as 400)."""
 
 
+class PolicyRevisionConflict(Exception):
+    """An expected_revision precondition failed (surfaced as 409).
+
+    ``current_revision`` is the revision the tenant currently carries, or
+    ``None`` when the tenant has no policy document.
+    """
+
+    def __init__(self, current_revision: Optional[str]) -> None:
+        super().__init__("policy revision conflict")
+        self.current_revision = current_revision
+
+
 @dataclass(frozen=True)
 class Rule:
     """One policy rule: an effect on a set of actions for one subject."""
@@ -156,6 +168,32 @@ def validate_rules(raw) -> List[Rule]:
         seen.add(rule.signature())
         rules.append(rule)
     return rules
+
+
+#: The expected_revision value asserting that no document exists.
+REVISION_NONE = "none"
+
+
+def compute_revision(rules: List[Rule]) -> str:
+    """Compute the opaque, stable revision for a normalized rule set.
+
+    The revision is a content digest of the canonical document: rules are
+    ordered by (subject, effect, sorted actions), so neither rule order nor
+    action order within a rule affects it. It never takes the value
+    :data:`REVISION_NONE`.
+    """
+    normalized = [
+        {
+            "subject": rule.subject,
+            "effect": rule.effect,
+            "actions": sorted(rule.actions),
+        }
+        for rule in rules
+    ]
+    normalized.sort(key=lambda item: (item["subject"], item["effect"],
+                                      item["actions"]))
+    blob = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    return "rev-" + hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
 
 
 class PolicyStore:
@@ -359,28 +397,84 @@ class PolicyStore:
             return None
         return doc[1]
 
-    def put(self, tenant_id: str, rules: List[Rule]) -> List[Rule]:
-        """Replace (or create) the tenant's document and audit policy_update."""
+    def revision(self, tenant_id: str) -> Optional[str]:
+        """Return the tenant's current revision, or None without a document."""
+        rules = self.get(tenant_id)
+        if rules is None:
+            return None
+        return compute_revision(rules)
+
+    def _read_current(self, path: str):
+        """Read an existing document under the tenant lock.
+
+        Returns the raw on-disk payload plus the parsed rules. An unreadable
+        or corrupt document is a storage failure, never a conflict.
+        """
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                previous = json.load(fh)
+            current_rules = [Rule.from_json(r) for r in previous["rules"]]
+        except (OSError, ValueError, KeyError, TypeError, PolicyError) as exc:
+            raise LedgerError(
+                "cannot read policy document: %s" % exc
+            ) from exc
+        return previous, current_rules
+
+    @staticmethod
+    def _revision_matches(expected: str, existed: bool,
+                          current_revision: Optional[str]) -> bool:
+        if expected == REVISION_NONE:
+            return not existed
+        return existed and expected == current_revision
+
+    def _reject(self, tenant_id: str, action: str,
+                current_revision: Optional[str]) -> None:
+        """Audit a failed revision precondition, then report the 409.
+
+        Runs inside the tenant lock after the compare failed; the document is
+        untouched. A ledger failure aborts with 500 instead of a conflict.
+        """
+        event = self.audit.new_event(
+            tenant_id, action, None, audit_mod.OUTCOME_REJECTED,
+        )
+        self.audit.append(event)
+        raise PolicyRevisionConflict(current_revision)
+
+    def put(self, tenant_id: str, rules: List[Rule],
+            expected: Optional[str] = None) -> str:
+        """Replace (or create) the tenant's document and audit policy_update.
+
+        With ``expected`` set (a revision previously read, or
+        :data:`REVISION_NONE`), the compare and the write happen in one
+        tenant-locked critical section: a mismatch leaves the document
+        unchanged, records ``policy_update/rejected`` and raises
+        :class:`PolicyRevisionConflict`. ``expected=None`` is the
+        unconditional legacy behavior. Returns the new revision.
+        """
         with self.tenant_lock(tenant_id):
             path = self._path_for(tenant_id)
             existed = os.path.exists(path)
             previous = None
+            current_revision = None
             if existed:
-                try:
-                    with open(path, "r", encoding="utf-8") as fh:
-                        previous = json.load(fh)
-                except (OSError, ValueError) as exc:
-                    raise LedgerError(
-                        "cannot read policy document: %s" % exc
-                    ) from exc
+                previous, current_rules = self._read_current(path)
+                current_revision = compute_revision(current_rules)
+            if expected is not None and not self._revision_matches(
+                expected, existed, current_revision
+            ):
+                self._reject(
+                    tenant_id, audit_mod.ACTION_POLICY_UPDATE,
+                    current_revision,
+                )
             event = self.audit.new_event(
                 tenant_id, audit_mod.ACTION_POLICY_UPDATE, None,
                 audit_mod.OUTCOME_SUCCESS,
             )
             self._commit_put(tenant_id, rules, event, existed, previous)
-        return rules
+        return compute_revision(rules)
 
-    def delete(self, tenant_id: str) -> None:
+    def delete(self, tenant_id: str,
+               expected: Optional[str] = None) -> None:
         """Delete the tenant's document and audit policy_delete.
 
         Tombstone sequence: write a ``.json.del`` marker carrying the event,
@@ -389,10 +483,27 @@ class PolicyStore:
         append itself fails, the original document is restored byte-for-byte
         and the tombstone discarded, so a failed delete never takes effect.
         Deleting a tenant that has no document still records the event.
+
+        With ``expected`` set, the compare and delete share one tenant-locked
+        critical section; a mismatch records ``policy_delete/rejected`` and
+        raises :class:`PolicyRevisionConflict` without removing anything.
+        ``expected=None`` keeps the unconditional legacy behavior.
         """
         with self.tenant_lock(tenant_id):
             path = self._path_for(tenant_id)
             existed = os.path.exists(path)
+            current_revision = None
+            previous = None
+            if existed:
+                previous, current_rules = self._read_current(path)
+                current_revision = compute_revision(current_rules)
+            if expected is not None and not self._revision_matches(
+                expected, existed, current_revision
+            ):
+                self._reject(
+                    tenant_id, audit_mod.ACTION_POLICY_DELETE,
+                    current_revision,
+                )
             event = self.audit.new_event(
                 tenant_id, audit_mod.ACTION_POLICY_DELETE, None,
                 audit_mod.OUTCOME_SUCCESS,
@@ -400,13 +511,6 @@ class PolicyStore:
             if not existed:
                 self.audit.append(event)
                 return
-            try:
-                with open(path, "r", encoding="utf-8") as fh:
-                    previous = json.load(fh)
-            except (OSError, ValueError) as exc:
-                raise LedgerError(
-                    "cannot read policy document: %s" % exc
-                ) from exc
             tombstone = path + ".del"
             self._write_atomic(
                 tombstone,

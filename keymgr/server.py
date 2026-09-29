@@ -22,7 +22,13 @@ from .artifacts import (
 from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
 from .operations import OperationStore
-from .policy import PolicyError, PolicyStore, validate_rules
+from .policy import (
+    PolicyError,
+    PolicyRevisionConflict,
+    PolicyStore,
+    compute_revision,
+    validate_rules,
+)
 from .provider import (
     ProviderInvalidMaterial,
     ProviderReconnectPending,
@@ -3708,6 +3714,39 @@ def make_handler(
                 {
                     "tenant_id": tenant_id,
                     "rules": [r.to_json() for r in rules],
+                    "revision": compute_revision(rules),
+                },
+            )
+
+        def _expected_revision(self, parts):
+            """Parse the optional expected_revision query parameter.
+
+            Returns ``(value, ok)``: omitted gives ``(None, True)``; otherwise
+            the single non-empty value. A duplicated or empty parameter is a
+            side-effect-free 400.
+            """
+            values = parse_qs(
+                parts.query, keep_blank_values=True
+            ).get("expected_revision", [])
+            if len(values) > 1:
+                self._bad_request(
+                    "duplicate expected_revision "
+                    "(provide a single expected_revision parameter)"
+                )
+                return None, False
+            if values and not values[0]:
+                self._bad_request(
+                    "field expected_revision must be a non-empty string"
+                )
+                return None, False
+            return (values[0] if values else None), True
+
+        def _revision_conflict(self, exc: PolicyRevisionConflict) -> None:
+            self._send_json(
+                409,
+                {
+                    "error": "policy revision conflict",
+                    "current_revision": exc.current_revision,
                 },
             )
 
@@ -3720,10 +3759,13 @@ def make_handler(
                 if self._record_conflict():
                     self._bad_request(
                         "field tenant_id must be a non-empty string"
-                    )
+                )
                 return
             tenant_id = self._tenant(parts, payload)
             if tenant_id is None:
+                return
+            expected, ok = self._expected_revision(parts)
+            if not ok:
                 return
             if "rules" not in payload:
                 self._bad_request("missing required field: rules")
@@ -3733,12 +3775,17 @@ def make_handler(
             except PolicyError as exc:
                 self._bad_request(str(exc))
                 return
-            policy_store.put(tenant_id, rules)
+            try:
+                revision = policy_store.put(tenant_id, rules, expected)
+            except PolicyRevisionConflict as exc:
+                self._revision_conflict(exc)
+                return
             self._send_json(
                 200,
                 {
                     "tenant_id": tenant_id,
                     "rules": [r.to_json() for r in rules],
+                    "revision": revision,
                 },
             )
 
@@ -3746,7 +3793,14 @@ def make_handler(
             tenant_id = self._strict_tenant(parts)
             if tenant_id is None:
                 return
-            policy_store.delete(tenant_id)
+            expected, ok = self._expected_revision(parts)
+            if not ok:
+                return
+            try:
+                policy_store.delete(tenant_id, expected)
+            except PolicyRevisionConflict as exc:
+                self._revision_conflict(exc)
+                return
             self._send_json(200, {"tenant_id": tenant_id, "deleted": True})
 
     return KeyHandler

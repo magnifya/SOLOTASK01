@@ -16,7 +16,13 @@ from . import tenantbundle
 from .audit import AuditLog, InvalidCursor, LedgerError
 from .crypto import SUPPORTED_ALGORITHMS
 from .operations import OperationStore
-from .policy import PolicyError, PolicyStore, validate_rules
+from .policy import (
+    PolicyError,
+    PolicyRevisionConflict,
+    PolicyStore,
+    compute_revision,
+    validate_rules,
+)
 from .provider import (
     ProviderInvalidMaterial,
     ProviderReconnectPending,
@@ -253,6 +259,14 @@ def build_parser() -> argparse.ArgumentParser:
         "delete", help="delete a tenant's policy"
     )
     p_policy_delete.add_argument("--tenant-id", required=True)
+    p_policy_set.add_argument(
+        "--expected-revision", default=None,
+        help="only replace when the current revision matches, or 'none'",
+    )
+    p_policy_delete.add_argument(
+        "--expected-revision", default=None,
+        help="only delete when the current revision matches, or 'none'",
+    )
 
     p_provider = sub.add_parser(
         "provider", help="inspect or reconnect the KMS/HSM provider"
@@ -308,6 +322,21 @@ def _fail(message: str, exit_code: int) -> int:
 
 def _ledger_fail(exc: Exception) -> int:
     return _fail("audit ledger is unavailable", 1)
+
+
+def _revision_conflict(exc: PolicyRevisionConflict) -> int:
+    """Report a failed expected_revision precondition (HTTP 409 -> exit 5)."""
+    print(
+        json.dumps(
+            {
+                "error": "policy revision conflict",
+                "current_revision": exc.current_revision,
+            },
+            separators=(",", ":"),
+        ),
+        file=sys.stderr,
+    )
+    return 5
 
 
 def _ledger_failure_text(exc: Exception) -> str:
@@ -1863,6 +1892,12 @@ def _policy_command(args, policies: PolicyStore) -> int:
     if not tenant_id:
         return _fail("field tenant_id must be a non-empty string", 2)
 
+    expected_revision = getattr(args, "expected_revision", None)
+    if expected_revision == "":
+        return _fail(
+            "field expected_revision must be a non-empty string", 2
+        )
+
     if args.policy_command == "show":
         rules = policies.get(tenant_id)
         if rules is None:
@@ -1873,7 +1908,8 @@ def _policy_command(args, policies: PolicyStore) -> int:
             return _ledger_fail(exc)
         _print(
             {"tenant_id": tenant_id,
-             "rules": [r.to_json() for r in rules]}
+             "rules": [r.to_json() for r in rules],
+             "revision": compute_revision(rules)}
         )
         return 0
 
@@ -1887,20 +1923,26 @@ def _policy_command(args, policies: PolicyStore) -> int:
         except PolicyError as exc:
             return _fail(str(exc), 2)
         try:
-            policies.put(tenant_id, rules)
+            revision = policies.put(
+                tenant_id, rules, expected_revision
+            )
+        except PolicyRevisionConflict as exc:
+            return _revision_conflict(exc)
         except LedgerError as exc:
             return _ledger_fail(exc)
         _print(
             {"tenant_id": tenant_id,
-             "rules": [r.to_json() for r in rules]}
+             "rules": [r.to_json() for r in rules],
+             "revision": revision}
         )
         return 0
 
     # policy delete
     try:
-        policies.delete(tenant_id)
+        policies.delete(tenant_id, expected_revision)
+    except PolicyRevisionConflict as exc:
+        return _revision_conflict(exc)
     except LedgerError as exc:
         return _ledger_fail(exc)
     _print({"tenant_id": tenant_id, "deleted": True})
     return 0
-

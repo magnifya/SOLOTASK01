@@ -311,7 +311,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   多文件原子恢复 `201` → `{tenant_id, key_ids, policy_restored,
   operation_id}`。空包同样成功（`key_ids:[]`、`policy_restored:false`）。
 - `GET /v1/policy` / `PUT /v1/policy` / `DELETE /v1/policy`：读/替换/删除
-  租户策略，见下。
+  租户策略，支持不透明 `revision` 乐观并发，见下。
 - `GET /v1/audit`：本租户审计查询，见下。
 - `GET /v1/operations/{operation_id}`：查询幂等操作，见下。
 - `GET /v1/provider/status` 与 `POST /v1/provider/reconnect`：KMS/HSM
@@ -501,8 +501,19 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 
 - `GET/PUT/DELETE /v1/policy`，租户由单一头或单一参数提供（PUT 也可由 body
   的 `tenant_id` 提供，来源须一致）。GET → `{tenant_id, rules}`（无策略
-  `404`）；PUT body `{tenant_id, rules}` 整体替换；DELETE 幂等，→
-  `{tenant_id, deleted:true}`。
+  `404`）；GET 与 PUT 成功返回在原有字段上追加不透明 `revision`，它按规范化
+  规则内容（排序后的 subject/effect/actions）稳定计算：内容不变则不变，语义
+  等价（规则或动作换序）也相同，内容改变才变化，且永不为 `none`；PUT body
+  `{tenant_id, rules}` 整体替换 → `{tenant_id, rules, revision}`；DELETE 幂等，
+  → `{tenant_id, deleted:true}`。
+- 乐观并发：PUT/DELETE 接受可选查询参数 `expected_revision`，值为先前读到的
+  `revision`，或 `none` 断言当前尚无策略；省略即保持无条件旧行为。比较与变更
+  在同一把租户锁内完成：匹配才提交并返回新 revision（PUT）；已有策略却断言
+  `none`、无策略却给出 revision、或 revision 不匹配均为 `409`，响应只含
+  `{"error":"policy revision conflict","current_revision":...}`（无策略时
+  `current_revision` 为 `null`），规则不变，分别记
+  `policy_update/rejected`、`policy_delete/rejected`，不记成功事件。参数重复
+  或为空是零副作用 `400`；账本/策略文件失败仍为固定 `500`。
 - 规则元素 `{subject, actions, effect}`：`subject` 为区分大小写的非空字符串；
   `actions` 为非空数组，取值
   `create/read/rotate/revoke/revoke_version/import/export/migrate/encrypt/decrypt/
@@ -608,7 +619,11 @@ python -m keymgr restore  --tenant-id t --passphrase pw --bundle <b> \
 # 审计 / 操作 / 策略
 python -m keymgr audit    --tenant-id t --action rotate --limit 100 --operator alice
 python -m keymgr operation --tenant-id t --operator alice --operation-id <id>
-python -m keymgr policy --operator admin set|show|delete --tenant-id t [--rules '<json>']
+python -m keymgr policy --operator admin show --tenant-id t
+python -m keymgr policy --operator admin set --tenant-id t --rules '<json>' [--expected-revision <rev>|none]
+python -m keymgr policy --operator admin delete --tenant-id t [--expected-revision <rev>|none]
+# show/set 输出含 revision；--expected-revision 省略时为无条件操作，
+# 冲突时输出 {"error":"policy revision conflict","current_revision":...} 并以码 5 退出
 # KMS/HSM 健康检查与无中断重连（全局，无 --tenant-id）
 python -m keymgr provider status    --operator alice
 python -m keymgr provider reconnect --operator alice
