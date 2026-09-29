@@ -86,6 +86,34 @@ class RestoreResult(NamedTuple):
     conflict: Optional[Conflict] = None
 
 
+class PreflightReport(NamedTuple):
+    """Read-only feasibility view of a validated tenant payload."""
+
+    key_ids: List[str]
+    policy_restored: bool
+    ready: bool
+    conflicts: List[dict]
+
+
+class PreflightForeignOccupation(Exception):
+    """A bundle key id (or the policy path) is owned by another tenant.
+
+    Surfaced as a 404 so cross-tenant existence never leaks, exactly like a
+    restore foreign conflict.
+    """
+
+    def __init__(
+        self, key_id: Optional[str] = None, owner: Optional[str] = None
+    ) -> None:
+        super().__init__("tenant backup target is occupied by another tenant")
+        self.key_id = key_id
+        self.owner = owner
+
+
+class PreflightUnavailable(Exception):
+    """The locks or on-disk state could not be observed reliably (500)."""
+
+
 class _PendingGroup:
     """Files sharing one restore marker discovered during recovery."""
 
@@ -158,6 +186,72 @@ class RestoreCoordinator:
         """Seal the tenant's full state into an opaque backup bundle."""
         return tenantbundle.encode_bundle(
             self.backup_payload(tenant_id), passphrase
+        )
+
+    # -- restore preflight -------------------------------------------------
+    def preflight(self, tenant_id: str, payload: dict) -> PreflightReport:
+        """Read-only check of whether a validated payload could restore.
+
+        Takes exactly the locks a restore takes -- the in-process and
+        cross-process restore locks, the tenant policy lock, then every
+        bundle key lock in sorted order -- so a concurrent restore
+        transaction is observed wholly before or wholly after this view. The
+        check never creates a key, writes a policy, mints a provider handle,
+        appends an audit event or persists an operation record; the only
+        files touched are the shared lock sidecars already used by every
+        backup/restore.
+
+        A ``key_id`` owned by another tenant (or a policy document on the
+        tenant's hashed path naming another owner) raises
+        :class:`PreflightForeignOccupation`; same-tenant owners are reported
+        as conflicts (key conflicts in ascending key_id order, then the
+        policy conflict). A policy document already present conflicts even
+        when the bundle carries no policy, matching the restore rule.
+        """
+        key_ids = sorted(entry["key_id"] for entry in payload["keys"])
+        policy_restored = payload["policy"] is not None
+        try:
+            with self._restore_locks(tenant_id, key_ids, None):
+                return self._preflight_locked(
+                    tenant_id, key_ids, policy_restored
+                )
+        except PreflightForeignOccupation:
+            raise
+        except OSError as exc:
+            # A lock sidecar or state file cannot be observed: the answer
+            # would be a guess, so the caller must answer a fixed 500.
+            raise PreflightUnavailable(str(exc)) from exc
+
+    def _preflight_locked(
+        self,
+        tenant_id: str,
+        key_ids: List[str],
+        policy_restored: bool,
+    ) -> PreflightReport:
+        """Scan for owners with every restore lock held. Read-only."""
+        conflicts: List[dict] = []
+        for key_id in key_ids:
+            existing = self.store.read_raw(key_id)
+            if existing is None:
+                continue
+            if existing.tenant_id != tenant_id:
+                # Foreign occupation wins over same-tenant conflicts and is
+                # reported as 404, so cross-tenant existence never leaks.
+                raise PreflightForeignOccupation(
+                    key_id=key_id, owner=existing.tenant_id
+                )
+            conflicts.append({"kind": "key", "key_id": key_id})
+        policy_path = self.policy_store.path_for(tenant_id)
+        if os.path.exists(policy_path):
+            owner = self.policy_store.owner_of_path(policy_path)
+            if owner is not None and owner != tenant_id:
+                raise PreflightForeignOccupation(owner=owner)
+            conflicts.append({"kind": "policy"})
+        return PreflightReport(
+            key_ids=key_ids,
+            policy_restored=policy_restored,
+            ready=not conflicts,
+            conflicts=conflicts,
         )
 
     # -- restore -----------------------------------------------------------

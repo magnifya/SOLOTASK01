@@ -60,6 +60,7 @@ _IMPORT_PATH = "/v1/keys/import"
 _BATCH_ROTATE_PATH = "/v1/keys/batch-rotate"
 _BACKUP_PATH = "/v1/backup"
 _RESTORE_PATH = "/v1/restore"
+_RESTORE_PREFLIGHT_PATH = "/v1/restore/preflight"
 _KEY_PATH_RE = re.compile(r"^/v1/keys/([^/]+)$")
 _ROTATE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/rotate$")
 _REVOKE_PATH_RE = re.compile(r"^/v1/keys/([^/]+)/revoke$")
@@ -895,6 +896,10 @@ def make_handler(
 
                 if path == _RESTORE_PATH:
                     self._restore_tenant(parts, operator)
+                    return
+
+                if path == _RESTORE_PREFLIGHT_PATH:
+                    self._restore_preflight(parts, operator)
                     return
 
                 if path == _PROVIDER_RECONNECT_PATH:
@@ -2992,6 +2997,109 @@ def make_handler(
 
             self._idempotent_guard(
                 parts.path, tenant_id, operator, payload, idem_key, execute
+            )
+
+        def _restore_preflight(self, parts, operator: str) -> None:
+            """POST /v1/restore/preflight.
+
+            A side-effect-free feasibility check for POST /v1/restore using
+            the same operator rule, the same single-source tenant rules and
+            the same {tenant_id, passphrase, bundle} body. It requires no
+            Idempotency-Key, binds no operation, mints no provider handle and
+            leaves no file or marker; a successful check appends no audit
+            event.
+
+            Order mirrors a restore: parameter/tenant-source failures are
+            ordinary 400s (a tenant-source failure still records the
+            invisible tenant_conflict, like every other tenant endpoint);
+            wrong passphrase/tampering/format or internal-field errors are a
+            single 400 "invalid tenant backup"; the import policy is then
+            enforced (a denial is 403 with one import/rejected event, as for
+            a restore); a bundle naming another tenant answers 404; under
+            the restore lock set a key id occupied by another tenant is 404
+            while same-tenant key/policy owners are listed as conflicts with
+            ready false. Any state that cannot be observed reliably answers
+            the fixed 500 "restore preflight unavailable".
+            """
+            payload = self._read_json_object()
+            if payload is None:
+                return
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                if not self._record_conflict():
+                    return
+                self._bad_request(
+                    "field tenant_id must be a non-empty string"
+                )
+                return
+            tenant_id = self._tenant(parts, payload)
+            if tenant_id is None:
+                return
+            passphrase = payload.get("passphrase")
+            if not isinstance(passphrase, str) or not passphrase:
+                self._bad_request(
+                    "field passphrase must be a non-empty string"
+                )
+                return
+            bundle = payload.get("bundle")
+            if not isinstance(bundle, str) or not bundle:
+                self._bad_request("field bundle must be a non-empty string")
+                return
+            extra = set(payload) - {"tenant_id", "passphrase", "bundle"}
+            if extra:
+                self._bad_request(
+                    "field %s is not accepted by this endpoint"
+                    % sorted(extra)[0]
+                )
+                return
+            # Decrypting/authenticating the bundle is side-effect free and
+            # creates nothing; every failure collapses to one opaque 400 so
+            # passphrase, tampering and malformed-payload details never leak.
+            try:
+                decoded = tenantbundle.decode_bundle(bundle, passphrase)
+            except tenantbundle.TenantBundleError:
+                self._bad_request("invalid tenant backup")
+                return
+            # Authorization uses the exact import action a restore uses, and
+            # precedes the in-bundle tenant check as it does for restore. The
+            # denial is the only audit event a preflight ever writes.
+            if not policy_store.is_allowed(
+                tenant_id, audit_mod.ACTION_IMPORT, operator
+            ):
+                if not self._record_attempt(
+                    tenant_id, None, audit_mod.ACTION_IMPORT,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._send_json(
+                    403, {"error": "action not permitted by policy"}
+                )
+                return
+            if decoded["tenant_id"] != tenant_id:
+                self._send_json(
+                    404, {"error": "tenant backup not found"}
+                )
+                return
+            try:
+                report = coordinator.preflight(tenant_id, decoded)
+            except restore_mod.PreflightForeignOccupation:
+                self._send_json(
+                    404, {"error": "tenant backup not found"}
+                )
+                return
+            except restore_mod.PreflightUnavailable:
+                self._send_json(
+                    500, {"error": "restore preflight unavailable"}
+                )
+                return
+            self._send_json(
+                200,
+                {
+                    "key_ids": report.key_ids,
+                    "policy_restored": report.policy_restored,
+                    "ready": report.ready,
+                    "conflicts": report.conflicts,
+                },
             )
 
         # -- provider health / reconnect ----------------------------------
