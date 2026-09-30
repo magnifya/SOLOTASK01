@@ -348,6 +348,21 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `404 {"error":"tenant backup not found"}`；内部状态无法可靠判断固定
   `500 {"error":"restore preflight unavailable"}`。预检绝不留下文件、
   标记、句柄或审计痕迹（仅有的锁 sidecar 除外）。
+- `POST /v1/backup/verify`，body 仅
+  `{tenant_id, passphrase, bundle}`（无需 `Idempotency-Key`）：租户备份
+  包只读校验，完整解密并认证 `tenant-backup-v1`，检查格式、包内租户、
+  逐 key 版本连续性（1..N 无缺口）、`current_version` 指向最新版本、
+  吊销字段、重复 `key_id` 与策略规则结构；不创建密钥、不铸提供者句柄、
+  不写策略/操作记录，成功不新增审计。`200` 单行 JSON →
+  `{valid, tenant_id, key_ids, policy_restored}`，`key_ids` 按 UUID 升序，
+  `policy_restored` 表示包是否携带策略；空包成功时
+  `key_ids:[]、policy_restored:false`。口令错误、篡改、base64/JSON 错误、
+  版本/字段/规则结构非法统一 `400 {"error":"invalid tenant backup"}`；
+  请求字段缺/多/类型错误与身份、租户来源缺失/重复/冲突沿用既有 400
+  （`tenant_conflict` 照旧）；按备份的 `export` 动作授权，拒绝为 `403`
+  并记一条 `export/rejected`（校验成功不新增任何事件）；包内 `tenant_id`
+  与请求不符为 `404 {"error":"tenant backup not found"}`；内部读取或校验
+  无法可靠完成固定 `500 {"error":"backup verify unavailable"}`。
 - `GET /v1/policy` / `PUT /v1/policy` / `DELETE /v1/policy`：读/替换/删除
   租户策略，见下。
 - `POST /v1/policy/check`：按当前策略只读判定一次 subject/action，见下。
@@ -681,6 +696,8 @@ python -m keymgr import   --tenant-id t --passphrase pw --bundle <b> \
 python -m keymgr backup   --tenant-id t --passphrase pw --operator alice
 python -m keymgr restore  --tenant-id t --passphrase pw --bundle <b> \
                           --operator alice --idempotency-key restore-0001
+python -m keymgr backup verify --tenant-id t --passphrase pw --bundle <b> \
+                          --operator alice
 # 审计 / 操作 / 策略
 python -m keymgr audit    --tenant-id t --action rotate --limit 100 --operator alice
 python -m keymgr audit verify --tenant-id t --operator alice

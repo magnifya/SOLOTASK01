@@ -203,10 +203,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--aad", default=None, help="optional base64 additional authenticated data"
     )
 
-    p_backup = tenant_parser(
+    backup_common = argparse.ArgumentParser(add_help=False)
+    backup_common.add_argument("--tenant-id", required=True)
+    backup_common.add_argument(
+        "--operator", required=True,
+        help="non-empty X-Operator-Id of the caller",
+    )
+    p_backup = sub.add_parser(
         "backup", help="back up all of a tenant's keys and policy"
     )
-    p_backup.add_argument("--passphrase", required=True)
+    # Mirror the audit/audit-verify split: the plain `backup` command keeps
+    # its own (runtime-validated) options, while the `verify` subcommand gets
+    # the required common identity options.
+    p_backup.add_argument("--tenant-id", default=None)
+    p_backup.add_argument(
+        "--operator", default=None,
+        help="non-empty X-Operator-Id of the caller",
+    )
+    p_backup.add_argument("--passphrase", default=None)
+    backup_sub = p_backup.add_subparsers(dest="backup_command")
+    p_backup_verify = backup_sub.add_parser(
+        "verify", parents=[backup_common],
+        help="read-only verify of an encrypted tenant backup bundle",
+    )
+    p_backup_verify.add_argument("--passphrase", required=True)
+    p_backup_verify.add_argument("--bundle", required=True)
 
     p_restore = tenant_parser(
         "restore", help="restore a tenant from an encrypted backup bundle"
@@ -1729,6 +1750,55 @@ def _run(argv: Optional[List[str]] = None) -> int:
         ):
             return 1
         _print({"plaintext": envelope.b64_encode(plaintext)})
+        return 0
+
+    if args.command == "backup" and args.backup_command == "verify":
+        # Read-only counterpart of POST /v1/backup/verify: decrypt and
+        # validate the bundle without minting keys/handles or writing
+        # policy/operation records. An export denial is the only audit
+        # event (export/rejected); success leaves no event.
+        if not args.tenant_id:
+            if not _conflict(store):
+                return 1
+            return _fail(
+                "field tenant_id must be a non-empty string", 2
+            )
+        if not args.passphrase:
+            return _fail(
+                "field passphrase must be a non-empty string", 2
+            )
+        if not args.bundle:
+            return _fail("field bundle must be a non-empty string", 2)
+        try:
+            decoded = tenantbundle.decode_bundle(
+                args.bundle, args.passphrase
+            )
+        except tenantbundle.TenantBundleError:
+            return _fail("invalid tenant backup", 2)
+        if not policies.is_allowed(
+            args.tenant_id, audit_mod.ACTION_EXPORT, args.operator
+        ):
+            try:
+                store.audit_attempt(
+                    args.tenant_id, None,
+                    audit_mod.ACTION_EXPORT,
+                    audit_mod.OUTCOME_REJECTED,
+                )
+            except LedgerError:
+                return _fail("backup verify unavailable", 1)
+            return _fail("action not permitted by policy", 3)
+        if decoded["tenant_id"] != args.tenant_id:
+            return _fail("tenant backup not found", 4)
+        _print(
+            {
+                "valid": True,
+                "tenant_id": args.tenant_id,
+                "key_ids": sorted(
+                    key["key_id"] for key in decoded["keys"]
+                ),
+                "policy_restored": decoded["policy"] is not None,
+            }
+        )
         return 0
 
     if args.command == "backup":
