@@ -131,6 +131,12 @@ def make_handler(
             # change by this point and no corruption detail leaks.
             self._send_json(500, {"error": "audit ledger is unavailable"})
 
+        def _policy_store_error(self) -> None:
+            # An existing policy document that cannot be read or parsed
+            # fails closed: a fixed 500 with no allow/deny decision and no
+            # audit event of either kind.
+            self._send_json(500, {"error": "policy store is unavailable"})
+
         def _provider_unavailable(self, exc: Exception) -> None:
             # A KMS/HSM backend failure is a 503 with a generic message: the
             # detail (which may mention handles) is kept server-side and never
@@ -638,7 +644,14 @@ def make_handler(
             the original action and key_id; unknown/cross-tenant keys remain
             404 and are handled by callers after enforcement.
             """
-            if policy_store.is_allowed(tenant_id, action, operator):
+            try:
+                allowed = policy_store.is_allowed(
+                    tenant_id, action, operator
+                )
+            except PolicyStoreUnavailable:
+                self._policy_store_error()
+                return False
+            if allowed:
                 return True
             if not self._record_attempt(
                 tenant_id, key_id, action, audit_mod.OUTCOME_REJECTED
@@ -927,6 +940,9 @@ def make_handler(
                 return
             except ProviderUnavailable as exc:
                 self._provider_unavailable(exc)
+                return
+            except PolicyStoreUnavailable:
+                self._policy_store_error()
                 return
             except LedgerError as exc:
                 self._server_error(exc)
@@ -3939,6 +3955,19 @@ def make_handler(
                 )
                 return
 
+            values, errored = self._single_param(qs, "operation_id")
+            if errored:
+                return
+            operation_id = values[0] if values else None
+            if operation_id is not None and not is_valid_key_id(
+                operation_id
+            ):
+                # A malformed/empty operation_id is a plain parameter 400
+                # naming the field: it is validated before authorization and
+                # writes no audit event (unlike a bad tenant/key source).
+                self._bad_request("field operation_id must be a UUID4")
+                return
+
             limit = 100
             values, errored = self._single_param(qs, "limit")
             if errored:
@@ -3975,6 +4004,7 @@ def make_handler(
                     tenant_id,
                     key_id=key_id,
                     action=action,
+                    operation_id=operation_id,
                     limit=limit,
                     cursor=cursor,
                 )
@@ -4077,6 +4107,8 @@ def make_handler(
                 return
             try:
                 self._put_policy(parts)
+            except PolicyStoreUnavailable:
+                self._policy_store_error()
             except LedgerError as exc:
                 self._server_error(exc)
             except PolicyRevisionConflict as exc:
@@ -4092,6 +4124,8 @@ def make_handler(
                 return
             try:
                 self._delete_policy(parts)
+            except PolicyStoreUnavailable:
+                self._policy_store_error()
             except LedgerError as exc:
                 self._server_error(exc)
             except PolicyRevisionConflict as exc:
@@ -4141,7 +4175,11 @@ def make_handler(
             tenant_id = self._strict_tenant(parts)
             if tenant_id is None:
                 return
-            rules = policy_store.get(tenant_id)
+            try:
+                rules = policy_store.get_strict(tenant_id)
+            except PolicyStoreUnavailable:
+                self._policy_store_error()
+                return
             if rules is None:
                 self._send_json(404, {"error": "policy not found"})
                 return
@@ -4325,7 +4363,17 @@ def _resolve_committed_operation(store, policy_store, record, event):
         # durable action and the current state.
         # A policy denial outranks existence: it is reconstructed whenever the
         # tenant's policy currently rejects this operator/action.
-        if not policy_store.is_allowed(tenant_id, policy_action, operator_id):
+        try:
+            policy_allows = policy_store.is_allowed(
+                tenant_id, policy_action, operator_id
+            )
+        except PolicyStoreUnavailable:
+            # Recovery replay must not crash startup on an unreadable policy
+            # document: the committed operation's projection falls through to
+            # the existence-based reconstruction; live requests still fail
+            # closed with the fixed 500.
+            policy_allows = True
+        if not policy_allows:
             return error(403, message_for(403))
         if kind == "restore":
             # A same-tenant conflict is reconstructed when any key from the

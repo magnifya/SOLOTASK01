@@ -263,6 +263,9 @@ def build_parser() -> argparse.ArgumentParser:
                          help="filter to one key_id (must be a UUID4)")
     p_audit.add_argument("--action", default=None,
                          help="one of: %s" % ", ".join(audit_mod.ACTIONS))
+    p_audit.add_argument("--operation-id", default=None,
+                         help="filter to one idempotent operation's event "
+                              "(must be a lowercase UUID4)")
     p_audit.add_argument("--limit", type=int, default=100,
                          help="page size, 1-1000 (default: %(default)s)")
     p_audit.add_argument("--cursor", default=None,
@@ -852,6 +855,17 @@ def _idempotent_run_body(op_store, store, artifact_store, executor, operation,
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    """CLI entry point with the fixed policy-store 500 mapping (exit 1)."""
+    try:
+        return _main(argv)
+    except PolicyStoreUnavailable:
+        # Fail closed: an existing policy document that cannot be read or
+        # parsed is never treated as allow/404; neither a success nor a
+        # rejected audit event is written by this path.
+        return _fail("policy store is unavailable", 1)
+
+
+def _main(argv: Optional[List[str]] = None) -> int:
     """CLI entry point; returns a process exit code.
 
     A KMS/HSM backend failure maps to exit code 1 (HTTP 503) with a generic
@@ -2046,6 +2060,10 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 % ", ".join(audit_mod.ACTIONS),
                 2,
             )
+        if args.operation_id is not None and not is_valid_key_id(
+            args.operation_id
+        ):
+            return _fail("field operation_id must be a UUID4", 2)
         if not 1 <= args.limit <= 1000:
             return _fail(
                 "field limit must be an integer between 1 and 1000", 2
@@ -2062,6 +2080,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 args.tenant_id,
                 key_id=args.key_id,
                 action=args.action,
+                operation_id=args.operation_id,
                 limit=args.limit,
                 cursor=args.cursor,
             )
@@ -2124,7 +2143,10 @@ def _policy_command(args, policies: PolicyStore) -> int:
         return 0
 
     if args.policy_command == "show":
-        rules = policies.get(tenant_id)
+        try:
+            rules = policies.get_strict(tenant_id)
+        except PolicyStoreUnavailable:
+            return _fail("policy store is unavailable", 1)
         if rules is None:
             return _fail("policy not found", 4)
         try:
@@ -2159,6 +2181,8 @@ def _policy_command(args, policies: PolicyStore) -> int:
             rules, new_revision = policies.put(
                 tenant_id, rules, expected_revision=expected
             )
+        except PolicyStoreUnavailable:
+            return _fail("policy store is unavailable", 1)
         except PolicyRevisionConflict as exc:
             return _revision_conflict(exc)
         except LedgerError as exc:
@@ -2179,6 +2203,8 @@ def _policy_command(args, policies: PolicyStore) -> int:
             return _fail(str(exc), 2)
     try:
         policies.delete(tenant_id, expected_revision=expected)
+    except PolicyStoreUnavailable:
+        return _fail("policy store is unavailable", 1)
     except PolicyRevisionConflict as exc:
         return _revision_conflict(exc)
     except LedgerError as exc:

@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import Iterator, List, Optional
 
 from . import audit as audit_mod
-from .audit import AuditEvent, AuditLog, LedgerError
+from .audit import AuditEvent, AuditLog
 
 try:  # fcntl is POSIX-only; policy writes still work without it.
     import fcntl
@@ -466,22 +466,7 @@ class PolicyStore:
         raised so the caller answers a fixed 500 instead of treating the
         tenant as unrestricted.
         """
-        path = self._path_for(tenant_id)
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        except FileNotFoundError:
-            return None
-        except (OSError, ValueError) as exc:
-            raise PolicyStoreUnavailable(
-                "cannot read policy document"
-            ) from exc
-        try:
-            return [Rule.from_json(rule) for rule in data["rules"]]
-        except (KeyError, TypeError, ValueError, PolicyError) as exc:
-            raise PolicyStoreUnavailable(
-                "cannot parse policy document"
-            ) from exc
+        return self.get_strict_for_path(self._path_for(tenant_id))
 
     def check(self, tenant_id: str, subject: str, action: str) -> dict:
         """Evaluate one (subject, action) without any side effect.
@@ -501,13 +486,33 @@ class PolicyStore:
 
     def _current_state(self, path: str):
         """Return (rules, revision) for an existing document under the lock."""
-        doc = self._read_doc(path)
-        if doc is None:
-            # A document we cannot parse cannot supply a current revision;
-            # take the same fixed-500 path as an unreadable put/delete.
-            raise LedgerError("cannot read policy document")
-        rules = doc[1]
+        # An existing document that cannot be read or parsed is backend
+        # corruption: a replace/delete must answer the fixed 500 instead of
+        # overwriting the file, 404ing or writing a rejected/success event.
+        rules = self.get_strict_for_path(path)
+        if rules is None:
+            # The file vanished between the existence check and the read
+            # (an external unlink): proceed as if no document exists.
+            return None, None
         return rules, revision_for_rules(rules)
+
+    def get_strict_for_path(self, path: str):
+        """Strict read of an explicit policy path (None only if absent)."""
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            raise PolicyStoreUnavailable(
+                "cannot read policy document"
+            ) from exc
+        try:
+            return [Rule.from_json(rule) for rule in data["rules"]]
+        except (KeyError, TypeError, ValueError, PolicyError) as exc:
+            raise PolicyStoreUnavailable(
+                "cannot parse policy document"
+            ) from exc
 
     def _check_expected(
         self, tenant_id: str, action: str,
@@ -559,8 +564,10 @@ class PolicyStore:
                     with open(path, "r", encoding="utf-8") as fh:
                         previous = json.load(fh)
                 except (OSError, ValueError) as exc:
-                    raise LedgerError(
-                        "cannot read policy document: %s" % exc
+                    # Never overwrite an unreadable document; the fixed 500
+                    # is emitted before any audit event is written.
+                    raise PolicyStoreUnavailable(
+                        "cannot read policy document"
                     ) from exc
             event = self.audit.new_event(
                 tenant_id, audit_mod.ACTION_POLICY_UPDATE, None,
@@ -604,8 +611,8 @@ class PolicyStore:
                 with open(path, "r", encoding="utf-8") as fh:
                     previous = json.load(fh)
             except (OSError, ValueError) as exc:
-                raise LedgerError(
-                    "cannot read policy document: %s" % exc
+                raise PolicyStoreUnavailable(
+                    "cannot read policy document"
                 ) from exc
             tombstone = path + ".del"
             self._write_atomic(
@@ -644,9 +651,11 @@ class PolicyStore:
         """Enforce the tenant document for (subject, action).
 
         No document means unrestricted. Otherwise deny wins, and an action no
-        rule matches is denied.
+        rule matches is denied. An existing document that cannot be read or
+        parsed is never treated as "no policy": PolicyStoreUnavailable is
+        raised so the caller fails closed with the fixed 500.
         """
-        rules = self.get(tenant_id)
+        rules = self.get_strict(tenant_id)
         if rules is None:
             return True
         allowed = False

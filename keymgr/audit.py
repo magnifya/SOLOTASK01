@@ -728,15 +728,19 @@ class AuditLog:
         tenant_id: str,
         key_id: Optional[str] = None,
         action: Optional[str] = None,
+        operation_id: Optional[str] = None,
         limit: int = 100,
         cursor: Optional[str] = None,
     ) -> AuditPage:
         """Return one tenant-isolated, filter-bound, snapshot-bound page.
 
-        Events are ordered by (timestamp, event_id) ascending. Conflict
+        ``operation_id`` matches the event_id under which an idempotent
+        operation's terminal event was logged. Events are ordered by
+        (timestamp, event_id) ascending. Conflict
         records carry a null tenant and are therefore visible to nobody.
-        A cursor is valid only with the same tenant, filters and an unchanged
-        ledger snapshot; otherwise InvalidCursor is raised.
+        A cursor is valid only with the same tenant, filters (including
+        operation_id) and an unchanged ledger snapshot; otherwise
+        InvalidCursor is raised.
         """
         anchor = None
         fingerprint = None
@@ -745,7 +749,11 @@ class AuditLog:
             try:
                 if payload.get("t") != tenant_id:
                     raise InvalidCursor("cursor does not match tenant_id")
-                if payload.get("k") != key_id or payload.get("a") != action:
+                if (
+                    payload.get("k") != key_id
+                    or payload.get("a") != action
+                    or payload.get("o") != operation_id
+                ):
                     raise InvalidCursor("cursor does not match filters")
                 if int(payload.get("l", -1)) != limit:
                     raise InvalidCursor("cursor does not match limit")
@@ -762,6 +770,7 @@ class AuditLog:
             if e.tenant_id == tenant_id
             and (key_id is None or e.key_id == key_id)
             and (action is None or e.action == action)
+            and (operation_id is None or e.event_id == operation_id)
         ]
         selected_all.sort(key=self._sort_key)
         # The snapshot is scoped to exactly the events this tenant and these
@@ -784,6 +793,7 @@ class AuditLog:
                     "t": tenant_id,
                     "k": key_id,
                     "a": action,
+                    "o": operation_id,
                     "l": limit,
                     "ts": last.timestamp,
                     "eid": last.event_id,
