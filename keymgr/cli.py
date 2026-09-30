@@ -206,7 +206,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_backup = tenant_parser(
         "backup", help="back up all of a tenant's keys and policy"
     )
-    p_backup.add_argument("--passphrase", required=True)
+    # The verify subcommand carries its own tenant/operator/passphrase
+    # arguments (like `audit verify`), so relax the parent parser's
+    # required flags: argparse only fills them on the plain backup path,
+    # which validates tenant_id/passphrase explicitly and the global
+    # operator gate validates --operator.
+    for backup_action in p_backup._actions:
+        if {"--tenant-id", "--operator"} & set(
+            backup_action.option_strings
+        ):
+            backup_action.required = False
+    # Not required at parse time so the ``verify`` subcommand (which carries
+    # its own --passphrase/--bundle) can parse; the plain backup path checks
+    # it explicitly and exits 2 when it is missing or empty.
+    p_backup.add_argument("--passphrase", default=None)
+    backup_sub = p_backup.add_subparsers(dest="backup_command")
+    p_backup_verify = backup_sub.add_parser(
+        "verify",
+        help="verify a tenant backup bundle without restoring",
+    )
+    p_backup_verify.add_argument("--tenant-id", required=True)
+    p_backup_verify.add_argument(
+        "--operator", required=True,
+        help="non-empty X-Operator-Id of the caller",
+    )
+    p_backup_verify.add_argument("--passphrase", required=True)
+    p_backup_verify.add_argument("--bundle", required=True)
 
     p_restore = tenant_parser(
         "restore", help="restore a tenant from an encrypted backup bundle"
@@ -1732,6 +1757,55 @@ def _run(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.command == "backup":
+        if getattr(args, "backup_command", None) == "verify":
+            # Read-only bundle integrity check: no key, handle, policy,
+            # operation or audit event is created; the only audit side
+            # effect is an export/rejected event on policy denial, exactly
+            # like POST /v1/backup/verify.
+            if not args.tenant_id:
+                return _fail(
+                    "field tenant_id must be a non-empty string", 2
+                )
+            if not args.passphrase:
+                return _fail(
+                    "field passphrase must be a non-empty string", 2
+                )
+            if not args.bundle:
+                return _fail(
+                    "field bundle must be a non-empty string", 2
+                )
+            try:
+                decoded = tenantbundle.decode_bundle(
+                    args.bundle, args.passphrase
+                )
+            except tenantbundle.TenantBundleError:
+                return _fail("invalid tenant backup", 2)
+            except Exception:
+                return _fail("backup verify unavailable", 1)
+            try:
+                permitted = policies.is_allowed(
+                    args.tenant_id, audit_mod.ACTION_EXPORT, args.operator
+                )
+            except Exception:
+                return _fail("backup verify unavailable", 1)
+            if not permitted:
+                return _deny(
+                    store, args.tenant_id, None,
+                    audit_mod.ACTION_EXPORT,
+                )
+            if decoded["tenant_id"] != args.tenant_id:
+                return _fail("tenant backup not found", 4)
+            _print(
+                {
+                    "valid": True,
+                    "tenant_id": args.tenant_id,
+                    "key_ids": sorted(
+                        key["key_id"] for key in decoded["keys"]
+                    ),
+                    "policy_restored": decoded["policy"] is not None,
+                }
+            )
+            return 0
         if not args.tenant_id or not args.passphrase:
             if not _identifiers_ok(args.tenant_id, None):
                 if not _conflict(store):

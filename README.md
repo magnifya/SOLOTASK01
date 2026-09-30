@@ -326,6 +326,22 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 - `POST /v1/backup`，body `{tenant_id, passphrase}` →
   `{format:"tenant-backup-v1", bundle}`；载荷
   `{format, tenant_id, keys, policy}`，空租户为 `keys:[]、policy:null`。
+- `POST /v1/backup/verify`，body 仅
+  `{tenant_id, passphrase, bundle}`（无需 `Idempotency-Key`）：只读校验
+  租户备份包，完整解密 `tenant-backup-v1` 并检查格式、租户、密钥版本连续
+  性（1..N 无缺号）、`current_version` 指向最新版本、吊销字段、重复
+  `key_id` 与策略规则结构；不创建密钥、不铸提供者句柄、不写策略、操作记
+  录或审计（成功不新增任何事件）。`200` 单行 JSON →
+  `{valid, tenant_id, key_ids, policy_restored}`，`key_ids` 按 UUID 升序，
+  `policy_restored` 表示包是否携带策略；空包成功为
+  `valid:true、key_ids:[]、policy_restored:false`。口令错误、篡改、
+  base64/JSON 格式错误、版本/字段/规则结构非法统一
+  `400 {"error":"invalid tenant backup"}`；请求字段缺失/多余/类型错误与身
+  份、租户来源缺失/重复/冲突沿用既有 400（`tenant_conflict` 照旧）；按备
+  份的 `export` 动作授权，拒绝为 `403` 并记一条 `export/rejected`（在包内
+  租户检查之前）；包内 `tenant_id` 与请求不一致为
+  `404 {"error":"tenant backup not found"}`；内部读取或校验无法可靠完成固
+  定 `500 {"error":"backup verify unavailable"}`。
 - `POST /v1/restore`，body `{tenant_id, passphrase, bundle}`，需
   `Idempotency-Key`。校验顺序：参数/解密/格式 `400` → 授权 `403` → 包内
   tenant 不符 `404` → 同租户 key_id/策略冲突 `409`（绝不覆盖既有策略）→
@@ -679,6 +695,8 @@ python -m keymgr decrypt  --tenant-id t --key-id <id> \
 python -m keymgr import   --tenant-id t --passphrase pw --bundle <b> \
                           --operator alice --idempotency-key import-0001
 python -m keymgr backup   --tenant-id t --passphrase pw --operator alice
+python -m keymgr backup verify --tenant-id t --passphrase pw --bundle <b> \
+                          --operator alice
 python -m keymgr restore  --tenant-id t --passphrase pw --bundle <b> \
                           --operator alice --idempotency-key restore-0001
 # 审计 / 操作 / 策略

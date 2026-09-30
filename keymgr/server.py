@@ -62,6 +62,7 @@ _OPERATIONS_PATH_RE = re.compile(r"^/v1/operations/([^/]+)$")
 _IMPORT_PATH = "/v1/keys/import"
 _BATCH_ROTATE_PATH = "/v1/keys/batch-rotate"
 _BACKUP_PATH = "/v1/backup"
+_BACKUP_VERIFY_PATH = "/v1/backup/verify"
 _RESTORE_PATH = "/v1/restore"
 _RESTORE_PREFLIGHT_PATH = "/v1/restore/preflight"
 _KEY_PATH_RE = re.compile(r"^/v1/keys/([^/]+)$")
@@ -896,6 +897,10 @@ def make_handler(
 
                 if path == _BACKUP_PATH:
                     self._backup_tenant(parts, operator)
+                    return
+
+                if path == _BACKUP_VERIFY_PATH:
+                    self._backup_verify(parts, operator)
                     return
 
                 if path == _RESTORE_PATH:
@@ -2867,6 +2872,115 @@ def make_handler(
                 return
             self._send_json(
                 200, {"format": tenantbundle.FORMAT, "bundle": bundle}
+            )
+
+        def _backup_verify(self, parts, operator: str) -> None:
+            """POST /v1/backup/verify.
+
+            A read-only integrity check of a tenant backup bundle: the
+            bundle is fully decrypted and its format, tenant, key versions
+            (contiguous 1..N), current_version pointers, revocation fields,
+            duplicate key_ids and policy rule structure are validated. No
+            key, provider handle, policy, operation record or audit event
+            is created; the sole audit side effect is the single
+            ``export/rejected`` event written when the backup's export
+            action is denied (a successful verify writes nothing).
+
+            Statuses mirror the other bundle endpoints: request field and
+            tenant-source failures follow the usual 400 rules (a
+            tenant-source failure still records tenant_conflict); a wrong
+            passphrase, tampered, malformed (bad base64/JSON) or internally
+            invalid bundle (format/version/field/rule structure) is the
+            fixed 400 ``invalid tenant backup``; policy denial is 403; a
+            bundle naming another tenant is 404
+            ``tenant backup not found``; any state that cannot be judged
+            reliably is the fixed 500 ``backup verify unavailable``.
+            """
+            payload = self._read_json_object()
+            if payload is None:
+                return
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                if self._record_conflict():
+                    self._bad_request(
+                        "field tenant_id must be a non-empty string"
+                    )
+                return
+            tenant_id = self._tenant(parts, payload)
+            if tenant_id is None:
+                return
+            unknown = set(payload) - {"tenant_id", "passphrase", "bundle"}
+            if unknown:
+                self._bad_request(
+                    "field %s is not accepted by this endpoint"
+                    % sorted(unknown)[0]
+                )
+                return
+            passphrase = payload.get("passphrase")
+            if not isinstance(passphrase, str) or not passphrase:
+                self._bad_request(
+                    "field passphrase must be a non-empty string"
+                )
+                return
+            bundle = payload.get("bundle")
+            if not isinstance(bundle, str) or not bundle:
+                self._bad_request("field bundle must be a non-empty string")
+                return
+            # Decrypting/authenticating the bundle is pure local validation:
+            # it mints no handle and reads or writes nothing on disk.
+            try:
+                decoded = tenantbundle.decode_bundle(bundle, passphrase)
+            except tenantbundle.TenantBundleError:
+                # Wrong passphrase, tampering, bad base64/JSON, format,
+                # version, field or rule-structure problems all share one
+                # detail-free 400: the failure never doubles as an
+                # existence probe.
+                self._bad_request("invalid tenant backup")
+                return
+            # Authorization uses the backup's export action, in the same
+            # order as /v1/restore/preflight (after decrypt, before the
+            # in-bundle tenant check). A denial is the only audit event a
+            # verify ever writes; a success writes nothing.
+            try:
+                permitted = policy_store.is_allowed(
+                    tenant_id, audit_mod.ACTION_EXPORT, operator
+                )
+            except Exception:
+                self._verify_unavailable()
+                return
+            if not permitted:
+                if not self._record_attempt(
+                    tenant_id, None, audit_mod.ACTION_EXPORT,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._send_json(
+                    403, {"error": "action not permitted by policy"}
+                )
+                return
+            if decoded["tenant_id"] != tenant_id:
+                # The sealed bundle belongs to another tenant: answer like
+                # a missing object so existence never leaks.
+                self._send_json(
+                    404, {"error": "tenant backup not found"}
+                )
+                return
+            self._send_json(
+                200,
+                {
+                    "valid": True,
+                    "tenant_id": tenant_id,
+                    "key_ids": sorted(
+                        key["key_id"] for key in decoded["keys"]
+                    ),
+                    "policy_restored": decoded["policy"] is not None,
+                },
+            )
+
+        def _verify_unavailable(self) -> None:
+            """Fixed 500 for a verify whose state cannot be judged."""
+            self._send_json(
+                500, {"error": "backup verify unavailable"}
             )
 
         def _restore_tenant(self, parts, operator: str) -> None:
