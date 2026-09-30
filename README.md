@@ -48,7 +48,9 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 - 租户来源：单一 `X-Tenant-Id` 头或单一 `?tenant_id=` 参数；允许 body 携带
   `tenant_id` 的端点，头/参数/体必须一致。缺失、重复、冲突均 `400` 且错误指
   `tenant_id`，并记一条任何租户都不可见的 `tenant_conflict` 事件（幂等端点在
-  幂等键绑定**之前**的参数/解析错误例外：不写任何审计、操作、密钥或句柄）。
+  幂等键绑定**之前**的其它参数/解析错误例外：不写任何审计、操作、密钥或句
+  柄；但租户来源缺失或冲突不在此例外内，照旧记 `tenant_conflict`，CLI 正文
+  `tenant_id` 与 `--tenant-id` 不一致同样 `400` 并记该事件）。
 - 错误 HTTP 状态与 CLI 退出码：`400→2`、`403→3`、`409→3`、`404→4`、
   `500/503→1`；成功 `0`。普通错误体仅 `{"error": ...}`；幂等变更的错误体仅
   `{"error", "operation_id"}`，成功体额外含 `operation_id`。
@@ -557,6 +559,10 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   的 `tenant_id` 提供，来源须一致）。GET → `{tenant_id, rules, revision}`
   （无策略 `404`）；PUT body `{tenant_id, rules}` 整体替换，成功 →
   `{tenant_id, rules, revision}`；DELETE 幂等，→ `{tenant_id, deleted:true}`。
+  策略文档**已存在**但不可读或不可解析时，策略读取（GET）、授权（一切受策
+  略管辖的端点）、替换（PUT）与删除（DELETE）一律固定 `500`
+  `{"error":"policy store is unavailable"}`：不放行、不伪装 `404`、不覆盖
+  原文件，也不写任何成功或拒绝审计；CLI 输出同一错误体并退出 `1`。
   `revision` 为不透明字符串，按规范化规则内容稳定计算：内容不变则不变、
   内容改变才变化，不反映内部文件结构，且不会取值 `none`。
 - 乐观并发：PUT/DELETE 接受可选查询参数 `expected_revision`，值为先前读到的
@@ -624,10 +630,18 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   至多一条 `batch_rotate` 事件，成功与拒绝终态的 `key_id` 均为 null，可按
   `action=batch_rotate` 筛选。
 - `GET /v1/audit`：单一租户来源；可选 `key_id`(UUID4)、`action`、
-  `limit`(1–1000，默认 100)、`cursor`。→ `{events, next_cursor}`，按
-  (timestamp, event_id) 升序；游标为 HMAC 签名令牌，绑定租户/筛选/快照，
-  被篡改或条件变化为 `400`。查询成功不记账，被策略拒绝才记一条
-  `audit/rejected`（key_id null）。
+  `operation_id`(小写 UUID4)、`limit`(1–1000，默认 100)、`cursor`。
+  各条件按同时满足处理；`operation_id` 按 `event_id` 定位幂等操作落账的
+  那一条事件，合法但无匹配（含未知 id、与其它筛选不匹配）返回空事件页
+  `{"events":[],"next_cursor":null}`，不是 `404`。显式空值、重复或格式
+  非法（含大写 UUID）均为指出 `operation_id` 的 `400`，参数校验先于策略
+  且不记账，只有租户来源缺失或冲突照旧记 `tenant_conflict`。→
+  `{events, next_cursor}`，按 (timestamp, event_id) 升序；游标为 HMAC
+  签名令牌，绑定租户/全部筛选（含 operation_id）/limit/发起查询时的可见
+  快照，筛选改变、游标篡改或过期均为 `400`，翻页不重不漏。查询成功不记
+  账，被策略拒绝才记一条 `audit/rejected`（key_id null）。账本损坏或不可
+  读固定 `500` `{"error":"audit ledger is unavailable"}`，不跳过、不重签、
+  不改写账本。
 - `GET /v1/audit/verify`：单一非空 `X-Operator-Id`，租户只允许从单一
   `X-Tenant-Id` 请求头或单一 `tenant_id` 查询参数取得；正文只能省略或为
   `{}`。按账本顺序验证整本 `audit.log` 的字段、序号、`event_id` 唯一性、
@@ -699,7 +713,8 @@ python -m keymgr restore  --tenant-id t --passphrase pw --bundle <b> \
 python -m keymgr backup verify --tenant-id t --passphrase pw --bundle <b> \
                           --operator alice
 # 审计 / 操作 / 策略
-python -m keymgr audit    --tenant-id t --action rotate --limit 100 --operator alice
+python -m keymgr audit    --tenant-id t --action rotate --limit 100 --operator alice \
+                          [--key-id <uuid>] [--operation-id <uuid>]
 python -m keymgr audit verify --tenant-id t --operator alice
 python -m keymgr operation --tenant-id t --operator alice --operation-id <id>
 python -m keymgr policy --operator admin show --tenant-id t

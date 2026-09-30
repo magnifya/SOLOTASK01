@@ -202,14 +202,17 @@ def test_pre_bind_parse_and_param_400s_leave_no_trace(stack):
         headers={"Idempotency-Key": "k3"},
     )
     assert status == 400
-    # Conflicting tenant (header vs body) pre-bind is silent, not even an
-    # invisible tenant_conflict.
+    # A conflicting tenant source (header vs body) still records the
+    # invisible tenant_conflict, even though the idempotency key has not
+    # been bound; the other pre-bind parameter errors above stay silent.
     status, _ = c.call(
         "POST", _enc_path(kid), _body(),
         headers={"Idempotency-Key": "k4", "X-Tenant-Id": "other"},
     )
     assert status == 400
-    assert [e.action for e in stack.audit._read_all()] == ["create"]
+    assert [e.action for e in stack.audit._read_all()] == [
+        "create", "tenant_conflict",
+    ]
     # None of these keys may have been consumed: rebinding k succeeds.
     status, out = c.call(
         "POST", _enc_path(kid), _body(), headers={"Idempotency-Key": "k2"}

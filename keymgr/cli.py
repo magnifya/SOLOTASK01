@@ -263,6 +263,9 @@ def build_parser() -> argparse.ArgumentParser:
                          help="filter to one key_id (must be a UUID4)")
     p_audit.add_argument("--action", default=None,
                          help="one of: %s" % ", ".join(audit_mod.ACTIONS))
+    p_audit.add_argument("--operation-id", default=None,
+                         help="filter to the event committed for one "
+                              "operation_id (must be a lowercase UUID4)")
     p_audit.add_argument("--limit", type=int, default=100,
                          help="page size, 1-1000 (default: %(default)s)")
     p_audit.add_argument("--cursor", default=None,
@@ -692,6 +695,27 @@ def idempotent_run(op_store, store, path, tenant_id, operator, body, key,
     """
     if _idem_key_error(key):
         return 2
+    body_tenant = body.get("tenant_id")
+    if not isinstance(body_tenant, str) or not body_tenant:
+        # Mirror HTTP: even before the idempotency key is bound, a missing or
+        # invalid tenant source records the invisible tenant_conflict event.
+        try:
+            store.audit_conflict()
+        except LedgerError:
+            return _fail("audit ledger is unavailable", 1)
+        return _fail("field tenant_id must be a non-empty string", 2)
+    if body_tenant != tenant_id:
+        # A body tenant_id disagreeing with --tenant-id is a 400 naming
+        # tenant_id and, like HTTP, records an invisible tenant_conflict.
+        try:
+            store.audit_conflict()
+        except LedgerError:
+            return _fail("audit ledger is unavailable", 1)
+        return _fail(
+            "conflicting tenant_id parameters (header, query and body "
+            "must agree)",
+            2,
+        )
     normalized = operations_mod.normalize_body(body)
 
     refusal = validator()
@@ -864,6 +888,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     except ProviderUnavailable:
         # Generic wording: never print a handle or material in the error.
         return _fail("key management provider is unavailable", 1)
+    except PolicyStoreUnavailable:
+        # A corrupt existing policy document fails closed at read,
+        # authorization, replacement and deletion: the same fixed body as
+        # HTTP 500, exit 1, with no success or rejection audit written.
+        return _fail("policy store is unavailable", 1)
 
 
 def _run(argv: Optional[List[str]] = None) -> int:
@@ -2046,6 +2075,13 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 % ", ".join(audit_mod.ACTIONS),
                 2,
             )
+        if args.operation_id is not None and not is_valid_key_id(
+            args.operation_id
+        ):
+            # Parameter validation precedes authorization and writes no
+            # audit (only a missing/conflicting tenant records
+            # tenant_conflict).
+            return _fail("field operation_id must be a UUID4", 2)
         if not 1 <= args.limit <= 1000:
             return _fail(
                 "field limit must be an integer between 1 and 1000", 2
@@ -2062,6 +2098,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 args.tenant_id,
                 key_id=args.key_id,
                 action=args.action,
+                operation_id=args.operation_id,
                 limit=args.limit,
                 cursor=args.cursor,
             )
@@ -2124,7 +2161,10 @@ def _policy_command(args, policies: PolicyStore) -> int:
         return 0
 
     if args.policy_command == "show":
-        rules = policies.get(tenant_id)
+        try:
+            rules = policies.get_strict(tenant_id)
+        except PolicyStoreUnavailable:
+            return _fail("policy store is unavailable", 1)
         if rules is None:
             return _fail("policy not found", 4)
         try:

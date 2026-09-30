@@ -638,7 +638,18 @@ def make_handler(
             the original action and key_id; unknown/cross-tenant keys remain
             404 and are handled by callers after enforcement.
             """
-            if policy_store.is_allowed(tenant_id, action, operator):
+            try:
+                allowed = policy_store.is_allowed(
+                    tenant_id, action, operator
+                )
+            except PolicyStoreUnavailable:
+                # Backend corruption must never fail open: fixed 500 with no
+                # success or rejection audit event.
+                self._send_json(
+                    500, {"error": "policy store is unavailable"}
+                )
+                return False
+            if allowed:
                 return True
             if not self._record_attempt(
                 tenant_id, key_id, action, audit_mod.OUTCOME_REJECTED
@@ -928,6 +939,11 @@ def make_handler(
             except ProviderUnavailable as exc:
                 self._provider_unavailable(exc)
                 return
+            except PolicyStoreUnavailable:
+                self._send_json(
+                    500, {"error": "policy store is unavailable"}
+                )
+                return
             except LedgerError as exc:
                 self._server_error(exc)
                 return
@@ -999,10 +1015,16 @@ def make_handler(
                 return
             body_tenant = payload.get("tenant_id")
             if not isinstance(body_tenant, str) or not body_tenant:
-                # The body must itself carry a non-empty tenant_id.
-                self._bad_request("field tenant_id must be a non-empty string")
+                # The body must itself carry a non-empty tenant_id. A missing
+                # or invalid tenant source still records the invisible
+                # tenant_conflict event, even before the idempotency key is
+                # bound (other parameter errors on this endpoint do not).
+                if self._record_conflict():
+                    self._bad_request(
+                        "field tenant_id must be a non-empty string"
+                    )
                 return
-            tenant_id = self._tenant(parts, payload, audit=False)
+            tenant_id = self._tenant(parts, payload)
             if tenant_id is None:
                 return
             if self._bad_key_id(key_id, audit=False):
@@ -1137,9 +1159,15 @@ def make_handler(
                 return
             body_tenant = payload.get("tenant_id")
             if not isinstance(body_tenant, str) or not body_tenant:
-                self._bad_request("field tenant_id must be a non-empty string")
+                # A missing or invalid tenant source still records the
+                # invisible tenant_conflict event, even before the
+                # idempotency key is bound.
+                if self._record_conflict():
+                    self._bad_request(
+                        "field tenant_id must be a non-empty string"
+                    )
                 return
-            tenant_id = self._tenant(parts, payload, audit=False)
+            tenant_id = self._tenant(parts, payload)
             if tenant_id is None:
                 return
             extra = [
@@ -1553,9 +1581,15 @@ def make_handler(
                 return
             body_tenant = payload.get("tenant_id")
             if not isinstance(body_tenant, str) or not body_tenant:
-                self._bad_request("field tenant_id must be a non-empty string")
+                # A missing or invalid tenant source still records the
+                # invisible tenant_conflict event, even before the
+                # idempotency key is bound.
+                if self._record_conflict():
+                    self._bad_request(
+                        "field tenant_id must be a non-empty string"
+                    )
                 return
-            tenant_id = self._tenant(parts, payload, audit=False)
+            tenant_id = self._tenant(parts, payload)
             if tenant_id is None:
                 return
             if self._bad_key_id(key_id, audit=False):
@@ -1749,9 +1783,15 @@ def make_handler(
                 return
             body_tenant = payload.get("tenant_id")
             if not isinstance(body_tenant, str) or not body_tenant:
-                self._bad_request("field tenant_id must be a non-empty string")
+                # A missing or invalid tenant source still records the
+                # invisible tenant_conflict event, even before the
+                # idempotency key is bound.
+                if self._record_conflict():
+                    self._bad_request(
+                        "field tenant_id must be a non-empty string"
+                    )
                 return
-            tenant_id = self._tenant(parts, payload, audit=False)
+            tenant_id = self._tenant(parts, payload)
             if tenant_id is None:
                 return
             if self._bad_key_id(key_id, audit=False):
@@ -2730,9 +2770,15 @@ def make_handler(
                 return
             body_tenant = payload.get("tenant_id")
             if not isinstance(body_tenant, str) or not body_tenant:
-                self._bad_request("field tenant_id must be a non-empty string")
+                # A missing or invalid tenant source still records the
+                # invisible tenant_conflict event, even before the
+                # idempotency key is bound.
+                if self._record_conflict():
+                    self._bad_request(
+                        "field tenant_id must be a non-empty string"
+                    )
                 return
-            tenant_id = self._tenant(parts, payload, audit=False)
+            tenant_id = self._tenant(parts, payload)
             if tenant_id is None:
                 return
             passphrase = payload.get("passphrase")
@@ -2999,9 +3045,15 @@ def make_handler(
                 return
             body_tenant = payload.get("tenant_id")
             if not isinstance(body_tenant, str) or not body_tenant:
-                self._bad_request("field tenant_id must be a non-empty string")
+                # A missing or invalid tenant source still records the
+                # invisible tenant_conflict event, even before the
+                # idempotency key is bound.
+                if self._record_conflict():
+                    self._bad_request(
+                        "field tenant_id must be a non-empty string"
+                    )
                 return
-            tenant_id = self._tenant(parts, payload, audit=False)
+            tenant_id = self._tenant(parts, payload)
             if tenant_id is None:
                 return
             passphrase = payload.get("passphrase")
@@ -3939,6 +3991,20 @@ def make_handler(
                 )
                 return
 
+            values, errored = self._single_param(qs, "operation_id")
+            if errored:
+                return
+            operation_id = values[0] if values else None
+            if operation_id is not None and not is_valid_key_id(
+                operation_id
+            ):
+                # An empty, duplicated or malformed operation_id is a plain
+                # parameter 400 naming the field: it precedes the policy check
+                # and writes no audit event (only a missing/conflicting
+                # tenant source records tenant_conflict).
+                self._bad_request("field operation_id must be a UUID4")
+                return
+
             limit = 100
             values, errored = self._single_param(qs, "limit")
             if errored:
@@ -3975,6 +4041,7 @@ def make_handler(
                     tenant_id,
                     key_id=key_id,
                     action=action,
+                    operation_id=operation_id,
                     limit=limit,
                     cursor=cursor,
                 )
@@ -4079,6 +4146,10 @@ def make_handler(
                 self._put_policy(parts)
             except LedgerError as exc:
                 self._server_error(exc)
+            except PolicyStoreUnavailable:
+                self._send_json(
+                    500, {"error": "policy store is unavailable"}
+                )
             except PolicyRevisionConflict as exc:
                 self._revision_conflict(exc)
 
@@ -4094,6 +4165,10 @@ def make_handler(
                 self._delete_policy(parts)
             except LedgerError as exc:
                 self._server_error(exc)
+            except PolicyStoreUnavailable:
+                self._send_json(
+                    500, {"error": "policy store is unavailable"}
+                )
             except PolicyRevisionConflict as exc:
                 self._revision_conflict(exc)
 
@@ -4141,7 +4216,13 @@ def make_handler(
             tenant_id = self._strict_tenant(parts)
             if tenant_id is None:
                 return
-            rules = policy_store.get(tenant_id)
+            try:
+                rules = policy_store.get_strict(tenant_id)
+            except PolicyStoreUnavailable:
+                self._send_json(
+                    500, {"error": "policy store is unavailable"}
+                )
+                return
             if rules is None:
                 self._send_json(404, {"error": "policy not found"})
                 return
@@ -4325,7 +4406,16 @@ def _resolve_committed_operation(store, policy_store, record, event):
         # durable action and the current state.
         # A policy denial outranks existence: it is reconstructed whenever the
         # tenant's policy currently rejects this operator/action.
-        if not policy_store.is_allowed(tenant_id, policy_action, operator_id):
+        try:
+            policy_allowed = policy_store.is_allowed(
+                tenant_id, policy_action, operator_id
+            )
+        except PolicyStoreUnavailable:
+            # A corrupt policy document must not block crash recovery: fall
+            # through to the durable state-based reconstruction below rather
+            # than guessing a 403.
+            policy_allowed = True
+        if not policy_allowed:
             return error(403, message_for(403))
         if kind == "restore":
             # A same-tenant conflict is reconstructed when any key from the

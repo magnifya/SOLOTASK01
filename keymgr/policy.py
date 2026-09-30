@@ -504,8 +504,10 @@ class PolicyStore:
         doc = self._read_doc(path)
         if doc is None:
             # A document we cannot parse cannot supply a current revision;
-            # take the same fixed-500 path as an unreadable put/delete.
-            raise LedgerError("cannot read policy document")
+            # take the same fixed-500 path as an unreadable put/delete. The
+            # original file is never overwritten, and no success or rejection
+            # event is written.
+            raise PolicyStoreUnavailable("cannot read policy document")
         rules = doc[1]
         return rules, revision_for_rules(rules)
 
@@ -559,7 +561,7 @@ class PolicyStore:
                     with open(path, "r", encoding="utf-8") as fh:
                         previous = json.load(fh)
                 except (OSError, ValueError) as exc:
-                    raise LedgerError(
+                    raise PolicyStoreUnavailable(
                         "cannot read policy document: %s" % exc
                     ) from exc
             event = self.audit.new_event(
@@ -604,7 +606,7 @@ class PolicyStore:
                 with open(path, "r", encoding="utf-8") as fh:
                     previous = json.load(fh)
             except (OSError, ValueError) as exc:
-                raise LedgerError(
+                raise PolicyStoreUnavailable(
                     "cannot read policy document: %s" % exc
                 ) from exc
             tombstone = path + ".del"
@@ -644,9 +646,11 @@ class PolicyStore:
         """Enforce the tenant document for (subject, action).
 
         No document means unrestricted. Otherwise deny wins, and an action no
-        rule matches is denied.
+        rule matches is denied. An existing document that cannot be read or
+        parsed is backend corruption: PolicyStoreUnavailable is raised so the
+        caller answers a fixed 500 instead of allowing the request through.
         """
-        rules = self.get(tenant_id)
+        rules = self.get_strict(tenant_id)
         if rules is None:
             return True
         allowed = False
