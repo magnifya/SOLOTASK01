@@ -1,12 +1,16 @@
 """Per-tenant action policies: validation, persistence and enforcement.
 
 A policy document is a list of rules; each rule binds a ``subject`` (the
-X-Operator-Id of the caller), a set of ``actions`` and an ``effect`` of
-``allow`` or ``deny``. Enforcement, for one (tenant, subject, action):
+X-Operator-Id of the caller), a set of ``actions``, an ``effect`` of
+``allow`` or ``deny`` and, optionally, a set of ``key_ids`` scoping the rule
+to specific keys. Enforcement, for one (tenant, subject, action[, key_id]):
 
 * a tenant with no document is unrestricted (every action is allowed);
-* among the rules whose subject equals the caller and whose actions contain
-  the action, any ``deny`` wins over ``allow``;
+* a request without a target key context matches only rules that omit
+  ``key_ids``; with a target key it matches unscoped rules plus rules whose
+  ``key_ids`` contain it;
+* among the matching rules whose subject equals the caller and whose actions
+  contain the action, any ``deny`` wins over ``allow``;
 * if no matching rule exists the action is denied (default deny).
 
 Documents are stored as one JSON file per tenant, written through the same
@@ -61,6 +65,23 @@ EXPECTED_NONE = "none"
 #: Opaque revisions are SHA-256 hex digests of the normalized rule content;
 #: that shape can never collide with the ``none`` keyword.
 REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
+#: A scoped key_id shares the canonical lowercase UUID4 shape of a key id.
+KEY_ID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+)
+
+#: Fixed validation text for a malformed rule key_ids and for a malformed
+#: check key_id (part of the HTTP/CLI contract, do not reword).
+KEY_IDS_ERROR = (
+    "field rules[i].key_ids must be a non-empty array of UUID4 strings "
+    "without duplicates"
+)
+CHECK_KEY_ID_ERROR = "field key_id must be a UUID4 or null"
+
+
+def is_policy_key_id(value) -> bool:
+    """True only for a canonical lowercase UUID4 string."""
+    return isinstance(value, str) and bool(KEY_ID_RE.fullmatch(value))
 
 
 class PolicyError(ValueError):
@@ -86,9 +107,14 @@ REASON_EXPLICIT_DENY = "explicit_deny"
 REASON_DEFAULT_DENY = "default_deny"
 
 
-def evaluate_rules(rules, subject: str, action: str) -> dict:
-    """Evaluate one (subject, action) against a non-None rule list.
+def evaluate_rules(rules, subject: str, action: str,
+                   key_id: Optional[str] = None) -> dict:
+    """Evaluate one (subject, action[, key_id]) against a non-None rule list.
 
+    Subject and action are matched first; the rules kept are then the ones
+    that apply to the request target. A request without a key context
+    (``key_id is None``) matches only rules that omit ``key_ids``; a request
+    with a target key matches unscoped rules plus rules scoped to that key.
     Matching keeps the document's original order. Any matching ``deny``
     wins; with no deny, at least one matching allow permits; otherwise the
     action is denied by default. Returns the matched rules and the reason
@@ -97,7 +123,12 @@ def evaluate_rules(rules, subject: str, action: str) -> dict:
     matched = [
         rule
         for rule in rules
-        if rule.subject == subject and action in rule.actions
+        if rule.subject == subject
+        and action in rule.actions
+        and (
+            rule.key_ids is None
+            or (key_id is not None and key_id in rule.key_ids)
+        )
     ]
     if any(rule.effect == "deny" for rule in matched):
         allowed = False
@@ -119,21 +150,30 @@ def evaluate_rules(rules, subject: str, action: str) -> dict:
 def revision_for_rules(rules) -> str:
     """Compute the opaque, content-addressed revision of a rule list.
 
-    Rules are normalized first (actions sorted, rules ordered by
-    subject/effect/actions), so the same logical document always yields the
-    same revision and any change yields a different one. Nothing about the
-    on-disk layout is reflected in the value.
+    Rules are normalized first (actions and key_ids sorted, rules ordered
+    by subject/effect/actions/key_ids), so the same logical document always
+    yields the same revision and any change yields a different one. The
+    ``key_ids`` slot is emitted only for scoped rules, so a document made
+    solely of rules that omit ``key_ids`` hashes exactly as before. Nothing
+    about the on-disk layout is reflected in the value.
     """
-    normalized = [
-        {
+    normalized = []
+    for rule in rules:
+        item = {
             "subject": rule.subject,
             "effect": rule.effect,
             "actions": sorted(rule.actions),
         }
-        for rule in rules
-    ]
+        if rule.key_ids is not None:
+            item["key_ids"] = sorted(rule.key_ids)
+        normalized.append(item)
     normalized.sort(
-        key=lambda item: (item["subject"], item["effect"], item["actions"])
+        key=lambda item: (
+            item["subject"],
+            item["effect"],
+            item["actions"],
+            item.get("key_ids") or [],
+        )
     )
     blob = json.dumps(
         normalized, separators=(",", ":"), sort_keys=True
@@ -155,19 +195,32 @@ def validate_expected_revision(raw) -> str:
 
 @dataclass(frozen=True)
 class Rule:
-    """One policy rule: an effect on a set of actions for one subject."""
+    """One policy rule: an effect on a set of actions for one subject.
+
+    ``key_ids`` is None when the rule is unscoped (applies to every key);
+    otherwise it is a frozenset of canonical UUID4 strings naming the keys
+    the rule applies to.
+    """
 
     subject: str
     actions: List[str]
     effect: str
+    key_ids: Optional[frozenset] = None
 
     def to_json(self) -> dict:
-        """Serialize to a plain dict; actions are emitted sorted."""
-        return {
+        """Serialize to a plain dict; actions and key_ids are emitted sorted.
+
+        The ``key_ids`` slot is omitted entirely for unscoped rules, so old
+        documents, old backups and old clients keep their exact shape.
+        """
+        data = {
             "subject": self.subject,
             "actions": list(self.actions),
             "effect": self.effect,
         }
+        if self.key_ids is not None:
+            data["key_ids"] = sorted(self.key_ids)
+        return data
 
     @classmethod
     def from_json(cls, data: dict) -> "Rule":
@@ -176,8 +229,18 @@ class Rule:
         return validate_rule(data)
 
     def signature(self):
-        """Dedup key: same subject/effect with the same unordered action set."""
-        return self.subject, self.effect, frozenset(self.actions)
+        """Dedup key: same subject/effect/action set/key set.
+
+        The key set is part of the key: an unscoped allow and an allow
+        scoped to one key are different rules, as are two rules scoped to
+        different key sets.
+        """
+        return (
+            self.subject,
+            self.effect,
+            frozenset(self.actions),
+            self.key_ids,
+        )
 
 
 def validate_rule(raw, index: Optional[int] = None) -> Rule:
@@ -193,13 +256,26 @@ def validate_rule(raw, index: Optional[int] = None) -> Rule:
 
     if not isinstance(raw, dict):
         raise err("field %s must be an object" % (where.rstrip(".") if index is not None else "rule"))
-    known = {"subject", "actions", "effect"}
+    known = {"subject", "actions", "effect", "key_ids"}
     unknown = set(raw) - known
     if unknown:
         raise err(
             "unknown field %s%s"
             % (where, sorted(unknown)[0])
         )
+    # key_ids is optional; its fixed error text is part of the API contract
+    # and always names the literal rules[i] slot, for every rule index.
+    key_ids = None
+    if "key_ids" in raw:
+        raw_key_ids = raw["key_ids"]
+        if (
+            not isinstance(raw_key_ids, list)
+            or not raw_key_ids
+            or not all(is_policy_key_id(v) for v in raw_key_ids)
+            or len(set(raw_key_ids)) != len(raw_key_ids)
+        ):
+            raise PolicyError(KEY_IDS_ERROR)
+        key_ids = frozenset(raw_key_ids)
     subject = raw.get("subject")
     if not isinstance(subject, str) or not subject:
         raise err("field %ssubject must be a non-empty string" % where)
@@ -229,7 +305,10 @@ def validate_rule(raw, index: Optional[int] = None) -> Rule:
             # Duplicates within one rule are dropped, not an error: the action
             # set is unordered, so ["read", "read"] carries no extra meaning.
             clean_actions.append(action)
-    return Rule(subject=subject, actions=clean_actions, effect=effect)
+    return Rule(
+        subject=subject, actions=clean_actions, effect=effect,
+        key_ids=key_ids,
+    )
 
 
 def validate_rules(raw) -> List[Rule]:
@@ -483,11 +562,16 @@ class PolicyStore:
                 "cannot parse policy document"
             ) from exc
 
-    def check(self, tenant_id: str, subject: str, action: str) -> dict:
-        """Evaluate one (subject, action) without any side effect.
+    def check(
+        self, tenant_id: str, subject: str, action: str,
+        key_id: Optional[str] = None,
+    ) -> dict:
+        """Evaluate one (subject, action[, key_id]) without any side effect.
 
         No document allows the action (``no_policy``); otherwise the rules
-        decide. Never writes an audit event, a revision or any file.
+        decide. ``key_id`` None evaluates the key-less context (only
+        unscoped rules match). Never writes an audit event, a revision or
+        any file.
         """
         rules = self.get_strict(tenant_id)
         if rules is None:
@@ -497,7 +581,7 @@ class PolicyStore:
                 "reason": REASON_NO_POLICY,
                 "rules": [],
             }
-        return evaluate_rules(rules, subject, action)
+        return evaluate_rules(rules, subject, action, key_id)
 
     def _current_state(self, path: str):
         """Return (rules, revision) for an existing document under the lock."""
@@ -642,13 +726,19 @@ class PolicyStore:
         )
         self.audit.append(event)
 
-    def is_allowed(self, tenant_id: str, action: str, subject: str) -> bool:
-        """Enforce the tenant document for (subject, action).
+    def is_allowed(
+        self, tenant_id: str, action: str, subject: str,
+        key_id: Optional[str] = None,
+    ) -> bool:
+        """Enforce the tenant document for (subject, action[, key_id]).
 
-        No document means unrestricted. Otherwise deny wins, and an action no
-        rule matches is denied. An existing document that cannot be read or
-        parsed is backend corruption: PolicyStoreUnavailable is raised so the
-        caller answers a fixed 500 instead of allowing the request through.
+        No document means unrestricted. A key-less request (``key_id``
+        None) is governed only by unscoped rules; a request naming a target
+        key is governed by unscoped rules and rules scoped to that key.
+        Otherwise deny wins, and an action no rule matches is denied. An
+        existing document that cannot be read or parsed is backend
+        corruption: PolicyStoreUnavailable is raised so the caller answers
+        a fixed 500 instead of allowing the request through.
         """
         rules = self.get_strict(tenant_id)
         if rules is None:
@@ -656,6 +746,10 @@ class PolicyStore:
         allowed = False
         for rule in rules:
             if rule.subject != subject or action not in rule.actions:
+                continue
+            if rule.key_ids is not None and (
+                key_id is None or key_id not in rule.key_ids
+            ):
                 continue
             if rule.effect == "deny":
                 return False

@@ -330,6 +330,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_policy_check.add_argument("--tenant-id", required=True)
     p_policy_check.add_argument("--subject", required=True)
     p_policy_check.add_argument("--action", required=True)
+    p_policy_check.add_argument(
+        "--key-id", default=None,
+        help="optional target key_id (UUID4); scopes the check to that key "
+             "and adds key_id to the output",
+    )
 
     p_provider = sub.add_parser(
         "provider", help="inspect or reconnect the KMS/HSM provider"
@@ -970,8 +975,15 @@ def _run(argv: Optional[List[str]] = None) -> int:
         )
 
     def allowed(action, key_id=None) -> bool:
-        """Policy gate; on denial the response/audit was already handled."""
-        if policies.is_allowed(args.tenant_id, action, args.operator):
+        """Policy gate; on denial the response/audit was already handled.
+
+        A target key_id scopes the decision (key-scoped rules apply in
+        addition to unscoped ones); key-less commands pass None and match
+        only unscoped rules.
+        """
+        if policies.is_allowed(
+            args.tenant_id, action, args.operator, key_id
+        ):
             return True
         return False  # caller returns _deny(...)
 
@@ -1007,7 +1019,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 if not _conflict(store):
                     return 1
             return _fail("field key_id must be a UUID4", 2)
-        if not allowed(audit_mod.ACTION_READ):
+        if not allowed(audit_mod.ACTION_READ, args.key_id):
             return _deny(store, args.tenant_id, args.key_id,
                          audit_mod.ACTION_READ)
         record = store.get(args.key_id, args.tenant_id)
@@ -1070,7 +1082,8 @@ def _run(argv: Optional[List[str]] = None) -> int:
                     {"kind": "rotate", "write_set": [args.key_id]}
                 )
             if not policies.is_allowed(
-                args.tenant_id, audit_mod.ACTION_ROTATE, args.operator
+                args.tenant_id, audit_mod.ACTION_ROTATE, args.operator,
+                args.key_id,
             ):
                 return _terminal_rejection(
                     op_store, store, operation,
@@ -1140,7 +1153,8 @@ def _run(argv: Optional[List[str]] = None) -> int:
                     {"kind": "migrate", "write_set": [args.key_id]}
                 )
             if not policies.is_allowed(
-                args.tenant_id, audit_mod.ACTION_MIGRATE, args.operator
+                args.tenant_id, audit_mod.ACTION_MIGRATE, args.operator,
+                args.key_id,
             ):
                 return _terminal_rejection(
                     op_store, store, operation,
@@ -1262,17 +1276,20 @@ def _run(argv: Optional[List[str]] = None) -> int:
                         "write_set": [key_id for key_id, _, _ in items],
                     }
                 )
-            # Authorization follows rotate; the rejection event is a single
-            # batch_rotate with key_id null.
-            if not policies.is_allowed(
-                args.tenant_id, audit_mod.ACTION_ROTATE, args.operator
-            ):
-                return _terminal_rejection(
-                    op_store, store, operation,
-                    args.tenant_id, None,
-                    audit_mod.ACTION_BATCH_ROTATE, 403,
-                    "action not permitted by policy",
-                )
+            # Authorization follows rotate per item; any single denied item
+            # rejects the whole batch with one batch_rotate rejection
+            # (key_id null) and changes no key.
+            for item_key_id, _, _ in items:
+                if not policies.is_allowed(
+                    args.tenant_id, audit_mod.ACTION_ROTATE, args.operator,
+                    item_key_id,
+                ):
+                    return _terminal_rejection(
+                        op_store, store, operation,
+                        args.tenant_id, None,
+                        audit_mod.ACTION_BATCH_ROTATE, 403,
+                        "action not permitted by policy",
+                    )
 
             def stage_success(records_by_id):
                 op_store.stage_terminal(
@@ -1343,7 +1360,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 if not _conflict(store):
                     return 1
             return _fail("field key_id must be a UUID4", 2)
-        if not allowed(audit_mod.ACTION_READ):
+        if not allowed(audit_mod.ACTION_READ, args.key_id):
             return _deny(store, args.tenant_id, args.key_id,
                          audit_mod.ACTION_READ)
         try:
@@ -1399,7 +1416,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 return _fail("invalid or expired cursor", 2)
             except LedgerError as exc:
                 return _ledger_fail(exc)
-        if not allowed(audit_mod.ACTION_READ):
+        if not allowed(audit_mod.ACTION_READ, args.key_id):
             return _deny(store, args.tenant_id, args.key_id,
                          audit_mod.ACTION_READ)
         if prefetched is not None:
@@ -1451,7 +1468,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
             if not _conflict(store):
                 return 1
             return _fail("field key_id must be a UUID4", 2)
-        if not allowed(audit_mod.ACTION_REVOKE):
+        if not allowed(audit_mod.ACTION_REVOKE, args.key_id):
             return _deny(store, args.tenant_id, args.key_id,
                          audit_mod.ACTION_REVOKE)
         try:
@@ -1476,7 +1493,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 if not _conflict(store):
                     return 1
             return _fail("field key_id must be a UUID4", 2)
-        if not allowed(audit_mod.ACTION_READ):
+        if not allowed(audit_mod.ACTION_READ, args.key_id):
             return _deny(store, args.tenant_id, args.key_id,
                          audit_mod.ACTION_READ)
         record = store.get(args.key_id, args.tenant_id)
@@ -1512,7 +1529,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
             if not _conflict(store):
                 return 1
             return _fail("field key_id must be a UUID4", 2)
-        if not allowed(audit_mod.ACTION_EXPORT):
+        if not allowed(audit_mod.ACTION_EXPORT, args.key_id):
             return _deny(store, args.tenant_id, args.key_id,
                          audit_mod.ACTION_EXPORT)
         try:
@@ -1586,7 +1603,8 @@ def _run(argv: Optional[List[str]] = None) -> int:
                     {"kind": "import", "write_set": [key_id]}
                 )
             if not policies.is_allowed(
-                args.tenant_id, audit_mod.ACTION_IMPORT, args.operator
+                args.tenant_id, audit_mod.ACTION_IMPORT, args.operator,
+                key_id,
             ):
                 return _terminal_rejection(
                     op_store, store, operation,
@@ -1655,7 +1673,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                     store, args.tenant_id, args.key_id,
                     audit_mod.ACTION_ENCRYPT, 400, str(exc),
                 )
-        if not allowed(audit_mod.ACTION_ENCRYPT):
+        if not allowed(audit_mod.ACTION_ENCRYPT, args.key_id):
             return _deny(store, args.tenant_id, args.key_id,
                          audit_mod.ACTION_ENCRYPT)
         status, record, ver, kek = store.crypto_material(
@@ -1719,7 +1737,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 audit_mod.ACTION_DECRYPT, 400,
                 "field envelope key_id does not match the request key_id",
             )
-        if not allowed(audit_mod.ACTION_DECRYPT):
+        if not allowed(audit_mod.ACTION_DECRYPT, args.key_id):
             return _deny(store, args.tenant_id, args.key_id,
                          audit_mod.ACTION_DECRYPT)
         status, record, ver, material = store.crypto_material(
@@ -1845,6 +1863,8 @@ def _run(argv: Optional[List[str]] = None) -> int:
             return _fail(
                 "field passphrase must be a non-empty string", 2
             )
+        # A tenant backup has no target key: only unscoped export rules
+        # apply.
         if not allowed(audit_mod.ACTION_EXPORT):
             return _deny(store, args.tenant_id, None,
                          audit_mod.ACTION_EXPORT)
@@ -2143,21 +2163,34 @@ def _policy_command(args, policies: PolicyStore) -> int:
                 % (action, ", ".join(POLICY_ACTIONS)),
                 2,
             )
+        # --key-id is optional: omitted keeps the legacy output (no key_id
+        # field, only unscoped rules match); a non-UUID value is an exit-2
+        # parameter error using the same fixed text as HTTP.
+        check_key_id = None
+        if args.key_id is not None and not is_valid_key_id(args.key_id):
+            return _fail("field key_id must be a UUID4 or null", 2)
         try:
-            result = policies.check(tenant_id, subject, action)
+            result = policies.check(
+                tenant_id, subject, action, args.key_id
+            )
         except PolicyStoreUnavailable:
             return _fail("policy store is unavailable", 1)
-        _print(
+        output = {
+            "tenant_id": tenant_id,
+            "subject": subject,
+            "action": action,
+        }
+        if args.key_id is not None:
+            output["key_id"] = args.key_id
+        output.update(
             {
-                "tenant_id": tenant_id,
-                "subject": subject,
-                "action": action,
                 "allowed": result["allowed"],
                 "effect": result["effect"],
                 "reason": result["reason"],
                 "rules": [rule.to_json() for rule in result["rules"]],
             }
         )
+        _print(output)
         return 0
 
     if args.policy_command == "show":

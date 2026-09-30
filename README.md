@@ -572,33 +572,50 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `{"error":"policy revision conflict","current_revision":<revision|null>}`，
   规则不变且分别记 `policy_update/rejected`、`policy_delete/rejected`（成功仍记
   原 success 事件）。参数重复或为空是零副作用 `400`。
-- 规则元素 `{subject, actions, effect}`：`subject` 为区分大小写的非空字符串；
+- 规则元素 `{subject, actions, effect, key_ids?}`：`subject` 为区分大小写的非空字符串；
   `actions` 为非空数组，取值
   `create/read/rotate/revoke/revoke_version/import/export/migrate/encrypt/decrypt/
-  rewrap/wrap_key/unwrap_key/sign/verify/audit/list`，单条内重复去重；`effect` 为 `allow`/`deny`；未知字段、类型错误、同
-  subject+effect+无序动作集的重复规则均 `400`；`rules:[]` 合法（全拒绝）。
-- 执行：管理动作 policy_* 免检；租户无策略时全部允许；有策略时匹配规则中
-  deny 优先于 allow，无匹配则拒绝 → `403`，并记一条原动作名、
-  `outcome=rejected`、携带当时已知 `key_id` 的事件（create/解密前的 import/
-  audit 查询为 null）。参数校验先于授权，授权先于存在性判断。
+  rewrap/wrap_key/unwrap_key/sign/verify/audit/list`，单条内重复去重；`effect` 为 `allow`/`deny`；
+  `key_ids` 可省略：省略表示该规则适用于**所有密钥**，出现时必须是非空、无重复的小写
+  UUID4 数组（非法或重复固定 `400`
+  `field rules[i].key_ids must be a non-empty array of UUID4 strings without duplicates`，
+  适用于任意下标），数组顺序不影响规则含义与 revision；未知字段、类型错误、同
+  subject+effect+无序动作集+相同 key 范围的重复规则均 `400`；`rules:[]` 合法（全拒绝）。
+- 执行：管理动作 policy_* 免检；租户无策略时全部允许；有策略时先匹配 subject 与 action，
+  再按请求目标 key_id 筛选规则——无目标密钥上下文的请求（如 create、list、audit、
+  backup/restore）只匹配未限定 key_ids 的规则；有目标 key_id 的请求同时匹配未限定规则
+  与 key_ids 含该 key_id 的规则。匹配规则中 deny 优先于 allow，仅 allow 放行；无匹配
+  规则则拒绝 → `403`，并记一条原动作名、`outcome=rejected`、携带当时已知 `key_id`
+  的事件（create/解密前的 import/audit 查询为 null）。参数校验先于授权，授权先于存在
+  性判断，不暴露跨租户密钥是否存在。批量轮换逐条按 key_id 使用 `rotate` 规则判断，
+  任一条目被拒绝时整批 `403`（单条 `batch_rotate/rejected`，key_id null）且不修改任何
+  密钥。
 - `POST /v1/policy/check`：在不写入、不生成 revision、不记审计的前提下，
   按当前策略判定一次授权。沿用 GET policy 的单一非空 `X-Operator-Id` 与
   单一租户来源（单一头或单一 `?tenant_id=`，冲突照旧记 `tenant_conflict`）；
-  body **仅** `{subject, action}`，二者均为非空字符串，`action` 必须属于上
-  述动作集合；坏 JSON、非对象、字段缺失或多余、`subject` 为空或非字符串、
-  `action` 为空/非字符串/不属于动作集合均为指出字段的 `400` 且不记审计。
-  成功 `200`，键序固定
-  `{tenant_id, subject, action, allowed, effect, reason, rules}`：
+  body 为 `{subject, action, key_id?}`——`key_id` 可省略、为 null 或小写 UUID4，
+  其它值（含空串、非字符串）固定 `400`
+  `field key_id must be a UUID4 or null`；`subject`、`action` 二者均为非空字符串，
+  `action` 必须属于上述动作集合；坏 JSON、非对象、字段缺失或多余、`subject` 为空或
+  非字符串、`action` 为空/非字符串/不属于动作集合均为指出字段的 `400` 且不记审计。
+  省略 `key_id` 时响应与判断保持原样（只匹配未限定 key_ids 的规则，响应无 key_id 键）；
+  传入（含 null）时响应在 `action` 后包含 `key_id`，并按该目标判定。
+  成功 `200`，省略 `key_id` 时键序固定
+  `{tenant_id, subject, action, allowed, effect, reason, rules}`，传入时为
+  `{tenant_id, subject, action, key_id, allowed, effect, reason, rules}`：
   `allowed` 为布尔值、`effect` 为 `allow`/`deny`；`reason` 取值
   `no_policy`（租户无策略，允许）、`explicit_allow`（仅命中 allow，显式
   允许）、`explicit_deny`（命中任一 deny，显式拒绝）、`default_deny`
   （有策略但无匹配规则，默认拒绝）；`rules` 为按策略原有顺序返回的全部
-  匹配规则（subject 相同且 actions 含该 action），无策略时为 `[]`。策略
+  匹配规则（subject 相同、actions 含该 action、且 key 范围适用），无策略时为 `[]`。策略
   文件缺失视为无策略；文件存在却损坏或读取失败固定 `500`
   `{"error":"policy store is unavailable"}`。CLI：
-  `policy --operator <op> check --tenant-id <t> --subject <s> --action <a>`，
-  成功输出同一单行 JSON，参数错误退出 2，策略存储故障在 stderr 输出同一
-  错误体并退出 1。
+  `policy --operator <op> check --tenant-id <t> --subject <s> --action <a> [--key-id <uuid>]`，
+  成功输出同一单行 JSON（省略 `--key-id` 时无 key_id 键），参数错误退出 2，策略存储
+  故障在 stderr 输出同一错误体并退出 1。`policy set` 的 `--rules` JSON 规则对象可携带
+  `key_ids`，其余调用方式不变。旧策略、旧备份及省略 key_ids 的规则保持原响应、原
+  revision 与原判断；含 key_ids 的 `tenant-backup-v1` 经校验备份/恢复后语义与 revision
+  均不变。
 
 ## 审计
 
@@ -723,7 +740,7 @@ python -m keymgr policy --operator admin set --tenant-id t --rules '<json>' \
 python -m keymgr policy --operator admin delete --tenant-id t \
                           [--expected-revision <rev>|none]
 python -m keymgr policy --operator admin check --tenant-id t \
-                          --subject alice --action read
+                          --subject alice --action read [--key-id <uuid>]
 # show/set 输出 revision；set/delete 的 --expected-revision 语义同查询参数，
 # 冲突时 stderr 输出与 HTTP 同口径的 409 错误体（exit 3），省略为无条件操作
 # KMS/HSM 健康检查与无中断重连（全局，无 --tenant-id）

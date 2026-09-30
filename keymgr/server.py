@@ -634,13 +634,16 @@ def make_handler(
         def _enforce(self, tenant_id, key_id, action, operator) -> bool:
             """Enforce the tenant policy. True to proceed; else response sent.
 
-            A rejection is a 403 carrying a rejected audit event that records
-            the original action and key_id; unknown/cross-tenant keys remain
-            404 and are handled by callers after enforcement.
+            The target key_id scopes the decision: key-scoped rules apply in
+            addition to unscoped ones, while key-less enforcement (key_id
+            None) matches only unscoped rules. A rejection is a 403 carrying
+            a rejected audit event that records the original action and
+            key_id; unknown/cross-tenant keys remain 404 and are handled by
+            callers after enforcement.
             """
             try:
                 allowed = policy_store.is_allowed(
-                    tenant_id, action, operator
+                    tenant_id, action, operator, key_id
                 )
             except PolicyStoreUnavailable:
                 # Backend corruption must never fail open: fixed 500 with no
@@ -1082,9 +1085,10 @@ def make_handler(
                     )
                 # Authorization follows validation and precedes existence; a
                 # denial is a bound terminal 403 whose single rejection event
-                # is named after the operation_id.
+                # is named after the operation_id. The target key scopes the
+                # rotate rule.
                 if not policy_store.is_allowed(
-                    tenant_id, audit_mod.ACTION_ROTATE, operator
+                    tenant_id, audit_mod.ACTION_ROTATE, operator, key_id
                 ):
                     return self._idempotent_rejection(
                         operation, tenant_id, key_id,
@@ -1222,17 +1226,21 @@ def make_handler(
                             "write_set": [key_id for key_id, _, _ in items],
                         }
                     )
-                # Authorization follows rotate and precedes existence; a
-                # denial is a bound terminal 403 with one rejected
-                # batch_rotate event (key_id null).
-                if not policy_store.is_allowed(
-                    tenant_id, audit_mod.ACTION_ROTATE, operator
-                ):
-                    return self._idempotent_rejection(
-                        operation, tenant_id, None,
-                        audit_mod.ACTION_BATCH_ROTATE, 403,
-                        "action not permitted by policy",
-                    )
+                # Authorization follows rotate and precedes existence; each
+                # item is checked against its own key_id (unscoped rules
+                # apply to every item). A single denied item rejects the
+                # whole batch as one terminal 403 with one rejected
+                # batch_rotate event (key_id null) and changes no key.
+                for item_key_id, _, _ in items:
+                    if not policy_store.is_allowed(
+                        tenant_id, audit_mod.ACTION_ROTATE, operator,
+                        item_key_id,
+                    ):
+                        return self._idempotent_rejection(
+                            operation, tenant_id, None,
+                            audit_mod.ACTION_BATCH_ROTATE, 403,
+                            "action not permitted by policy",
+                        )
 
                 def stage_success(records_by_id):
                     # After every key file landed, before the single
@@ -1649,8 +1657,9 @@ def make_handler(
                         {"kind": "encrypt", "write_set": [key_id]}
                     )
                 # Authorization follows validation and precedes existence.
+                # The target key scopes the encrypt rule.
                 if not policy_store.is_allowed(
-                    tenant_id, action, operator
+                    tenant_id, action, operator, key_id
                 ):
                     return self._idempotent_rejection(
                         operation, tenant_id, key_id, action, 403,
@@ -1807,7 +1816,7 @@ def make_handler(
                         {"kind": "migrate", "write_set": [key_id]}
                     )
                 if not policy_store.is_allowed(
-                    tenant_id, audit_mod.ACTION_MIGRATE, operator
+                    tenant_id, audit_mod.ACTION_MIGRATE, operator, key_id
                 ):
                     return self._idempotent_rejection(
                         operation, tenant_id, key_id,
@@ -2822,9 +2831,9 @@ def make_handler(
                     )
                 # Authorization precedes the conflict check: a denial is a
                 # bound terminal 403 even when the key_id already exists for
-                # another tenant.
+                # another tenant. The in-bundle key scopes the import rule.
                 if not policy_store.is_allowed(
-                    tenant_id, audit_mod.ACTION_IMPORT, operator
+                    tenant_id, audit_mod.ACTION_IMPORT, operator, key_id
                 ):
                     return self._idempotent_rejection(
                         operation, tenant_id, key_id,
@@ -4241,9 +4250,14 @@ def make_handler(
 
             Tenant and operator follow the GET policy rules (a source
             conflict is the usual audited tenant_conflict). The body carries
-            only ``subject`` and ``action``; every body/parameter failure is
-            a 400 naming the field with no audit event. A successful check
-            writes nothing: no audit event, no revision, no file change.
+            ``subject`` and ``action`` and optionally ``key_id``; every
+            body/parameter failure is a 400 naming the field with no audit
+            event. ``key_id`` must be null or a canonical UUID4: omitted,
+            the response keeps its legacy shape and the decision matches
+            only unscoped rules; present (including null), the response
+            includes it and scoped rules for it participate. A successful
+            check writes nothing: no audit event, no revision, no file
+            change.
             """
             tenant_id = self._strict_tenant(parts)
             if tenant_id is None:
@@ -4251,7 +4265,7 @@ def make_handler(
             payload = self._read_json_object(audit=False)
             if payload is None:
                 return
-            unknown = set(payload) - {"subject", "action"}
+            unknown = set(payload) - {"subject", "action", "key_id"}
             if unknown:
                 self._bad_request("unknown field: %s" % sorted(unknown)[0])
                 return
@@ -4279,25 +4293,43 @@ def make_handler(
                     % (action, ", ".join(POLICY_ACTIONS))
                 )
                 return
+            # key_id is optional; when present it must be null or a
+            # canonical UUID4 -- the fixed text is part of the contract.
+            key_id = None
+            if "key_id" in payload:
+                raw_key_id = payload["key_id"]
+                if raw_key_id is not None and not is_valid_key_id(raw_key_id):
+                    self._bad_request(
+                        "field key_id must be a UUID4 or null"
+                    )
+                    return
+                key_id = raw_key_id
             try:
-                result = policy_store.check(tenant_id, subject, action)
+                result = policy_store.check(tenant_id, subject, action, key_id)
             except PolicyStoreUnavailable:
                 self._send_json(
                     500, {"error": "policy store is unavailable"}
                 )
                 return
-            self._send_json(
-                200,
+            response = {
+                "tenant_id": tenant_id,
+                "subject": subject,
+                "action": action,
+            }
+            if "key_id" in payload:
+                # Present requests (including explicit null) carry the
+                # requested key_id directly after the action; omitted keeps
+                # the legacy key order byte-for-byte.
+                response["key_id"] = key_id
+            response.update(
                 {
-                    "tenant_id": tenant_id,
-                    "subject": subject,
-                    "action": action,
                     "allowed": result["allowed"],
                     "effect": result["effect"],
                     "reason": result["reason"],
                     "rules": [rule.to_json() for rule in result["rules"]],
-                },
+                }
             )
+            self._send_json(200, response)
 
         def _put_policy(self, parts) -> None:
             payload = self._read_json_object()
@@ -4405,11 +4437,31 @@ def _resolve_committed_operation(store, policy_store, record, event):
         # Older records without the stashed terminal: infer once from the
         # durable action and the current state.
         # A policy denial outranks existence: it is reconstructed whenever the
-        # tenant's policy currently rejects this operator/action.
+        # tenant's policy currently rejects this operator/action. The durable
+        # event names the target key when one existed, so key-scoped rules
+        # apply exactly as they did at the original decision.
+        replay_key_id = event.key_id
+        if replay_key_id is None and kind in ("rotate", "import", "migrate"):
+            replay_key_id = details.get("key_id")
+        if replay_key_id is not None and not is_valid_key_id(replay_key_id):
+            replay_key_id = None
         try:
-            policy_allowed = policy_store.is_allowed(
-                tenant_id, policy_action, operator_id
-            )
+            if kind == "batch_rotate":
+                # The batch was authorized item-by-item under rotate; deny is
+                # reconstructed when any item's current policy denies it.
+                policy_allowed = all(
+                    policy_store.is_allowed(
+                        tenant_id, policy_action, operator_id,
+                        one.get("key_id")
+                        if is_valid_key_id(one.get("key_id"))
+                        else None,
+                    )
+                    for one in details.get("items", [])
+                )
+            else:
+                policy_allowed = policy_store.is_allowed(
+                    tenant_id, policy_action, operator_id, replay_key_id
+                )
         except PolicyStoreUnavailable:
             # A corrupt policy document must not block crash recovery: fall
             # through to the durable state-based reconstruction below rather
