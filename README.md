@@ -96,8 +96,10 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   同一已提交视图比较：任一 `expected_version` 不等则整批绑定后
   `409`（体仅 `error,operation_id`，状态 conflict，记一条
   `batch_rotate/rejected`，`key_id` 为 null），不铸句柄、不改文件。
-  按 `rotate` 授权：策略拒绝 `403`；任一 `key_id` 未知
-  或属于其它租户则整批 `404`（不泄露跨租户存在性），皆零变更。`201` →
+  按 `rotate` 授权：逐条按该项 `key_id` 判定（受 key_ids 限定的规则只对
+  对应项生效），任一项被策略拒绝则整批 `403`（体仅 `error,operation_id`，
+  记一条 `batch_rotate/rejected`，`key_id` 为 null）且零变更；任一 `key_id`
+  未知或属于其它租户则整批 `404`（不泄露跨租户存在性），皆零变更。`201` →
   `{items:[{key_id, version, algorithm, public_key}, ...], operation_id}`，
   items 严格按请求序；各 key 沿用单键 rotate 语义，整批原子提交（共享一把
   per-key 锁顺序、单一 provision/snapshot 记账、单条提交事件）。
@@ -572,31 +574,42 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `{"error":"policy revision conflict","current_revision":<revision|null>}`，
   规则不变且分别记 `policy_update/rejected`、`policy_delete/rejected`（成功仍记
   原 success 事件）。参数重复或为空是零副作用 `400`。
-- 规则元素 `{subject, actions, effect}`：`subject` 为区分大小写的非空字符串；
+- 规则元素 `{subject, actions, effect, key_ids?}`：`subject` 为区分大小写的非空字符串；
   `actions` 为非空数组，取值
   `create/read/rotate/revoke/revoke_version/import/export/migrate/encrypt/decrypt/
-  rewrap/wrap_key/unwrap_key/sign/verify/audit/list`，单条内重复去重；`effect` 为 `allow`/`deny`；未知字段、类型错误、同
-  subject+effect+无序动作集的重复规则均 `400`；`rules:[]` 合法（全拒绝）。
-- 执行：管理动作 policy_* 免检；租户无策略时全部允许；有策略时匹配规则中
-  deny 优先于 allow，无匹配则拒绝 → `403`，并记一条原动作名、
-  `outcome=rejected`、携带当时已知 `key_id` 的事件（create/解密前的 import/
-  audit 查询为 null）。参数校验先于授权，授权先于存在性判断。
+  rewrap/wrap_key/unwrap_key/sign/verify/audit/list`，单条内重复去重；`effect` 为 `allow`/`deny`；可选 `key_ids` 省略时适用于所有密钥，出现时只能是非空、无重复的 UUID4
+  数组（顺序不影响规则含义和 revision，写出时按 UUID 升序）；非法或重复固定
+  `400`，文本为
+  `field rules[i].key_ids must be a non-empty array of UUID4 strings without duplicates`；
+  未知字段、类型错误、同 subject+effect+无序动作集+相同 key 作用域的重复规则均
+  `400`；`rules:[]` 合法（全拒绝）。
+- 执行：管理动作 policy_* 免检；租户无策略时全部允许；有策略时先按 subject 与
+  action 匹配，再按请求目标 `key_id` 筛选规则——未限定 key_ids 的规则匹配每
+  个请求，限定了 key_ids 的规则只在请求点名其列内密钥时匹配，无目标密钥上下
+  文的请求（create/list/audit/backup 等）只匹配未限定 key_ids 的规则；匹配规
+  则中 deny 优先于 allow，仅 allow 放行，无匹配则拒绝 → `403`，并记一条原动
+  作名、`outcome=rejected`、携带当时已知 `key_id` 的事件（create/解密前的
+  import/audit 查询为 null）。参数校验先于授权，授权先于存在性判断。
 - `POST /v1/policy/check`：在不写入、不生成 revision、不记审计的前提下，
   按当前策略判定一次授权。沿用 GET policy 的单一非空 `X-Operator-Id` 与
   单一租户来源（单一头或单一 `?tenant_id=`，冲突照旧记 `tenant_conflict`）；
-  body **仅** `{subject, action}`，二者均为非空字符串，`action` 必须属于上
-  述动作集合；坏 JSON、非对象、字段缺失或多余、`subject` 为空或非字符串、
-  `action` 为空/非字符串/不属于动作集合均为指出字段的 `400` 且不记审计。
-  成功 `200`，键序固定
-  `{tenant_id, subject, action, allowed, effect, reason, rules}`：
-  `allowed` 为布尔值、`effect` 为 `allow`/`deny`；`reason` 取值
+  body 为 `{subject, action, key_id?}`——`key_id` 可选，省略时保持原判断
+  （只匹配未限定 key_ids 的规则）与原响应；显式给出时必须为 UUID4 或 null，
+  否则固定 `400` `field key_id must be a UUID4 or null`，且不记审计；
+  `subject`/`action` 的要求不变。坏 JSON、非对象、字段缺失或多余、`subject`
+  为空或非字符串、`action` 为空/非字符串/不属于动作集合均为指出字段的 `400`
+  且不记审计。成功 `200`，省略 key_id 时键序固定
+  `{tenant_id, subject, action, allowed, effect, reason, rules}`；给出 key_id
+  时在 action 后插入 `key_id` 并按该目标密钥筛选规则；`allowed` 为布尔值、
+  `effect` 为 `allow`/`deny`；`reason` 取值
   `no_policy`（租户无策略，允许）、`explicit_allow`（仅命中 allow，显式
   允许）、`explicit_deny`（命中任一 deny，显式拒绝）、`default_deny`
   （有策略但无匹配规则，默认拒绝）；`rules` 为按策略原有顺序返回的全部
-  匹配规则（subject 相同且 actions 含该 action），无策略时为 `[]`。策略
+  匹配规则（subject 相同、actions 含该 action、且 key 作用域命中目标），
+  无策略时为 `[]`。策略
   文件缺失视为无策略；文件存在却损坏或读取失败固定 `500`
   `{"error":"policy store is unavailable"}`。CLI：
-  `policy --operator <op> check --tenant-id <t> --subject <s> --action <a>`，
+  `policy --operator <op> check --tenant-id <t> --subject <s> --action <a> [--key-id <uuid>]`，
   成功输出同一单行 JSON，参数错误退出 2，策略存储故障在 stderr 输出同一
   错误体并退出 1。
 
@@ -723,7 +736,7 @@ python -m keymgr policy --operator admin set --tenant-id t --rules '<json>' \
 python -m keymgr policy --operator admin delete --tenant-id t \
                           [--expected-revision <rev>|none]
 python -m keymgr policy --operator admin check --tenant-id t \
-                          --subject alice --action read
+                          --subject alice --action read [--key-id <uuid>]
 # show/set 输出 revision；set/delete 的 --expected-revision 语义同查询参数，
 # 冲突时 stderr 输出与 HTTP 同口径的 409 错误体（exit 3），省略为无条件操作
 # KMS/HSM 健康检查与无中断重连（全局，无 --tenant-id）

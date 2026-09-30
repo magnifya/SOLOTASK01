@@ -1,12 +1,18 @@
 """Per-tenant action policies: validation, persistence and enforcement.
 
 A policy document is a list of rules; each rule binds a ``subject`` (the
-X-Operator-Id of the caller), a set of ``actions`` and an ``effect`` of
-``allow`` or ``deny``. Enforcement, for one (tenant, subject, action):
+X-Operator-Id of the caller), a set of ``actions``, an ``effect`` of
+``allow`` or ``deny`` and, optionally, a non-empty set of ``key_ids``. A
+rule without ``key_ids`` governs every key; a rule with ``key_ids`` only
+governs requests targeting one of those keys. Enforcement, for one
+(tenant, subject, action[, key_id]):
 
 * a tenant with no document is unrestricted (every action is allowed);
-* among the rules whose subject equals the caller and whose actions contain
-  the action, any ``deny`` wins over ``allow``;
+* rules are first matched on subject and action, then filtered by the
+  request target key_id: a key-scoped rule matches only when the request
+  names one of its key_ids, and a request with no key context matches
+  only unscoped rules;
+* among the matching rules any ``deny`` wins over ``allow``;
 * if no matching rule exists the action is denied (default deny).
 
 Documents are stored as one JSON file per tenant, written through the same
@@ -27,6 +33,7 @@ from typing import Iterator, List, Optional
 
 from . import audit as audit_mod
 from .audit import AuditEvent, AuditLog, LedgerError
+from .store import is_valid_key_id
 
 try:  # fcntl is POSIX-only; policy writes still work without it.
     import fcntl
@@ -86,18 +93,35 @@ REASON_EXPLICIT_DENY = "explicit_deny"
 REASON_DEFAULT_DENY = "default_deny"
 
 
-def evaluate_rules(rules, subject: str, action: str) -> dict:
-    """Evaluate one (subject, action) against a non-None rule list.
+def _rule_covers_key(rule, key_id: Optional[str]) -> bool:
+    """Whether a rule applies to a request's target key context.
 
-    Matching keeps the document's original order. Any matching ``deny``
-    wins; with no deny, at least one matching allow permits; otherwise the
-    action is denied by default. Returns the matched rules and the reason
-    token for the decision.
+    An unscoped rule (no key_ids) applies to every request; a key-scoped
+    rule applies only to a request that names one of its key_ids. A request
+    without a target key (``key_id is None``) matches unscoped rules only.
+    """
+    if rule.key_ids is None:
+        return True
+    return key_id is not None and key_id in rule.key_ids
+
+
+def evaluate_rules(rules, subject: str, action: str,
+                   key_id: Optional[str] = None) -> dict:
+    """Evaluate one (subject, action[, key_id]) against a non-None rule list.
+
+    Matching keeps the document's original order: rules first match on
+    subject and action, then on the request target key_id (see
+    :func:`_rule_covers_key`). Any matching ``deny`` wins; with no deny, at
+    least one matching allow permits; otherwise the action is denied by
+    default. Returns the matched rules and the reason token for the
+    decision.
     """
     matched = [
         rule
         for rule in rules
-        if rule.subject == subject and action in rule.actions
+        if rule.subject == subject
+        and action in rule.actions
+        and _rule_covers_key(rule, key_id)
     ]
     if any(rule.effect == "deny" for rule in matched):
         allowed = False
@@ -119,21 +143,32 @@ def evaluate_rules(rules, subject: str, action: str) -> dict:
 def revision_for_rules(rules) -> str:
     """Compute the opaque, content-addressed revision of a rule list.
 
-    Rules are normalized first (actions sorted, rules ordered by
-    subject/effect/actions), so the same logical document always yields the
-    same revision and any change yields a different one. Nothing about the
-    on-disk layout is reflected in the value.
+    Rules are normalized first (actions and key_ids sorted, rules ordered
+    by subject/effect/actions/key_ids), so the same logical document always
+    yields the same revision and any change yields a different one. The
+    key_ids order carries no meaning and never perturbs the revision.
+    Nothing about the on-disk layout is reflected in the value.
     """
     normalized = [
         {
             "subject": rule.subject,
             "effect": rule.effect,
             "actions": sorted(rule.actions),
+            **(
+                {"key_ids": sorted(rule.key_ids)}
+                if rule.key_ids is not None
+                else {}
+            ),
         }
         for rule in rules
     ]
     normalized.sort(
-        key=lambda item: (item["subject"], item["effect"], item["actions"])
+        key=lambda item: (
+            item["subject"],
+            item["effect"],
+            item["actions"],
+            item.get("key_ids", []),
+        )
     )
     blob = json.dumps(
         normalized, separators=(",", ":"), sort_keys=True
@@ -155,19 +190,29 @@ def validate_expected_revision(raw) -> str:
 
 @dataclass(frozen=True)
 class Rule:
-    """One policy rule: an effect on a set of actions for one subject."""
+    """One policy rule: an effect on actions for a subject, optionally scoped.
+
+    ``key_ids`` is None when the rule is unscoped (applies to every key);
+    otherwise a tuple of the unique UUID4 key_ids the rule governs.
+    """
 
     subject: str
     actions: List[str]
     effect: str
+    key_ids: Optional[tuple] = None
 
     def to_json(self) -> dict:
-        """Serialize to a plain dict; actions are emitted sorted."""
-        return {
+        """Serialize to a plain dict; actions and key_ids are emitted sorted."""
+        data = {
             "subject": self.subject,
             "actions": list(self.actions),
             "effect": self.effect,
         }
+        if self.key_ids is not None:
+            # Emitted sorted: key_ids order carries no meaning, so the wire
+            # representation is canonical (and revision-stable).
+            data["key_ids"] = sorted(self.key_ids)
+        return data
 
     @classmethod
     def from_json(cls, data: dict) -> "Rule":
@@ -176,8 +221,9 @@ class Rule:
         return validate_rule(data)
 
     def signature(self):
-        """Dedup key: same subject/effect with the same unordered action set."""
-        return self.subject, self.effect, frozenset(self.actions)
+        """Dedup key: same subject/effect, action set and key-id scope."""
+        key_scope = None if self.key_ids is None else frozenset(self.key_ids)
+        return self.subject, self.effect, frozenset(self.actions), key_scope
 
 
 def validate_rule(raw, index: Optional[int] = None) -> Rule:
@@ -193,7 +239,7 @@ def validate_rule(raw, index: Optional[int] = None) -> Rule:
 
     if not isinstance(raw, dict):
         raise err("field %s must be an object" % (where.rstrip(".") if index is not None else "rule"))
-    known = {"subject", "actions", "effect"}
+    known = {"subject", "actions", "effect", "key_ids"}
     unknown = set(raw) - known
     if unknown:
         raise err(
@@ -229,7 +275,33 @@ def validate_rule(raw, index: Optional[int] = None) -> Rule:
             # Duplicates within one rule are dropped, not an error: the action
             # set is unordered, so ["read", "read"] carries no extra meaning.
             clean_actions.append(action)
-    return Rule(subject=subject, actions=clean_actions, effect=effect)
+    clean_key_ids = None
+    if "key_ids" in raw:
+        key_ids = raw["key_ids"]
+        # One fixed message covers an empty/non-array value, a non-UUID4
+        # element and duplicates; inside a document it names rules[i].
+        bad = (
+            "field rules[%d].key_ids must be a non-empty array of UUID4 "
+            "strings without duplicates" % index
+            if index is not None
+            else "field key_ids must be a non-empty array of UUID4 "
+            "strings without duplicates"
+        )
+        if not isinstance(key_ids, list) or not key_ids:
+            raise err(bad)
+        seen = set()
+        clean_key_ids = []
+        for key_id in key_ids:
+            if not is_valid_key_id(key_id) or key_id in seen:
+                raise err(bad)
+            seen.add(key_id)
+            clean_key_ids.append(key_id)
+    return Rule(
+        subject=subject,
+        actions=clean_actions,
+        effect=effect,
+        key_ids=tuple(clean_key_ids) if clean_key_ids is not None else None,
+    )
 
 
 def validate_rules(raw) -> List[Rule]:
@@ -483,8 +555,9 @@ class PolicyStore:
                 "cannot parse policy document"
             ) from exc
 
-    def check(self, tenant_id: str, subject: str, action: str) -> dict:
-        """Evaluate one (subject, action) without any side effect.
+    def check(self, tenant_id: str, subject: str, action: str,
+              key_id: Optional[str] = None) -> dict:
+        """Evaluate one (subject, action[, key_id]) without any side effect.
 
         No document allows the action (``no_policy``); otherwise the rules
         decide. Never writes an audit event, a revision or any file.
@@ -497,7 +570,7 @@ class PolicyStore:
                 "reason": REASON_NO_POLICY,
                 "rules": [],
             }
-        return evaluate_rules(rules, subject, action)
+        return evaluate_rules(rules, subject, action, key_id)
 
     def _current_state(self, path: str):
         """Return (rules, revision) for an existing document under the lock."""
@@ -642,25 +715,23 @@ class PolicyStore:
         )
         self.audit.append(event)
 
-    def is_allowed(self, tenant_id: str, action: str, subject: str) -> bool:
-        """Enforce the tenant document for (subject, action).
+    def is_allowed(self, tenant_id: str, action: str, subject: str,
+                   key_id: Optional[str] = None) -> bool:
+        """Enforce the tenant document for (subject, action[, key_id]).
 
-        No document means unrestricted. Otherwise deny wins, and an action no
-        rule matches is denied. An existing document that cannot be read or
-        parsed is backend corruption: PolicyStoreUnavailable is raised so the
-        caller answers a fixed 500 instead of allowing the request through.
+        No document means unrestricted. Otherwise the rules are matched on
+        subject/action and filtered by the target key_id (an unscoped rule
+        matches every request; a key-scoped rule matches only its keys, and
+        a keyless request matches unscoped rules only); deny wins, and an
+        action no rule matches is denied. An existing document that cannot
+        be read or parsed is backend corruption: PolicyStoreUnavailable is
+        raised so the caller answers a fixed 500 instead of allowing the
+        request through.
         """
         rules = self.get_strict(tenant_id)
         if rules is None:
             return True
-        allowed = False
-        for rule in rules:
-            if rule.subject != subject or action not in rule.actions:
-                continue
-            if rule.effect == "deny":
-                return False
-            allowed = True
-        return allowed
+        return evaluate_rules(rules, subject, action, key_id)["allowed"]
 
     # -- tenant restore hooks ---------------------------------------------
     def owner_of_path(self, path: str) -> Optional[str]:

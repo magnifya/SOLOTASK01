@@ -636,11 +636,13 @@ def make_handler(
 
             A rejection is a 403 carrying a rejected audit event that records
             the original action and key_id; unknown/cross-tenant keys remain
-            404 and are handled by callers after enforcement.
+            404 and are handled by callers after enforcement. The target
+            key_id scopes key_ids-limited rules (None matches unscoped rules
+            only).
             """
             try:
                 allowed = policy_store.is_allowed(
-                    tenant_id, action, operator
+                    tenant_id, action, operator, key_id
                 )
             except PolicyStoreUnavailable:
                 # Backend corruption must never fail open: fixed 500 with no
@@ -1082,9 +1084,10 @@ def make_handler(
                     )
                 # Authorization follows validation and precedes existence; a
                 # denial is a bound terminal 403 whose single rejection event
-                # is named after the operation_id.
+                # is named after the operation_id. The target key_id scopes
+                # key_ids-limited rules.
                 if not policy_store.is_allowed(
-                    tenant_id, audit_mod.ACTION_ROTATE, operator
+                    tenant_id, audit_mod.ACTION_ROTATE, operator, key_id
                 ):
                     return self._idempotent_rejection(
                         operation, tenant_id, key_id,
@@ -1222,11 +1225,18 @@ def make_handler(
                             "write_set": [key_id for key_id, _, _ in items],
                         }
                     )
-                # Authorization follows rotate and precedes existence; a
-                # denial is a bound terminal 403 with one rejected
-                # batch_rotate event (key_id null).
-                if not policy_store.is_allowed(
-                    tenant_id, audit_mod.ACTION_ROTATE, operator
+                # Authorization follows rotate and precedes existence; each
+                # item is checked against its own key_id (a key_ids-scoped
+                # rule applies to that entry only). Any denied item fails the
+                # WHOLE batch with zero changes: a bound terminal 403 with one
+                # rejected batch_rotate event (key_id null), exactly like the
+                # unscoped denial path.
+                if any(
+                    not policy_store.is_allowed(
+                        tenant_id, audit_mod.ACTION_ROTATE, operator,
+                        item_key_id,
+                    )
+                    for item_key_id, _, _ in items
                 ):
                     return self._idempotent_rejection(
                         operation, tenant_id, None,
@@ -1648,9 +1658,10 @@ def make_handler(
                     mirror.describe(
                         {"kind": "encrypt", "write_set": [key_id]}
                     )
-                # Authorization follows validation and precedes existence.
+                # Authorization follows validation and precedes existence;
+                # the target key_id scopes key_ids-limited rules.
                 if not policy_store.is_allowed(
-                    tenant_id, action, operator
+                    tenant_id, action, operator, key_id
                 ):
                     return self._idempotent_rejection(
                         operation, tenant_id, key_id, action, 403,
@@ -1807,7 +1818,7 @@ def make_handler(
                         {"kind": "migrate", "write_set": [key_id]}
                     )
                 if not policy_store.is_allowed(
-                    tenant_id, audit_mod.ACTION_MIGRATE, operator
+                    tenant_id, audit_mod.ACTION_MIGRATE, operator, key_id
                 ):
                     return self._idempotent_rejection(
                         operation, tenant_id, key_id,
@@ -2822,9 +2833,9 @@ def make_handler(
                     )
                 # Authorization precedes the conflict check: a denial is a
                 # bound terminal 403 even when the key_id already exists for
-                # another tenant.
+                # another tenant. The in-bundle key_id is the request target.
                 if not policy_store.is_allowed(
-                    tenant_id, audit_mod.ACTION_IMPORT, operator
+                    tenant_id, audit_mod.ACTION_IMPORT, operator, key_id
                 ):
                     return self._idempotent_rejection(
                         operation, tenant_id, key_id,
@@ -4241,9 +4252,14 @@ def make_handler(
 
             Tenant and operator follow the GET policy rules (a source
             conflict is the usual audited tenant_conflict). The body carries
-            only ``subject`` and ``action``; every body/parameter failure is
-            a 400 naming the field with no audit event. A successful check
-            writes nothing: no audit event, no revision, no file change.
+            ``subject``, ``action`` and an optional ``key_id``; every
+            body/parameter failure is a 400 naming the field with no audit
+            event. When ``key_id`` is omitted the judgment matches only
+            unscoped rules and the response stays in its historical shape;
+            when provided (null or a UUID4) the rules are additionally
+            filtered by that target key and the response echoes the key_id.
+            A successful check writes nothing: no audit event, no revision,
+            no file change.
             """
             tenant_id = self._strict_tenant(parts)
             if tenant_id is None:
@@ -4251,7 +4267,7 @@ def make_handler(
             payload = self._read_json_object(audit=False)
             if payload is None:
                 return
-            unknown = set(payload) - {"subject", "action"}
+            unknown = set(payload) - {"subject", "action", "key_id"}
             if unknown:
                 self._bad_request("unknown field: %s" % sorted(unknown)[0])
                 return
@@ -4279,25 +4295,39 @@ def make_handler(
                     % (action, ", ".join(POLICY_ACTIONS))
                 )
                 return
+            key_id = None
+            key_given = "key_id" in payload
+            if key_given:
+                raw_key_id = payload["key_id"]
+                if raw_key_id is not None and not is_valid_key_id(raw_key_id):
+                    self._bad_request(
+                        "field key_id must be a UUID4 or null"
+                    )
+                    return
+                key_id = raw_key_id
             try:
-                result = policy_store.check(tenant_id, subject, action)
+                result = policy_store.check(
+                    tenant_id, subject, action, key_id
+                )
             except PolicyStoreUnavailable:
                 self._send_json(
                     500, {"error": "policy store is unavailable"}
                 )
                 return
-            self._send_json(
-                200,
-                {
-                    "tenant_id": tenant_id,
-                    "subject": subject,
-                    "action": action,
-                    "allowed": result["allowed"],
-                    "effect": result["effect"],
-                    "reason": result["reason"],
-                    "rules": [rule.to_json() for rule in result["rules"]],
-                },
-            )
+            body = {
+                "tenant_id": tenant_id,
+                "subject": subject,
+                "action": action,
+                "allowed": result["allowed"],
+                "effect": result["effect"],
+                "reason": result["reason"],
+                "rules": [rule.to_json() for rule in result["rules"]],
+            }
+            if key_given:
+                # Echo the exact requested target (including an explicit
+                # null); omitted entirely when the field was omitted.
+                body["key_id"] = key_id
+            self._send_json(200, body)
 
         def _put_policy(self, parts) -> None:
             payload = self._read_json_object()
@@ -4405,11 +4435,37 @@ def _resolve_committed_operation(store, policy_store, record, event):
         # Older records without the stashed terminal: infer once from the
         # durable action and the current state.
         # A policy denial outranks existence: it is reconstructed whenever the
-        # tenant's policy currently rejects this operator/action.
+        # tenant's policy currently rejects this operator/action. Single-key
+        # operations replay against the durable key_id; a batch rotation is
+        # authorized item-by-item (any denied key rejects the whole batch),
+        # matching the request-time rule.
         try:
-            policy_allowed = policy_store.is_allowed(
-                tenant_id, policy_action, operator_id
-            )
+            if kind == "batch_rotate":
+                item_ids = [
+                    one.get("key_id")
+                    for one in details.get("items", [])
+                    if is_valid_key_id(one.get("key_id"))
+                ]
+                if item_ids:
+                    policy_allowed = all(
+                        policy_store.is_allowed(
+                            tenant_id, audit_mod.ACTION_ROTATE, operator_id,
+                            item_key_id,
+                        )
+                        for item_key_id in item_ids
+                    )
+                else:
+                    policy_allowed = policy_store.is_allowed(
+                        tenant_id, policy_action, operator_id
+                    )
+            else:
+                legacy_key_id = event.key_id or details.get("key_id")
+                policy_allowed = policy_store.is_allowed(
+                    tenant_id, policy_action, operator_id,
+                    legacy_key_id
+                    if is_valid_key_id(legacy_key_id)
+                    else None,
+                )
         except PolicyStoreUnavailable:
             # A corrupt policy document must not block crash recovery: fall
             # through to the durable state-based reconstruction below rather
