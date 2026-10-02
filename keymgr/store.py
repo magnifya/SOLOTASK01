@@ -534,17 +534,32 @@ class NativeWrap(NamedTuple):
     handle: str
 
 
-class NativeRewrap(NamedTuple):
-    """A resolved source/target pair whose DEK must be re-wrapped natively.
+class RewrapNativeBinding(NamedTuple):
+    """A resolved same-provider rewrap's native execution binding.
 
-    Returned by :meth:`KeyStore.native_rewrap_binding` when BOTH versions of
-    a rewrap are owned by the same provider_id and that provider declares
-    the ``rewrap_key`` operation: the caller passes this provider and the
-    two handles to ``envelope.rewrap_envelope_native`` instead of exporting
-    either KEK, so the DEK, the KEK private material and the plaintext never
-    enter the service process.
+    Returned by :meth:`KeyStore.rewrap_native_binding` when BOTH versions of
+    a rewrap are owned by the same provider_id and that provider declares at
+    least one of the optional ``rewrap_key``/``unwrap_key``/``wrap_key``
+    operations. ``mode`` selects the execution path:
+
+    * :attr:`KeyStore.REWRAP_NATIVE_FULL`: the provider declares
+      ``rewrap_key``; the caller hands ``provider`` and both handles to
+      ``envelope.rewrap_envelope_native`` -- the whole rewrap, including the
+      wrapped-DEK and content-tag authentication, stays inside the KMS/HSM.
+    * :attr:`KeyStore.REWRAP_NATIVE_SPLIT`: ``rewrap_key`` is not declared
+      but at least one of ``unwrap_key``/``wrap_key`` is. The caller resolves
+      each side's material separately with
+      :meth:`crypto_material`'s ``native_unwrap``/``native_wrap`` modes: a
+      declaring side stays inside its provider (no
+      ``export_material``), a non-declaring side exports its KEK for the
+      in-memory path.
+
+    In both modes the DEK, the KEK private material and the plaintext cross
+    provider boundaries only as wrapped material and enter the service
+    process solely as transient in-memory values.
     """
 
+    mode: str
     provider: object
     source_handle: str
     target_handle: str
@@ -4522,29 +4537,44 @@ class KeyStore:
                 return self.REWRAP_REVOKED, record, source_ver, target_ver
             return self.REWRAP_OK, record, source_ver, target_ver
 
+    # Same-provider rewrap native execution modes returned by
+    # rewrap_native_binding alongside a RewrapNativeBinding:
+    #
+    # REWRAP_NATIVE_FULL  - the provider declares rewrap_key: the ENTIRE
+    #   rewrap (wrapped-DEK and content-tag authentication plus re-wrapping)
+    #   runs inside one KMS/HSM call; export_material is never invoked.
+    # REWRAP_NATIVE_SPLIT - rewrap_key is not declared but at least one side
+    #   declares unwrap_key/wrap_key: each side is resolved independently, a
+    #   declaring side stays inside its provider and only a non-declaring
+    #   side exports its KEK for the in-memory fallback.
+    REWRAP_NATIVE_FULL = "native_full"
+    REWRAP_NATIVE_SPLIT = "native_split"
+
     @_provider_session
-    def native_rewrap_binding(
+    def rewrap_native_binding(
         self,
         key_id: str,
         tenant_id: str,
         source_version: int,
         target_version: int,
     ) -> tuple:
-        """Resolve a KMS/HSM-native rewrap binding for two versions of a key.
+        """Resolve the native execution binding for a same-provider rewrap.
 
         Returns ``(status, native)`` with the REWRAP_* status semantics of
         :meth:`rewrap_versions`. On REWRAP_OK ``native`` is a
-        :class:`NativeRewrap` ``(provider, source_handle, target_handle)``
-        triple when BOTH versions are owned by the same provider_id and that
-        provider declares the optional ``rewrap_key`` operation, and None
-        otherwise (the caller then keeps the export-based rewrap path). The
-        record is re-read under the key locks over the committed projection,
-        so a concurrent revoke/rotate/migrate between the caller's version
-        resolution and the provider call is still answered 409/404 and the
-        handles are always the currently committed ones. A record owned by
-        an inactive provider raises ProviderUnavailable (503), never a
-        silent fallback. Nothing is persisted and no audit event is written
-        here.
+        :class:`RewrapNativeBinding` when BOTH versions are owned by the same
+        provider_id and that provider declares ``rewrap_key`` (mode
+        ``REWRAP_NATIVE_FULL``) or at least one of ``unwrap_key``/
+        ``wrap_key`` (mode ``REWRAP_NATIVE_SPLIT``); when the versions are
+        owned by DIFFERENT providers, or the one provider declares none of
+        the three operations, ``native`` is None and the caller keeps the
+        export-based rewrap path. The record is re-read under the key locks
+        over the committed projection, so a concurrent
+        revoke/rotate/migrate between the caller's version resolution and
+        the provider call is still answered 409/404 and the handles are
+        always the currently committed ones. A record owned by an inactive
+        provider raises ProviderUnavailable (503), never a silent fallback.
+        Nothing is persisted and no audit event is written here.
         """
         if not is_valid_key_id(key_id):
             return self.REWRAP_NOT_FOUND, None
@@ -4570,9 +4600,17 @@ class KeyStore:
                 # by different providers keep the export-based path.
                 return self.REWRAP_OK, None
             provider = self._provider_for(source_ver.provider_id)
-            if not provider_mod.declares_rewrap_key(provider):
+            if provider_mod.declares_rewrap_key(provider):
+                mode = self.REWRAP_NATIVE_FULL
+            elif (
+                provider_mod.declares_unwrap_key(provider)
+                or provider_mod.declares_wrap_key(provider)
+            ):
+                mode = self.REWRAP_NATIVE_SPLIT
+            else:
                 return self.REWRAP_OK, None
-            return self.REWRAP_OK, NativeRewrap(
+            return self.REWRAP_OK, RewrapNativeBinding(
+                mode=mode,
                 provider=provider,
                 source_handle=source_ver.handle,
                 target_handle=target_ver.handle,

@@ -698,6 +698,25 @@ def rewrap_envelope(
     data key itself exists only in process memory for the duration of the
     call and never enters the returned token in the clear.
     """
+    dek = authenticate_envelope(opened, source_kek)
+    return rewrap_envelope_with_dek(
+        opened, dek,
+        target_version=target_version,
+        target_algorithm=target_algorithm,
+        target_kek=target_kek,
+    )
+
+
+def authenticate_envelope(opened: OpenedEnvelope, source_kek) -> bytes:
+    """Fully authenticate an envelope with an exported source KEK.
+
+    Unwraps the data key with the source KEK and verifies the content GCM
+    tag (the recovered plaintext is used only for that check, never stored
+    or returned), then returns the SAME 32-byte data key so the split
+    rewrap path can re-wrap it under the target version. Any wrapping-key
+    or content-tag authentication failure is one field-naming
+    :class:`EnvelopeError` (``field envelope``).
+    """
     dek = _unwrap_dek(opened, source_kek)
     try:
         AESGCM(dek).decrypt(
@@ -707,8 +726,124 @@ def rewrap_envelope(
         raise EnvelopeError(
             "field envelope is tampered or cannot be authenticated"
         ) from exc
+    return dek
+
+
+def rewrap_envelope_with_dek(
+    opened: OpenedEnvelope,
+    dek: bytes,
+    *,
+    target_version: int,
+    target_algorithm: str,
+    target_kek,
+) -> str:
+    """Re-wrap an already-authenticated data key with an exported target KEK.
+
+    The export-based target half of a split rewrap: the data key recovered
+    and authenticated by :func:`authenticate_envelope` (or natively by
+    :func:`recover_dek_native`) is wrapped in-process with the exported
+    target KEK and sealed into the ordinary ``keymgr-envelope-v1`` token.
+    """
     wrapped_key, wrap_nonce = _wrap_dek_with(
         target_algorithm, target_kek, dek
+    )
+    return _reseal_envelope(
+        opened,
+        target_version=target_version,
+        target_algorithm=target_algorithm,
+        wrapped_key=wrapped_key,
+        wrap_nonce=wrap_nonce,
+    )
+
+
+def recover_dek_native(opened: OpenedEnvelope, provider, handle: str) -> bytes:
+    """Authenticate an envelope and recover its 32-byte data key natively.
+
+    The split-native rewrap counterpart of :func:`open_envelope_native`:
+    the data key is unwrapped INSIDE the provider by its bound KEK (the
+    service never calls ``export_material`` and never loads the KEK private
+    material into this process), and the content GCM tag is authenticated
+    here under the recovered data key before it is handed to the target
+    side. The recovered data key exists only in process memory for the
+    duration of one rewrap.
+
+    Error mapping matches the rewrap contract: a wrapping-key
+    authentication failure (``ProviderInvalidMaterial``) and a failed
+    content authentication alike raise :class:`EnvelopeError` (the 400
+    naming the envelope); an unknown/algorithm-mismatched handle or any
+    backend failure raises ``ProviderUnavailable`` (the fixed 503, no audit
+    event); an unexpected ``ValueError``/``TypeError`` from the provider or
+    a non-32-byte result is a contract violation normalized to
+    ``ProviderUnavailable``.
+    """
+    from .provider import (
+        ProviderInvalidMaterial,
+        ProviderUnavailable,
+    )
+
+    try:
+        dek = provider.unwrap_key(
+            handle, opened.wrapped_key, opened.wrap_nonce
+        )
+    except ProviderInvalidMaterial as exc:
+        raise EnvelopeError(
+            "field envelope is tampered or cannot be authenticated"
+        ) from exc
+    except ProviderUnavailable:
+        raise
+    except Exception as exc:
+        # A conforming provider cannot raise these for a structurally
+        # valid envelope: treat any residual exception, including a
+        # ValueError/TypeError or a backend fault the adapter did not
+        # normalize, as a contract/backend failure -> 503, never carrying
+        # provider text.
+        raise ProviderUnavailable(
+            "provider unwrap_key raised a contract violation"
+        ) from exc
+    if not isinstance(dek, bytes) or len(dek) != _KEY_LEN:
+        raise ProviderUnavailable(
+            "provider returned a malformed data key from unwrap_key"
+        )
+    try:
+        AESGCM(dek).decrypt(
+            opened.nonce, opened.ciphertext + opened.tag, opened.aad
+        )
+    except InvalidTag as exc:
+        raise EnvelopeError(
+            "field envelope is tampered or cannot be authenticated"
+        ) from exc
+    return dek
+
+
+def rewrap_envelope_split(
+    opened: OpenedEnvelope,
+    dek: bytes,
+    *,
+    target_version: int,
+    target_algorithm: str,
+    target_provider,
+    target_handle: str,
+) -> str:
+    """Re-wrap an already-authenticated data key natively under a new KEK.
+
+    The target half of a split-native rewrap: the data key recovered and
+    authenticated by :func:`recover_dek_native` is wrapped INSIDE the
+    target provider by the target handle's KEK, so the target side never
+    calls ``export_material`` and never loads its KEK private material into
+    this process. The returned ``(wrapped_key, wrap_nonce)`` is sealed into
+    the ordinary ``keymgr-envelope-v1`` token here, byte-compatible with
+    :func:`rewrap_envelope` and :func:`rewrap_envelope_native`.
+
+    Result validation is identical to :func:`wrap_data_key_native`: a
+    non-tuple, wrong arity, wrong types or wrong lengths are contract
+    failures normalized to ``ProviderUnavailable`` (the fixed 503), as is
+    any ``ValueError``/``TypeError``/backend exception from the provider.
+    """
+    wrapped_key, wrap_nonce = wrap_data_key_native(
+        provider=target_provider,
+        handle=target_handle,
+        algorithm=target_algorithm,
+        data_key=dek,
     )
     return _reseal_envelope(
         opened,

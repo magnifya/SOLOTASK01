@@ -583,3 +583,260 @@ def test_endpoint_falls_back_when_not_declared(plain_stack):
     assert plain_stack.fake_kms.call_count("export_material") == 2
     status, reply = _decrypt(client, kid, body["envelope"])
     assert status == 200 and base64.b64decode(reply["plaintext"]) == b"legacy"
+
+
+# -- split-native rewrap (per-side unwrap_key / wrap_key) -------------------
+@pytest.fixture()
+def split_stack(tmp_path, monkeypatch):
+    yield from _build_server(
+        tmp_path, monkeypatch,
+        {"declare_unwrap_key": True, "declare_wrap_key": True},
+    )
+
+
+@pytest.fixture()
+def split_unwrap_stack(tmp_path, monkeypatch):
+    yield from _build_server(
+        tmp_path, monkeypatch, {"declare_unwrap_key": True}
+    )
+
+
+@pytest.fixture()
+def split_wrap_stack(tmp_path, monkeypatch):
+    yield from _build_server(
+        tmp_path, monkeypatch, {"declare_wrap_key": True}
+    )
+
+
+@pytest.mark.parametrize(
+    "src_algorithm,dst_algorithm",
+    [
+        ("AES256", "AES256"),
+        ("AES256", "RSA2048"),
+        ("RSA2048", "AES256"),
+        ("RSA2048", "RSA2048"),
+    ],
+)
+def test_endpoint_split_native_all_algorithm_pairs(
+    split_stack, src_algorithm, dst_algorithm
+):
+    client = split_stack.client
+    kid = _make_key(client, algorithm=src_algorithm)
+    token = _encrypt(client, kid, b"split", version=1, aad=b64(b"a"))
+    _rotate(client, kid, dst_algorithm, "rot-split-%s" % dst_algorithm)
+    split_stack.fake_kms.reset()
+    status, body = _rewrap(client, kid, token, aad=b64(b"a"))
+    assert status == 200, body
+    # rewrap_key is NOT declared; the source DEK is unwrapped natively, the
+    # SAME DEK is re-wrapped natively and export_material is never called.
+    assert split_stack.fake_kms.call_count("rewrap_key") == 0
+    assert split_stack.fake_kms.call_count("unwrap_key") == 1
+    assert split_stack.fake_kms.call_count("wrap_key") == 1
+    assert split_stack.fake_kms.call_count("export_material") == 0
+    before, after = _inner(token), _inner(body["envelope"])
+    assert after["version"] == 2
+    assert after["algorithm"] == dst_algorithm
+    for field in ("key_id", "nonce", "tag", "ciphertext", "aad"):
+        assert after[field] == before[field], field
+    status, reply = _decrypt(client, kid, body["envelope"], aad=b64(b"a"))
+    assert status == 200
+    assert base64.b64decode(reply["plaintext"]) == b"split"
+
+
+def test_endpoint_split_prefers_full_rewrap_when_declared(native_stack):
+    # When rewrap_key is declared alongside the per-side operations the full
+    # native rewrap keeps precedence (the split path is not used).
+    client = native_stack.client
+    kid = _make_key(client)
+    token = _encrypt(client, kid, b"full", version=1)
+    _rotate(client, kid, "AES256", "rot-full-precedence")
+    _set_faults(
+        native_stack,
+        {
+            "declare_rewrap_key": True,
+            "declare_unwrap_key": True,
+            "declare_wrap_key": True,
+        },
+    )
+    native_stack.fake_kms.reset()
+    status, body = _rewrap(client, kid, token)
+    assert status == 200, body
+    assert native_stack.fake_kms.call_count("rewrap_key") == 1
+    assert native_stack.fake_kms.call_count("unwrap_key") == 0
+    assert native_stack.fake_kms.call_count("wrap_key") == 0
+    assert native_stack.fake_kms.call_count("export_material") == 0
+
+
+def test_endpoint_split_source_only_native_exports_target(split_unwrap_stack):
+    client = split_unwrap_stack.client
+    kid = _make_key(client)
+    token = _encrypt(client, kid, b"src-only", version=1)
+    _rotate(client, kid, "AES256", "rot-split-src")
+    split_unwrap_stack.fake_kms.reset()
+    status, body = _rewrap(client, kid, token)
+    assert status == 200, body
+    assert split_unwrap_stack.fake_kms.call_count("unwrap_key") == 1
+    assert split_unwrap_stack.fake_kms.call_count("wrap_key") == 0
+    # Only the TARGET KEK is exported for the in-memory re-wrap.
+    assert split_unwrap_stack.fake_kms.call_count("export_material") == 1
+    status, reply = _decrypt(client, kid, body["envelope"])
+    assert status == 200
+    assert base64.b64decode(reply["plaintext"]) == b"src-only"
+
+
+def test_endpoint_split_target_only_native_exports_source(split_wrap_stack):
+    client = split_wrap_stack.client
+    kid = _make_key(client)
+    token = _encrypt(client, kid, b"tgt-only", version=1)
+    _rotate(client, kid, "AES256", "rot-split-tgt")
+    split_wrap_stack.fake_kms.reset()
+    status, body = _rewrap(client, kid, token)
+    assert status == 200, body
+    # Only the SOURCE KEK is exported; the same DEK is wrapped natively.
+    assert split_wrap_stack.fake_kms.call_count("wrap_key") == 1
+    assert split_wrap_stack.fake_kms.call_count("unwrap_key") == 0
+    assert split_wrap_stack.fake_kms.call_count("export_material") == 1
+    status, reply = _decrypt(client, kid, body["envelope"])
+    assert status == 200
+    assert base64.b64decode(reply["plaintext"]) == b"tgt-only"
+
+
+def _tampered_envelope(token, field):
+    obj = _inner(token)
+    raw = bytearray(base64.b64decode(obj[field]))
+    raw[0] ^= 0x01
+    obj[field] = b64(bytes(raw))
+    return b64(json.dumps(obj, sort_keys=True).encode())
+
+
+def test_endpoint_split_wrap_auth_failure_is_400_not_audited(split_stack):
+    client = split_stack.client
+    kid = _make_key(client)
+    token = _encrypt(client, kid, b"wrapauth", version=1)
+    _rotate(client, kid, "AES256", "rot-split-wrap-auth")
+    tampered = _tampered_envelope(token, "wrapped_key")
+    split_stack.fake_kms.reset()
+    status, err = _rewrap(client, kid, tampered)
+    assert status == 400, err
+    assert "field envelope" in err["error"]
+    # The source unwrap was attempted natively; the target wrap was NOT.
+    assert split_stack.fake_kms.call_count("unwrap_key") == 1
+    assert split_stack.fake_kms.call_count("wrap_key") == 0
+    # A native authentication failure must NOT fall back to export.
+    assert split_stack.fake_kms.call_count("export_material") == 0
+    assert _rewrap_events(split_stack) == []
+
+
+def test_endpoint_split_content_tag_failure_is_400_not_audited(split_stack):
+    client = split_stack.client
+    kid = _make_key(client)
+    token = _encrypt(client, kid, b"tagauth", version=1)
+    _rotate(client, kid, "AES256", "rot-split-tag-auth")
+    tampered = _tampered_envelope(token, "ciphertext")
+    split_stack.fake_kms.reset()
+    status, err = _rewrap(client, kid, tampered)
+    assert status == 400, err
+    assert "field envelope" in err["error"]
+    # The DEK was unwrapped (the wrap authenticated) but the content tag
+    # failed here, so no target wrap and no export fallback.
+    assert split_stack.fake_kms.call_count("unwrap_key") == 1
+    assert split_stack.fake_kms.call_count("wrap_key") == 0
+    assert split_stack.fake_kms.call_count("export_material") == 0
+    assert _rewrap_events(split_stack) == []
+
+
+def test_endpoint_split_unwrap_backend_fault_is_503_not_audited(split_stack):
+    client = split_stack.client
+    kid = _make_key(client)
+    token = _encrypt(client, kid, b"fault", version=1)
+    _rotate(client, kid, "AES256", "rot-split-unwrap-fault")
+    _set_faults(
+        split_stack,
+        {"declare_unwrap_key": True, "declare_wrap_key": True,
+         "unwrap_fail": True},
+    )
+    split_stack.fake_kms.reset()
+    status, body = _rewrap(client, kid, token)
+    assert status == 503
+    assert body == {"error": "key management provider is unavailable"}
+    # No fallback to export, no target wrap, no audit.
+    assert split_stack.fake_kms.call_count("wrap_key") == 0
+    assert split_stack.fake_kms.call_count("export_material") == 0
+    assert _rewrap_events(split_stack) == []
+
+
+def test_endpoint_split_unwrap_short_dek_is_503_not_audited(split_stack):
+    client = split_stack.client
+    kid = _make_key(client)
+    token = _encrypt(client, kid, b"short", version=1)
+    _rotate(client, kid, "AES256", "rot-split-unwrap-short")
+    _set_faults(
+        split_stack,
+        {"declare_unwrap_key": True, "declare_wrap_key": True,
+         "unwrap_short": True},
+    )
+    split_stack.fake_kms.reset()
+    status, body = _rewrap(client, kid, token)
+    assert status == 503
+    assert body == {"error": "key management provider is unavailable"}
+    assert split_stack.fake_kms.call_count("wrap_key") == 0
+    assert _rewrap_events(split_stack) == []
+
+
+def test_endpoint_split_wrap_backend_fault_is_503_not_audited(split_stack):
+    client = split_stack.client
+    kid = _make_key(client)
+    token = _encrypt(client, kid, b"wrapfault", version=1)
+    _rotate(client, kid, "AES256", "rot-split-wrap-fault")
+    _set_faults(
+        split_stack,
+        {"declare_unwrap_key": True, "declare_wrap_key": True,
+         "wrap_fail": True},
+    )
+    split_stack.fake_kms.reset()
+    status, body = _rewrap(client, kid, token)
+    assert status == 503
+    assert body == {"error": "key management provider is unavailable"}
+    # Source authenticated natively first; no export fallback on the wrap.
+    assert split_stack.fake_kms.call_count("unwrap_key") == 1
+    assert split_stack.fake_kms.call_count("export_material") == 0
+    assert _rewrap_events(split_stack) == []
+
+
+def test_endpoint_split_wrap_short_blob_is_503_not_audited(split_stack):
+    client = split_stack.client
+    kid = _make_key(client)
+    token = _encrypt(client, kid, b"wrapshort", version=1)
+    _rotate(client, kid, "AES256", "rot-split-wrap-short")
+    _set_faults(
+        split_stack,
+        {"declare_unwrap_key": True, "declare_wrap_key": True,
+         "wrap_short": True},
+    )
+    split_stack.fake_kms.reset()
+    status, body = _rewrap(client, kid, token)
+    assert status == 503
+    assert body == {"error": "key management provider is unavailable"}
+    assert split_stack.fake_kms.call_count("unwrap_key") == 1
+    assert _rewrap_events(split_stack) == []
+
+
+@pytest.fixture()
+def broken_split_stack(tmp_path, monkeypatch):
+    # Declaring unwrap_key without a callable method breaks the provider
+    # contract at factory validation, so every provider call is fixed 503.
+    yield from _build_server(
+        tmp_path, monkeypatch,
+        {"declare_unwrap_key": True, "unwrap_not_callable": True},
+    )
+
+
+def test_endpoint_split_unwrap_not_callable_breaks_contract(
+    broken_split_stack
+):
+    status, body = broken_split_stack.client.call(
+        "POST", "/v1/keys",
+        {"tenant_id": "t", "algorithm": "AES256", "label": "k"},
+    )
+    assert status == 503
+    assert body == {"error": "key management provider is unavailable"}
