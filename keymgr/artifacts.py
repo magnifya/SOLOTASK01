@@ -63,6 +63,7 @@ _DIR_NAME = "operation-artifacts"
 
 # Kinds and the audit action each commits with.
 _KIND_ACTIONS = {
+    "create": audit_mod.ACTION_CREATE,
     "rotate": audit_mod.ACTION_ROTATE,
     "batch_rotate": audit_mod.ACTION_BATCH_ROTATE,
     "import": audit_mod.ACTION_IMPORT,
@@ -118,6 +119,18 @@ class ArtifactStrandUnavailable(Exception):
     def __init__(self, message: str = "", http_status: int = 503) -> None:
         super().__init__(message)
         self.http_status = http_status
+
+
+class ArtifactEvidenceRetained(ArtifactStrandUnavailable):
+    """A bound attempt reached a provider and left surviving evidence.
+
+    Marks the strand-unavailable cases where provisioning happened (or the
+    mirror is corrupt) and a live request must not re-execute the attempt:
+    the evidence set is retained and the operation stays pending until a
+    process restart settles the cleanup. Carries the conventional 503; the
+    HTTP layer maps it to a 500 for key creation, whose contract reserves
+    503 exclusively for an unavailable provider.
+    """
 
 
 class ArtifactAlreadyTerminal(Exception):
@@ -221,7 +234,7 @@ class ArtifactMirror:
             seen.add(key_id)
             normalized.append(key_id)
         normalized.sort()
-        if kind in ("rotate", "import", "migrate", "encrypt") and len(
+        if kind in ("create", "rotate", "import", "migrate", "encrypt") and len(
             normalized
         ) != 1:
             raise ArtifactInconsistent(
@@ -592,7 +605,7 @@ class ArtifactStore:
         if os.path.exists(self.path_for(operation_id)):
             # Named on disk but unparseable: a corrupt mirror is evidence to
             # preserve, never rebuilt over by a live request.
-            raise ArtifactStrandUnavailable("corrupt mirror")
+            raise ArtifactEvidenceRetained("corrupt mirror")
         # Missing mirror: the classic failed strand (mirror creation raised
         # before the first provider call) -- only restartable when not a trace
         # of the attempt survives and nothing committed under this id.
@@ -603,7 +616,7 @@ class ArtifactStore:
             "empty_marker": None,
         }
         if not self._clean_strand_descriptor(operation, probe):
-            raise ArtifactStrandUnavailable(
+            raise ArtifactEvidenceRetained(
                 "missing mirror with surviving or uncertain evidence"
             )
         try:
@@ -626,15 +639,15 @@ class ArtifactStore:
         """
         phase = descriptor.get("phase")
         if phase != PHASE_BOUND or descriptor.get("handles"):
-            raise ArtifactStrandUnavailable(
+            raise ArtifactEvidenceRetained(
                 "mirror phase %r cannot be taken over" % phase
             )
         if descriptor.get("journal") or descriptor.get("snapshot"):
-            raise ArtifactStrandUnavailable(
+            raise ArtifactEvidenceRetained(
                 "mirror already references a journal or snapshot"
             )
         if not self._clean_strand_descriptor(operation, descriptor):
-            raise ArtifactStrandUnavailable(
+            raise ArtifactEvidenceRetained(
                 "surviving evidence blocks the mirror takeover"
             )
         # Reset the durable image to a fresh bound strand. Discard first so a
@@ -1026,7 +1039,7 @@ class ArtifactStore:
             if not _is_key_id(key_id) or key_id in seen:
                 return False
             seen.add(key_id)
-        if kind in ("rotate", "import", "migrate", "encrypt") and len(
+        if kind in ("create", "rotate", "import", "migrate", "encrypt") and len(
             seen
         ) != 1:
             return False
@@ -1050,7 +1063,7 @@ class ArtifactStore:
         if not isinstance(details, dict) or details.get("kind") != kind:
             return False
         write_set = descriptor.get("write_set") or []
-        if kind in ("rotate", "import", "migrate", "encrypt"):
+        if kind in ("create", "rotate", "import", "migrate", "encrypt"):
             return details.get("key_id") == (write_set[0] if write_set else None)
         if kind == "batch_rotate":
             items = details.get("items")
@@ -1134,7 +1147,14 @@ class ArtifactStore:
             return False
         kind = descriptor.get("kind")
         write_set = descriptor.get("write_set") or []
-        if kind in ("rotate", "import", "migrate", "encrypt"):
+        if kind == "create":
+            # A create rejection happens BEFORE the provider call: the write
+            # set is not the key being rejected, so the rejection projects no
+            # key_id even though the mirror's write set names the key that a
+            # success would have created.
+            if event.key_id is not None:
+                return False
+        elif kind in ("rotate", "import", "migrate", "encrypt"):
             if event.key_id != (write_set[0] if write_set else None):
                 return False
         elif event.key_id is not None:
@@ -1189,7 +1209,7 @@ class ArtifactStore:
         allowed_status = 200 if kind in _STATUS_200_KINDS else 201
         if http_status != allowed_status:
             return False
-        if kind in ("rotate", "import"):
+        if kind in ("create", "rotate", "import"):
             key_id = write_set[0] if write_set else None
             if response.get("key_id") != key_id:
                 return False
@@ -1199,6 +1219,17 @@ class ArtifactStore:
             if kind == "rotate":
                 version = response.get("version")
                 if not isinstance(version, int) or key.get_version(version) is None:
+                    return False
+            else:
+                # create/import: the replay must preserve the ORIGINAL
+                # algorithm and public key (version 1), even if the key was
+                # rotated later.
+                version = key.get_version(1)
+                if version is None:
+                    return False
+                if response.get("algorithm") != version.algorithm:
+                    return False
+                if response.get("public_key") != version.public_key:
                     return False
         elif kind == "migrate":
             key_id = write_set[0] if write_set else None

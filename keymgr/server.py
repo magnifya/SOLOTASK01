@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -16,6 +17,7 @@ from . import restore as restore_mod
 from . import signing as signing_mod
 from . import tenantbundle
 from .artifacts import (
+    ArtifactEvidenceRetained,
     ArtifactAlreadyTerminal,
     ArtifactStrandUnavailable,
 )
@@ -298,6 +300,8 @@ def make_handler(
             kind = details.get("kind")
             if kind == "batch_rotate":
                 action = audit_mod.ACTION_BATCH_ROTATE
+            elif kind == "create":
+                action = audit_mod.ACTION_CREATE
             elif kind == "rotate":
                 action = audit_mod.ACTION_ROTATE
             elif kind == "encrypt":
@@ -438,8 +442,18 @@ def make_handler(
                 return
             except ArtifactStrandUnavailable as exc:
                 # Mirror claim/creation failed with the op still bound and
-                # pending: surface 500/503 without finalizing it.
-                self._send_strand_unavailable(op_id, exc.http_status)
+                # pending: surface 500/503 without finalizing it. Key
+                # creation answers retained-evidence/persistence faults with
+                # 500 and reserves 503 for an unavailable provider.
+                kind = (operation.details or {}).get("kind")
+                if kind == "create" and (
+                    isinstance(exc, ArtifactEvidenceRetained)
+                    or exc.http_status == 500
+                ):
+                    status = 500
+                else:
+                    status = exc.http_status
+                self._send_strand_unavailable(op_id, status)
                 return
             except BlockingIOError:
                 # A live owner holds the attempt; the caller waits.
@@ -463,9 +477,25 @@ def make_handler(
             except ArtifactStrandUnavailable as exc:
                 # The mirror could not be described/tied in before the first
                 # provider call, or a clean strand could not be taken over.
-                # Nothing committed: leave the operation PENDING and answer
-                # 500/503. A same-key HTTP/CLI retry reuses the operation_id.
-                self._send_strand_unavailable(op_id, exc.http_status)
+                # Nothing committed: leave the operation PENDING. For a key
+                # creation every such material/evidence fault is a 500 (the
+                # endpoint reserves its fixed 503 exclusively for an
+                # unavailable provider); the other idempotent mutations keep
+                # their existing 500/503 distinction. A same-key HTTP/CLI
+                # retry reuses the operation_id.
+                kind = (operation.details or {}).get("kind")
+                if kind == "create" and (
+                    isinstance(exc, ArtifactEvidenceRetained)
+                    or exc.http_status == 500
+                ):
+                    # Key creation answers retained-evidence and persistence
+                    # faults with 500; its fixed 503 is reserved for an
+                    # unavailable provider. Other mutations keep the existing
+                    # 500/503 distinction.
+                    status = 500
+                else:
+                    status = exc.http_status
+                self._send_strand_unavailable(op_id, status)
                 return
             except LockTimeout:
                 # Lock wait exceeded 5 s: no key, audit event or handle was
@@ -830,7 +860,7 @@ def make_handler(
                 return
             try:
                 if path == "/v1/keys":
-                    self._create_key(operator)
+                    self._create_key(operator, parts)
                     return
 
                 rotate_match = _ROTATE_PATH_RE.match(path)
@@ -953,7 +983,140 @@ def make_handler(
 
             self._send_json(404, {"error": "not found"})
 
-        def _create_key(self, operator: str) -> None:
+        def _optional_idempotency_key(self):
+            """Return (key, present). An absent header returns (None, True).
+
+            An EMPTY, duplicated or malformed Idempotency-Key is a side-effect-
+            free 400 naming the header, identical in wording to the required-
+            header endpoints; the absence of the header keeps the legacy
+            non-idempotent POST /v1/keys behavior.
+            """
+            values = self.headers.get_all("Idempotency-Key") or []
+            if not values:
+                return None, True
+            if len(values) > 1:
+                self._bad_request(
+                    "duplicate Idempotency-Key (provide a single header)"
+                )
+                return None, False
+            value = values[0]
+            if not operations_mod.is_valid_idempotency_key(value):
+                self._bad_request(
+                    "field Idempotency-Key must be 1-128 characters from "
+                    "A-Za-z0-9._~-"
+                )
+                return None, False
+            return value, True
+
+        def _create_key(self, operator: str, parts) -> None:
+            # The Idempotency-Key is OPTIONAL on this endpoint: without it the
+            # request keeps the legacy (non-idempotent) create behavior. When
+            # present it is validated first, exactly like the required-header
+            # endpoints, and every later parse/parameter/field failure up to
+            # the bind is a side-effect-free 400 (no audit, operation record,
+            # key or handle; the tenant-source missing/conflict convention
+            # still records its invisible tenant_conflict).
+            idem_key, ok = self._optional_idempotency_key()
+            if not ok:
+                return
+            if idem_key is None:
+                self._create_key_legacy(operator)
+                return
+
+            payload = self._read_json_object(audit=False)
+            if payload is None:
+                return
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                # A missing/invalid tenant source still records the invisible
+                # tenant_conflict, even before the idempotency key is bound.
+                if self._record_conflict():
+                    self._bad_request(
+                        "field tenant_id must be a non-empty string"
+                    )
+                return
+            tenant_id = self._tenant(parts, payload)
+            if tenant_id is None:
+                return
+            # Exactly {tenant_id, algorithm, label}; label may be "".
+            allowed = ("tenant_id", "algorithm", "label")
+            extra = [field for field in payload if field not in allowed]
+            if extra:
+                self._bad_request(
+                    "field %s is not accepted by this endpoint" % extra[0]
+                )
+                return
+            for field in ("algorithm", "label"):
+                if field not in payload or not isinstance(payload[field], str):
+                    self._bad_request(
+                        "field %s must be a string" % field
+                        if field in payload
+                        else "missing required field: %s" % field
+                    )
+                    return
+            algorithm = payload["algorithm"]
+            if algorithm not in SUPPORTED_ALGORITHMS:
+                self._bad_request(
+                    "unsupported value for field algorithm: %r (supported: %s)"
+                    % (algorithm, ", ".join(SUPPORTED_ALGORITHMS))
+                )
+                return
+            label = payload["label"]
+
+            def execute(operation, mirror=None):
+                # The key_id is fixed durably with the operation BEFORE the
+                # mirror describes the write set and before any provider
+                # call, so an identical retry (or a post-crash takeover)
+                # creates exactly this one key rather than minting another.
+                prior = operation.details or {}
+                key_id = prior.get("key_id")
+                if not is_valid_key_id(key_id):
+                    key_id = str(uuid.uuid4())
+                # Kind and exact write-set key_id are durable before the
+                # authorization check, so any bound terminal replays from
+                # context alone.
+                operation_store.update_details(
+                    operation,
+                    {"kind": "create", "key_id": key_id,
+                     "algorithm": algorithm},
+                )
+                if mirror is not None:
+                    mirror.describe({"kind": "create", "write_set": [key_id]})
+                # Authorization follows validation. A denial is a bound
+                # terminal 403 with exactly one create/rejected event named
+                # after the operation_id (key_id null: no key was minted).
+                if not policy_store.is_allowed(
+                    tenant_id, audit_mod.ACTION_CREATE, operator, None
+                ):
+                    return self._idempotent_rejection(
+                        operation, tenant_id, None,
+                        audit_mod.ACTION_CREATE, 403,
+                        "action not permitted by policy",
+                    )
+
+                def stage_success(committed_record):
+                    body = committed_record.to_create_response()
+                    body["operation_id"] = operation.operation_id
+                    operation_store.stage_terminal(operation, 201, body)
+
+                record = store.create(
+                    tenant_id=tenant_id,
+                    algorithm=algorithm,
+                    label=label,
+                    event_id=operation.operation_id,
+                    pre_commit=stage_success,
+                    mirror=mirror,
+                    key_id=key_id,
+                )
+                # The single success event committed in the same outbox
+                # transaction (event_id == operation_id).
+                return 201, record.to_create_response()
+
+            self._idempotent_guard(
+                parts.path, tenant_id, operator, payload, idem_key, execute
+            )
+
+        def _create_key_legacy(self, operator: str) -> None:
             payload = self._read_json_object()
             if payload is None:
                 # Conflict (if any) was already recorded by the body parser.
@@ -4573,10 +4736,24 @@ def _resolve_committed_operation(store, policy_store, record, event):
             )
         if complete:
             return 201, {"items": result_items, "operation_id": op_id}
-    if kind == "import":
+    if kind in ("create", "import"):
         key_id = event.key_id or details.get("key_id")
         key = store.get(key_id, tenant_id)
         if key is not None:
+            if kind == "create":
+                # Replay the ORIGINAL version-1 facts even if the key was
+                # rotated later: later rotation can never change a create
+                # replay's algorithm or public key.
+                version = key.get_version(1)
+                if version is None:
+                    return 201, {"operation_id": op_id}
+                body = {
+                    "key_id": key_id,
+                    "algorithm": version.algorithm,
+                    "public_key": version.public_key,
+                    "operation_id": op_id,
+                }
+                return 201, body
             body = key.to_create_response()
             body["operation_id"] = op_id
             return 201, body

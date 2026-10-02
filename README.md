@@ -60,8 +60,27 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 ## HTTP 接口
 
 - `POST /v1/keys`，body `{tenant_id, algorithm, label}`，`algorithm` 仅
-  `AES256`/`RSA2048`。`201` → `{key_id, algorithm, public_key}`（AES 的
-  `public_key` 为 null，RSA 为 PEM）。
+  `AES256`/`RSA2048`，`label` 可为空字符串。`201` →
+  `{key_id, algorithm, public_key}`（AES 的 `public_key` 为 null，RSA 为
+  PEM）。**可选**单一 `Idempotency-Key` 头：不带头（以及 CLI `gen`）保持
+  旧的非幂等行为，每次新建密钥；带头时按幂等操作处理，绑定租户、操作者、
+  路径与规范化体（仍只用 tenant_id/algorithm/label，忽略 JSON 空白与字段
+  顺序），`201` 成功体额外含 `operation_id`，密钥从 active 版本 1 开始，
+  `event_id` 即 `operation_id`、每操作至多一条 `create` 事件。空值、重复或
+  非法幂等键返回指出 `Idempotency-Key` 的 `400` 且零副作用；坏 JSON、正文非
+  对象、字段缺失/多余/类型错误及非法算法均为绑定**之前**的字段级 `400`（不
+  占用幂等键、不写审计），身份与租户来源错误沿用公开约定（
+  `tenant_conflict` 照旧）。同绑定重试重放首次状态码与完整响应（后来轮换密
+  钥也不改变重放的版本 1 算法与公钥）；任一绑定要素改变返回 `409`，体仅
+  `error,operation_id`。同键并发只执行一次，等待方超 5 秒返回固定 `503`
+  （等待方不写任何状态）。授权仍用 `create`：拒绝 `403` 只记一次
+  `create/rejected`（key_id 为 null），成功只记一次 `create/success`。提
+  供者不可用返回固定 `503`（不写审计，操作保持 pending，同键重试恰好继续一
+  次）；策略存储不可用返回固定 `500` 且不写审计；账本或密钥存储失败为绑定后
+  `500`（体仅 `error,operation_id`）。重启后已提交操作恢复原完整 `201`；
+  明确未提交的操作回滚新密钥与句柄后置 failed 并以 `500` 重放；证据不足或
+  清理失败则保留恢复线索、保持 pending 并返回 `500`。私钥、句柄与包装材料
+  不进入响应、审计或错误。
 - `GET /v1/keys/{key_id}` → `{algorithm, label, created_at, public_key}`。
 - `GET /v1/keys`：本租户密钥快照分页清单。单一租户来源（单一头或单一
   `?tenant_id=`）；可选单值参数 `status`(active|revoked)、
@@ -493,12 +512,16 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   维持非幂等、无此头）必须携带**单一** `Idempotency-Key` 头（前五个 CLI
   必填 `--idempotency-key`），值为 1–128 个 `[A-Za-z0-9._~-]` 字符。缺失、为空、
   重复、非法一律 `400`（CLI `2`），且该校验先于请求体读取与一切业务：不写
-  审计、操作记录、密钥或提供者句柄。
+  审计、操作记录、密钥或提供者句柄。`POST /v1/keys` 的幂等键为**可选**：不
+  带头（含 CLI `gen`）保持每次新建的旧行为，带头时遵循同一套校验、绑定、重
+  放、并发与崩溃一致性规则（动作 `create`，见该端点说明），无 CLI 对应。
 - 键全局唯一，绑定记录 `operation_id`(UUID4)、租户、操作者、路径、规范化体
   （键排序紧凑 JSON）、状态、HTTP 状态与响应；存于 `operations/<id>.json`
   (0600) 与 `operations/index.json`，进程内锁 + `operations.lock` 的 fcntl
   排他锁串行化。encrypt 的规范化体对明文/AAD 只保存键控不透明承诺，绝不保存
-  明文或 AAD 本身。
+  明文或 AAD 本身。带头的密钥生成 (`create`) 同样使用该全局绑定：其写集为
+  新 key_id（版本 1），并像 rotate 一样配 provision journal 与 operation 工
+  件镜像。
 - 相同绑定重试：直接重放首次状态码、响应体与审计事件（同一
   `operation_id`，业务不执行第二次）。同键不同绑定：`409`（CLI `3`），错误
   体给出已有 `operation_id`。绑定前的导入/恢复解密无副作用：口令错误 `400`
@@ -523,7 +546,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   时保持 `pending`（信封无法在无请求的情况下重建，故绝不臆造终态），由同键
   HTTP 重试在同一 `operation_id` 下恰好再执行一次。不重复记账（账本按
   event_id 去重），不误判。
-- **operation 工件镜像**：rotate/import/restore/batch-rotate/migrate 以及
+- **operation 工件镜像**：带头的密钥生成 (create)、rotate/import/restore/batch-rotate/migrate 以及
   HTTP encrypt 在幂等键绑定记录耐久**之后**、首次调用提供者**之前**，原子创建
   `operation-artifacts/<operation_id>.json`（0600、temp 文件 fsync 后 rename；
   非幂等入口与未绑定请求不创建该目录；CLI `encrypt` 为非幂等入口不创建）。
@@ -871,7 +894,7 @@ python -m keymgr provider reconnect --operator alice
   策略文件与标记，下一次启动重试，全部句柄确认删除后才移除整组文件。
 - 私钥与口令只存在于口令加密的包内或经提供者包装后的记录中；游标 HMAC 密钥
   存于 `audit.secret`(0600)。材料不会出现在任何响应、审计投影或错误信息中。
-- rotate/import/restore/batch-rotate/migrate 另有 0600 的 operation 工件镜像
+- 带头的密钥生成 (create)、rotate/import/restore/batch-rotate/migrate 另有 0600 的 operation 工件镜像
   `operation-artifacts/<operation_id>.json`：绑定后、调用提供者前创建，交叉
   关联 `operations/<id>.json`、`provisions/<id>.json`、restore 标记（含空
   restore 标记）或 batch snapshot；migrate 另关联其

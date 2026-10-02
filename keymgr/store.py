@@ -161,6 +161,10 @@ class VersionHistoryPage(NamedTuple):
     next_cursor: Optional[str]
 
 
+# Default deadline for contending the per-key locks of a fresh create.
+LOCK_WAIT_SECONDS_DEFAULT = 5.0
+
+
 class LockTimeout(Exception):
     """A guarded key could not be locked within the allowed wait.
 
@@ -1582,7 +1586,16 @@ class KeyStore:
         return active
 
     @_provider_session
-    def create(self, tenant_id: str, algorithm: str, label: str) -> KeyRecord:
+    def create(
+        self,
+        tenant_id: str,
+        algorithm: str,
+        label: str,
+        event_id: Optional[str] = None,
+        pre_commit=None,
+        mirror=None,
+        key_id: Optional[str] = None,
+    ) -> KeyRecord:
         """Generate, persist and return a new key record (version 1).
 
         Material is minted by the active KMS/HSM provider; only the provider
@@ -1591,7 +1604,35 @@ class KeyStore:
         ledger failure deletes both the just-written file and the minted
         handle and raises LedgerError, so the change and its event never land
         separately.
+
+        An idempotent POST /v1/keys supplies ``event_id`` (its operation_id,
+        so a crash or retry dedupes on one id), a ``pre_commit`` hook that
+        stages the exact 201 response before the commit-point append, and the
+        attempt's artifact ``mirror``. In that mode the key_id is generated
+        BEFORE the provider is called so it can be journaled and mirrored as
+        the write set, and a provision journal records the single minted
+        handle exactly like a rotation: a crash before the commit point is
+        reaped at the next open (event absent -> handle deleted, key file
+        removed). A provider gate that never effectively starts raises
+        ProviderReconnectPending with the mirror reset and no handle minted;
+        a failed post-mint cleanup that cannot be confirmed raises
+        ArtifactStrandUnavailable, leaving the full evidence set in place and
+        the operation pending.
         """
+        if event_id is not None:
+            # The idempotent path fixes the key_id up front so the journal and
+            # mirror name the write set before any provider call; take the
+            # per-key locks first so the provider gate runs inside them, as a
+            # rotation does.
+            if key_id is None:
+                key_id = str(uuid.uuid4())
+            with self.key_locks(
+                key_id, timeout=LOCK_WAIT_SECONDS_DEFAULT
+            ):
+                return self._create_idempotent(
+                    tenant_id, algorithm, label, key_id, event_id,
+                    pre_commit, mirror,
+                )
         provider = self._provider()
         triple = provider.generate(algorithm)
         key_id = str(uuid.uuid4())
@@ -1624,6 +1665,135 @@ class KeyStore:
                 self._path_for(key_id), record, event, None,
                 provider=provider, new_handles=(triple.handle,),
             )
+        return record
+
+    def _create_idempotent(
+        self, tenant_id, algorithm, label, key_id, event_id,
+        pre_commit, mirror,
+    ) -> KeyRecord:
+        """The mirrored, journaled create body; caller holds the key locks."""
+        from .artifacts import ArtifactStrandUnavailable
+
+        path = self._path_for(key_id)
+        created_at = datetime.now(timezone.utc).isoformat()
+        event = self.audit.new_event(
+            tenant_id, audit_mod.ACTION_CREATE, key_id,
+            audit_mod.OUTCOME_SUCCESS, timestamp=created_at,
+            event_id=event_id,
+        )
+        journal_id, journal_path = self._new_provision_journal(
+            event.event_id, event.tenant_id, event.action
+        )
+        provider = None
+        minted_handle = None
+        try:
+            if mirror is not None:
+                try:
+                    mirror.provision(journal_id)
+                except OSError as exc:
+                    # Mirror tie-in failed with only an EMPTY journal and
+                    # before any provider call: scrub the journal and strand
+                    # the bound op pending for a same-id retry.
+                    self.drop_provision_journal(journal_id)
+                    raise ArtifactStrandUnavailable(str(exc), 500)
+            provider = self._provider()
+            triple = provider.generate(algorithm)
+            minted_handle = triple.handle
+            self._append_provision(
+                journal_path, provider.provider_id, triple.handle
+            )
+            if mirror is not None:
+                mirror.add_handle(provider.provider_id, triple.handle)
+            record = KeyRecord(
+                key_id=key_id,
+                tenant_id=tenant_id,
+                label=label,
+                versions=[
+                    VersionRecord(
+                        version=1,
+                        created_at=created_at,
+                        algorithm=algorithm,
+                        public_key=triple.public_key,
+                        provider_id=provider.provider_id,
+                        handle=triple.handle,
+                        encrypted_material=triple.encrypted_material,
+                    )
+                ],
+                current_version=1,
+            )
+            if mirror is not None:
+                # The key file is about to land: the write set is staged.
+                mirror.phase(PHASE_STAGED)
+            self._commit_mutation(
+                path, record, event, None,
+                provider=provider, new_handles=(triple.handle,),
+                journal_id=journal_id,
+                pre_commit=pre_commit,
+            )
+        except BaseException as exc:
+            if isinstance(exc, ArtifactStrandUnavailable):
+                raise
+            if isinstance(exc, ProviderReconnectPending):
+                # The gate never effectively started a provider call: no
+                # handle was minted. Drop the empty journal, return the mirror
+                # to a clean bound strand and stay pending for a same-id
+                # continuation.
+                self.drop_provision_journal(journal_id)
+                if mirror is not None:
+                    try:
+                        mirror.reset_for_pending_retry()
+                    except OSError:
+                        pass
+                raise
+            cleaned = True
+            if minted_handle is not None and provider is not None:
+                try:
+                    provider.delete(minted_handle)
+                except Exception:
+                    cleaned = False
+            if not self.rollback_provision_journal(journal_id):
+                cleaned = False
+            if not cleaned:
+                # Evidence survives (a handle may still exist in the backend
+                # or the journal could not be reconciled): never guess. Keep
+                # the whole evidence set and the operation pending; the next
+                # open/retry answers 500 and eventually finishes the cleanup.
+                raise ArtifactStrandUnavailable(
+                    "create cleanup unconfirmed", 500
+                ) from exc
+            if isinstance(exc, ProviderUnavailable):
+                # Every minted handle was deleted and the journal reconciled:
+                # a create with an unavailable provider books NO audit event
+                # and stays PENDING with the fixed 503, so an identical retry
+                # runs once (under the same operation_id) once the bound
+                # provider is healthy again. Drop the spent journal and reset
+                # the mirror to a clean bound strand.
+                self.drop_provision_journal(journal_id)
+                if mirror is not None:
+                    try:
+                        mirror.reset_for_pending_retry()
+                    except OSError:
+                        pass
+                raise ProviderReconnectPending(
+                    "provider unavailable during idempotent create"
+                ) from exc
+            # Ledger/key-store failure with fully verified rollback: finalize
+            # failed(500) via the idempotent guard.
+            if mirror is not None:
+                try:
+                    mirror.phase(PHASE_ROLLED_BACK)
+                except OSError:
+                    pass
+            raise
+        # Committed: the new handle is owned by version 1 and the durable
+        # success event makes the journal obsolete.
+        self.drop_provision_journal(journal_id)
+        if mirror is not None:
+            try:
+                mirror.phase(PHASE_COMMITTED)
+            except OSError:
+                pass
+        record.pending_event = None
         return record
 
     def _marker_event_durable(self, marker) -> bool:
