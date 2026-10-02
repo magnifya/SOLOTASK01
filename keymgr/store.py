@@ -550,6 +550,25 @@ class NativeRewrap(NamedTuple):
     target_handle: str
 
 
+class NativeRewrapSplit(NamedTuple):
+    """A resolved same-provider rewrap bound per side to native DEK calls.
+
+    Returned by :meth:`KeyStore.native_rewrap_binding` when both versions are
+    owned by the same provider_id that does NOT declare ``rewrap_key`` but
+    declares at least one of the per-side operations: the caller resolves the
+    native provider/handle pairs here and exports ONLY the side missing its
+    declaration (via :meth:`crypto_material`), handing the result to
+    ``envelope.rewrap_envelope_split``. When both flags are set neither KEK
+    is exported. A native failure is terminal (503), never a fallback export.
+    """
+
+    provider: object
+    source_handle: str
+    target_handle: str
+    native_unwrap: bool
+    native_wrap: bool
+
+
 class KeyStore:
     """File-backed key store with one JSON file per key."""
 
@@ -4533,18 +4552,27 @@ class KeyStore:
         """Resolve a KMS/HSM-native rewrap binding for two versions of a key.
 
         Returns ``(status, native)`` with the REWRAP_* status semantics of
-        :meth:`rewrap_versions`. On REWRAP_OK ``native`` is a
-        :class:`NativeRewrap` ``(provider, source_handle, target_handle)``
-        triple when BOTH versions are owned by the same provider_id and that
-        provider declares the optional ``rewrap_key`` operation, and None
-        otherwise (the caller then keeps the export-based rewrap path). The
-        record is re-read under the key locks over the committed projection,
-        so a concurrent revoke/rotate/migrate between the caller's version
-        resolution and the provider call is still answered 409/404 and the
-        handles are always the currently committed ones. A record owned by
-        an inactive provider raises ProviderUnavailable (503), never a
-        silent fallback. Nothing is persisted and no audit event is written
-        here.
+        :meth:`rewrap_versions`. On REWRAP_OK ``native`` is one of:
+
+        * a :class:`NativeRewrap` ``(provider, source_handle, target_handle)``
+          triple when BOTH versions are owned by the same provider_id and
+          that provider declares the optional ``rewrap_key`` operation;
+        * a :class:`NativeRewrapSplit` when the provider does not declare
+          ``rewrap_key`` but the source version's provider declares
+          ``unwrap_key`` and/or the target version's provider declares
+          ``wrap_key`` -- the caller then exports ONLY the undeclared side
+          and runs ``envelope.rewrap_envelope_split``;
+        * None otherwise (versions owned by different providers, or one
+          shared provider that declares none of the three operations; the
+          caller keeps the fully export-based rewrap path).
+
+        The record is re-read under the key locks over the committed
+        projection, so a concurrent revoke/rotate/migrate between the
+        caller's version resolution and the provider call is still answered
+        409/404 and the handles are always the currently committed ones. A
+        record owned by an inactive provider raises ProviderUnavailable
+        (503), never a silent fallback. Nothing is persisted and no audit
+        event is written here.
         """
         if not is_valid_key_id(key_id):
             return self.REWRAP_NOT_FOUND, None
@@ -4570,13 +4598,27 @@ class KeyStore:
                 # by different providers keep the export-based path.
                 return self.REWRAP_OK, None
             provider = self._provider_for(source_ver.provider_id)
-            if not provider_mod.declares_rewrap_key(provider):
-                return self.REWRAP_OK, None
-            return self.REWRAP_OK, NativeRewrap(
-                provider=provider,
-                source_handle=source_ver.handle,
-                target_handle=target_ver.handle,
-            )
+            if provider_mod.declares_rewrap_key(provider):
+                return self.REWRAP_OK, NativeRewrap(
+                    provider=provider,
+                    source_handle=source_ver.handle,
+                    target_handle=target_ver.handle,
+                )
+            # No combined operation: each side independently keeps its DEK
+            # native when it declares the matching per-side operation. Only a
+            # provider declaring NEITHER (and versions on different providers,
+            # handled above) stays fully export-based.
+            native_unwrap = provider_mod.declares_unwrap_key(provider)
+            native_wrap = provider_mod.declares_wrap_key(provider)
+            if native_unwrap or native_wrap:
+                return self.REWRAP_OK, NativeRewrapSplit(
+                    provider=provider,
+                    source_handle=source_ver.handle,
+                    target_handle=target_ver.handle,
+                    native_unwrap=native_unwrap,
+                    native_wrap=native_wrap,
+                )
+            return self.REWRAP_OK, None
 
     # -- sign / verify ------------------------------------------------------
     # Outcomes shared by sign_message and verification_key: the version

@@ -312,14 +312,20 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `200` 键序固定 `format,envelope`，`format` 固定
   `keymgr-envelope-v1`。成功记 `rewrap/success`（带 key_id）。无 CLI；
   AAD 只可随信封返回，明文、数据密钥、私钥、句柄绝不入其他响应、审计、
-  错误或落盘。当源、目标版本同属一个 `provider_id` 且该提供者声明
-  `rewrap_key` 时走 KMS/HSM 原生路径：端点在五秒门限内调用绑定提供者的
-  `rewrap_key(src, dst, envelope)`（`envelope` 为令牌经 base64 解码的
-  信封字节），由提供者在内部认证包装 DEK 与内容 GCM 标签并把同一 DEK
-  改包到目标句柄，服务绝不调用 `export_material`，DEK、KEK 私钥与明文
-  不进入服务进程；认证失败仍为指出 envelope 的 `400`（不记账），缺方
-  法、返回结构/类型/长度不符或提供者故障为固定文案 `503` 且不记账。
-  其余情形（分属不同提供者或提供者未声明）沿用导出 KEK 在内存中改包
+  错误或落盘。源、目标版本同属一个 `provider_id` 时按提供者声明在五秒
+  门限内选择原生边界：声明 `rewrap_key` 时走整体原生路径，调用绑定提
+  供者的 `rewrap_key(src, dst, envelope)`（`envelope` 为令牌经 base64
+  解码的信封字节），由提供者在内部认证包装 DEK 与内容 GCM 标签并把同
+  一 DEK 改包到目标句柄，服务绝不调用 `export_material`；否则按侧分别
+  处理——源侧声明 `unwrap_key` 即不导出源 KEK（在提供者内解包 DEK），
+  目标侧声明 `wrap_key` 即不导出目标 KEK（在提供者内包装同一 DEK），
+  仅缺少对应声明的一侧才调用 `export_material` 沿用内存路径，两侧均声
+  明时两个 KEK 都不导出、改包仍成功。无论何种原生路径，DEK、KEK 私钥
+  与明文都不进入服务进程；源包装密钥或内容标签认证成功后才会重新包
+  装，认证失败仍为指出 envelope 的 `400`（不记账），原生解包结果不是
+  32 字节 bytes、包装结果违反算法契约、方法不可调用、后端异常或门限超
+  时均为固定文案 `503` 且不记账，原生失败绝不回退导出。其余情形（分属
+  不同提供者，或同一提供者三者均未声明）沿用导出两侧 KEK 在内存中改包
   的旧路径。
 - `POST /v1/keys/{key_id}/sign`，**非幂等**（无需 `Idempotency-Key`），
   body 仅 `{tenant_id, version?, message}`；`message` 为标准 base64（可空），
@@ -825,11 +831,19 @@ python -m keymgr provider reconnect --operator alice
   未知/算法不符句柄或后端故障抛 `ProviderUnavailable`；AES256 目标成功
   须返回 48 字节 wrapped_key 与 12 字节 wrap_nonce，RSA2048 目标须返回
   256 字节 wrapped_key 与 None；声明而无可调用方法，或返回结构/类型/长
-  度不符，均为提供者不可用。两版本同属一个 provider_id 且声明时，
-  rewrap 端点在五秒门限内调用绑定提供者的 `rewrap_key`，绝不调用
-  `export_material`，DEK、KEK 私钥与明文不进入服务进程（认证失败 400
-  指出 envelope，异常/故障固定 503 且不记审计）；否则沿用导出旧路径。
-  本地提供者已实现并声明 `rewrap_key`。`capabilities.operations` 还可另
+  度不符，均为提供者不可用。两版本同属一个 provider_id 且声明
+  `rewrap_key` 时，rewrap 端点在五秒门限内调用绑定提供者的
+  `rewrap_key`，绝不调用 `export_material`，DEK、KEK 私钥与明文不进
+  入服务进程（认证失败 400 指出 envelope，异常/故障固定 503 且不记审
+  计）。未声明 `rewrap_key` 时，同一提供者的源、目标两侧按各自声明独
+  立保持原生：源侧声明 `unwrap_key` 就不导出源密钥，目标侧声明
+  `wrap_key` 就不导出目标密钥，仅缺少对应声明的一侧才调用
+  `export_material`，两侧均声明时禁止导出的密钥也改包成功；服务在源包
+  装密钥与内容标签均认证成功后才重新包装，原生解包结果非 32 字节
+  bytes、包装结果违反算法契约、方法不可调用、后端异常或门限超时一律固
+  定 503 且不记审计，原生失败绝不回退导出。分属不同提供者或三者均未声
+  明时沿用导出旧路径。本地提供者已实现并声明 `rewrap_key`（同时声明
+  `unwrap_key`、`wrap_key`）。`capabilities.operations` 还可另
   含一对 `transfer_out`、`transfer_in`（专供提供者链的整键 migrate）：
   二者**必须成对声明**，只声明其一律契约不符；成对声明即须同时实现可
   调用的

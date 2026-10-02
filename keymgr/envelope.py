@@ -808,3 +808,87 @@ def rewrap_envelope_native(
         wrapped_key=wrapped_key,
         wrap_nonce=wrap_nonce,
     )
+
+
+def rewrap_envelope_split(
+    opened: OpenedEnvelope,
+    source,
+    target,
+    *,
+    target_version: int,
+    target_algorithm: str,
+) -> str:
+    """Re-wrap via per-side native ``unwrap_key``/``wrap_key`` declarations.
+
+    Used when both envelope versions share one ``provider_id`` but that
+    provider does NOT declare ``rewrap_key``. Each side independently chooses
+    its boundary: a side that declares the matching native operation is a
+    ``(provider, handle)`` pair (the DEK is unwrapped/wrapped INSIDE the
+    provider and that side's KEK is never exported), a side that does not is
+    the already-exported in-memory KEK. When both sides are native the data
+    key exists only in process memory for the duration of this call and
+    neither KEK is ever exported; a native failure is a terminal error (it is
+    never papered over by exporting the corresponding KEK).
+
+    Authentication order matches :func:`rewrap_envelope`: the source wrapped
+    DEK and the content GCM tag are both verified BEFORE the target wrap. An
+    authentication failure (a native ``ProviderInvalidMaterial`` or an
+    in-memory :class:`EnvelopeError`) surfaces as one :class:`EnvelopeError`
+    naming ``field envelope`` (the 400 contract); a backend fault, a
+    non-callable native method, a native ``unwrap_key`` result that is not a
+    32-byte bytes value or a native ``wrap_key`` result violating the target
+    algorithm contract raises ``ProviderUnavailable`` (the fixed 503).
+    """
+    from .provider import ProviderInvalidMaterial
+
+    if isinstance(source, tuple):
+        src_provider, src_handle = source
+        try:
+            dek = unwrap_data_key_native(
+                provider=src_provider,
+                handle=src_handle,
+                wrapped_key=opened.wrapped_key,
+                wrap_nonce=opened.wrap_nonce,
+            )
+        except ProviderInvalidMaterial as exc:
+            raise EnvelopeError(
+                "field envelope is tampered or cannot be authenticated"
+            ) from exc
+    else:
+        try:
+            dek = unwrap_data_key(
+                opened.algorithm,
+                source,
+                opened.wrapped_key,
+                opened.wrap_nonce,
+            )
+        except EnvelopeError as exc:
+            raise EnvelopeError(
+                "field envelope is tampered or cannot be authenticated"
+            ) from exc
+    try:
+        AESGCM(dek).decrypt(
+            opened.nonce, opened.ciphertext + opened.tag, opened.aad
+        )
+    except InvalidTag as exc:
+        raise EnvelopeError(
+            "field envelope is tampered or cannot be authenticated"
+        ) from exc
+    if isinstance(target, tuple):
+        wrapped_key, wrap_nonce = wrap_data_key_native(
+            provider=target[0],
+            handle=target[1],
+            algorithm=target_algorithm,
+            data_key=dek,
+        )
+    else:
+        wrapped_key, wrap_nonce = _wrap_dek_with(
+            target_algorithm, target, dek
+        )
+    return _reseal_envelope(
+        opened,
+        target_version=target_version,
+        target_algorithm=target_algorithm,
+        wrapped_key=wrapped_key,
+        wrap_nonce=wrap_nonce,
+    )

@@ -46,6 +46,8 @@ from .store import (
     KeyStore,
     LockTimeout,
     MigrationTransferParked,
+    NativeRewrap,
+    NativeRewrapSplit,
     NativeUnwrap,
     NativeWrap,
     is_valid_key_id,
@@ -2533,12 +2535,18 @@ def make_handler(
             version: nonce, tag, ciphertext, aad and key_id bytes are carried
             over unchanged and the answer is
             ``200 {"format","envelope"}``. When both versions are owned by
-            the same provider_id and it declares the optional ``rewrap_key``
-            operation, the rewrap runs inside the KMS/HSM (no export, no
-            DEK/KEK/plaintext in this process) within the five-second
-            provider-call gate; otherwise both KEKs are exported and the
-            rewrap runs in memory. The data key, plaintext, handles
-            and material never enter a response, the ledger or any file.
+            the same provider_id the native boundary is chosen per the
+            provider's declarations within the five-second provider-call
+            gate: a declared ``rewrap_key`` runs the whole rewrap inside the
+            KMS/HSM (no export, no DEK/KEK/plaintext in this process);
+            otherwise a source ``unwrap_key`` declaration and/or a target
+            ``wrap_key`` declaration keeps that side's DEK inside the
+            provider and ONLY the undeclared side exports its KEK -- a
+            native failure is the fixed 503, never a fallback export.
+            Versions on different providers, or a shared provider declaring
+            none of the three operations, export both KEKs and rewrap in
+            memory. The data key, plaintext, handles and material never enter
+            a response, the ledger or any file.
             """
             action = audit_mod.ACTION_REWRAP
             # Like sign/verify, a malformed body is a plain 400 with no
@@ -2645,15 +2653,19 @@ def make_handler(
                     "target_version is the envelope's current key version",
                 )
                 return
-            # Step 2: when BOTH versions are owned by the same provider_id
-            # and that provider declares the optional rewrap_key operation,
-            # the whole rewrap happens inside the KMS/HSM within the ordinary
-            # five-second provider-call gate: export_material is never called
-            # and the DEK, the KEK private keys and the plaintext never enter
-            # this process. An authentication failure is a 400 naming the
-            # envelope (not audited); a provider fault or a malformed result
-            # propagates to do_POST's fixed 503 (also not audited). Anything
-            # else keeps the export-based path below.
+            # Step 2: when BOTH versions are owned by the same provider_id,
+            # resolve the native binding: a declared rewrap_key runs the
+            # whole rewrap inside the KMS/HSM; otherwise per-side
+            # unwrap_key/wrap_key declarations keep each declared side's DEK
+            # inside the provider and only the undeclared side exports.
+            # Everything runs within the ordinary five-second provider-call
+            # gate. An authentication failure is a 400 naming the envelope
+            # (not audited); a provider fault, non-callable method, a
+            # non-32-byte native unwrap result or a wrap result violating the
+            # algorithm contract propagates to do_POST's fixed 503 (also not
+            # audited), never a fallback export. Different providers, or a
+            # shared provider declaring none of the operations, keep the
+            # fully export-based path below.
             native = None
             if source_ver.provider_id == target_ver.provider_id:
                 native_status, native = store.native_rewrap_binding(
@@ -2669,7 +2681,7 @@ def make_handler(
                         tenant_id, key_id, action, 409, "key is revoked"
                     )
                     return
-            if native is not None:
+            if isinstance(native, NativeRewrap):
                 try:
                     with provider_mod.provider_call():
                         new_token = envelope.rewrap_envelope_native(
@@ -2683,6 +2695,68 @@ def make_handler(
                 except envelope.EnvelopeError as exc:
                     # The source envelope did not authenticate inside the
                     # provider: 400 naming the envelope, no event.
+                    self._bad_request(str(exc))
+                    return
+            elif isinstance(native, NativeRewrapSplit):
+                # The shared provider declares no combined rewrap_key but
+                # declares per-side DEK operations: only the side missing its
+                # declaration exports its KEK (one crypto_material call). A
+                # native-side failure is terminal 503 -- it is never papered
+                # over by exporting that KEK. Provider/material faults
+                # propagate to do_POST's fixed 503 and are deliberately NOT
+                # audited; nothing has been written.
+                if native.native_unwrap:
+                    source_material = (
+                        native.provider, native.source_handle
+                    )
+                else:
+                    src_status, _r1, _src_ver, source_kek = (
+                        store.crypto_material(
+                            key_id, tenant_id, source_ver.version
+                        )
+                    )
+                    if src_status == store.CRYPTO_NOT_FOUND:
+                        self._reject_crypto(
+                            tenant_id, key_id, action, 404, "key not found"
+                        )
+                        return
+                    if src_status == store.CRYPTO_REVOKED:
+                        self._reject_crypto(
+                            tenant_id, key_id, action, 409, "key is revoked"
+                        )
+                        return
+                    source_material = source_kek
+                if native.native_wrap:
+                    target_material = (
+                        native.provider, native.target_handle
+                    )
+                else:
+                    tgt_status, _r2, _tgt_ver, target_kek = (
+                        store.crypto_material(
+                            key_id, tenant_id, target_ver.version
+                        )
+                    )
+                    if tgt_status == store.CRYPTO_NOT_FOUND:
+                        self._reject_crypto(
+                            tenant_id, key_id, action, 404, "key not found"
+                        )
+                        return
+                    if tgt_status == store.CRYPTO_REVOKED:
+                        self._reject_crypto(
+                            tenant_id, key_id, action, 409, "key is revoked"
+                        )
+                        return
+                    target_material = target_kek
+                try:
+                    with provider_mod.provider_call():
+                        new_token = envelope.rewrap_envelope_split(
+                            opened, source_material, target_material,
+                            target_version=target_ver.version,
+                            target_algorithm=target_ver.algorithm,
+                        )
+                except envelope.EnvelopeError as exc:
+                    # The source wrapping key or content tag did not
+                    # authenticate: 400 naming the envelope, no event.
                     self._bad_request(str(exc))
                     return
             else:
