@@ -4141,6 +4141,38 @@ def make_handler(
                 return
             qs = parse_qs(parts.query, keep_blank_values=True)
 
+            since = None
+            until = None
+            values, errored = self._single_param(qs, "since")
+            if errored:
+                return
+            if values:
+                since = values[0]
+                try:
+                    since = audit_mod.canonical_rfc3339(since)
+                except ValueError:
+                    self._bad_request(
+                        "field since must be an RFC3339 timestamp"
+                    )
+                    return
+            values, errored = self._single_param(qs, "until")
+            if errored:
+                return
+            if values:
+                until = values[0]
+                try:
+                    until = audit_mod.canonical_rfc3339(until)
+                except ValueError:
+                    self._bad_request(
+                        "field until must be an RFC3339 timestamp"
+                    )
+                    return
+            if since is not None and until is not None and since > until:
+                self._bad_request(
+                    "field until must not be earlier than since"
+                )
+                return
+
             values, errored = self._single_param(qs, "key_id")
             if errored:
                 return
@@ -4214,6 +4246,8 @@ def make_handler(
                     key_id=key_id,
                     action=action,
                     operation_id=operation_id,
+                    since=since,
+                    until=until,
                     limit=limit,
                     cursor=cursor,
                 )

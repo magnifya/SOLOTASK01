@@ -5,10 +5,12 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import tempfile
 import threading
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import List, NamedTuple, Optional, Tuple
 
 try:  # fcntl is POSIX-only.
@@ -91,6 +93,51 @@ _CHAIN_FIELDS = _EVENT_FIELDS + ("prev_mac", "mac")
 _ANCHOR_FIELDS = ("schema_version", "legacy_bytes", "legacy_mac")
 _ANCHOR_SCHEMA_VERSION = 1
 _HEX64 = frozenset("0123456789abcdef")
+_RFC3339_RE = re.compile(
+    r"^(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})"
+    r"T(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})"
+    r"(?:\.(?P<fraction>\d{1,6}))?"
+    r"(?P<timezone>Z|[+-](?P<offset_hour>\d{2}):(?P<offset_minute>\d{2}))$"
+)
+
+
+def parse_rfc3339(value: str) -> datetime:
+    """Parse a strict RFC3339 timestamp, rejecting leap seconds."""
+    match = _RFC3339_RE.fullmatch(value if isinstance(value, str) else "")
+    if match is None:
+        raise ValueError("invalid RFC3339 timestamp")
+    second = int(match.group("second"))
+    if second == 60:
+        raise ValueError("leap seconds are not supported")
+    offset_hour = int(match.group("offset_hour") or 0)
+    offset_minute = int(match.group("offset_minute") or 0)
+    if offset_hour > 23 or offset_minute > 59:
+        raise ValueError("invalid RFC3339 timezone offset")
+    if match.group("timezone") == "Z":
+        tzinfo = timezone.utc
+    else:
+        sign = 1 if value[match.start("timezone")] == "+" else -1
+        tzinfo = timezone(timedelta(
+            hours=sign * offset_hour, minutes=sign * offset_minute
+        ))
+    fraction = match.group("fraction")
+    return datetime(
+        int(match.group("year")),
+        int(match.group("month")),
+        int(match.group("day")),
+        int(match.group("hour")),
+        int(match.group("minute")),
+        second,
+        int(fraction.ljust(6, "0")) if fraction is not None else 0,
+        tzinfo,
+    )
+
+
+def canonical_rfc3339(value: str) -> str:
+    """Return the UTC RFC3339 form identifying one instant."""
+    return parse_rfc3339(value).astimezone(timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
 
 
 class LedgerError(Exception):
@@ -729,6 +776,8 @@ class AuditLog:
         key_id: Optional[str] = None,
         action: Optional[str] = None,
         operation_id: Optional[str] = None,
+        since: Optional[str] = None,
+        until: Optional[str] = None,
         limit: int = 100,
         cursor: Optional[str] = None,
     ) -> AuditPage:
@@ -742,6 +791,20 @@ class AuditLog:
         cursor is valid only with the same tenant, filters and an unchanged
         ledger snapshot; otherwise InvalidCursor is raised.
         """
+        canonical_since = (
+            canonical_rfc3339(since) if since is not None else None
+        )
+        canonical_until = (
+            canonical_rfc3339(until) if until is not None else None
+        )
+        since_dt = (
+            parse_rfc3339(canonical_since)
+            if canonical_since is not None else None
+        )
+        until_dt = (
+            parse_rfc3339(canonical_until)
+            if canonical_until is not None else None
+        )
         anchor = None
         fingerprint = None
         if cursor is not None:
@@ -753,6 +816,8 @@ class AuditLog:
                     payload.get("k") != key_id
                     or payload.get("a") != action
                     or payload.get("o") != operation_id
+                    or payload.get("s") != canonical_since
+                    or payload.get("u") != canonical_until
                 ):
                     raise InvalidCursor("cursor does not match filters")
                 if int(payload.get("l", -1)) != limit:
@@ -764,6 +829,21 @@ class AuditLog:
 
         events = self._read_all()
 
+        time_range_active = since is not None or until is not None
+        parsed_events = {}
+
+        def event_time(event: AuditEvent) -> datetime:
+            if event.event_id not in parsed_events:
+                try:
+                    parsed_events[event.event_id] = parse_rfc3339(
+                        event.timestamp
+                    )
+                except ValueError as exc:
+                    raise LedgerError(
+                        "audit log timestamp is not valid RFC3339"
+                    ) from exc
+            return parsed_events[event.event_id]
+
         selected_all = [
             e
             for e in events
@@ -771,6 +851,13 @@ class AuditLog:
             and (key_id is None or e.key_id == key_id)
             and (action is None or e.action == action)
             and (operation_id is None or e.event_id == operation_id)
+            and (
+                not time_range_active
+                or (
+                    (since_dt is None or event_time(e) >= since_dt)
+                    and (until_dt is None or event_time(e) < until_dt)
+                )
+            )
         ]
         selected_all.sort(key=self._sort_key)
         # The snapshot is scoped to exactly the events this tenant and these
@@ -794,6 +881,8 @@ class AuditLog:
                     "k": key_id,
                     "a": action,
                     "o": operation_id,
+                    "s": canonical_since,
+                    "u": canonical_until,
                     "l": limit,
                     "ts": last.timestamp,
                     "eid": last.event_id,

@@ -266,6 +266,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_audit.add_argument("--operation-id", default=None,
                          help="filter to the event committed for one "
                               "operation_id (must be a lowercase UUID4)")
+    p_audit.add_argument("--since", action="append",
+                         help="inclusive RFC3339 lower time bound")
+    p_audit.add_argument("--until", action="append",
+                         help="exclusive RFC3339 upper time bound")
     p_audit.add_argument("--limit", type=int, default=100,
                          help="page size, 1-1000 (default: %(default)s)")
     p_audit.add_argument("--cursor", default=None,
@@ -2087,6 +2091,30 @@ def _run(argv: Optional[List[str]] = None) -> int:
 
         if not args.tenant_id:
             return _fail("field tenant_id must be a non-empty string", 2)
+        since = None
+        until = None
+        if args.since:
+            if len(args.since) > 1:
+                return _fail("duplicate since parameter", 2)
+            try:
+                since = audit_mod.canonical_rfc3339(args.since[0])
+            except ValueError:
+                return _fail(
+                    "field since must be an RFC3339 timestamp", 2
+                )
+        if args.until:
+            if len(args.until) > 1:
+                return _fail("duplicate until parameter", 2)
+            try:
+                until = audit_mod.canonical_rfc3339(args.until[0])
+            except ValueError:
+                return _fail(
+                    "field until must be an RFC3339 timestamp", 2
+                )
+        if since is not None and until is not None and since > until:
+            return _fail(
+                "field until must not be earlier than since", 2
+            )
         if args.key_id is not None and not is_valid_key_id(args.key_id):
             return _fail("field key_id must be a UUID4", 2)
         if args.action is not None and args.action not in audit_mod.ACTIONS:
@@ -2119,6 +2147,8 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 key_id=args.key_id,
                 action=args.action,
                 operation_id=args.operation_id,
+                since=since,
+                until=until,
                 limit=args.limit,
                 cursor=args.cursor,
             )
