@@ -670,18 +670,29 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   至多一条 `batch_rotate` 事件，成功与拒绝终态的 `key_id` 均为 null，可按
   `action=batch_rotate` 筛选。
 - `GET /v1/audit`：单一租户来源；可选 `key_id`(UUID4)、`action`、
-  `operation_id`(小写 UUID4)、`limit`(1–1000，默认 100)、`cursor`。
-  各条件按同时满足处理；`operation_id` 按 `event_id` 定位幂等操作落账的
-  那一条事件，合法但无匹配（含未知 id、与其它筛选不匹配）返回空事件页
-  `{"events":[],"next_cursor":null}`，不是 `404`。显式空值、重复或格式
-  非法（含大写 UUID）均为指出 `operation_id` 的 `400`，参数校验先于策略
-  且不记账，只有租户来源缺失或冲突照旧记 `tenant_conflict`。→
-  `{events, next_cursor}`，按 (timestamp, event_id) 升序；游标为 HMAC
-  签名令牌，绑定租户/全部筛选（含 operation_id）/limit/发起查询时的可见
-  快照，筛选改变、游标篡改或过期均为 `400`，翻页不重不漏。查询成功不记
-  账，被策略拒绝才记一条 `audit/rejected`（key_id null）。账本损坏或不可
-  读固定 `500` `{"error":"audit ledger is unavailable"}`，不跳过、不重签、
-  不改写账本。
+  `operation_id`(小写 UUID4)、`since`、`until`、`limit`(1–1000，默认
+  100)、`cursor`。各条件按同时满足处理；`operation_id` 按 `event_id`
+  定位幂等操作落账的那一条事件，合法但无匹配（含未知 id、与其它筛选
+  不匹配）返回空事件页 `{"events":[],"next_cursor":null}`，不是 `404`。
+  显式空值、重复或格式非法（含大写 UUID）均为指出 `operation_id` 的
+  `400`，参数校验先于策略且不记账，只有租户来源缺失或冲突照旧记
+  `tenant_conflict`。`since`/`until` 为可选、单值的 RFC3339 日期时间
+  （日期与含秒时间用大写 `T` 分隔，大写 `Z` 或 `±HH:MM` 时区，可带
+  一至六位小数秒），按事件实际时刻比较：`since` 含起点、`until` 不含
+  终点，单传一端时另一端不限，同一时刻的不同偏移/小数写法等价；空值、
+  重复、缺时区、格式不符、无效日期或闰秒均为指出对应字段的 `400`，
+  `since` 晚于 `until` 以 `until` 报错，两者相等是合法空范围，校验先于
+  audit 授权且不记账。→ `{events, next_cursor}`，省略时间参数时按
+  (timestamp, event_id) 升序；带时间参数时按实际时刻 (instant,
+  event_id) 升序。游标为 HMAC 签名令牌，绑定租户/全部筛选（含
+  operation_id、归一化后的时间边界）/limit/发起查询时的可见快照，筛选
+  或实际边界改变（等价时间写法不算改变）、游标篡改或过期均为指出
+  `cursor` 的 `400`，翻页不重不漏；可见快照只含本租户且满足全部条件
+  （含时间范围）的事件，范围内追加匹配事件使旧游标失效，其他租户或
+  范围外新增不影响。查询成功不记账，被策略拒绝才记一条
+  `audit/rejected`（key_id null）。范围查询遇到本租户且满足其它筛选的
+  事件时间无法按上述格式解析时，与账本损坏或不可读一样固定 `500`
+  `{"error":"audit ledger is unavailable"}`，不跳过、不重签、不改写账本。
 - `GET /v1/audit/verify`：单一非空 `X-Operator-Id`，租户只允许从单一
   `X-Tenant-Id` 请求头或单一 `tenant_id` 查询参数取得；正文只能省略或为
   `{}`。按账本顺序验证整本 `audit.log` 的字段、序号、`event_id` 唯一性、
@@ -754,7 +765,8 @@ python -m keymgr backup verify --tenant-id t --passphrase pw --bundle <b> \
                           --operator alice
 # 审计 / 操作 / 策略
 python -m keymgr audit    --tenant-id t --action rotate --limit 100 --operator alice \
-                          [--key-id <uuid>] [--operation-id <uuid>]
+                          [--key-id <uuid>] [--operation-id <uuid>] \
+                          [--since <rfc3339>] [--until <rfc3339>]
 python -m keymgr audit verify --tenant-id t --operator alice
 python -m keymgr operation --tenant-id t --operator alice --operation-id <id>
 python -m keymgr policy --operator admin show --tenant-id t

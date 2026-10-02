@@ -5,10 +5,12 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import tempfile
 import threading
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import List, NamedTuple, Optional, Tuple
 
 try:  # fcntl is POSIX-only.
@@ -99,6 +101,70 @@ class LedgerError(Exception):
 
 class InvalidCursor(Exception):
     """Raised when a pagination cursor is malformed, tampered or stale."""
+
+
+class InvalidTimestamp(Exception):
+    """Raised when an RFC3339 time boundary cannot be parsed."""
+
+
+# Strict RFC3339 date-time: a capital T separates the full date from the
+# hour-minute-second time; the zone is a capital Z or a signed +/-HH:MM;
+# fractional seconds, when present, use one to six digits.
+_RFC3339_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})"
+    r"T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?"
+    r"(Z|[+-]\d{2}:\d{2})$"
+)
+
+
+def parse_rfc3339(value: str) -> datetime:
+    """Parse the strict RFC3339 date-time used by the since/until filters.
+
+    Returns a timezone-aware datetime normalized to UTC so that the same
+    instant written with different offsets or fractional-second spellings
+    compares equal. Leap seconds and impossible dates are rejected.
+    """
+    match = _RFC3339_RE.fullmatch(value)
+    if match is None:
+        raise InvalidTimestamp("not an RFC3339 date-time")
+    year, month, day, hour, minute, second, fraction, zone = match.groups()
+    year, month, day = int(year), int(month), int(day)
+    hour, minute, second = int(hour), int(minute), int(second)
+    if second == 60:
+        # Leap seconds are not representable as an instant here.
+        raise InvalidTimestamp("not an RFC3339 date-time")
+    if hour > 23 or minute > 59 or second > 59:
+        raise InvalidTimestamp("not an RFC3339 date-time")
+    if zone == "Z":
+        offset = timedelta(0)
+    else:
+        sign = 1 if zone[0] == "+" else -1
+        offset_hours, offset_minutes = int(zone[1:3]), int(zone[4:6])
+        if offset_hours > 23 or offset_minutes > 59:
+            raise InvalidTimestamp("not an RFC3339 date-time")
+        offset = sign * timedelta(
+            hours=offset_hours, minutes=offset_minutes
+        )
+    micros = int((fraction or "").ljust(6, "0"))
+    try:
+        parsed = datetime(
+            year, month, day, hour, minute, second, micros,
+            tzinfo=timezone(offset),
+        )
+    except ValueError as exc:
+        raise InvalidTimestamp("not an RFC3339 date-time") from exc
+    return parsed.astimezone(timezone.utc)
+
+
+def _instant_micros(moment: datetime) -> int:
+    """Microseconds since the POSIX epoch for an aware datetime."""
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = moment.astimezone(timezone.utc) - epoch
+    return (
+        delta.days * 86_400_000_000
+        + delta.seconds * 1_000_000
+        + delta.microseconds
+    )
 
 
 @dataclass
@@ -729,19 +795,31 @@ class AuditLog:
         key_id: Optional[str] = None,
         action: Optional[str] = None,
         operation_id: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
         limit: int = 100,
         cursor: Optional[str] = None,
     ) -> AuditPage:
         """Return one tenant-isolated, filter-bound, snapshot-bound page.
 
-        Events are ordered by (timestamp, event_id) ascending. Conflict
+        Without a time range the raw event order is (timestamp, event_id)
+        ascending. When ``since``/``until`` are given, every visible
+        candidate timestamp is parsed as strict RFC3339 and events are
+        ordered by the actual instant (since inclusive, until exclusive);
+        an unparseable visible timestamp is indistinguishable from a
+        corrupt or unreadable ledger and raises LedgerError. Conflict
         records carry a null tenant and are therefore visible to nobody.
         ``operation_id`` filters on the event id, locating the single event
         committed under an idempotent operation's ``operation_id``; a valid
         id with no matching event simply yields an empty page (never 404). A
-        cursor is valid only with the same tenant, filters and an unchanged
-        ledger snapshot; otherwise InvalidCursor is raised.
+        cursor is valid only with the same tenant, filters (including the
+        exact time boundaries) and an unchanged snapshot of the visible
+        set; otherwise InvalidCursor is raised.
         """
+        range_active = since is not None or until is not None
+        since_micros = _instant_micros(since) if since is not None else None
+        until_micros = _instant_micros(until) if until is not None else None
+
         anchor = None
         fingerprint = None
         if cursor is not None:
@@ -755,16 +833,42 @@ class AuditLog:
                     or payload.get("o") != operation_id
                 ):
                     raise InvalidCursor("cursor does not match filters")
+                cursor_since = payload.get("si")
+                cursor_until = payload.get("ui")
+                if range_active:
+                    def _bound(value):
+                        return value if isinstance(value, int) and not isinstance(
+                            value, bool
+                        ) else None
+
+                    if (
+                        _bound(cursor_since) != since_micros
+                        or _bound(cursor_until) != until_micros
+                    ):
+                        raise InvalidCursor("cursor does not match filters")
+                elif "si" in payload or "ui" in payload:
+                    raise InvalidCursor("cursor does not match filters")
                 if int(payload.get("l", -1)) != limit:
                     raise InvalidCursor("cursor does not match limit")
-                anchor = (payload["ts"], payload["eid"], int(payload["seq"]))
+                if range_active:
+                    anchor = (
+                        int(payload["ti"]),
+                        payload["eid"],
+                        int(payload["seq"]),
+                    )
+                else:
+                    anchor = (
+                        payload["ts"],
+                        payload["eid"],
+                        int(payload["seq"]),
+                    )
                 fingerprint = payload["f"]
             except (KeyError, TypeError, ValueError) as exc:
                 raise InvalidCursor("malformed cursor") from exc
 
         events = self._read_all()
 
-        selected_all = [
+        candidates = [
             e
             for e in events
             if e.tenant_id == tenant_id
@@ -772,35 +876,88 @@ class AuditLog:
             and (action is None or e.action == action)
             and (operation_id is None or e.event_id == operation_id)
         ]
-        selected_all.sort(key=self._sort_key)
+
+        if range_active:
+            # Range membership cannot be decided for a record without
+            # understanding its instant, so every candidate (same tenant
+            # and matching every other filter) must parse; an unparseable
+            # candidate is the same fixed failure as a corrupt ledger and
+            # is never skipped. Other tenants' records never reach here.
+            timed = []
+            for event in candidates:
+                try:
+                    instant = _instant_micros(parse_rfc3339(event.timestamp))
+                except InvalidTimestamp as exc:
+                    raise LedgerError(
+                        "audit log timestamp is not an RFC3339 date-time"
+                    ) from exc
+                if (
+                    since_micros is not None and instant < since_micros
+                ) or (
+                    until_micros is not None and instant >= until_micros
+                ):
+                    continue
+                timed.append((instant, event))
+            timed.sort(
+                key=lambda item: (item[0], item[1].event_id, item[1].seq)
+            )
+            selected_all = [event for _instant, event in timed]
+            instant_of = {event.seq: instant for instant, event in timed}
+
+            def sort_key(event: AuditEvent):
+                return instant_of[event.seq], event.event_id, event.seq
+        else:
+            selected_all = candidates
+            selected_all.sort(key=self._sort_key)
+            sort_key = self._sort_key
+
         # The snapshot is scoped to exactly the events this tenant and these
-        # filters can see: another tenant's activity must not invalidate the
-        # cursor, while any change to the visible set does.
+        # filters can see: another tenant's activity, or an event outside the
+        # requested time range, must not invalidate the cursor, while any
+        # change to the visible set does.
         current_fingerprint = self._fingerprint(selected_all)
         if fingerprint is not None and fingerprint != current_fingerprint:
             raise InvalidCursor("cursor snapshot is no longer valid")
 
         selected = selected_all
         if anchor is not None:
-            selected = [e for e in selected if self._sort_key(e) > anchor]
+            selected = [e for e in selected if sort_key(e) > anchor]
 
         page = selected[:limit]
         if len(selected) > limit and page:
             last = page[-1]
-            next_cursor = self._encode_cursor(
-                {
-                    "v": 1,
-                    "t": tenant_id,
-                    "k": key_id,
-                    "a": action,
-                    "o": operation_id,
-                    "l": limit,
-                    "ts": last.timestamp,
-                    "eid": last.event_id,
-                    "seq": last.seq,
-                    "f": current_fingerprint,
-                }
-            )
+            if range_active:
+                next_cursor = self._encode_cursor(
+                    {
+                        "v": 2,
+                        "t": tenant_id,
+                        "k": key_id,
+                        "a": action,
+                        "o": operation_id,
+                        "si": since_micros,
+                        "ui": until_micros,
+                        "l": limit,
+                        "ti": instant_of[last.seq],
+                        "eid": last.event_id,
+                        "seq": last.seq,
+                        "f": current_fingerprint,
+                    }
+                )
+            else:
+                next_cursor = self._encode_cursor(
+                    {
+                        "v": 1,
+                        "t": tenant_id,
+                        "k": key_id,
+                        "a": action,
+                        "o": operation_id,
+                        "l": limit,
+                        "ts": last.timestamp,
+                        "eid": last.event_id,
+                        "seq": last.seq,
+                        "f": current_fingerprint,
+                    }
+                )
         else:
             next_cursor = None
         return AuditPage(events=page, next_cursor=next_cursor)

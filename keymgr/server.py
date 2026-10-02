@@ -21,7 +21,13 @@ from .artifacts import (
     ArtifactAlreadyTerminal,
     ArtifactStrandUnavailable,
 )
-from .audit import AuditLog, InvalidCursor, LedgerError
+from .audit import (
+    AuditLog,
+    InvalidCursor,
+    InvalidTimestamp,
+    LedgerError,
+    parse_rfc3339,
+)
 from .crypto import SUPPORTED_ALGORITHMS
 from .operations import OperationStore
 from .policy import (
@@ -4177,6 +4183,31 @@ def make_handler(
                 self._bad_request("field operation_id must be a UUID4")
                 return
 
+            bounds = {}
+            for field_name in ("since", "until"):
+                values, errored = self._single_param(qs, field_name)
+                if errored:
+                    return
+                if values:
+                    try:
+                        bounds[field_name] = parse_rfc3339(values[0])
+                    except InvalidTimestamp:
+                        self._bad_request(
+                            "field %s must be an RFC3339 date-time"
+                            % field_name
+                        )
+                        return
+            since = bounds.get("since")
+            until = bounds.get("until")
+            # An inverted range is a malformed until (the exclusive end is
+            # the offending bound); equal bounds are a legal empty range.
+            if since is not None and until is not None and since > until:
+                self._bad_request(
+                    "field until must be an RFC3339 date-time not earlier "
+                    "than since"
+                )
+                return
+
             limit = 100
             values, errored = self._single_param(qs, "limit")
             if errored:
@@ -4214,6 +4245,8 @@ def make_handler(
                     key_id=key_id,
                     action=action,
                     operation_id=operation_id,
+                    since=since,
+                    until=until,
                     limit=limit,
                     cursor=cursor,
                 )

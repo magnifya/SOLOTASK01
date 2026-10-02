@@ -13,7 +13,13 @@ from . import keybundle
 from . import operations as operations_mod
 from . import restore as restore_mod
 from . import tenantbundle
-from .audit import AuditLog, InvalidCursor, LedgerError
+from .audit import (
+    AuditLog,
+    InvalidCursor,
+    InvalidTimestamp,
+    LedgerError,
+    parse_rfc3339,
+)
 from .crypto import SUPPORTED_ALGORITHMS
 from .operations import OperationStore
 from .policy import (
@@ -266,6 +272,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_audit.add_argument("--operation-id", default=None,
                          help="filter to the event committed for one "
                               "operation_id (must be a lowercase UUID4)")
+    p_audit.add_argument("--since", default=None,
+                         help="inclusive lower bound, RFC3339 date-time "
+                              "(e.g. 2026-09-26T00:00:00Z)")
+    p_audit.add_argument("--until", default=None,
+                         help="exclusive upper bound, RFC3339 date-time")
     p_audit.add_argument("--limit", type=int, default=100,
                          help="page size, 1-1000 (default: %(default)s)")
     p_audit.add_argument("--cursor", default=None,
@@ -2102,6 +2113,29 @@ def _run(argv: Optional[List[str]] = None) -> int:
             # audit (only a missing/conflicting tenant records
             # tenant_conflict).
             return _fail("field operation_id must be a UUID4", 2)
+        since = until = None
+        for field_name, value in (
+            ("since", args.since),
+            ("until", args.until),
+        ):
+            if value is not None:
+                try:
+                    parsed = parse_rfc3339(value)
+                except InvalidTimestamp:
+                    return _fail(
+                        "field %s must be an RFC3339 date-time" % field_name,
+                        2,
+                    )
+                if field_name == "since":
+                    since = parsed
+                else:
+                    until = parsed
+        if since is not None and until is not None and since > until:
+            return _fail(
+                "field until must be an RFC3339 date-time not earlier "
+                "than since",
+                2,
+            )
         if not 1 <= args.limit <= 1000:
             return _fail(
                 "field limit must be an integer between 1 and 1000", 2
@@ -2119,6 +2153,8 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 key_id=args.key_id,
                 action=args.action,
                 operation_id=args.operation_id,
+                since=since,
+                until=until,
                 limit=args.limit,
                 cursor=args.cursor,
             )
