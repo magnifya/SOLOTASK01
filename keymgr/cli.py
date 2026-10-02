@@ -266,6 +266,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_audit.add_argument("--operation-id", default=None,
                          help="filter to the event committed for one "
                               "operation_id (must be a lowercase UUID4)")
+    p_audit.add_argument("--outcome", action="append",
+                         help="filter by execution result; one of: %s "
+                              "(case-sensitive)" % ", ".join(audit_mod.OUTCOMES))
     p_audit.add_argument("--since", action="append",
                          help="inclusive RFC3339 lower time bound")
     p_audit.add_argument("--until", action="append",
@@ -2130,6 +2133,21 @@ def _run(argv: Optional[List[str]] = None) -> int:
             # audit (only a missing/conflicting tenant records
             # tenant_conflict).
             return _fail("field operation_id must be a UUID4", 2)
+        if args.outcome:
+            if len(args.outcome) > 1:
+                return _fail("duplicate outcome parameter", 2)
+            outcome = args.outcome[0]
+            if outcome not in audit_mod.OUTCOMES:
+                # Case-sensitive: an empty, cased or whitespace-padded
+                # value is an exit-2 parameter error naming outcome,
+                # emitted before any policy or ledger work.
+                return _fail(
+                    "field outcome must be one of: %s"
+                    % ", ".join(audit_mod.OUTCOMES),
+                    2,
+                )
+        else:
+            outcome = None
         if not 1 <= args.limit <= 1000:
             return _fail(
                 "field limit must be an integer between 1 and 1000", 2
@@ -2147,6 +2165,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 key_id=args.key_id,
                 action=args.action,
                 operation_id=args.operation_id,
+                outcome=outcome,
                 since=since,
                 until=until,
                 limit=args.limit,

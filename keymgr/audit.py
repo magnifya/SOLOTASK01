@@ -776,6 +776,7 @@ class AuditLog:
         key_id: Optional[str] = None,
         action: Optional[str] = None,
         operation_id: Optional[str] = None,
+        outcome: Optional[str] = None,
         since: Optional[str] = None,
         until: Optional[str] = None,
         limit: int = 100,
@@ -786,10 +787,14 @@ class AuditLog:
         Events are ordered by (timestamp, event_id) ascending. Conflict
         records carry a null tenant and are therefore visible to nobody.
         ``operation_id`` filters on the event id, locating the single event
-        committed under an idempotent operation's ``operation_id``; a valid
-        id with no matching event simply yields an empty page (never 404). A
-        cursor is valid only with the same tenant, filters and an unchanged
-        ledger snapshot; otherwise InvalidCursor is raised.
+        committed under an idempotent operation's ``operation_id``; ``outcome``
+        filters on the exact execution result. A valid id with no matching
+        event simply yields an empty page (never 404). A cursor is valid only
+        with the same tenant, filters (including whether ``outcome`` was
+        omitted at all) and an unchanged ledger snapshot; otherwise
+        InvalidCursor is raised. A cursor issued before outcome filtering
+        existed (no bound outcome) remains valid only when ``outcome`` is
+        omitted, never with an explicit outcome.
         """
         canonical_since = (
             canonical_rfc3339(since) if since is not None else None
@@ -807,6 +812,9 @@ class AuditLog:
         )
         anchor = None
         fingerprint = None
+        # Distinguish a cursor with no bound outcome (issued before outcome
+        # filtering existed) from one explicitly bound to outcome omitted.
+        no_bound_outcome = object()
         if cursor is not None:
             payload = self._decode_cursor(cursor)
             try:
@@ -819,6 +827,16 @@ class AuditLog:
                     or payload.get("s") != canonical_since
                     or payload.get("u") != canonical_until
                 ):
+                    raise InvalidCursor("cursor does not match filters")
+                # The outcome condition is bound as its absence/presence and
+                # value together: a pre-upgrade cursor (no "oc") is only
+                # reusable with outcome omitted, while a cursor bound to an
+                # omitted outcome rejects an explicit value and vice versa.
+                bound_outcome = payload.get("oc", no_bound_outcome)
+                if bound_outcome is no_bound_outcome:
+                    if outcome is not None:
+                        raise InvalidCursor("cursor does not match filters")
+                elif bound_outcome != outcome:
                     raise InvalidCursor("cursor does not match filters")
                 if int(payload.get("l", -1)) != limit:
                     raise InvalidCursor("cursor does not match limit")
@@ -851,6 +869,7 @@ class AuditLog:
             and (key_id is None or e.key_id == key_id)
             and (action is None or e.action == action)
             and (operation_id is None or e.event_id == operation_id)
+            and (outcome is None or e.outcome == outcome)
             and (
                 not time_range_active
                 or (
@@ -881,6 +900,7 @@ class AuditLog:
                     "k": key_id,
                     "a": action,
                     "o": operation_id,
+                    "oc": outcome,
                     "s": canonical_since,
                     "u": canonical_until,
                     "l": limit,

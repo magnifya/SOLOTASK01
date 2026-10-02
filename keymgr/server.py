@@ -4283,6 +4283,20 @@ def make_handler(
                 self._bad_request("field operation_id must be a UUID4")
                 return
 
+            values, errored = self._single_param(qs, "outcome")
+            if errored:
+                return
+            outcome = values[0] if values else None
+            if outcome is not None and outcome not in audit_mod.OUTCOMES:
+                # Case-sensitive; an empty, whitespace-padded or cased
+                # variant is a plain parameter 400 naming the field, checked
+                # before the policy decision and without any audit write.
+                self._bad_request(
+                    "field outcome must be one of: %s"
+                    % ", ".join(audit_mod.OUTCOMES)
+                )
+                return
+
             limit = 100
             values, errored = self._single_param(qs, "limit")
             if errored:
@@ -4320,6 +4334,7 @@ def make_handler(
                     key_id=key_id,
                     action=action,
                     operation_id=operation_id,
+                    outcome=outcome,
                     since=since,
                     until=until,
                     limit=limit,
