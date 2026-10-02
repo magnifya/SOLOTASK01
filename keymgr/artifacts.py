@@ -63,6 +63,7 @@ _DIR_NAME = "operation-artifacts"
 
 # Kinds and the audit action each commits with.
 _KIND_ACTIONS = {
+    "create": audit_mod.ACTION_CREATE,
     "rotate": audit_mod.ACTION_ROTATE,
     "batch_rotate": audit_mod.ACTION_BATCH_ROTATE,
     "import": audit_mod.ACTION_IMPORT,
@@ -118,6 +119,21 @@ class ArtifactStrandUnavailable(Exception):
     def __init__(self, message: str = "", http_status: int = 503) -> None:
         super().__init__(message)
         self.http_status = http_status
+
+
+class ArtifactBoundRetry(ArtifactStrandUnavailable):
+    """A bound op hit a pre-commit environment fault with a fixed message.
+
+    Like :class:`ArtifactStrandUnavailable` the operation stays pending with
+    no provider/key/handle/audit touched and a same-key retry continues under
+    the same operation_id, but the response uses the caller's fixed status
+    and message (e.g. a policy-store outage's fixed 500) rather than the
+    generic temporary-storage wording.
+    """
+
+    def __init__(self, message: str, http_status: int = 500) -> None:
+        super().__init__(message, http_status)
+        self.message = message
 
 
 class ArtifactAlreadyTerminal(Exception):
@@ -221,7 +237,7 @@ class ArtifactMirror:
             seen.add(key_id)
             normalized.append(key_id)
         normalized.sort()
-        if kind in ("rotate", "import", "migrate", "encrypt") and len(
+        if kind in ("create", "rotate", "import", "migrate", "encrypt") and len(
             normalized
         ) != 1:
             raise ArtifactInconsistent(
@@ -1026,7 +1042,7 @@ class ArtifactStore:
             if not _is_key_id(key_id) or key_id in seen:
                 return False
             seen.add(key_id)
-        if kind in ("rotate", "import", "migrate", "encrypt") and len(
+        if kind in ("create", "rotate", "import", "migrate", "encrypt") and len(
             seen
         ) != 1:
             return False
@@ -1050,7 +1066,7 @@ class ArtifactStore:
         if not isinstance(details, dict) or details.get("kind") != kind:
             return False
         write_set = descriptor.get("write_set") or []
-        if kind in ("rotate", "import", "migrate", "encrypt"):
+        if kind in ("create", "rotate", "import", "migrate", "encrypt"):
             return details.get("key_id") == (write_set[0] if write_set else None)
         if kind == "batch_rotate":
             items = details.get("items")
@@ -1134,7 +1150,7 @@ class ArtifactStore:
             return False
         kind = descriptor.get("kind")
         write_set = descriptor.get("write_set") or []
-        if kind in ("rotate", "import", "migrate", "encrypt"):
+        if kind in ("create", "rotate", "import", "migrate", "encrypt"):
             if event.key_id != (write_set[0] if write_set else None):
                 return False
         elif event.key_id is not None:
@@ -1189,7 +1205,26 @@ class ArtifactStore:
         allowed_status = 200 if kind in _STATUS_200_KINDS else 201
         if http_status != allowed_status:
             return False
-        if kind in ("rotate", "import"):
+        if kind == "create":
+            key_id = write_set[0] if write_set else None
+            if response.get("key_id") != key_id:
+                return False
+            key = self.key_store._read_record(self.key_store._path_for(key_id))
+            if key is None or key.tenant_id != tenant_id:
+                return False
+            # A created key starts at version 1, and the staged algorithm and
+            # public key must be exactly those the committed version 1 still
+            # carries -- a later rotation never rewrites the replay.
+            if key.current_version != 1 or key.get_version(1) is None:
+                return False
+            version_one = key.versions[0]
+            if version_one.version != 1:
+                return False
+            if response.get("algorithm") != version_one.algorithm:
+                return False
+            if response.get("public_key") != version_one.public_key:
+                return False
+        elif kind in ("rotate", "import"):
             key_id = write_set[0] if write_set else None
             if response.get("key_id") != key_id:
                 return False

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -16,6 +17,7 @@ from . import restore as restore_mod
 from . import signing as signing_mod
 from . import tenantbundle
 from .artifacts import (
+    ArtifactBoundRetry,
     ArtifactAlreadyTerminal,
     ArtifactStrandUnavailable,
 )
@@ -40,6 +42,7 @@ from .provider import (
 )
 from .store import (
     IMPORT_CONFLICT,
+    CreateProviderRetry,
     KeyAlreadyMigrated,
     KeyStore,
     LockTimeout,
@@ -353,6 +356,17 @@ def make_handler(
             # reuses this operation_id.
             self._send_json(status, self._strand_unavailable_body(operation_id))
 
+        def _send_bound_retry(self, operation_id, status: int,
+                              message: str) -> None:
+            """Answer a bound op whose pre-commit environment fault retries.
+
+            The operation STAYS pending and no audit is written; the body
+            contains only the fixed message and the operation_id.
+            """
+            self._send_json(
+                status, {"error": message, "operation_id": operation_id}
+            )
+
         def _idempotent_guard(self, path, tenant_id, operator, payload, key,
                               executor) -> None:
             """Bind the Idempotency-Key and run an idempotent mutation.
@@ -465,7 +479,12 @@ def make_handler(
                 # provider call, or a clean strand could not be taken over.
                 # Nothing committed: leave the operation PENDING and answer
                 # 500/503. A same-key HTTP/CLI retry reuses the operation_id.
-                self._send_strand_unavailable(op_id, exc.http_status)
+                if isinstance(exc, ArtifactBoundRetry):
+                    self._send_bound_retry(
+                        op_id, exc.http_status, exc.message
+                    )
+                else:
+                    self._send_strand_unavailable(op_id, exc.http_status)
                 return
             except LockTimeout:
                 # Lock wait exceeded 5 s: no key, audit event or handle was
@@ -504,6 +523,20 @@ def make_handler(
                 # stays PENDING with NO audit event; only the fixed safe 503
                 # is sent (never resetting the mirror, which is the restart's
                 # rollback index).
+                body = {
+                    "error": "key management provider is unavailable",
+                    "operation_id": op_id,
+                }
+                self._send_json(503, body)
+                return
+            except CreateProviderRetry:
+                # An idempotent create never reached its commit point and
+                # books NO audit: the op stays pending (the executor already
+                # reset its mirror to a clean bound strand and the store
+                # abort path removed the new key/journal/handle), and the
+                # fixed safe 503 is sent. A same-key request after the
+                # provider recovers takes the strand over under the SAME
+                # operation_id and creates the key exactly once.
                 body = {
                     "error": "key management provider is unavailable",
                     "operation_id": op_id,
@@ -954,35 +987,108 @@ def make_handler(
             self._send_json(404, {"error": "not found"})
 
         def _create_key(self, operator: str) -> None:
-            payload = self._read_json_object()
-            if payload is None:
-                # Conflict (if any) was already recorded by the body parser.
+            # The Idempotency-Key is OPTIONAL on this endpoint: requests
+            # without one keep the legacy (non-idempotent) behavior, as does
+            # the CLI ``gen`` command. With a header, a key creation is a
+            # globally-unique idempotent operation exactly like rotate.
+            values = self.headers.get_all("Idempotency-Key") or []
+            if len(values) > 1:
+                self._bad_request(
+                    "duplicate Idempotency-Key (provide a single header)"
+                )
                 return
-            # tenant_id comes from the body for create; validate it first so
-            # later field errors are tenant-visible rejections.
+            idem_key = values[0] if values else None
+            if idem_key is not None and not operations_mod.is_valid_idempotency_key(
+                idem_key
+            ):
+                self._bad_request(
+                    "field Idempotency-Key must be 1-128 characters from "
+                    "A-Za-z0-9._~-"
+                )
+                return
+            payload = self._read_json_object(
+                audit=idem_key is None
+            )
+            if payload is None:
+                # On the idempotent path the parse failure consumed no key
+                # and wrote no audit; on the legacy path a conflict event (if
+                # any) was already recorded by the body parser.
+                return
+            # tenant_id comes from the body for create; a missing/invalid
+            # tenant source always records the invisible tenant_conflict
+            # event, even on the idempotent path before the key is bound.
             tenant_id = payload.get("tenant_id")
             if not isinstance(tenant_id, str) or not tenant_id:
                 if not self._record_conflict():
                     return
                 self._bad_request("field tenant_id must be a non-empty string")
                 return
-            for field in ("algorithm", "label"):
-                if field not in payload or not isinstance(
-                    payload[field], str
-                ):
-                    if not self._record_attempt(
-                        tenant_id, None, audit_mod.ACTION_CREATE,
-                        audit_mod.OUTCOME_REJECTED,
-                    ):
-                        return
+            extra = [
+                field
+                for field in payload
+                if field not in ("tenant_id", "algorithm", "label")
+            ]
+            if extra:
+                if idem_key is not None:
+                    # Pre-bind parameter error: name the field, consume no
+                    # Idempotency-Key and write no audit.
                     self._bad_request(
-                        "field %s must be a string" % field
-                        if field in payload
-                        else "missing required field: %s" % field
+                        "field %s is not accepted by this endpoint"
+                        % extra[0]
                     )
                     return
+                if not self._record_attempt(
+                    tenant_id, None, audit_mod.ACTION_CREATE,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._bad_request(
+                    "field %s is not accepted by this endpoint" % extra[0]
+                )
+                return
+            # Validate label first (the order is irrelevant to the contract,
+            # but keep the two string checks together).
+            if not isinstance(payload.get("label"), str):
+                field = "label"
+                if idem_key is not None:
+                    self._bad_request(
+                        "missing required field: %s" % field
+                        if field not in payload
+                        else "field %s must be a string" % field
+                    )
+                    return
+                if not self._record_attempt(
+                    tenant_id, None, audit_mod.ACTION_CREATE,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._bad_request(
+                    "missing required field: %s" % field
+                    if field not in payload
+                    else "field %s must be a string" % field
+                )
+                return
+            if not isinstance(payload.get("algorithm"), str):
+                field = "algorithm"
+                if idem_key is not None:
+                    self._bad_request("missing required field: %s" % field)
+                    return
+                if not self._record_attempt(
+                    tenant_id, None, audit_mod.ACTION_CREATE,
+                    audit_mod.OUTCOME_REJECTED,
+                ):
+                    return
+                self._bad_request("missing required field: %s" % field)
+                return
             algorithm = payload["algorithm"]
             if algorithm not in SUPPORTED_ALGORITHMS:
+                if idem_key is not None:
+                    self._bad_request(
+                        "unsupported value for field algorithm: %r "
+                        "(supported: %s)"
+                        % (algorithm, ", ".join(SUPPORTED_ALGORITHMS))
+                    )
+                    return
                 if not self._record_attempt(
                     tenant_id, None, audit_mod.ACTION_CREATE,
                     audit_mod.OUTCOME_REJECTED,
@@ -993,16 +1099,117 @@ def make_handler(
                     % (algorithm, ", ".join(SUPPORTED_ALGORITHMS))
                 )
                 return
-            if not self._enforce(
-                tenant_id, None, audit_mod.ACTION_CREATE, operator
-            ):
+            if idem_key is None:
+                if not self._enforce(
+                    tenant_id, None, audit_mod.ACTION_CREATE, operator
+                ):
+                    return
+                record = store.create(
+                    tenant_id=tenant_id,
+                    algorithm=algorithm,
+                    label=payload["label"],
+                )
+                self._send_json(201, record.to_create_response())
                 return
-            record = store.create(
+
+            self._create_key_idempotent(
+                parts_path=_KEYS_PATH,
                 tenant_id=tenant_id,
+                operator=operator,
+                payload=payload,
+                idem_key=idem_key,
                 algorithm=algorithm,
                 label=payload["label"],
             )
-            self._send_json(201, record.to_create_response())
+
+        def _create_key_idempotent(
+            self, parts_path, tenant_id, operator, payload, idem_key,
+            algorithm, label,
+        ) -> None:
+            """POST /v1/keys carrying an Idempotency-Key."""
+
+            def execute(operation, mirror=None):
+                # The prospective key_id and operation kind are durable in
+                # the operation details/mirror BEFORE the policy check and
+                # the provider call, so every terminal is replayable. A
+                # retry taking a clean bound strand over REUSES the original
+                # prospective key_id (it is already part of the binding's
+                # durable evidence) rather than minting a second one.
+                existing = (operation.details or {}).get("key_id")
+                if is_valid_key_id(existing):
+                    key_id = existing
+                else:
+                    key_id = str(uuid.uuid4())
+                    operation_store.update_details(
+                        operation,
+                        {"kind": "create", "key_id": key_id,
+                         "algorithm": algorithm, "label": label},
+                    )
+                if mirror is not None:
+                    mirror.describe(
+                        {"kind": "create", "write_set": [key_id]}
+                    )
+                try:
+                    allowed = policy_store.is_allowed(
+                        tenant_id, audit_mod.ACTION_CREATE, operator, None
+                    )
+                except PolicyStoreUnavailable:
+                    # Fixed 500, no audit; the op stays pending (nothing was
+                    # written) and a same-key retry continues once the policy
+                    # store recovers.
+                    raise ArtifactBoundRetry(
+                        "policy store is unavailable", 500
+                    )
+                if not allowed:
+                    return self._idempotent_rejection(
+                        operation, tenant_id, key_id,
+                        audit_mod.ACTION_CREATE, 403,
+                        "action not permitted by policy",
+                    )
+
+                def stage_success(committed_record):
+                    body = dict(committed_record.to_create_response())
+                    body["operation_id"] = operation.operation_id
+                    operation_store.stage_terminal(operation, 201, body)
+
+                try:
+                    record = store.create(
+                        tenant_id=tenant_id,
+                        algorithm=algorithm,
+                        label=label,
+                        event_id=operation.operation_id,
+                        key_id=key_id,
+                        pre_commit=stage_success,
+                        mirror=mirror,
+                    )
+                except ArtifactStrandUnavailable:
+                    # Cleanup of a failed create could not be verified: the
+                    # scene is parked, the op stays pending and no audit is
+                    # written; the generic guard answers a material-safe 500.
+                    raise
+                except CreateProviderRetry:
+                    raise
+                except ProviderUnavailable:
+                    # The KMS/HSM was unavailable (generation failed, or a
+                    # handle minted for a failed attempt could not be
+                    # deleted). No audit is booked for create: leave the op
+                    # pending and answer the fixed 503; a same-key retry
+                    # continues under the same operation_id after the
+                    # rollback strand has been reset.
+                    if mirror is not None:
+                        try:
+                            mirror.reset_for_pending_retry()
+                        except OSError:
+                            pass
+                    raise CreateProviderRetry(
+                        "key management provider is unavailable"
+                    )
+                # The success event committed in the same outbox transaction.
+                return 201, record.to_create_response()
+
+            self._idempotent_guard(
+                parts_path, tenant_id, operator, payload, idem_key, execute
+            )
 
         def _rotate_key(self, key_id: str, parts, operator: str) -> None:
             # Validate the Idempotency-Key before reading or parsing the body
@@ -4579,6 +4786,20 @@ def _resolve_committed_operation(store, policy_store, record, event):
         if key is not None:
             body = key.to_create_response()
             body["operation_id"] = op_id
+            return 201, body
+    if kind == "create":
+        key_id = event.key_id or details.get("key_id")
+        key = store.get(key_id, tenant_id)
+        if key is not None:
+            # A create always replays version 1's algorithm/public key; a
+            # later rotation never rewrites the original response.
+            version_one = key.get_version(1)
+            body = {
+                "key_id": key_id,
+                "algorithm": version_one.algorithm,
+                "public_key": version_one.public_key,
+                "operation_id": op_id,
+            }
             return 201, body
     if kind == "restore":
         return (

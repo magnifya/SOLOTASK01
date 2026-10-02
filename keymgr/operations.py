@@ -96,6 +96,7 @@ def state_for_http_status(http_status: int) -> str:
 
 # The audit action each operation kind commits with.
 _KIND_ACTIONS = {
+    "create": "create",
     "rotate": "rotate",
     "batch_rotate": "batch_rotate",
     "import": "import",

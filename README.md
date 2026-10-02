@@ -3,7 +3,8 @@
 一个多租户密钥管理服务，同时提供 HTTP API 与命令行入口。支持 AES256 / RSA2048
 密钥的生成、版本化轮换、吊销、加密导出/导入、租户级加密备份/恢复、按租户的
 操作者策略、只追加的审计账，以及可插拔的 KMS/HSM 提供者。HTTP 信封加密、
-轮换/导入/恢复是幂等操作：同一 `Idempotency-Key` 的重试只重放原结果，进程
+轮换/导入/恢复是幂等操作，`POST /v1/keys` 携带可选 `Idempotency-Key` 时亦然
+（不带头与 CLI `gen` 保持非幂等）：同一 `Idempotency-Key` 的重试只重放原结果，进程
 在任一步骤崩溃后重启都能据 `operation_id` 判定是否已耐久并一致收尾。
 （CLI `encrypt` 保持旧的非幂等行为，不携带 `Idempotency-Key`。）私钥只保存
 在服务端，任何响应与审计投影都不含私钥、句柄或包装材料。
@@ -60,8 +61,27 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 ## HTTP 接口
 
 - `POST /v1/keys`，body `{tenant_id, algorithm, label}`，`algorithm` 仅
-  `AES256`/`RSA2048`。`201` → `{key_id, algorithm, public_key}`（AES 的
-  `public_key` 为 null，RSA 为 PEM）。
+  `AES256`/`RSA2048`，`label` 可为空字符串。`201` →
+  `{key_id, algorithm, public_key}`（AES 的 `public_key` 为 null，RSA 为
+  PEM），密钥从 active 的版本 1 开始。该入口的 `Idempotency-Key` 头为
+  **可选**：不带头时（以及 CLI `gen`）维持原有非幂等行为，每次都新建
+  密钥；带头时创建成为全局唯一幂等操作，`201` 体额外含 `operation_id`，
+  绑定要素为租户、操作者、路径与规范化体 `{tenant_id, algorithm,
+  label}`（忽略 JSON 空白与字段顺序）。绑定**之前**的空值/重复/非法
+  Idempotency-Key、坏 JSON、正文非对象、字段缺失/多余/类型错误及非法
+  算法均为指出 `Idempotency-Key` 或字段名的 `400`，不占用幂等键、不写
+  审计（租户来源缺失/冲突仍照旧记 `tenant_conflict`）；绑定后的授权用
+  `create`，拒绝为 `403` 且只记一次 `create/rejected`（`event_id` 等于
+  `operation_id`），成功只记一次 `create/success`。绑定要素改变返回
+  `409`，体仅含 `error` 与原 `operation_id`；同键并发只执行一次，等待
+  超过五秒返回 `503`，等待方不写任何状态。提供者不可用为固定 `503`、
+  策略存储不可用为固定 `500`，二者均不写审计、操作保持 pending 待同键
+  重试；账本或密钥存储失败为 `500`（绑定后错误体仅含 `error` 与
+  `operation_id`）。重启后已提交操作重放原完整 `201`（后来轮换不改变
+  重放的算法与公钥）；证据明确的未提交操作回滚新密钥与句柄后置
+  failed 并以 `500` 重放，证据不足或清理失败则保留恢复线索、保持
+  pending 并返回 `500`。可由 `GET /v1/operations/{operation_id}` 查询，
+  pending 时隐藏响应。私钥、句柄与包装材料不进入响应、审计或错误。
 - `GET /v1/keys/{key_id}` → `{algorithm, label, created_at, public_key}`。
 - `GET /v1/keys`：本租户密钥快照分页清单。单一租户来源（单一头或单一
   `?tenant_id=`）；可选单值参数 `status`(active|revoked)、
@@ -488,6 +508,14 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 
 ## 幂等操作
 
+- HTTP 的 `POST /v1/keys` 接受**可选**单一 `Idempotency-Key` 头：不带头
+  时维持原有非幂等创建行为（CLI `gen` 同样非幂等、无此头），带头时遵守
+  下列与 rotate 相同的绑定/并发/崩溃语义（仅 HTTP，无 CLI 入口）。其
+  绑定前参数错误（坏 JSON、非对象、字段缺失/多余/类型错误、非法算法）
+  为零副作用 `400`、不占用幂等键、不写审计；租户来源缺失/冲突仍照旧记
+  `tenant_conflict`。绑定后的提供者不可用（`503`）与策略存储不可用
+  （`500`）沿用各自固定文案、**不写审计且操作保持 pending**，同键重试在
+  同一 `operation_id` 下恰好创建一次；账本/密钥存储失败为 failed(`500`)。
 - HTTP 的 rotate/import/restore/batch-rotate/migrate/encrypt（CLI：
   `rotate`/`import`/`restore`/`batch-rotate`/`migrate`；CLI `encrypt`
   维持非幂等、无此头）必须携带**单一** `Idempotency-Key` 头（前五个 CLI
@@ -523,8 +551,8 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   时保持 `pending`（信封无法在无请求的情况下重建，故绝不臆造终态），由同键
   HTTP 重试在同一 `operation_id` 下恰好再执行一次。不重复记账（账本按
   event_id 去重），不误判。
-- **operation 工件镜像**：rotate/import/restore/batch-rotate/migrate 以及
-  HTTP encrypt 在幂等键绑定记录耐久**之后**、首次调用提供者**之前**，原子创建
+- **operation 工件镜像**：携带 `Idempotency-Key` 的 HTTP create、
+  rotate/import/restore/batch-rotate/migrate 以及 HTTP encrypt 在幂等键绑定记录耐久**之后**、首次调用提供者**之前**，原子创建
   `operation-artifacts/<operation_id>.json`（0600、temp 文件 fsync 后 rename；
   非幂等入口与未绑定请求不创建该目录；CLI `encrypt` 为非幂等入口不创建）。
   镜像是一次尝试全部耐久工件的交叉索引，记录租户、操作者、路径、规范化请求
