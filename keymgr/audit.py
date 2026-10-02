@@ -776,6 +776,7 @@ class AuditLog:
         key_id: Optional[str] = None,
         action: Optional[str] = None,
         operation_id: Optional[str] = None,
+        outcome: Optional[str] = None,
         since: Optional[str] = None,
         until: Optional[str] = None,
         limit: int = 100,
@@ -787,8 +788,10 @@ class AuditLog:
         records carry a null tenant and are therefore visible to nobody.
         ``operation_id`` filters on the event id, locating the single event
         committed under an idempotent operation's ``operation_id``; a valid
-        id with no matching event simply yields an empty page (never 404). A
-        cursor is valid only with the same tenant, filters and an unchanged
+        id with no matching event simply yields an empty page (never 404).
+        ``outcome`` (``success``/``rejected``) and-combines with every other
+        filter. A cursor is valid only with the same tenant, filters
+        (including whether outcome was supplied at all) and an unchanged
         ledger snapshot; otherwise InvalidCursor is raised.
         """
         canonical_since = (
@@ -819,6 +822,14 @@ class AuditLog:
                     or payload.get("s") != canonical_since
                     or payload.get("u") != canonical_until
                 ):
+                    raise InvalidCursor("cursor does not match filters")
+                # The outcome condition is bound as a whole: whether it was
+                # supplied and which value it had must both match. A legacy
+                # cursor issued before the filter existed carries no "oc" and
+                # therefore cannot page an outcome-filtered query.
+                if ("oc" in payload) != (outcome is not None):
+                    raise InvalidCursor("cursor does not match filters")
+                if outcome is not None and payload.get("oc") != outcome:
                     raise InvalidCursor("cursor does not match filters")
                 if int(payload.get("l", -1)) != limit:
                     raise InvalidCursor("cursor does not match limit")
@@ -851,6 +862,7 @@ class AuditLog:
             and (key_id is None or e.key_id == key_id)
             and (action is None or e.action == action)
             and (operation_id is None or e.event_id == operation_id)
+            and (outcome is None or e.outcome == outcome)
             and (
                 not time_range_active
                 or (
@@ -874,22 +886,27 @@ class AuditLog:
         page = selected[:limit]
         if len(selected) > limit and page:
             last = page[-1]
-            next_cursor = self._encode_cursor(
-                {
-                    "v": 1,
-                    "t": tenant_id,
-                    "k": key_id,
-                    "a": action,
-                    "o": operation_id,
-                    "s": canonical_since,
-                    "u": canonical_until,
-                    "l": limit,
-                    "ts": last.timestamp,
-                    "eid": last.event_id,
-                    "seq": last.seq,
-                    "f": current_fingerprint,
-                }
-            )
+            next_payload = {
+                "v": 1,
+                "t": tenant_id,
+                "k": key_id,
+                "a": action,
+                "o": operation_id,
+                "s": canonical_since,
+                "u": canonical_until,
+                "l": limit,
+                "ts": last.timestamp,
+                "eid": last.event_id,
+                "seq": last.seq,
+                "f": current_fingerprint,
+            }
+            # Only an explicit outcome enters the token: cursors issued
+            # without the filter stay byte-compatible with pre-upgrade ones,
+            # and an old token can never validate an outcome query (it has no
+            # bound "oc").
+            if outcome is not None:
+                next_payload["oc"] = outcome
+            next_cursor = self._encode_cursor(next_payload)
         else:
             next_cursor = None
         return AuditPage(events=page, next_cursor=next_cursor)

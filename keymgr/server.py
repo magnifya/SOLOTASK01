@@ -4283,6 +4283,22 @@ def make_handler(
                 self._bad_request("field operation_id must be a UUID4")
                 return
 
+            values, errored = self._single_param(qs, "outcome")
+            if errored:
+                return
+            outcome = values[0] if values else None
+            if outcome is not None and outcome not in audit_mod.OUTCOMES:
+                # Exact, case-sensitive match: an empty value, a duplicate, a
+                # case variant or surrounding whitespace all land here. The
+                # check precedes the policy decision and the ledger query and
+                # writes no audit event (only a missing/conflicting tenant
+                # source records tenant_conflict).
+                self._bad_request(
+                    "field outcome must be one of: %s"
+                    % ", ".join(audit_mod.OUTCOMES)
+                )
+                return
+
             limit = 100
             values, errored = self._single_param(qs, "limit")
             if errored:
@@ -4320,6 +4336,7 @@ def make_handler(
                     key_id=key_id,
                     action=action,
                     operation_id=operation_id,
+                    outcome=outcome,
                     since=since,
                     until=until,
                     limit=limit,
