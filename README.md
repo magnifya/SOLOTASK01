@@ -212,6 +212,23 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   active）。同租户已有 key_id 为
   `409`，key_id 被其它租户占用为 `404`；口令/篡改/格式错误为 `400` 且不占用
   幂等键。
+- `POST /v1/keys/import/preflight`，body 仅
+  `{tenant_id, passphrase, bundle}`（无需 `Idempotency-Key`，携带时忽略且
+  不绑定，无 CLI 入口）：导入预检。依次完成包认证与结构校验（沿用正式导入
+  的 `keymgr-export-v1` 解释）、按包内 key_id 的 `import` 授权（密钥范围规
+  则同正式导入）、目标标识占用判断；只读、不加载或调用提供者，不创建密钥、
+  句柄、策略、操作记录或恢复工件（锁文件除外），除拒权与既有
+  `tenant_conflict` 外不记审计。`200` 仅返
+  `{key_id, label, current_version, version_count, status, ready}`：
+  `version_count` 为版本总数，其余摘要取自包内；标识未占用 `ready:true`，
+  同租户已占用（含已吊销密钥）`ready:false`，其它租户占用为
+  `404 {"error":"key not found"}`。口令错误、篡改、编码/格式错误或包内字
+  段非法统一 `400 {"error":"invalid key export"}`；请求字段与租户来源错
+  误沿用既有 400（`tenant_conflict` 照旧）；并发导入或恢复时仅依据完整已
+  提交状态答复，记录损坏、读取失败、账本不可用或五秒内无法可靠判定目标状
+  态固定 `500 {"error":"key import preflight unavailable"}`；策略存储不可
+  用沿用既有固定 `500`。`ready` 仅反映认证、结构与占用检查，正式导入仍检
+  查提供者可用性与材料。
 - `POST /v1/keys/{key_id}/encrypt`，需单一 `Idempotency-Key` 头，body
   `{tenant_id, version?, plaintext, aad?}`；`plaintext`、`aad` 为 base64，
   `version` 缺省为 current。幂等键先于请求体与一切业务校验：缺失/为空/重复/

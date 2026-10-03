@@ -64,6 +64,7 @@ _PROVIDER_RECONNECT_PATH = "/v1/provider/reconnect"
 _PROVIDER_SWITCHOVER_PATH = "/v1/provider/switchover"
 _OPERATIONS_PATH_RE = re.compile(r"^/v1/operations/([^/]+)$")
 _IMPORT_PATH = "/v1/keys/import"
+_IMPORT_PREFLIGHT_PATH = "/v1/keys/import/preflight"
 _BATCH_ROTATE_PATH = "/v1/keys/batch-rotate"
 _BACKUP_PATH = "/v1/backup"
 _BACKUP_VERIFY_PATH = "/v1/backup/verify"
@@ -935,6 +936,10 @@ def make_handler(
 
                 if path == _IMPORT_PATH:
                     self._import_key(parts, operator)
+                    return
+
+                if path == _IMPORT_PREFLIGHT_PATH:
+                    self._import_preflight(parts, operator)
                     return
 
                 if path == _BATCH_ROTATE_PATH:
@@ -3112,6 +3117,122 @@ def make_handler(
 
             self._idempotent_guard(
                 parts.path, tenant_id, operator, payload, idem_key, execute
+            )
+
+        def _import_preflight(self, parts, operator: str) -> None:
+            """POST /v1/keys/import/preflight.
+
+            A side-effect-free dry run of POST /v1/keys/import: the bundle
+            is authenticated and validated exactly like an import, the
+            import action is authorized against the in-bundle key_id and
+            the target's occupancy is observed under the per-key lock, so
+            a concurrent import or restore is answered wholly before or
+            wholly after its committed state. No Idempotency-Key is
+            required (a supplied one is ignored and never bound); no key,
+            provider handle, policy, operation record or restore artifact
+            is created (lock files aside) and no audit event is left --
+            the sole exceptions being the single ``import/rejected``
+            event on a policy denial and the usual invisible
+            tenant_conflict. The readiness verdict reflects only
+            authentication, structure and occupancy: the formal import
+            still checks provider availability and material.
+
+            Statuses: request field and tenant-source failures follow the
+            usual 400 rules; a wrong passphrase, tampering, bad
+            base64/JSON or any in-bundle field problem is the fixed 400
+            ``invalid key export``; policy denial is 403; a key_id owned
+            by another tenant (including a revoked key) is 404 so
+            existence never leaks; a corrupt record, an unreadable
+            ledger or a target state that cannot be judged within five
+            seconds is the fixed 500 ``key import preflight unavailable``.
+            """
+            payload = self._read_json_object()
+            if payload is None:
+                return
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                if self._record_conflict():
+                    self._bad_request(
+                        "field tenant_id must be a non-empty string"
+                    )
+                return
+            tenant_id = self._tenant(parts, payload)
+            if tenant_id is None:
+                return
+            unknown = set(payload) - {"tenant_id", "passphrase", "bundle"}
+            if unknown:
+                self._bad_request(
+                    "field %s is not accepted by this endpoint"
+                    % sorted(unknown)[0]
+                )
+                return
+            passphrase = payload.get("passphrase")
+            if not isinstance(passphrase, str) or not passphrase:
+                self._bad_request(
+                    "field passphrase must be a non-empty string"
+                )
+                return
+            bundle = payload.get("bundle")
+            if not isinstance(bundle, str) or not bundle:
+                self._bad_request("field bundle must be a non-empty string")
+                return
+            try:
+                decoded = keybundle.decode_bundle(bundle, passphrase)
+            except keybundle.BundleError:
+                # Wrong passphrase, tampering, bad base64/JSON and any
+                # in-bundle format/version/field problem share one
+                # detail-free 400: the failure never doubles as an
+                # existence probe.
+                self._bad_request("invalid key export")
+                return
+            key_id = decoded["key_id"]
+            # Authorization uses the import action scoped by the in-bundle
+            # key_id, in the same order as the formal import (after
+            # authentication, before occupancy). A denial is the only
+            # audit event a preflight ever writes.
+            if not policy_store.is_allowed(
+                tenant_id, audit_mod.ACTION_IMPORT, operator, key_id
+            ):
+                try:
+                    store.audit_attempt(
+                        tenant_id, key_id, audit_mod.ACTION_IMPORT,
+                        audit_mod.OUTCOME_REJECTED,
+                    )
+                except LedgerError:
+                    self._import_preflight_unavailable()
+                    return
+                self._send_json(
+                    403, {"error": "action not permitted by policy"}
+                )
+                return
+            try:
+                owner = store.committed_owner(
+                    key_id, lock_timeout=operations_mod.LOCK_WAIT_SECONDS
+                )
+            except (LockTimeout, LedgerError, OSError):
+                self._import_preflight_unavailable()
+                return
+            if owner is not None and owner != tenant_id:
+                # Same answer as a missing key: never confirm another
+                # tenant owns this key_id.
+                self._send_json(404, {"error": "key not found"})
+                return
+            self._send_json(
+                200,
+                {
+                    "key_id": key_id,
+                    "label": decoded["label"],
+                    "current_version": decoded["current_version"],
+                    "version_count": len(decoded["versions"]),
+                    "status": decoded["status"],
+                    "ready": owner is None,
+                },
+            )
+
+        def _import_preflight_unavailable(self) -> None:
+            """Fixed 500 for a preflight whose target state cannot be judged."""
+            self._send_json(
+                500, {"error": "key import preflight unavailable"}
             )
 
         # -- tenant backup / restore --------------------------------------

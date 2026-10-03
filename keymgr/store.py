@@ -5414,6 +5414,50 @@ class KeyStore:
             return None
         return self._read_record(self._path_for(key_id))
 
+    def committed_owner(
+        self, key_id: str, lock_timeout: Optional[float] = None
+    ) -> Optional[str]:
+        """Return the tenant owning ``key_id`` in fully committed state.
+
+        The import preflight's occupancy check: the read runs under the
+        per-key locks (a finite ``lock_timeout`` shares one deadline and
+        raises :class:`LockTimeout` when it elapses), so a concurrent
+        import or restore is observed wholly before or wholly after. Only
+        fully committed state answers: a file still carrying an
+        uncommitted create/import/restore marker projects as absent
+        (None). A corrupt or unreadable record raises :class:`LedgerError`
+        (the caller answers its fixed 500 rather than reporting the id
+        free), and when a pending marker must be settled an unreadable
+        ledger raises too instead of silently projecting "not durable".
+        """
+        if not _KEY_ID_RE.fullmatch(key_id):
+            return None
+        with self.key_locks(key_id, timeout=lock_timeout):
+            record = self._read_record(self._path_for(key_id), strict=True)
+            if record is None:
+                return None
+            marker = record.pending_event
+            if isinstance(marker, dict) and marker:
+                self._settle_marker_event(marker)
+            committed = self._committed_record(record)
+            if committed is None:
+                return None
+            return committed.tenant_id
+
+    def _settle_marker_event(self, marker: dict) -> None:
+        """Raise LedgerError when the ledger cannot settle a pending marker.
+
+        ``_committed_record`` treats an unreadable ledger as "not durable"
+        so a read never exposes an uncommitted current; a preflight
+        occupancy answer must instead fail, so the marker's event is
+        looked up here with ledger errors propagating.
+        """
+        nested = marker.get("event")
+        desc = nested if isinstance(nested, dict) else marker
+        event_id = desc.get("event_id") if isinstance(desc, dict) else None
+        if isinstance(event_id, str) and event_id:
+            self.audit.get_event(event_id)
+
     def record_from_backup(
         self, tenant_id: str, entry: dict, journal: Optional[str] = None,
         mirror=None,
