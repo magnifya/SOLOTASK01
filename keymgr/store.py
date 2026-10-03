@@ -5119,6 +5119,87 @@ class KeyStore:
                         raise
                     self._abort_provision(journal_id, adopted)
 
+    def _marker_event_durable_strict(self, marker) -> bool:
+        """_marker_event_durable that propagates ledger read failures.
+
+        A read that must answer from fully committed state (the import
+        preflight) cannot treat "the ledger cannot be read" as "not
+        durable": it surfaces the LedgerError so the caller answers its
+        fixed 500 instead of guessing occupancy.
+        """
+        if not isinstance(marker, dict):
+            return False
+        nested = marker.get("event")
+        desc = nested if isinstance(nested, dict) else marker
+        event_id = desc.get("event_id") if isinstance(desc, dict) else None
+        if not isinstance(event_id, str) or not event_id:
+            return False
+        event = self.audit.get_event(event_id)
+        if event is None or event.outcome != audit_mod.OUTCOME_SUCCESS:
+            return False
+        action = desc.get("action") if isinstance(desc, dict) else None
+        if isinstance(action, str) and action and event.action != action:
+            return False
+        tenant = desc.get("tenant_id") if isinstance(desc, dict) else None
+        if isinstance(tenant, str) and tenant and event.tenant_id != tenant:
+            return False
+        return True
+
+    def import_preflight_owner(
+        self, key_id: str, lock_timeout: Optional[float] = None
+    ) -> Optional[str]:
+        """Return the tenant owning key_id's committed state, or None.
+
+        A pure read for POST /v1/keys/import/preflight: no event, journal,
+        handle, key file, marker or operation record is created (the
+        advisory lock sidecar excepted), and no provider is loaded or
+        called. The read runs under the same per-key locks an import or a
+        restore takes, so a concurrent import/restore is observed wholly
+        before or wholly after. Only fully committed state counts: a file
+        still carrying an uncommitted create/import/restore marker is not
+        an occupant yet, while a committed (or existing-key) mutation
+        marker -- rotate, revoke, migrate, a batch group -- sits on a key
+        that already exists and stays occupied, revoked keys included.
+
+        Raises LockTimeout when the locks cannot be taken within
+        ``lock_timeout`` and LedgerError when an existing record cannot be
+        read/parsed or the ledger cannot answer a durability question: the
+        caller maps both to the fixed 500 rather than guessing occupancy.
+        """
+        if not _KEY_ID_RE.fullmatch(key_id):
+            return None
+        with self.key_locks(key_id, timeout=lock_timeout):
+            record = self._read_record(self._path_for(key_id), strict=True)
+            if record is None:
+                return None
+            marker = record.pending_event
+            if (
+                isinstance(marker, dict)
+                and marker
+                and not self._marker_event_durable_strict(marker)
+            ):
+                if marker.get("_restore"):
+                    # An uncommitted restore only ever creates brand-new
+                    # files; not an occupant until its event is durable.
+                    return None
+                if "event" not in marker and not marker.get("_batch_rotate"):
+                    # A flat single-key outbox marker. Create/import write a
+                    # brand-new file: uncommitted, it is not an occupant.
+                    # Rotate/revoke/migrate sit on an already-committed key,
+                    # which stays occupied either way. An unrecognized flat
+                    # shape projects "not here", mirroring
+                    # _committed_record.
+                    action = marker.get("action")
+                    if action in (
+                        audit_mod.ACTION_CREATE,
+                        audit_mod.ACTION_IMPORT,
+                        None,
+                    ):
+                        return None
+                # Batch/restore-style nested markers and existing-key
+                # mutations: the key's committed pre-image occupies the id.
+            return record.tenant_id
+
     # -- tenant backup / restore ------------------------------------------
     def list_for_tenant(self, tenant_id: str) -> list:
         """Return all KeyRecords owned by the tenant (sorted by key_id)."""
