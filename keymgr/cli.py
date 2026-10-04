@@ -269,6 +269,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_audit.add_argument("--outcome", action="append",
                          help="filter by execution result; one of: %s "
                               "(case-sensitive)" % ", ".join(audit_mod.OUTCOMES))
+    p_audit.add_argument("--operator-id", action="append",
+                         help="filter by the recorded operator identity "
+                              "(exact, case-sensitive match; --operator "
+                              "still identifies the caller)")
     p_audit.add_argument("--since", action="append",
                          help="inclusive RFC3339 lower time bound")
     p_audit.add_argument("--until", action="append",
@@ -2160,6 +2164,21 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 )
         else:
             outcome = None
+        if args.operator_id:
+            if len(args.operator_id) > 1:
+                return _fail("duplicate operator_id parameter", 2)
+            operator_id = args.operator_id[0]
+            if not operator_id:
+                # The filter matches the recorded identity verbatim
+                # (case-sensitive, whitespace and Unicode preserved); only
+                # an empty or repeated value is an exit-2 parameter error
+                # naming operator_id, emitted before any policy or ledger
+                # work. --operator remains the caller's identity.
+                return _fail(
+                    "field operator_id must be a non-empty string", 2
+                )
+        else:
+            operator_id = None
         if not 1 <= args.limit <= 1000:
             return _fail(
                 "field limit must be an integer between 1 and 1000", 2
@@ -2178,6 +2197,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 action=args.action,
                 operation_id=args.operation_id,
                 outcome=outcome,
+                operator_id=operator_id,
                 since=since,
                 until=until,
                 limit=args.limit,
