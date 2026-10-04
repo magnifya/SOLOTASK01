@@ -66,6 +66,7 @@ _KIND_ACTIONS = {
     "create": audit_mod.ACTION_CREATE,
     "rotate": audit_mod.ACTION_ROTATE,
     "batch_rotate": audit_mod.ACTION_BATCH_ROTATE,
+    "batch_revoke": audit_mod.ACTION_BATCH_REVOKE,
     "import": audit_mod.ACTION_IMPORT,
     "restore": audit_mod.ACTION_IMPORT,
     "migrate": audit_mod.ACTION_MIGRATE,
@@ -80,8 +81,9 @@ _KIND_ACTIONS = {
 _READ_ONLY_KINDS = frozenset(("encrypt",))
 
 # Kinds whose success terminal is HTTP 200 (rather than the 201 of a creating
-# mutation): read-only encrypt and the in-place migrate (no new key/version).
-_STATUS_200_KINDS = frozenset(("encrypt", "migrate"))
+# mutation): read-only encrypt, the in-place migrate (no new key/version) and
+# the in-place batch revocation (no new key, version or handle).
+_STATUS_200_KINDS = frozenset(("encrypt", "migrate", "batch_revoke"))
 
 
 class ArtifactInconsistent(Exception):
@@ -244,6 +246,10 @@ class ArtifactMirror:
         if kind == "batch_rotate" and not normalized:
             raise ArtifactInconsistent(
                 "a batch_rotate mirror requires a non-empty write set"
+            )
+        if kind == "batch_revoke" and not normalized:
+            raise ArtifactInconsistent(
+                "a batch_revoke mirror requires a non-empty write set"
             )
         return normalized
 
@@ -1045,6 +1051,8 @@ class ArtifactStore:
             return False
         if kind == "batch_rotate" and not seen:
             return False
+        if kind == "batch_revoke" and not seen:
+            return False
         return True
 
     @staticmethod
@@ -1278,6 +1286,31 @@ class ArtifactStore:
                     return False
                 version = item.get("version")
                 if not isinstance(version, int) or key.get_version(version) is None:
+                    return False
+            if response_keys != set(write_set):
+                return False
+        elif kind == "batch_revoke":
+            items = response.get("items")
+            if not isinstance(items, list):
+                return False
+            response_keys = set()
+            for item in items:
+                if not isinstance(item, dict):
+                    return False
+                key_id = item.get("key_id")
+                if not _is_key_id(key_id):
+                    return False
+                response_keys.add(key_id)
+                # A committed batch revocation leaves every key revoked; the
+                # staged item must project exactly that whole-key state.
+                if item.get("status") != "revoked":
+                    return False
+                key = self.key_store._read_record(
+                    self.key_store._path_for(key_id)
+                )
+                if key is None or key.tenant_id != tenant_id:
+                    return False
+                if key.status != "revoked":
                     return False
             if response_keys != set(write_set):
                 return False

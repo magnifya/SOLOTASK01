@@ -120,6 +120,28 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `{items:[{key_id, version, algorithm, public_key}, ...], operation_id}`，
   items 严格按请求序；各 key 沿用单键 rotate 语义，整批原子提交（共享一把
   per-key 锁顺序、单一 provision/snapshot 记账、单条提交事件）。
+- `POST /v1/keys/batch-revoke`（无 CLI、需 `Idempotency-Key`，先于正文校验），
+  body 仅 `{tenant_id, key_ids, reason, operator}`：`key_ids` 为 1–100 个不重复
+  小写 UUID4 的数组（数组顺序计入幂等绑定），`reason`/`operator` 为非空字符串。
+  坏 JSON、非对象、字段缺失或多余、类型错误、空值、越界及非法或重复标识一律在
+  绑定**之前**返回指明字段的 `400`，不占幂等键、不写审计/操作/密钥；租户来源
+  错误仍记不可见的 `tenant_conflict`。绑定后逐键按 `revoke` 及密钥范围规则授权
+  （任一拒权整批 `403`），再检查存在性（任一未知或跨租户键整批 `404`，不泄露
+  存在性），拒权优先于缺失，二者皆零变更且只记一条 `batch_revoke/rejected`
+  （`key_id` null）。成功 `200` → `{items, operation_id}`，items 按请求序给出整键
+  status 查询的完整字段（`key_id,status,reason,operator,revoked_at`）：首次吊销
+  采用正文 reason/operator，同批新吊销共享同一 UTC 时间；已吊销键保留首次信息，
+  全部已吊销也成功。版本材料、版本级事实与当前版本不变，整键吊销继续优先并限制
+  所有版本的密码操作。请求不加载、探活或调用提供者，外部 KMS 不可用仍可吊销。
+  整批经单一 outbox 事务原子提交（共享 per-key 锁顺序、单条
+  `batch_revoke/success` 事件，`key_id` null、`event_id` 等于 `operation_id`、
+  主体取请求头）；批次与并发单键变更整批先后生效，读取不暴露未提交吊销。提交前
+  失败或崩溃还原整批并重放 `500`，提交后恢复按原结果重放；证据不足保持
+  `pending` 并返回 `500`，保留恢复线索。同绑定重试重放原结果（JSON 空白与字段
+  顺序不影响绑定），不同绑定 `409` 携带原 `operation_id`；同键并发只执行一次，
+  等待超过五秒 `503` 且等待方不写状态。策略存储不可用 `500` 且不记审计；记录
+  损坏或存储、账本故障 `500`。绑定后错误体仅含 `error,operation_id`；操作可按
+  `GET /v1/operations/{operation_id}` 查询；密钥材料与句柄不入响应、审计或错误。
 - `POST /v1/keys/{key_id}/migrate`，body 仅 `{"tenant_id": T}`，需
   `Idempotency-Key` 与操作者头。把主备链中该键**全部版本**从各自当前
   绑定的提供者**迁移**、导入此刻 **ready** 的链项并就地重绑键文件：版本号、
@@ -698,7 +720,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 ## 审计
 
 - 事件字段 `{event_id, tenant_id, action, key_id, outcome, timestamp}`；
-  `action` 为 `create/read/rotate/batch_rotate/revoke/revoke_version/import/export/
+  `action` 为 `create/read/rotate/batch_rotate/revoke/revoke_version/batch_revoke/import/export/
   migrate/encrypt/decrypt/rewrap/wrap_key/unwrap_key/sign/verify/audit/list/
   tenant_conflict/
   policy_read/policy_update/policy_delete`，`outcome` 为 `success/rejected`。
@@ -723,7 +745,9 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   成功写对应 action 的 success 事件。备份记 `export`、恢复记 `import`，两者
   `key_id` 均为 null；恢复的所有事件（含成功）`key_id` 为 null；批量轮换整批
   至多一条 `batch_rotate` 事件，成功与拒绝终态的 `key_id` 均为 null，可按
-  `action=batch_rotate` 筛选。
+  `action=batch_rotate` 筛选。批量吊销整批至多一条 `batch_revoke` 事件，成功与
+  拒绝终态的 `key_id` 均为 null、`event_id` 等于 `operation_id`、主体取请求头，
+  可按 `action=batch_revoke` 筛选与核验。
 - `GET /v1/audit`：单一租户来源；可选 `key_id`(UUID4)、`action`、
   `operation_id`(小写 UUID4)、`outcome`、`operator_id`、`since`、`until`、`limit`(1–1000，默认
   100)、`cursor`。各条件按同时满足处理；`since` 含起点、`until` 排除

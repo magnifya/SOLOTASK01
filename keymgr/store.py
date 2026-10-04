@@ -128,6 +128,35 @@ def validate_batch_items(
     return items, None
 
 
+def validate_batch_key_ids(raw) -> Tuple[Optional[List[str]], Optional[str]]:
+    """Validate a batch-revoke key_ids array (shared by HTTP and CLI).
+
+    Returns ``(key_ids, None)`` with the ids in request order, or
+    ``(None, message)`` naming the offending field. ``key_ids`` must be a
+    list of 1-100 unique canonical lowercase UUID4 strings. The check is
+    side-effect free and runs before the Idempotency-Key is bound.
+    """
+    if not isinstance(raw, list) or not (
+        BATCH_MIN_ITEMS <= len(raw) <= BATCH_MAX_ITEMS
+    ):
+        return None, (
+            "field key_ids must be an array of %d to %d items"
+            % (BATCH_MIN_ITEMS, BATCH_MAX_ITEMS)
+        )
+    key_ids: List[str] = []
+    seen = set()
+    for index, element in enumerate(raw):
+        if not is_valid_key_id(element):
+            return None, "field key_ids[%d] must be a UUID4" % index
+        if element in seen:
+            return None, (
+                "field key_ids contains a duplicate key_id: %s" % element
+            )
+        seen.add(element)
+        key_ids.append(element)
+    return key_ids, None
+
+
 # Outcomes of an import: a brand-new record, or a key_id that already exists
 # (whose on-disk record must remain byte-for-byte untouched).
 IMPORT_CREATED = "created"
@@ -593,6 +622,10 @@ class KeyStore:
         # durable -> keep and clear markers; otherwise roll every file of the
         # group back only after every minted handle was deleted) ...
         self._recover_batch_rotations()
+        # ... and multi-key batch-revocation groups (commit-point event
+        # durable -> keep and clear markers; otherwise restore every marked
+        # file to its still-active pre-image) ...
+        self._recover_batch_revocations()
         # ... then take over raw pre-provider records once, at startup, while
         # the local provider is active (a plain file scan; an external
         # module:factory provider is never imported or configured here) ...
@@ -1236,6 +1269,7 @@ class KeyStore:
                 audit_mod.ACTION_BATCH_ROTATE,
                 audit_mod.ACTION_REVOKE,
                 audit_mod.ACTION_REVOKE_VERSION,
+                audit_mod.ACTION_BATCH_REVOKE,
                 audit_mod.ACTION_IMPORT,
                 audit_mod.ACTION_EXPORT,
                 audit_mod.ACTION_MIGRATE,
@@ -1281,11 +1315,12 @@ class KeyStore:
                     continue
                 # A multi-file tenant restore transaction is resolved by the
                 # RestoreCoordinator (its manifest drives the shared event),
-                # and a multi-key batch-rotation group by
-                # _recover_batch_rotations; neither is resolved here.
+                # and a multi-key batch-rotation/batch-revocation group by
+                # _recover_batch_rotations/_recover_batch_revocations;
+                # neither is resolved here.
                 if record.pending_event.get("_restore") or record.pending_event.get(
                     "_batch_rotate"
-                ):
+                ) or record.pending_event.get("_batch_revoke"):
                     continue
                 # append() is idempotent on event_id, so this is safe whether
                 # the crash happened before or after the ledger write.
@@ -2029,6 +2064,21 @@ class KeyStore:
             # snapshot; an in-memory trim of the current file could never
             # prove another key's pre-image and must not be trusted.
             return self._batch_committed_view(record)
+        if marker.get("_batch_revoke"):
+            # A batch whole-key revocation marks only first-time
+            # active->revoked transitions and adds no version, so its
+            # pre-image is this same record while still active -- exactly
+            # like the single-key revoke projection below. A durable commit
+            # event makes the on-disk revoked state authoritative; anything
+            # else projects the still-active pre-image rather than exposing
+            # an uncommitted revocation.
+            if self._marker_event_durable(marker):
+                return record
+            record.status = "active"
+            record.reason = None
+            record.operator = None
+            record.revoked_at = None
+            return record
         if self._marker_event_durable(marker):
             return record
         nested = marker.get("event")
@@ -4182,6 +4232,375 @@ class KeyStore:
             if not self._delete_provisioned_handle(provider_id, handle):
                 cleaned = False
         return cleaned
+
+    # -- batch whole-key revocation -----------------------------------------
+    # A batch revocation touches no provider: it only flips the key-level
+    # revocation fields on 1-100 existing records and commits them through
+    # one outbox transaction with a single ``batch_revoke`` event (key_id
+    # null). Because a marked file is always a first-time active->revoked
+    # transition, its rollback pre-image is deterministic (still active, no
+    # revocation facts), so the group needs no snapshot journal: the marker
+    # each file carries is the complete recovery basis.
+    BATCH_REVOKED = "revoked"
+
+    def batch_revoke(
+        self,
+        tenant_id: str,
+        key_ids: List[str],
+        reason: str,
+        operator: str,
+        event_id: Optional[str] = None,
+        lock_timeout: Optional[float] = None,
+        pre_commit=None,
+        mirror=None,
+        operator_id: Optional[str] = None,
+    ) -> Tuple[str, object]:
+        """Atomically revoke many whole keys, keeping first-revocation facts.
+
+        ``key_ids`` is the validated request-order list of 1-100 unique
+        canonical UUID4s. Returns ``(BATCH_REVOKED, [(key_id, record), ...])``
+        in request order, or ``(BATCH_NOT_FOUND, missing_key_id)`` when any
+        key is unknown or owned by another tenant -- with zero files, events
+        or markers changed. The per-key locks (in-process plus fcntl) are
+        taken in sorted key_id order against one shared deadline, so a batch
+        and a concurrent single-key mutation never interleave on a shared
+        key; a wait beyond ``lock_timeout`` raises :class:`LockTimeout`
+        before any file, marker or event exists. No provider is loaded,
+        probed or called: an unavailable external KMS never blocks a
+        revocation.
+
+        Every key newly revoked by the batch shares one UTC ``revoked_at``
+        (the commit event's timestamp) and records the request's
+        reason/operator; a key already revoked keeps its first revocation's
+        values and its file is not rewritten (an all-already-revoked batch
+        still succeeds and still commits its single event). Versions,
+        version-level facts and the current pointer are never touched.
+
+        The whole batch commits through one outbox transaction: phase 1
+        writes every transitioning file carrying a shared ``_batch_revoke``
+        marker, ``pre_commit`` then stages the exact idempotent response,
+        and the single ledger append is the commit point. Any fault before
+        the append restores every changed file to its pre-batch content; a
+        rollback that cannot be verified, or a commit the ledger cannot
+        confirm, retains the whole marked scene and raises
+        ArtifactStrandUnavailable so the bound operation stays pending for
+        startup recovery. A crash is settled by
+        :meth:`_recover_batch_revocations` on the next open.
+        """
+        from .artifacts import ArtifactStrandUnavailable
+
+        request_order = list(key_ids)
+        ordered = sorted(request_order)
+        with self.multi_key_locks(ordered, timeout=lock_timeout):
+            records: dict = {}
+            for key_id in ordered:
+                record = self._read_record(self._path_for(key_id), strict=True)
+                if record is None or record.tenant_id != tenant_id:
+                    # Existence/ownership for the WHOLE batch is resolved
+                    # before any marker, file write or event exists.
+                    return self.BATCH_NOT_FOUND, key_id
+                # A parked crash scene (unresolved, non-durable marker) makes
+                # the whole batch a transient 503 rather than overwriting the
+                # preserved retry basis.
+                self._ensure_settled(record)
+                records[key_id] = record
+
+            revoked_at = datetime.now(timezone.utc).isoformat()
+            event = self.audit.new_event(
+                tenant_id, audit_mod.ACTION_BATCH_REVOKE, None,
+                audit_mod.OUTCOME_SUCCESS, timestamp=revoked_at,
+                event_id=event_id, operator_id=operator_id,
+            )
+            marker = {
+                "_batch_revoke": True,
+                "event": event.to_json(),
+                "tenant_id": tenant_id,
+                "key_ids": ordered,
+            }
+            previous: dict = {}
+            changed: List[str] = []
+            for key_id in ordered:
+                record = records[key_id]
+                if record.status == "revoked":
+                    # First revocation wins: keep the recorded facts and
+                    # leave the file untouched.
+                    continue
+                previous[key_id] = record.to_json()
+                record.status = "revoked"
+                record.reason = reason
+                record.operator = operator
+                record.revoked_at = revoked_at
+                changed.append(key_id)
+            # Set when append() returned without raising but the post-append
+            # ledger fact does not prove THIS batch committed (unreadable
+            # ledger, missing event, or a same-id event whose action/tenant
+            # differ): neither commit nor rollback is provable, so the whole
+            # marked scene is retained for startup recovery.
+            commit_unverifiable = False
+            try:
+                # Phase 1: every transitioning file lands carrying the shared
+                # marker.
+                for key_id in changed:
+                    record = records[key_id]
+                    record.pending_event = marker
+                    self._write_atomic(
+                        self._path_for(key_id), record.to_json()
+                    )
+                if mirror is not None:
+                    # The whole write set is durable and marked: staged.
+                    mirror.phase(PHASE_STAGED)
+                # The whole write set is durable: stage the exact idempotent
+                # response before the single commit-point append.
+                if pre_commit is not None:
+                    pre_commit(records)
+                # Phase 2: the single ledger append is the commit point.
+                self.audit.append(event)
+                # append() dedupes silently on event_id without comparing
+                # action/tenant: re-read the durable fact and require the
+                # ledger to now hold exactly this batch_revoke success for
+                # this tenant before treating the append as the commit point.
+                try:
+                    committed = self.audit.get_event(event.event_id)
+                except LedgerError:
+                    # append() itself re-reads the whole ledger and fsynced
+                    # the line before returning, so a fresh read error is a
+                    # transient outage AFTER a durable commit, not a missing
+                    # event: trust the fsynced append and proceed.
+                    committed = event
+                if (
+                    committed is None
+                    or committed.outcome != audit_mod.OUTCOME_SUCCESS
+                    or committed.action != audit_mod.ACTION_BATCH_REVOKE
+                    or committed.tenant_id != tenant_id
+                ):
+                    commit_unverifiable = True
+                    raise LedgerError(
+                        "the batch revocation commit event could not be "
+                        "confirmed as the expected batch_revoke success event"
+                    )
+            except BaseException as exc:
+                if commit_unverifiable:
+                    # The append returned but the durable fact is missing or
+                    # belongs to a different action/tenant: neither commit nor
+                    # rollback is provable. Retain the ENTIRE marked scene
+                    # unchanged for startup recovery; delete and write nothing.
+                    raise ArtifactStrandUnavailable(
+                        "could not confirm the batch revocation commit; the "
+                        "whole group is retained for startup recovery", 500
+                    ) from exc
+                # Establish the commit decision from the ledger before
+                # touching anything. The append is the last step, so a
+                # durable success event means every phase-1 file and the
+                # staged response are already on disk and only marker
+                # housekeeping remains; an unreadable ledger proves neither
+                # side, so the whole scene is retained rather than risking a
+                # committed revocation.
+                try:
+                    durable = self.audit.get_event(event.event_id)
+                except LedgerError:
+                    raise ArtifactStrandUnavailable(
+                        "could not determine whether the batch revocation "
+                        "committed; the whole group is retained for startup "
+                        "recovery", 500
+                    ) from exc
+                if (
+                    durable is not None
+                    and durable.outcome == audit_mod.OUTCOME_SUCCESS
+                    and durable.action == audit_mod.ACTION_BATCH_REVOKE
+                    and durable.tenant_id == tenant_id
+                ):
+                    # The commit point actually passed (e.g. the failure was
+                    # clearing a marker after a durable append): finalize the
+                    # in-memory records, which match every file on disk, and
+                    # answer success rather than rolling a committed
+                    # revocation back.
+                    self._batch_revoke_finalize(changed, records)
+                    if mirror is not None:
+                        try:
+                            mirror.phase(PHASE_COMMITTED)
+                        except OSError:
+                            pass
+                    return self.BATCH_REVOKED, [
+                        (key_id, records[key_id]) for key_id in request_order
+                    ]
+                if durable is not None:
+                    # A durable event carries this event id but is not this
+                    # batch's success (a rejection, or an action/tenant
+                    # collision): neither "committed" nor "roll back" is
+                    # provable. Park the whole scene -- no file write-back,
+                    # no marker clear, no success event -- until an
+                    # operator/startup settles it.
+                    raise ArtifactStrandUnavailable(
+                        "a durable event with this id does not match the "
+                        "batch revocation; the whole group is retained for "
+                        "startup recovery", 500
+                    ) from exc
+                # Nothing committed: the durable success event is absent.
+                # Restore every changed file to its exact pre-batch content;
+                # a write-back that fails retains the whole marked scene for
+                # startup recovery instead of guessing.
+                for key_id in changed:
+                    try:
+                        self._write_atomic(
+                            self._path_for(key_id), previous[key_id]
+                        )
+                    except OSError as rollback_exc:
+                        raise ArtifactStrandUnavailable(
+                            "batch revocation rollback could not restore "
+                            "every key file; the whole group is retained "
+                            "for startup recovery", 500
+                        ) from rollback_exc
+                if mirror is not None:
+                    # Every changed file was restored: the rollback is fully
+                    # verified. A bookkeeping failure here must not mask it.
+                    try:
+                        mirror.phase(PHASE_ROLLED_BACK)
+                    except OSError:
+                        pass
+                raise
+
+            # Phase 3: commit point passed. Clear markers as best-effort
+            # housekeeping; a failure or crash is repaired idempotently on
+            # the next open and never rolls the revocation back.
+            self._batch_revoke_finalize(changed, records)
+            if mirror is not None:
+                # Commit already durable; never let this bookkeeping write
+                # change the committed outcome.
+                try:
+                    mirror.phase(PHASE_COMMITTED)
+                except OSError:
+                    pass
+            return self.BATCH_REVOKED, [
+                (key_id, records[key_id]) for key_id in request_order
+            ]
+
+    def _batch_revoke_finalize(self, changed, records) -> None:
+        """Post-commit marker clear for ``batch_revoke`` (best effort).
+
+        Shared by the normal phase-3 path and the rare failure path that
+        discovers the commit-point append actually succeeded: clear every
+        changed file's marker; a failure is repaired on the next open and
+        never rolls the revocation back.
+        """
+        for key_id in changed:
+            record = records[key_id]
+            record.pending_event = None
+            try:
+                self._write_atomic(self._path_for(key_id), record.to_json())
+            except OSError:
+                pass
+
+    def _recover_batch_revocations(self) -> None:
+        """Finish or roll back batch revocations interrupted by a crash.
+
+        Recovery is driven by the ``_batch_revoke`` markers surviving on key
+        files, grouped by their event id. A marked file is always a
+        first-time active->revoked transition, so its pre-image is
+        deterministic (still active, no revocation facts) and no snapshot is
+        needed. The whole group is locked in sorted key_id order so recovery
+        never interleaves with a single-key mutation, and under those locks
+        the ledger decides, exactly once per event:
+
+        * the matching ``batch_revoke`` success event is durable -> the
+          batch committed: keep the revocation and clear surviving markers;
+        * no event carries the id -> the batch never committed: restore
+          every marked file to its still-active pre-image;
+        * a durable event with the id matches neither, or the ledger cannot
+          be read -> leave the ENTIRE scene untouched for the next open.
+
+        A file that cannot be rewritten keeps its marker for the next open;
+        the state is never guessed at.
+        """
+        groups: dict = {}
+        try:
+            names = os.listdir(self.data_dir)
+        except OSError:
+            return
+        for name in names:
+            if not (name.endswith(".json") and is_valid_key_id(name[:-5])):
+                continue
+            path = os.path.join(self.data_dir, name)
+            record = self._read_record(path)
+            marker = getattr(record, "pending_event", None)
+            if not isinstance(marker, dict) or not marker.get(
+                "_batch_revoke"
+            ):
+                continue
+            desc = marker.get("event")
+            eid = desc.get("event_id") if isinstance(desc, dict) else None
+            if not isinstance(eid, str) or not is_valid_key_id(eid):
+                # A marker whose event cannot be identified cannot be safely
+                # resolved either way; leave it (and its file) untouched.
+                continue
+            groups.setdefault(eid, []).append(record.key_id)
+
+        for eid in sorted(groups):
+            self._recover_batch_revoke_unit(eid, sorted(set(groups[eid])))
+
+    def _recover_batch_revoke_unit(self, eid: str, key_ids) -> None:
+        """Resolve one batch-revocation event: commit-finalize or roll back."""
+        with self.multi_key_locks(key_ids):
+            try:
+                event = self.audit.get_event(eid)
+            except LedgerError:
+                # The ledger cannot be read right now; leave everything for
+                # a later open rather than guessing committed-vs-not.
+                return
+            pending = []
+            tenant_id = None
+            for key_id in key_ids:
+                path = self._path_for(key_id)
+                # Re-read under the held locks; a file another recovery (or
+                # a concurrent request) already settled simply drops out.
+                record = self._read_record(path)
+                marker = getattr(record, "pending_event", None)
+                if not isinstance(marker, dict) or not marker.get(
+                    "_batch_revoke"
+                ):
+                    continue
+                desc = marker.get("event")
+                if not isinstance(desc, dict) or desc.get("event_id") != eid:
+                    continue
+                if desc.get("action") != audit_mod.ACTION_BATCH_REVOKE:
+                    continue
+                if (
+                    desc.get("tenant_id") != record.tenant_id
+                    or marker.get("tenant_id") != record.tenant_id
+                ):
+                    continue
+                tenant_id = record.tenant_id
+                pending.append((record, path))
+            if not pending:
+                return
+            committed = (
+                event is not None
+                and event.outcome == audit_mod.OUTCOME_SUCCESS
+                and event.action == audit_mod.ACTION_BATCH_REVOKE
+                and event.tenant_id == tenant_id
+            )
+            if event is not None and not committed:
+                # A durable event carries the id but is not this batch's
+                # success: an id collision. Park the whole scene for
+                # operator/startup resolution rather than settling it on a
+                # foreign fact.
+                return
+            for record, path in pending:
+                if committed:
+                    record.pending_event = None
+                else:
+                    # Never committed: restore the deterministic pre-image of
+                    # a first-time revocation (still active, no revocation
+                    # facts, no marker).
+                    record.status = "active"
+                    record.reason = None
+                    record.operator = None
+                    record.revoked_at = None
+                    record.pending_event = None
+                try:
+                    self._write_atomic(path, record.to_json())
+                except OSError:
+                    # Leave this file's marker for the next open.
+                    pass
 
     def revoke(
         self, key_id: str, tenant_id: str, reason: str, operator: str,
