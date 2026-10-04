@@ -815,6 +815,7 @@ class AuditLog:
         action: Optional[str] = None,
         operation_id: Optional[str] = None,
         outcome: Optional[str] = None,
+        operator_id: Optional[str] = None,
         since: Optional[str] = None,
         until: Optional[str] = None,
         limit: int = 100,
@@ -826,13 +827,17 @@ class AuditLog:
         records carry a null tenant and are therefore visible to nobody.
         ``operation_id`` filters on the event id, locating the single event
         committed under an idempotent operation's ``operation_id``; ``outcome``
-        filters on the exact execution result. A valid id with no matching
-        event simply yields an empty page (never 404). A cursor is valid only
-        with the same tenant, filters (including whether ``outcome`` was
-        omitted at all) and an unchanged ledger snapshot; otherwise
-        InvalidCursor is raised. A cursor issued before outcome filtering
-        existed (no bound outcome) remains valid only when ``outcome`` is
-        omitted, never with an explicit outcome.
+        filters on the exact execution result. ``operator_id`` filters on the
+        exact recorded request identity: a case-sensitive string match that
+        preserves whitespace and Unicode verbatim, so events carrying a null
+        (pre-attribution) identity appear only when the filter is omitted. A
+        valid id with no matching event simply yields an empty page (never
+        404). A cursor is valid only with the same tenant, filters (including
+        whether ``outcome``/``operator_id`` were omitted at all) and an
+        unchanged ledger snapshot; otherwise InvalidCursor is raised. A cursor
+        issued before outcome or operator filtering existed (no bound
+        condition) remains valid only with that condition omitted, never with
+        an explicit value.
         """
         canonical_since = (
             canonical_rfc3339(since) if since is not None else None
@@ -850,9 +855,10 @@ class AuditLog:
         )
         anchor = None
         fingerprint = None
-        # Distinguish a cursor with no bound outcome (issued before outcome
-        # filtering existed) from one explicitly bound to outcome omitted.
+        # Distinguish a cursor with no bound outcome/operator (issued before
+        # that filtering existed) from one explicitly bound to it omitted.
         no_bound_outcome = object()
+        no_bound_operator = object()
         if cursor is not None:
             payload = self._decode_cursor(cursor)
             try:
@@ -875,6 +881,15 @@ class AuditLog:
                     if outcome is not None:
                         raise InvalidCursor("cursor does not match filters")
                 elif bound_outcome != outcome:
+                    raise InvalidCursor("cursor does not match filters")
+                # The operator condition is bound the same way: a cursor
+                # without "op" predates operator filtering and is only
+                # reusable with operator_id omitted.
+                bound_operator = payload.get("op", no_bound_operator)
+                if bound_operator is no_bound_operator:
+                    if operator_id is not None:
+                        raise InvalidCursor("cursor does not match filters")
+                elif bound_operator != operator_id:
                     raise InvalidCursor("cursor does not match filters")
                 if int(payload.get("l", -1)) != limit:
                     raise InvalidCursor("cursor does not match limit")
@@ -908,6 +923,7 @@ class AuditLog:
             and (action is None or e.action == action)
             and (operation_id is None or e.event_id == operation_id)
             and (outcome is None or e.outcome == outcome)
+            and (operator_id is None or e.operator_id == operator_id)
             and (
                 not time_range_active
                 or (
@@ -939,6 +955,7 @@ class AuditLog:
                     "a": action,
                     "o": operation_id,
                     "oc": outcome,
+                    "op": operator_id,
                     "s": canonical_since,
                     "u": canonical_until,
                     "l": limit,

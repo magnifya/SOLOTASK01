@@ -4439,6 +4439,22 @@ def make_handler(
                 )
                 return
 
+            values, errored = self._single_param(qs, "operator_id")
+            if errored:
+                return
+            operator_id = values[0] if values else None
+            if operator_id is not None and not operator_id:
+                # An empty or duplicated operator filter is a plain parameter
+                # 400 naming the field, checked before the policy decision and
+                # without any audit write. Any other value matches the
+                # recorded identity verbatim (case-sensitive, whitespace and
+                # Unicode preserved); it never replaces the X-Operator-Id
+                # caller identity used for authorization.
+                self._bad_request(
+                    "field operator_id must be a non-empty string"
+                )
+                return
+
             limit = 100
             values, errored = self._single_param(qs, "limit")
             if errored:
@@ -4477,6 +4493,7 @@ def make_handler(
                     action=action,
                     operation_id=operation_id,
                     outcome=outcome,
+                    operator_id=operator_id,
                     since=since,
                     until=until,
                     limit=limit,

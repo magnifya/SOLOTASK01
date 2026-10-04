@@ -696,30 +696,34 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   至多一条 `batch_rotate` 事件，成功与拒绝终态的 `key_id` 均为 null，可按
   `action=batch_rotate` 筛选。
 - `GET /v1/audit`：单一租户来源；可选 `key_id`(UUID4)、`action`、
-  `operation_id`(小写 UUID4)、`outcome`、`since`、`until`、`limit`(1–1000，默认
+  `operation_id`(小写 UUID4)、`outcome`、`operator_id`、`since`、`until`、`limit`(1–1000，默认
   100)、`cursor`。各条件按同时满足处理；`since` 含起点、`until` 排除
   终点，任一省略表示该侧不限，二者相等为合法空范围。时间值必须为
   RFC3339（大写 `T`、`Z` 或 `±HH:MM` 时区，小数秒 1–6 位，禁闰秒），按
   实际时刻比较，等价偏移和小数写法等价。`operation_id` 按 `event_id` 定位幂等操作落账的
   那一条事件；`outcome` 按执行结果筛选，只允许区分大小写的 `success` 或
-  `rejected`，省略时返回完整结果集。合法但无匹配（含未知 id、与其它筛选不匹配）返回空事件页
+  `rejected`，省略时返回完整结果集。`operator_id` 按事件保存的操作者身份做
+  区分大小写的字符串精确匹配（保留首尾空白与 Unicode 原貌，HTTP 以 URL
+  解码后的值为准）；`X-Operator-Id`/`--operator` 仍是查询者身份并用于授权，
+  不被筛选值替代，身份也不从吊销正文 operator 或策略 subject 推断。历史事件的
+  null 身份只在省略该筛选时出现，不补写历史。合法但无匹配（含未知 id、与其它筛选不匹配）返回空事件页
   `{"events":[],"next_cursor":null}`，不是 `404`。显式空值、重复参数（即使两次值相同）
   或格式非法（含大写 UUID；时间缺时区、非法日期或闰秒；`outcome` 大小写
   变体或带首尾空白）均为指出对应字段的 `400`（错误体仅 `error`），`since`
   晚于 `until` 指出 `until`；参数校验先于策略且不记账，
   只有租户来源缺失或冲突照旧记 `tenant_conflict`。→
   `{events, next_cursor}`，按 (timestamp, event_id) 升序；游标为 HMAC
-  签名令牌，绑定租户/全部筛选（含 operation_id、outcome 的省略状态与取值
+  签名令牌，绑定租户/全部筛选（含 operation_id、outcome、operator_id 的省略状态与取值
   及实际时间边界）/limit/发起查询时的可见快照，等价时间写法可继续翻页，
-  增加、移除或更换任一筛选（含 `outcome`）、游标篡改或
-  过期均为指出 cursor 的 `400`，翻页不重不漏。升级前签发的无 outcome
-  游标，在未传 outcome 且其他条件与快照不变时继续可用，但不能用于带
-  outcome 的查询。只有本租户且符合全部条件的追加事件会
-  使旧游标失效；其他结果或其他租户的追加事件不影响翻页。范围查询遇到这类事件的时间戳不可按上述 RFC3339 解析
+  增加、移除或更换任一筛选（含 `outcome`、`operator_id`）、游标篡改或
+  过期均为指出 cursor 的 `400`，翻页不重不漏。升级前签发的无 outcome/
+  operator_id 游标，在未传对应条件且其他条件与快照不变时继续可用，但不能用于带
+  该条件的查询。只有本租户且符合全部条件的追加事件会
+  使旧游标失效；指定操作者时其他操作者的事件、其他结果或其他租户的追加事件不影响翻页。范围查询遇到这类事件的时间戳不可按上述 RFC3339 解析
   时，视同账本损坏或不可读。查询成功不记账，被策略拒绝才记一条
   `audit/rejected`（key_id null）。账本损坏或不可读固定 `500`
   `{"error":"audit ledger is unavailable"}`，不跳过、不重签、不改写账本。
-  CLI `audit` 接受对应 `--outcome`（重复给出即退出 2）；参数错误在
+  CLI `audit` 接受对应 `--outcome`、`--operator-id`（重复给出即退出 2）；参数错误在
   stderr 输出同口径单行 JSON 并退出 `2`，授权拒绝退出 `3`，账本不可用
   退出 `1`。
 - `GET /v1/audit/verify`：单一非空 `X-Operator-Id`，租户只允许从单一
