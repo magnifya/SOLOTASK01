@@ -99,6 +99,7 @@ _KIND_ACTIONS = {
     "create": "create",
     "rotate": "rotate",
     "batch_rotate": "batch_rotate",
+    "batch_revoke": "batch_revoke",
     "import": "import",
     "restore": "import",
     "migrate": "migrate",

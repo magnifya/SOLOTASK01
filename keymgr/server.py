@@ -52,6 +52,7 @@ from .store import (
     NativeWrap,
     is_valid_key_id,
     validate_batch_items,
+    validate_batch_revoke_key_ids,
 )
 
 _AUDIT_PATH = "/v1/audit"
@@ -66,6 +67,7 @@ _OPERATIONS_PATH_RE = re.compile(r"^/v1/operations/([^/]+)$")
 _IMPORT_PATH = "/v1/keys/import"
 _IMPORT_PREFLIGHT_PATH = "/v1/keys/import/preflight"
 _BATCH_ROTATE_PATH = "/v1/keys/batch-rotate"
+_BATCH_REVOKE_PATH = "/v1/keys/batch-revoke"
 _BACKUP_PATH = "/v1/backup"
 _BACKUP_VERIFY_PATH = "/v1/backup/verify"
 _RESTORE_PATH = "/v1/restore"
@@ -262,12 +264,12 @@ def make_handler(
             """
             op_id = operation.operation_id
             body = {"error": message, "operation_id": op_id}
-            # The accurate key_id rule: a restore's and a batch rotation's
-            # events are always key_id null; rotate/import carry the (already
-            # validated) key_id.
+            # The accurate key_id rule: a restore's, a batch rotation's and a
+            # batch revocation's events are always key_id null; rotate/import
+            # carry the (already validated) key_id.
             kind = (operation.details or {}).get("kind")
             audit_key_id = (
-                None if kind in ("restore", "batch_rotate")
+                None if kind in ("restore", "batch_rotate", "batch_revoke")
                 else (key_id if is_valid_key_id(key_id) else None)
             )
             audit_desc = {
@@ -369,7 +371,7 @@ def make_handler(
             self._send_json(status, self._strand_unavailable_body(operation_id))
 
         def _idempotent_guard(self, path, tenant_id, operator, payload, key,
-                              executor) -> None:
+                              executor, mirror_required: bool = True) -> None:
             """Bind the Idempotency-Key and run an idempotent mutation.
 
             ``key`` is the already-validated Idempotency-Key. ``executor`` is
@@ -385,6 +387,12 @@ def make_handler(
             in-flight owner beyond 5 s answers timed_out (503) without
             writing anything.
 
+            ``mirror_required=False`` (the batch revocation, which never
+            touches a provider) binds the operation without an artifact
+            mirror: startup crash recovery finalizes it from the ledger alone
+            (committed -> staged result replay; uncommitted -> failed 500),
+            exactly like the pre-mirror generation.
+
             If the 0600 mirror cannot be created (an OSError making the
             directory, temp file or rename) AFTER the key bound but BEFORE the
             first provider call, the bound operation is left pending and the
@@ -395,7 +403,8 @@ def make_handler(
             """
             normalized = operations_mod.normalize_body(payload)
             begin = operation_store.begin(
-                tenant_id, operator, path, normalized, key
+                tenant_id, operator, path, normalized, key,
+                mirror_required=mirror_required,
             )
             if begin.kind == "conflict":
                 self._serve_conflict(begin.record)
@@ -413,7 +422,7 @@ def make_handler(
             if record.is_terminal():
                 self._replay_terminal(record)
                 return
-            if artifact_store is None:
+            if artifact_store is None or not record.mirror_required:
                 self._serve_pending_wait(record)
                 return
             # Still pending. First try to claim the attempt immediately: if a
@@ -436,8 +445,10 @@ def make_handler(
             (``takeover=True``).
             """
             op_id = operation.operation_id
-            if artifact_store is None:
-                # Mirrors disabled (tests/legacy wiring): run directly.
+            if artifact_store is None or not operation.mirror_required:
+                # Mirrors disabled (tests/legacy wiring) or the operation is
+                # of the non-mirrored generation (batch revocation): run
+                # directly; startup recovery resolves it from the ledger.
                 self._idempotent_run_body(operation, op_id, executor, None)
                 return
             attempt_cm = artifact_store.attempt(
@@ -956,6 +967,10 @@ def make_handler(
 
                 if path == _BATCH_ROTATE_PATH:
                     self._batch_rotate_keys(parts, operator)
+                    return
+
+                if path == _BATCH_REVOKE_PATH:
+                    self._batch_revoke_keys(parts, operator)
                     return
 
                 if path == _BACKUP_PATH:
@@ -1489,6 +1504,151 @@ def make_handler(
 
             self._idempotent_guard(
                 parts.path, tenant_id, operator, payload, idem_key, execute
+            )
+
+        def _parse_batch_revoke_key_ids(self, raw):
+            """Validate a batch-revoke key_ids array before the key is bound.
+
+            Thin HTTP wrapper over the shared, side-effect-free validator so
+            the CLI and the service accept exactly the same key_ids shape.
+            """
+            return validate_batch_revoke_key_ids(raw)
+
+        def _batch_revoke_keys(self, parts, operator: str) -> None:
+            """POST /v1/keys/batch-revoke.
+
+            The Idempotency-Key is checked before the body is read. Every
+            parse/parameter/key_ids failure is a side-effect-free 400 (no
+            audit event, operation record or key change) and never consumes
+            the key; a bad tenant source still records the invisible
+            tenant_conflict. After binding, authorization follows the
+            ``revoke`` action per key (a single denial rejects the whole
+            batch as one terminal 403 whose single rejected ``batch_revoke``
+            event has key_id null); any unknown or foreign key_id makes the
+            whole batch a terminal 404 with zero changes (403 outranks 404).
+            On success every key is revoked under the whole-key semantics
+            (first revocation wins, one shared UTC revoked_at), the batch
+            commits atomically, and the response items are the whole-key
+            status projection in request order. The request never loads,
+            probes or calls a provider, so an unavailable KMS never blocks
+            the revocation. The operation binds without an artifact mirror
+            (the batch has no provider artifacts); crash recovery resolves
+            it from the ledger alone.
+            """
+            idem_key = self._idempotency_key()
+            if idem_key is None:
+                return
+            payload = self._read_json_object(audit=False)
+            if payload is None:
+                return
+            body_tenant = payload.get("tenant_id")
+            if not isinstance(body_tenant, str) or not body_tenant:
+                # A missing or invalid tenant source still records the
+                # invisible tenant_conflict event, even before the
+                # idempotency key is bound.
+                if self._record_conflict():
+                    self._bad_request(
+                        "field tenant_id must be a non-empty string"
+                    )
+                return
+            tenant_id = self._tenant(parts, payload)
+            if tenant_id is None:
+                return
+            extra = [
+                field
+                for field in payload
+                if field not in ("tenant_id", "key_ids", "reason", "operator")
+            ]
+            if extra:
+                self._bad_request(
+                    "field %s is not accepted by this endpoint" % extra[0]
+                )
+                return
+            key_ids, error = self._parse_batch_revoke_key_ids(
+                payload.get("key_ids")
+            )
+            if error is not None:
+                self._bad_request(error)
+                return
+            for field in ("reason", "operator"):
+                value = payload.get(field)
+                if not isinstance(value, str) or not value:
+                    self._bad_request(
+                        "field %s must be a non-empty string" % field
+                        if value is not None
+                        else "missing required field: %s" % field
+                    )
+                    return
+
+            def execute(operation, mirror=None):
+                # Kind and the exact request-order key set are durable before
+                # any business check, so a 403/404 terminal replays from
+                # context alone after a crash.
+                operation_store.update_details(
+                    operation,
+                    {
+                        "kind": "batch_revoke",
+                        "key_ids": list(key_ids),
+                    },
+                )
+                # Authorization follows revoke and precedes existence; each
+                # key is checked against its own key_id (unscoped rules apply
+                # to every key). A single denied key rejects the whole batch
+                # as one terminal 403 with one rejected batch_revoke event
+                # (key_id null) and changes no key.
+                for item_key_id in key_ids:
+                    if not policy_store.is_allowed(
+                        tenant_id, audit_mod.ACTION_REVOKE, operator,
+                        item_key_id,
+                    ):
+                        return self._idempotent_rejection(
+                            operation, tenant_id, None,
+                            audit_mod.ACTION_BATCH_REVOKE, 403,
+                            "action not permitted by policy",
+                        )
+
+                def stage_success(records_by_id):
+                    # After every key file landed, before the single
+                    # commit-point append: stage the exact 200 body verbatim,
+                    # with items in REQUEST order.
+                    result_items = [
+                        records_by_id[key_id].to_status_response()
+                        for key_id in key_ids
+                    ]
+                    operation_store.stage_terminal(
+                        operation,
+                        200,
+                        {
+                            "items": result_items,
+                            "operation_id": operation.operation_id,
+                        },
+                    )
+
+                status, result = store.batch_revoke(
+                    tenant_id, key_ids,
+                    payload["reason"], payload["operator"],
+                    event_id=operation.operation_id,
+                    lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
+                    pre_commit=stage_success,
+                    operator_id=operator,
+                )
+                if status == store.BATCH_NOT_FOUND:
+                    # Any unknown/foreign key_id fails the whole batch with no
+                    # change; the answer is identical to a missing key so
+                    # cross-tenant existence never leaks.
+                    return self._idempotent_rejection(
+                        operation, tenant_id, None,
+                        audit_mod.ACTION_BATCH_REVOKE, 404, "key not found",
+                    )
+                result_items = [
+                    record.to_status_response() for _, record in result
+                ]
+                # The single success event committed with the files.
+                return 200, {"items": result_items}
+
+            self._idempotent_guard(
+                parts.path, tenant_id, operator, payload, idem_key, execute,
+                mirror_required=False,
             )
 
         def _revoke_key(self, key_id: str, parts, operator: str) -> None:
@@ -5039,14 +5199,14 @@ def _resolve_committed_operation(store, policy_store, record, event):
     if event.outcome == audit_mod.OUTCOME_REJECTED:
         action = event.action
         terminal = details.get("terminal")
-        # A batch rotation is AUTHORIZED as rotate even though its audit
-        # action is batch_rotate; map back for the legacy no-terminal policy
-        # reconstruction below.
-        policy_action = (
-            audit_mod.ACTION_ROTATE
-            if action == audit_mod.ACTION_BATCH_ROTATE
-            else action
-        )
+        # A batch rotation is AUTHORIZED as rotate (and a batch revocation as
+        # revoke) even though its audit action is batch_rotate/batch_revoke;
+        # map back for the legacy no-terminal policy reconstruction below.
+        policy_action = action
+        if action == audit_mod.ACTION_BATCH_ROTATE:
+            policy_action = audit_mod.ACTION_ROTATE
+        elif action == audit_mod.ACTION_BATCH_REVOKE:
+            policy_action = audit_mod.ACTION_REVOKE
 
         def message_for(status: int) -> str:
             if status == 403:
@@ -5092,6 +5252,16 @@ def _resolve_committed_operation(store, policy_store, record, event):
                         else None,
                     )
                     for one in details.get("items", [])
+                )
+            elif kind == "batch_revoke":
+                # The batch was authorized key-by-key under revoke; deny is
+                # reconstructed when any key's current policy denies it.
+                policy_allowed = all(
+                    policy_store.is_allowed(
+                        tenant_id, policy_action, operator_id,
+                        one if is_valid_key_id(one) else None,
+                    )
+                    for one in details.get("key_ids", [])
                 )
             else:
                 policy_allowed = policy_store.is_allowed(
@@ -5208,6 +5378,26 @@ def _resolve_committed_operation(store, policy_store, record, event):
             )
         if complete:
             return 201, {"items": result_items, "operation_id": op_id}
+    if kind == "batch_revoke":
+        # The batch's single event carries key_id null; the request-order
+        # key set is durable in details. Rebuild each item's committed
+        # whole-key status projection. A key that is no longer readable
+        # makes the projection fall back to operation_id-only rather than
+        # fabricating a status.
+        result_items = []
+        complete = True
+        for key_id in details.get("key_ids", []):
+            key = (
+                store.get(key_id, tenant_id)
+                if is_valid_key_id(key_id)
+                else None
+            )
+            if key is None:
+                complete = False
+                break
+            result_items.append(key.to_status_response())
+        if complete:
+            return 200, {"items": result_items, "operation_id": op_id}
     if kind in ("create", "import"):
         key_id = event.key_id or details.get("key_id")
         key = store.get(key_id, tenant_id)

@@ -20,7 +20,12 @@ from . import audit as audit_mod
 from . import keybundle
 from . import provider as provider_mod
 from . import signing as signing_mod
-from .artifacts import PHASE_COMMITTED, PHASE_ROLLED_BACK, PHASE_STAGED
+from .artifacts import (
+    ArtifactStrandUnavailable,
+    PHASE_COMMITTED,
+    PHASE_ROLLED_BACK,
+    PHASE_STAGED,
+)
 from .audit import AuditEvent, AuditLog, InvalidCursor, LedgerError
 from .provider import (
     LOCAL_PROVIDER_ID,
@@ -126,6 +131,35 @@ def validate_batch_items(
             expected_version = raw_expected
         items.append((key_id, algorithm, expected_version))
     return items, None
+
+
+def validate_batch_revoke_key_ids(raw) -> Tuple[Optional[List[str]], Optional[str]]:
+    """Validate a batch-revoke key_ids array (shared by HTTP and CLI).
+
+    Returns ``(key_ids, None)`` with the ids in request order, or
+    ``(None, message)`` naming the offending field. ``key_ids`` must be a
+    list of 1-100 unique canonical lowercase UUID4 strings. The check is
+    side-effect free and runs before the Idempotency-Key is bound.
+    """
+    if not isinstance(raw, list) or not (
+        BATCH_MIN_ITEMS <= len(raw) <= BATCH_MAX_ITEMS
+    ):
+        return None, (
+            "field key_ids must be an array of %d to %d items"
+            % (BATCH_MIN_ITEMS, BATCH_MAX_ITEMS)
+        )
+    key_ids: List[str] = []
+    seen = set()
+    for index, element in enumerate(raw):
+        if not is_valid_key_id(element):
+            return None, "field key_ids[%d] must be a UUID4" % index
+        if element in seen:
+            return None, (
+                "field key_ids contains a duplicate key_id: %s" % element
+            )
+        seen.add(element)
+        key_ids.append(element)
+    return key_ids, None
 
 
 # Outcomes of an import: a brand-new record, or a key_id that already exists
@@ -593,6 +627,10 @@ class KeyStore:
         # durable -> keep and clear markers; otherwise roll every file of the
         # group back only after every minted handle was deleted) ...
         self._recover_batch_rotations()
+        # ... and multi-key batch-revocation groups (same commit-point rule;
+        # the batch mints no handles, so the rollback is a pure file
+        # restore) ...
+        self._recover_batch_revocations()
         # ... then take over raw pre-provider records once, at startup, while
         # the local provider is active (a plain file scan; an external
         # module:factory provider is never imported or configured here) ...
@@ -1236,6 +1274,7 @@ class KeyStore:
                 audit_mod.ACTION_BATCH_ROTATE,
                 audit_mod.ACTION_REVOKE,
                 audit_mod.ACTION_REVOKE_VERSION,
+                audit_mod.ACTION_BATCH_REVOKE,
                 audit_mod.ACTION_IMPORT,
                 audit_mod.ACTION_EXPORT,
                 audit_mod.ACTION_MIGRATE,
@@ -1281,11 +1320,12 @@ class KeyStore:
                     continue
                 # A multi-file tenant restore transaction is resolved by the
                 # RestoreCoordinator (its manifest drives the shared event),
-                # and a multi-key batch-rotation group by
-                # _recover_batch_rotations; neither is resolved here.
+                # and a multi-key batch-rotation/batch-revocation group by
+                # _recover_batch_rotations/_recover_batch_revocations;
+                # neither is resolved here.
                 if record.pending_event.get("_restore") or record.pending_event.get(
                     "_batch_rotate"
-                ):
+                ) or record.pending_event.get("_batch_revoke"):
                     continue
                 # append() is idempotent on event_id, so this is safe whether
                 # the crash happened before or after the ledger write.
@@ -2023,12 +2063,21 @@ class KeyStore:
                 return None
             if view is not None:
                 return view
+            view = self._markerless_batch_revoke_view(record)
+            if view is _HIDE_UNCOMMITTED:
+                return None
+            if view is not None:
+                return view
             return record
         if marker.get("_batch_rotate"):
             # Batch groups are projected exclusively from the durable
             # snapshot; an in-memory trim of the current file could never
             # prove another key's pre-image and must not be trusted.
             return self._batch_committed_view(record)
+        if marker.get("_batch_revoke"):
+            # Batch-revocation groups are likewise projected exclusively
+            # from the durable snapshot.
+            return self._batch_revoke_committed_view(record)
         if self._marker_event_durable(marker):
             return record
         nested = marker.get("event")
@@ -2236,6 +2285,10 @@ class KeyStore:
                 "key file is awaiting crash recovery"
             )
         if self._pending_batch_snapshot_for(record):
+            raise ProviderUnavailable(
+                "key file is awaiting crash recovery"
+            )
+        if self._pending_batch_revoke_snapshot_for(record):
             raise ProviderUnavailable(
                 "key file is awaiting crash recovery"
             )
@@ -4182,6 +4235,706 @@ class KeyStore:
             if not self._delete_provisioned_handle(provider_id, handle):
                 cleaned = False
         return cleaned
+
+    # -- batch revocation ---------------------------------------------------
+    # Outcomes of batch_revoke: the whole batch committed, or any key was
+    # unknown/foreign (the batch changed nothing).
+    BATCH_REVOKED = "revoked"
+    _BATCH_REVOKE_DIR = "batch-revocations"
+
+    def _batch_revoke_snapshot_path(self, snapshot_id: str) -> str:
+        return os.path.join(
+            self.data_dir, self._BATCH_REVOKE_DIR, snapshot_id + ".json"
+        )
+
+    def _write_batch_revoke_snapshot(
+        self, snapshot_id: str, tenant_id: str, key_ids: List[str],
+        previous_bytes: dict,
+    ) -> None:
+        """Durably record the pre-batch whole-file bytes of every group key.
+
+        Same shape and durability contract as
+        :meth:`_write_batch_snapshot`, in the batch-revocation directory: the
+        exact pre-batch bytes are stored base64-encoded so an uncommitted
+        batch restores each file byte-for-byte.
+        """
+        directory = os.path.join(self.data_dir, self._BATCH_REVOKE_DIR)
+        os.makedirs(directory, exist_ok=True)
+        path = self._batch_revoke_snapshot_path(snapshot_id)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        payload = {
+            "event_id": snapshot_id,
+            "tenant_id": tenant_id,
+            "keys": [
+                {
+                    "key_id": key_id,
+                    "previous_b64": base64.b64encode(
+                        previous_bytes[key_id]
+                    ).decode("ascii"),
+                }
+                for key_id in key_ids
+            ],
+        }
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+        except BaseException:
+            # The durable snapshot never landed and no key file references
+            # it yet; remove the partial file so a corrupt snapshot cannot
+            # outlive the attempt.
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
+
+    def _read_batch_revoke_snapshot(self, snapshot_id: str) -> Optional[dict]:
+        try:
+            with open(
+                self._batch_revoke_snapshot_path(snapshot_id),
+                "r", encoding="utf-8",
+            ) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict) or not isinstance(
+            data.get("keys"), list
+        ):
+            return None
+        return data
+
+    def _discard_batch_revoke_snapshot(self, snapshot_id: str) -> None:
+        try:
+            os.unlink(self._batch_revoke_snapshot_path(snapshot_id))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # Startup recovery retries; an in-request failure keeps the
+            # snapshot on purpose, so a removal failure is never fatal here.
+            pass
+
+    def _list_batch_revoke_snapshot_ids(self) -> List[str]:
+        directory = os.path.join(self.data_dir, self._BATCH_REVOKE_DIR)
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return []
+        return [name[:-5] for name in names if name.endswith(".json")]
+
+    def batch_revoke(
+        self,
+        tenant_id: str,
+        key_ids: List[str],
+        reason: str,
+        operator: str,
+        event_id: Optional[str] = None,
+        lock_timeout: Optional[float] = None,
+        pre_commit=None,
+        operator_id: Optional[str] = None,
+    ) -> Tuple[str, object]:
+        """Atomically revoke many keys as one whole-key revocation batch.
+
+        ``key_ids`` is the validated list of 1-100 unique canonical UUID4s in
+        REQUEST order. Returns ``(BATCH_REVOKED, [(key_id, record), ...])``
+        in request order, or ``(BATCH_NOT_FOUND, missing_key_id)`` when any
+        key is unknown or owned by another tenant -- with zero files, events
+        or snapshots changed. The per-key locks (in-process plus fcntl) are
+        taken in sorted key_id order against one shared deadline, so a batch
+        and a concurrent single-key mutation take effect wholly before or
+        after each other; a wait beyond ``lock_timeout`` raises
+        :class:`LockTimeout` before any snapshot, marker or event exists.
+
+        Every key keeps the whole-key revoke semantics of
+        :meth:`KeyStore.revoke`: the first revocation's
+        reason/operator/revoked_at win and are never overwritten; an
+        already-revoked key is part of the batch's write set (its file
+        carries the shared marker) but its recorded facts do not change. All
+        keys revoked by this batch share one UTC ``revoked_at`` (the commit
+        event's timestamp). The batch commits through one outbox transaction
+        with a single ``batch_revoke`` event whose key_id is null. A fault
+        before the commit-point append restores every file to its pre-batch
+        bytes; a fault that makes the commit undecidable, or a rollback that
+        cannot restore every file, parks the whole scene (snapshot + markers)
+        for startup recovery and raises
+        :class:`ArtifactStrandUnavailable` (500) so the operation stays
+        pending with its recovery clues retained. No provider is loaded,
+        probed or called: external KMS unavailability never blocks a
+        revocation.
+        """
+        request_order = list(key_ids)
+        ordered_ids = sorted(set(request_order))
+        with self.multi_key_locks(ordered_ids, timeout=lock_timeout):
+            records: dict = {}
+            previous_bytes: dict = {}
+            for key_id in ordered_ids:
+                record = self._read_record(
+                    self._path_for(key_id), strict=True
+                )
+                if record is None or record.tenant_id != tenant_id:
+                    # Existence/ownership for the WHOLE batch is resolved
+                    # before any snapshot, marker or event exists.
+                    return self.BATCH_NOT_FOUND, key_id
+                try:
+                    self._ensure_settled(record)
+                except ProviderUnavailable as exc:
+                    # A key file still owes crash recovery: the batch cannot
+                    # resolve the committed state, so it parks (500) with the
+                    # scene retained rather than guessing.
+                    raise ArtifactStrandUnavailable(str(exc), 500) from exc
+                records[key_id] = record
+            for key_id in ordered_ids:
+                # Capture the file's exact pre-batch bytes under the held
+                # locks: an uncommitted rollback restores these byte-for-byte.
+                previous_bytes[key_id] = self._read_file_bytes(
+                    self._path_for(key_id)
+                )
+            revoked_at = datetime.now(timezone.utc).isoformat()
+            event = self.audit.new_event(
+                tenant_id, audit_mod.ACTION_BATCH_REVOKE, None,
+                audit_mod.OUTCOME_SUCCESS, timestamp=revoked_at,
+                event_id=event_id, operator_id=operator_id,
+            )
+            try:
+                self._write_batch_revoke_snapshot(
+                    event.event_id, tenant_id, ordered_ids, previous_bytes
+                )
+                marker = {
+                    "_batch_revoke": True,
+                    "event": event.to_json(),
+                    "tenant_id": tenant_id,
+                    "key_ids": ordered_ids,
+                    "snapshot": event.event_id,
+                }
+                # Phase 1: every file lands carrying the shared marker.
+                for key_id in ordered_ids:
+                    record = records[key_id]
+                    if record.status != "revoked":
+                        record.status = "revoked"
+                        record.reason = reason
+                        record.operator = operator
+                        record.revoked_at = revoked_at
+                    record.pending_event = marker
+                    self._write_atomic(
+                        self._path_for(key_id), record.to_json()
+                    )
+                # The whole write set is durable and marked: stage the exact
+                # idempotent response before the single commit-point append.
+                if pre_commit is not None:
+                    pre_commit(records)
+                # Phase 2: the single ledger append is the commit point.
+                self.audit.append(event)
+                # append() dedupes silently on event_id without comparing
+                # action/tenant: confirm the durable fact is exactly this
+                # batch_revoke success before treating it as the commit
+                # point (a same-id collision parks the scene, never rolls
+                # back over a foreign record).
+                try:
+                    committed = self.audit.get_event(event.event_id)
+                except LedgerError:
+                    # The append fsynced before returning, so a fresh read
+                    # error is a transient outage AFTER a durable commit:
+                    # trust the fsynced append and proceed.
+                    committed = event
+                if (
+                    committed is None
+                    or committed.outcome != audit_mod.OUTCOME_SUCCESS
+                    or committed.action != audit_mod.ACTION_BATCH_REVOKE
+                    or committed.tenant_id != tenant_id
+                ):
+                    # The durable fact under this id is absent or belongs to
+                    # a different action/tenant: neither commit nor rollback
+                    # is provable. Park the whole scene for startup recovery.
+                    raise ArtifactStrandUnavailable(
+                        "the batch revocation commit event could not be "
+                        "confirmed as the expected batch_revoke success "
+                        "event",
+                        500,
+                    )
+            except ArtifactStrandUnavailable:
+                # Commit undecidable: retain the ENTIRE scene (marked files,
+                # snapshot) unchanged for startup recovery.
+                raise
+            except BaseException as exc:
+                # Nothing committed: the durable success event is absent.
+                # Roll back every file byte-for-byte from the pre-batch bytes
+                # captured under the held locks; a restore failure parks the
+                # whole scene (snapshot + markers) for startup recovery and
+                # the batch stays pending (500). No success audit event is
+                # written by this rollback.
+                rollback_ok = True
+                for key_id in ordered_ids:
+                    try:
+                        self._write_bytes_atomic(
+                            self._path_for(key_id), previous_bytes[key_id]
+                        )
+                    except OSError:
+                        rollback_ok = False
+                if not rollback_ok:
+                    raise ArtifactStrandUnavailable(
+                        "could not restore every key file of the failed "
+                        "batch revocation; the whole group is retained for "
+                        "startup recovery",
+                        500,
+                    ) from exc
+                self._discard_batch_revoke_snapshot(event.event_id)
+                raise
+            # Phase 3: commit point passed. Clear markers as best-effort
+            # housekeeping; a failure or crash is repaired idempotently on
+            # the next open and never rolls the revocations back.
+            for key_id in ordered_ids:
+                record = records[key_id]
+                record.pending_event = None
+                try:
+                    self._write_atomic(
+                        self._path_for(key_id), record.to_json()
+                    )
+                except OSError:
+                    pass
+            self._discard_batch_revoke_snapshot(event.event_id)
+            return self.BATCH_REVOKED, [
+                (key_id, records[key_id]) for key_id in request_order
+            ]
+
+    def _batch_revoke_committed_view(
+        self, record: KeyRecord
+    ) -> Optional[KeyRecord]:
+        """Project one file carrying an unsettled ``_batch_revoke`` marker.
+
+        The pre-batch state is reconstructed from the DURABLE snapshot
+        ``batch-revocations/<event_id>.json``, re-read from disk and
+        validated exactly like crash recovery -- never from this frame's
+        in-memory file. Returns the snapshot's pre-batch KeyRecord, the
+        on-disk record when the batch's success event is durable, or None
+        (hide the record) whenever the snapshot is missing/corrupt/
+        mismatched, the marker's references disagree, or the ledger cannot
+        be read.
+        """
+        marker = record.pending_event
+        if not isinstance(marker, dict) or not marker.get("_batch_revoke"):
+            return None
+        desc = marker.get("event")
+        if not isinstance(desc, dict):
+            return None
+        eid = desc.get("event_id")
+        if not is_valid_key_id(eid):
+            return None
+        if desc.get("action") != audit_mod.ACTION_BATCH_REVOKE:
+            return None
+        marker_tenant = desc.get("tenant_id")
+        if (
+            not isinstance(marker_tenant, str)
+            or marker_tenant != record.tenant_id
+            or marker.get("tenant_id") != record.tenant_id
+        ):
+            return None
+        # The ledger is the commit authority. An unreadable ledger is
+        # "unsettled and unprovable": hide rather than project either view.
+        try:
+            event = self.audit.get_event(eid)
+        except LedgerError:
+            return None
+        if event is not None:
+            if (
+                event.outcome == audit_mod.OUTCOME_SUCCESS
+                and event.action == audit_mod.ACTION_BATCH_REVOKE
+                and event.tenant_id == record.tenant_id
+            ):
+                # Committed: the revocations are authoritative; only
+                # marker-clear housekeeping remains.
+                return record
+        snapshot_path = self._batch_revoke_snapshot_path(eid)
+        if not os.path.exists(snapshot_path):
+            return None
+        raw_snapshot = self._read_batch_revoke_snapshot(eid)
+        if raw_snapshot is None or raw_snapshot.get("tenant_id") != record.tenant_id:
+            return None
+        entries = self._validated_batch_revoke_snapshot(
+            eid, raw_snapshot, [marker]
+        )
+        if entries is None:
+            return None
+        for key_id, _raw_bytes, previous_record in entries:
+            if key_id == record.key_id:
+                # This view is a PROJECTION of durable rollback data, not the
+                # file on disk: tag it so export/backup's lazy legacy
+                # adoption never rewrites the still-marked file.
+                previous_record._unsettled_projection = True
+                return previous_record
+        return None
+
+    def _validated_batch_revoke_snapshot(
+        self, snapshot_id: str, raw_snapshot, markers
+    ) -> Optional[list]:
+        """Cross-validate the snapshot filename, payload and residual markers.
+
+        Same contract as :meth:`_validated_batch_snapshot` but for a batch
+        revocation: the marker carries no provision journal (the batch mints
+        no handle), only the snapshot reference and the complete key set.
+        Returns the COMPLETE write set as
+        ``[(key_id, previous_bytes, KeyRecord), ...]`` sorted by key_id, or
+        None when the snapshot is absent/corrupt/semantically mismatched.
+        """
+        if not is_valid_key_id(snapshot_id):
+            return None
+        if not isinstance(raw_snapshot, dict):
+            return None
+        if raw_snapshot.get("event_id") != snapshot_id:
+            return None
+        tenant_id = raw_snapshot.get("tenant_id")
+        if not isinstance(tenant_id, str) or not tenant_id:
+            return None
+        raw_entries = raw_snapshot.get("keys")
+        if not isinstance(raw_entries, list) or not raw_entries:
+            return None
+        entries = []
+        seen = set()
+        for entry in raw_entries:
+            if not isinstance(entry, dict):
+                return None
+            key_id = entry.get("key_id")
+            if not is_valid_key_id(key_id) or key_id in seen:
+                return None
+            encoded = entry.get("previous_b64")
+            if not isinstance(encoded, str):
+                return None
+            try:
+                raw_bytes = base64.b64decode(encoded, validate=True)
+                data = json.loads(raw_bytes.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return None
+            record = self._strict_previous_record(key_id, tenant_id, data)
+            if record is None:
+                return None
+            seen.add(key_id)
+            entries.append((key_id, raw_bytes, record))
+        entries.sort(key=lambda item: item[0])
+        # Every residual marker must be consistent with the snapshot and with
+        # each other: same event, tenant, snapshot reference and the exact
+        # complete key set.
+        for marker in markers:
+            if not isinstance(marker, dict) or not marker.get("_batch_revoke"):
+                return None
+            event_desc = marker.get("event")
+            if not isinstance(event_desc, dict):
+                return None
+            if event_desc.get("event_id") != snapshot_id:
+                return None
+            if event_desc.get("action") != audit_mod.ACTION_BATCH_REVOKE:
+                return None
+            if event_desc.get("tenant_id") != tenant_id:
+                return None
+            if marker.get("tenant_id") != tenant_id:
+                return None
+            if marker.get("snapshot") != snapshot_id:
+                return None
+            marked = marker.get("key_ids")
+            if not isinstance(marked, list):
+                return None
+            marked_set = set()
+            for value in marked:
+                if not is_valid_key_id(value) or value in marked_set:
+                    return None
+                marked_set.add(value)
+            if marked_set != seen:
+                return None
+        return entries
+
+    def _rescan_batch_revoke_markers(self, eid: str) -> Tuple[dict, list]:
+        """Re-read, under the group locks, the files still carrying event eid.
+
+        Returns ``({key_id: path}, [marker, ...])`` reflecting the on-disk
+        scene at decision time, exactly like :meth:`_rescan_batch_markers`.
+        """
+        files: dict = {}
+        markers: list = []
+        try:
+            names = os.listdir(self.data_dir)
+        except OSError:
+            return files, markers
+        for name in names:
+            if not (name.endswith(".json") and is_valid_key_id(name[:-5])):
+                continue
+            path = os.path.join(self.data_dir, name)
+            record = self._read_record(path)
+            marker = getattr(record, "pending_event", None)
+            if not isinstance(marker, dict) or not marker.get("_batch_revoke"):
+                continue
+            event_desc = marker.get("event")
+            marked_eid = (
+                event_desc.get("event_id")
+                if isinstance(event_desc, dict)
+                else None
+            )
+            if marked_eid == eid:
+                files[record.key_id] = path
+                markers.append(marker)
+        return files, markers
+
+    def _pending_batch_revoke_snapshot_for(self, record: KeyRecord) -> bool:
+        """Whether ``record`` belongs to an unsettled batch-revoke snapshot.
+
+        Mirrors :meth:`_pending_batch_snapshot_for` for the batch-revocation
+        snapshot directory: a markerless file named by a surviving,
+        not-yet-committed snapshot must refuse a fresh mutation (503) rather
+        than let the next open restore bytes over it. A snapshot whose
+        ``batch_revoke`` success event IS durable is mere residue and does
+        not block; an unreadable ledger blocks conservatively.
+        """
+        for snapshot_id in self._list_batch_revoke_snapshot_ids():
+            snapshot = self._read_batch_revoke_snapshot(snapshot_id)
+            if not isinstance(snapshot, dict):
+                continue
+            if snapshot.get("tenant_id") != record.tenant_id:
+                continue
+            keys = snapshot.get("keys")
+            if not isinstance(keys, list):
+                continue
+            member = any(
+                isinstance(entry, dict) and entry.get("key_id") == record.key_id
+                for entry in keys
+            )
+            if not member:
+                continue
+            try:
+                event = self.audit.get_event(snapshot_id)
+            except LedgerError:
+                return True
+            if (
+                event is None
+                or event.outcome != audit_mod.OUTCOME_SUCCESS
+                or event.action != audit_mod.ACTION_BATCH_REVOKE
+                or event.tenant_id != record.tenant_id
+            ):
+                return True
+        return False
+
+    def _markerless_batch_revoke_view(self, record: KeyRecord):
+        """Project a markerless file named by a surviving batch-revoke snapshot.
+
+        Mirrors :meth:`_markerless_batch_view` for the batch-revocation
+        snapshot directory: a surviving, not-yet-committed snapshot that
+        names this key supplies its validated pre-image (or hides the record
+        when that cannot be proven); committed residue is ignored.
+        """
+        for snapshot_id in self._list_batch_revoke_snapshot_ids():
+            if not is_valid_key_id(snapshot_id):
+                continue
+            raw_snapshot = self._read_batch_revoke_snapshot(snapshot_id)
+            if not isinstance(raw_snapshot, dict):
+                continue
+            tenant_id = raw_snapshot.get("tenant_id")
+            if tenant_id != record.tenant_id:
+                continue
+            keys = raw_snapshot.get("keys")
+            if not isinstance(keys, list):
+                continue
+            if not any(
+                isinstance(entry, dict)
+                and entry.get("key_id") == record.key_id
+                for entry in keys
+            ):
+                continue
+            try:
+                event = self.audit.get_event(snapshot_id)
+            except LedgerError:
+                return _HIDE_UNCOMMITTED
+            if event is not None:
+                if (
+                    event.outcome == audit_mod.OUTCOME_SUCCESS
+                    and event.action == audit_mod.ACTION_BATCH_REVOKE
+                    and event.tenant_id == record.tenant_id
+                ):
+                    # Committed residue: the on-disk file is authoritative.
+                    continue
+                if event.outcome == audit_mod.OUTCOME_SUCCESS:
+                    return _HIDE_UNCOMMITTED
+            entries = self._validated_batch_revoke_snapshot(
+                snapshot_id, raw_snapshot, []
+            )
+            if entries is None:
+                return _HIDE_UNCOMMITTED
+            for key_id, _raw_bytes, previous_record in entries:
+                if key_id == record.key_id:
+                    previous_record._unsettled_projection = True
+                    return previous_record
+            return _HIDE_UNCOMMITTED
+        return None
+
+    def _recover_batch_revocations(self) -> None:
+        """Finish or roll back batch revocations interrupted by a crash.
+
+        Mirrors :meth:`_recover_batch_rotations` but for the batch-revocation
+        snapshot directory (the batch mints no provider handles, so no
+        journal exists): the whole write set is locked in sorted key_id
+        order, and the ledger decides exactly once per event:
+
+        * the success event is durable -> the batch committed: keep every
+          revocation and clear surviving markers (snapshot not consulted);
+        * otherwise -> the batch never committed: every old file is restored
+          byte-for-byte from the validated snapshot; the snapshot and markers
+          are removed only after every write-back lands.
+
+        A missing/unreadable snapshot while a file still needs resolution, or
+        an unreadable ledger, leaves the ENTIRE scene for the next open.
+        """
+        marker_groups: dict = {}
+        try:
+            names = os.listdir(self.data_dir)
+        except OSError:
+            names = []
+        for name in names:
+            if not (name.endswith(".json") and is_valid_key_id(name[:-5])):
+                continue
+            path = os.path.join(self.data_dir, name)
+            record = self._read_record(path)
+            marker = getattr(record, "pending_event", None)
+            if not isinstance(marker, dict) or not marker.get("_batch_revoke"):
+                continue
+            event_desc = marker.get("event")
+            eid = (
+                event_desc.get("event_id")
+                if isinstance(event_desc, dict)
+                else None
+            )
+            if not isinstance(eid, str) or not is_valid_key_id(eid):
+                # A marker whose event cannot be identified cannot be safely
+                # resolved either way; leave it (and its files) untouched.
+                continue
+            group = marker_groups.get(eid)
+            if group is None:
+                group = {"files": {}, "markers": []}
+                marker_groups[eid] = group
+            group["files"][record.key_id] = path
+            group["markers"].append(marker)
+
+        snapshots: dict = {}
+        for snapshot_id in self._list_batch_revoke_snapshot_ids():
+            snapshots[snapshot_id] = self._read_batch_revoke_snapshot(
+                snapshot_id
+            )
+
+        for eid in sorted(set(marker_groups) | set(snapshots)):
+            self._recover_batch_revoke_unit(
+                eid, marker_groups.get(eid), snapshots.get(eid),
+                snapshot_present=eid in snapshots,
+            )
+
+    def _recover_batch_revoke_unit(
+        self, eid: str, group: Optional[dict], snapshot: Optional[dict],
+        snapshot_present: bool = False,
+    ) -> None:
+        """Resolve one batch-revocation event: commit-finalize or roll back.
+
+        The whole write set is locked in sorted key_id order (in-process lock
+        plus the per-key fcntl lock), so recovery never interleaves with a
+        single-key mutation on a shared key. Under those locks the scene and
+        the snapshot are re-read and cross-validated, and only then does the
+        ledger decide; the batch has no provider handles, so the rollback is
+        a pure byte-for-byte file restore.
+        """
+        files = dict(group["files"]) if group else {}
+        pre_entries = self._validated_batch_revoke_snapshot(
+            eid, snapshot, list(group["markers"]) if group else []
+        )
+        pre_snapshot_keys = (
+            {key_id for key_id, _, _ in pre_entries}
+            if pre_entries is not None
+            else set()
+        )
+        lock_keys = sorted(set(files) | pre_snapshot_keys)
+        with self.multi_key_locks(lock_keys):
+            # Re-read the scene and the snapshot while holding every lock of
+            # the write set, so nothing below acts on a stale observation.
+            files, markers = self._rescan_batch_revoke_markers(eid)
+            snapshot_path = self._batch_revoke_snapshot_path(eid)
+            present_now = os.path.exists(snapshot_path)
+            current_snapshot = (
+                self._read_batch_revoke_snapshot(eid) if present_now else None
+            )
+            try:
+                event = self.audit.get_event(eid)
+            except LedgerError:
+                # The ledger cannot be read right now; leave everything for a
+                # later open rather than guessing committed-vs-not.
+                return
+            scene_tenant = self._batch_scene_tenant(markers, current_snapshot)
+            if (
+                event is not None
+                and event.outcome == audit_mod.OUTCOME_SUCCESS
+                and event.action == audit_mod.ACTION_BATCH_REVOKE
+                and (
+                    scene_tenant is None
+                    or event.tenant_id == scene_tenant
+                )
+            ):
+                self._batch_revoke_finish_committed(eid, files)
+                return
+            if event is not None and event.outcome == audit_mod.OUTCOME_SUCCESS:
+                # Durable but mismatched (action/tenant collision): do
+                # nothing and expose nothing; wait for repair/startup with
+                # the scene intact.
+                return
+
+            # The success event never landed: the batch is uncommitted. The
+            # snapshot is trusted only after its filename, payload and every
+            # residual marker fully agree and every pre-batch image parses.
+            entries = self._validated_batch_revoke_snapshot(
+                eid, current_snapshot, markers
+            )
+            if entries is not None:
+                self._batch_revoke_rollback_unit(entries, eid)
+                return
+            # No trusted snapshot while a file still needs its pre-batch
+            # bytes, or a corrupt snapshot file survives: preserve the ENTIRE
+            # scene (files, markers, snapshot) for a later open and never
+            # guess or expose the uncommitted revocation.
+            return
+
+    def _batch_revoke_finish_committed(self, eid: str, files: dict) -> None:
+        """Post-commit housekeeping: clear markers, then drop the snapshot.
+
+        The durable success event already makes the revocations authoritative;
+        nothing here is ever rolled back. A marker-clear failure leaves that
+        file's marker for the next open.
+        """
+        for key_id, path in files.items():
+            record = self._read_record(path)
+            marker = getattr(record, "pending_event", None)
+            if record is None or not isinstance(marker, dict):
+                continue
+            event_desc = marker.get("event")
+            marked_eid = (
+                event_desc.get("event_id")
+                if isinstance(event_desc, dict)
+                else None
+            )
+            if marked_eid != eid:
+                continue
+            record.pending_event = None
+            try:
+                self._write_atomic(path, record.to_json())
+            except OSError:
+                pass
+        self._discard_batch_revoke_snapshot(eid)
+
+    def _batch_revoke_rollback_unit(self, entries: list, eid: str) -> bool:
+        """Restore every old file byte-for-byte, then drop the snapshot.
+
+        Returns True only when every file write-back has been verified, after
+        which the snapshot is removed. Any failure returns False with the
+        whole group and the snapshot retained for the next open.
+        """
+        for key_id, previous_bytes, _previous_record in entries:
+            try:
+                self._write_bytes_atomic(
+                    self._path_for(key_id), previous_bytes
+                )
+            except OSError:
+                return False
+        self._discard_batch_revoke_snapshot(eid)
+        return True
 
     def revoke(
         self, key_id: str, tenant_id: str, reason: str, operator: str,
