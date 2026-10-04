@@ -644,14 +644,17 @@ def _reseal_envelope(
     target_algorithm: str,
     wrapped_key: bytes,
     wrap_nonce: Optional[bytes],
+    target_key_id: Optional[str] = None,
 ) -> str:
     """Rebuild the envelope token around a re-wrapped data key.
 
-    The key_id, nonce, tag, ciphertext and aad bytes are carried over from
-    the authenticated source envelope unchanged; the version, algorithm and
-    wrap fields are rebuilt for the target. Shared by the export-based
-    :func:`rewrap_envelope` and the KMS/HSM-native
-    :func:`rewrap_envelope_native`, so both produce byte-identical shapes.
+    The nonce, tag, ciphertext and aad bytes are carried over from the
+    authenticated source envelope unchanged; the key_id, version, algorithm
+    and wrap fields are rebuilt for the target (the key_id stays the source
+    one unless ``target_key_id`` names a different key for a cross-key
+    rewrap). Shared by the export-based :func:`rewrap_envelope` and the
+    KMS/HSM-native :func:`rewrap_envelope_native`, so both produce
+    byte-identical shapes.
     """
     wrap = (
         WRAP_AES_GCM
@@ -660,7 +663,7 @@ def _reseal_envelope(
     )
     payload = {
         "format": FORMAT,
-        "key_id": opened.key_id,
+        "key_id": opened.key_id if target_key_id is None else target_key_id,
         "version": target_version,
         "algorithm": target_algorithm,
         "enc": ENC_AES_GCM,
@@ -686,6 +689,7 @@ def rewrap_envelope(
     target_version: int,
     target_algorithm: str,
     target_kek,
+    target_key_id: Optional[str] = None,
 ) -> str:
     """Re-wrap an authenticated envelope's data key under a new KEK version.
 
@@ -693,10 +697,11 @@ def rewrap_envelope(
     with the source KEK and the content GCM tag is verified (the recovered
     plaintext is used only for that check, never stored or returned). Only
     then is the SAME data key wrapped under the target version's KEK. The
-    key_id, nonce, tag, ciphertext and aad bytes are carried over unchanged;
-    the version, algorithm and wrap fields are rebuilt for the target. The
-    data key itself exists only in process memory for the duration of the
-    call and never enters the returned token in the clear.
+    nonce, tag, ciphertext and aad bytes are carried over unchanged; the
+    key_id (replaced by ``target_key_id`` on a cross-key rewrap), version,
+    algorithm and wrap fields are rebuilt for the target. The data key
+    itself exists only in process memory for the duration of the call and
+    never enters the returned token in the clear.
     """
     dek = _unwrap_dek(opened, source_kek)
     try:
@@ -716,6 +721,7 @@ def rewrap_envelope(
         target_algorithm=target_algorithm,
         wrapped_key=wrapped_key,
         wrap_nonce=wrap_nonce,
+        target_key_id=target_key_id,
     )
 
 
@@ -728,6 +734,7 @@ def rewrap_envelope_native(
     target_version: int,
     target_algorithm: str,
     envelope_bytes: bytes,
+    target_key_id: Optional[str] = None,
 ) -> str:
     """Re-wrap via a KMS/HSM-native ``rewrap_key`` provider operation.
 
@@ -807,6 +814,7 @@ def rewrap_envelope_native(
         target_algorithm=target_algorithm,
         wrapped_key=wrapped_key,
         wrap_nonce=wrap_nonce,
+        target_key_id=target_key_id,
     )
 
 
@@ -817,6 +825,7 @@ def rewrap_envelope_split(
     *,
     target_version: int,
     target_algorithm: str,
+    target_key_id: Optional[str] = None,
 ) -> str:
     """Re-wrap via per-side native ``unwrap_key``/``wrap_key`` declarations.
 
@@ -891,4 +900,5 @@ def rewrap_envelope_split(
         target_algorithm=target_algorithm,
         wrapped_key=wrapped_key,
         wrap_nonce=wrap_nonce,
+        target_key_id=target_key_id,
     )

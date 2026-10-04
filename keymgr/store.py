@@ -4640,6 +4640,166 @@ class KeyStore:
                 )
             return self.REWRAP_OK, None
 
+    def _rewrap_pair_locked(
+        self,
+        source_key_id: str,
+        target_key_id: str,
+        tenant_id: str,
+        source_version: int,
+        target_version: Optional[int],
+    ) -> tuple:
+        """Resolve both sides of a CROSS-KEY rewrap under both key locks.
+
+        Returns ``(status, source_record, target_record, source_ver,
+        target_ver)`` with the REWRAP_* status semantics of
+        :meth:`rewrap_versions`. Both records are read strictly (a corrupt
+        or unreadable record raises :class:`LedgerError` for the fixed 500,
+        never a misleading 404) over the committed projection while holding
+        every key lock in sorted order, so a concurrent rotation, revocation
+        or migration on EITHER key is answered wholly before or wholly after
+        this resolution -- the two sides never mix committed states from
+        different moments. ``target_version`` defaults to the TARGET key's
+        current committed version; an equal version number on two different
+        keys is not a conflict. A missing key/version on either side and a
+        foreign tenant share the indistinct REWRAP_NOT_FOUND; a revoked key
+        or selected version on either side is REWRAP_REVOKED.
+        """
+        source_record = target_record = None
+        source_ver = target_ver = None
+        with self.multi_key_locks([source_key_id, target_key_id]):
+            for which, key_id in (
+                ("source", source_key_id), ("target", target_key_id)
+            ):
+                on_disk = self._read_record(
+                    self._path_for(key_id), strict=True
+                )
+                if on_disk is None or on_disk.tenant_id != tenant_id:
+                    return (
+                        self.REWRAP_NOT_FOUND, None, None, None, None
+                    )
+                record = self._committed_record(on_disk)
+                if record is None:
+                    return (
+                        self.REWRAP_NOT_FOUND, None, None, None, None
+                    )
+                self._take_over_legacy(record)
+                if which == "source":
+                    source_record = record
+                else:
+                    target_record = record
+            if (
+                source_record.status == "revoked"
+                or target_record.status == "revoked"
+            ):
+                return (
+                    self.REWRAP_REVOKED,
+                    source_record, target_record, None, None,
+                )
+            source_ver = source_record.get_version(source_version)
+            if source_ver is None:
+                return self.REWRAP_NOT_FOUND, None, None, None, None
+            if target_version is None:
+                target_ver = target_record.current
+            else:
+                target_ver = target_record.get_version(target_version)
+                if target_ver is None:
+                    return self.REWRAP_NOT_FOUND, None, None, None, None
+            if source_ver.is_revoked or target_ver.is_revoked:
+                return (
+                    self.REWRAP_REVOKED,
+                    source_record, target_record, source_ver, target_ver,
+                )
+            return (
+                self.REWRAP_OK,
+                source_record, target_record, source_ver, target_ver,
+            )
+
+    def rewrap_versions_cross(
+        self,
+        source_key_id: str,
+        target_key_id: str,
+        tenant_id: str,
+        source_version: int,
+        target_version: Optional[int] = None,
+    ) -> tuple:
+        """Resolve the source and target VERSION records for a cross-key rewrap.
+
+        Same contract as :meth:`rewrap_versions` but the two versions belong
+        to two DIFFERENT keys of one tenant; no provider is probed and no
+        material exported, so the 404/409/400 answers of the endpoint never
+        depend on a KMS/HSM being reachable. The caller then resolves the
+        native binding or each KEK exactly once.
+        """
+        if not is_valid_key_id(source_key_id) or not is_valid_key_id(
+            target_key_id
+        ):
+            return self.REWRAP_NOT_FOUND, None, None, None, None
+        return self._rewrap_pair_locked(
+            source_key_id, target_key_id, tenant_id,
+            source_version, target_version,
+        )
+
+    @_provider_session
+    def native_rewrap_binding_cross(
+        self,
+        source_key_id: str,
+        target_key_id: str,
+        tenant_id: str,
+        source_version: int,
+        target_version: int,
+    ) -> tuple:
+        """Resolve a KMS/HSM-native binding for a cross-key rewrap.
+
+        Returns ``(status, native)`` with the same REWRAP_* semantics and
+        NativeRewrap/NativeRewrapSplit/None values as
+        :meth:`native_rewrap_binding`, resolved across two keys of one
+        tenant. A cross-key rewrap is supported only when BOTH versions are
+        owned by the same provider_id: a pair bound to different providers
+        raises :class:`ProviderUnavailable` (the fixed 503), as does a
+        record owned by an inactive provider -- never a silent fallback.
+        Both records are re-read under both key locks over the committed
+        projection, so a concurrent revoke/rotate/migrate on either key
+        between the caller's version resolution and the provider call is
+        still answered 409/404 and the handles are always the currently
+        committed ones. Nothing is persisted and no audit event is written
+        here.
+        """
+        if not is_valid_key_id(source_key_id) or not is_valid_key_id(
+            target_key_id
+        ):
+            return self.REWRAP_NOT_FOUND, None
+        status, _sr, _tr, source_ver, target_ver = self._rewrap_pair_locked(
+            source_key_id, target_key_id, tenant_id,
+            source_version, target_version,
+        )
+        if status != self.REWRAP_OK:
+            return status, None
+        if source_ver.provider_id != target_ver.provider_id:
+            # A native rewrap happens inside ONE provider and the cross-key
+            # contract supports only same-provider pairs: different
+            # providers are the fixed 503, never a fallback export.
+            raise ProviderUnavailable(
+                "cross-key rewrap requires both versions on one provider"
+            )
+        provider = self._provider_for(source_ver.provider_id)
+        if provider_mod.declares_rewrap_key(provider):
+            return self.REWRAP_OK, NativeRewrap(
+                provider=provider,
+                source_handle=source_ver.handle,
+                target_handle=target_ver.handle,
+            )
+        native_unwrap = provider_mod.declares_unwrap_key(provider)
+        native_wrap = provider_mod.declares_wrap_key(provider)
+        if native_unwrap or native_wrap:
+            return self.REWRAP_OK, NativeRewrapSplit(
+                provider=provider,
+                source_handle=source_ver.handle,
+                target_handle=target_ver.handle,
+                native_unwrap=native_unwrap,
+                native_wrap=native_wrap,
+            )
+        return self.REWRAP_OK, None
+
     # -- sign / verify ------------------------------------------------------
     # Outcomes shared by sign_message and verification_key: the version
     # is usable, the key/version is not found for this tenant, the key is

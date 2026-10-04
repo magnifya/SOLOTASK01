@@ -2541,37 +2541,54 @@ def make_handler(
         def _rewrap_key(self, key_id: str, parts, operator: str) -> None:
             """POST /v1/keys/{key_id}/rewrap.
 
-            Body is exactly ``{tenant_id, envelope, target_version?, aad?}``
-            (non-idempotent, no Idempotency-Key). ``envelope`` and ``aad``
-            are canonical standard base64; ``target_version`` defaults to the
-            key's current version. An unparseable/non-object body, the UUID4
-            key_id, the base64 fields, the envelope structure and an envelope
+            Body is exactly ``{tenant_id, envelope, target_version?, aad?,
+            target_key_id?}`` (non-idempotent, no Idempotency-Key).
+            ``envelope`` and ``aad`` are canonical standard base64;
+            ``target_version`` defaults to the target key's current
+            committed version; ``target_key_id`` is an optional canonical
+            lowercase UUID4 that, when present and different from the path
+            key, re-wraps the envelope onto ANOTHER key of the same tenant
+            (an empty value, null or a wrong type is a plain 400 naming the
+            field; omitted or equal to the path key keeps the same-key
+            behavior). An unparseable/non-object body, the UUID4 key ids,
+            the base64 fields, the envelope structure and an envelope
             key_id differing from the path are all parameter validation: a
             400 naming the field, written to no ledger. Only a wrong/missing
             tenant *source* records the invisible tenant_conflict.
 
-            Authorization (``rewrap``) precedes existence: a denial is 403
-            with a ``rewrap/rejected`` event carrying key_id. After that an
-            unknown/cross-tenant key or an unknown version is 404, a revoked
-            key or an already-current target is 409, an algorithm mismatch
+            Authorization (``rewrap``) precedes existence and is checked
+            per key scope -- the source key and, on a cross-key request, the
+            target key: either denial is a 403 with ONE ``rewrap/rejected``
+            event carrying the source key_id. After that an
+            unknown/cross-tenant key or version (either side) is 404, a
+            revoked key or selected version (either side) is 409, an
+            already-current target on the SAME key is 409 (equal version
+            numbers on different keys never conflict), an algorithm mismatch
             with the SOURCE version or a failed authentication is 400, and a
             provider/material failure is the fixed 503 text (not audited).
             Success rewraps the SAME authenticated data key under the target
-            version: nonce, tag, ciphertext, aad and key_id bytes are carried
-            over unchanged and the answer is
-            ``200 {"format","envelope"}``. When both versions are owned by
-            the same provider_id the native boundary is chosen per the
-            provider's declarations within the five-second provider-call
+            version: nonce, tag, ciphertext and aad bytes are carried over
+            unchanged, the envelope is rebuilt with the TARGET key_id,
+            version, algorithm and wrap fields, and the answer is
+            ``200 {"format","envelope"}`` -- the new envelope decrypts under
+            the target key while the original keeps decrypting under the
+            source key. A cross-key pair must be bound to the SAME
+            provider_id (any AES256/RSA2048 combination); versions on
+            different providers are the fixed 503. When both versions are
+            owned by the same provider_id the native boundary is chosen per
+            the provider's declarations within the five-second provider-call
             gate: a declared ``rewrap_key`` runs the whole rewrap inside the
             KMS/HSM (no export, no DEK/KEK/plaintext in this process);
             otherwise a source ``unwrap_key`` declaration and/or a target
             ``wrap_key`` declaration keeps that side's DEK inside the
             provider and ONLY the undeclared side exports its KEK -- a
-            native failure is the fixed 503, never a fallback export.
-            Versions on different providers, or a shared provider declaring
-            none of the three operations, export both KEKs and rewrap in
-            memory. The data key, plaintext, handles and material never enter
-            a response, the ledger or any file.
+            native failure is the fixed 503, never a fallback export. A
+            shared provider declaring none of the three operations exports
+            both KEKs and rewraps in memory. Both sides are resolved under
+            both key locks over the committed projection, so a concurrent
+            rotation, revocation or migration happens wholly before or
+            wholly after this rewrap. The data key, plaintext, handles and
+            material never enter a response, the ledger or any file.
             """
             action = audit_mod.ACTION_REWRAP
             # Like sign/verify, a malformed body is a plain 400 with no
@@ -2595,7 +2612,10 @@ def make_handler(
                 return
             extra = [
                 f for f in payload
-                if f not in ("tenant_id", "envelope", "target_version", "aad")
+                if f not in (
+                    "tenant_id", "envelope", "target_version", "aad",
+                    "target_key_id",
+                )
             ]
             if extra:
                 self._bad_request(
@@ -2612,6 +2632,18 @@ def make_handler(
                     "field target_version must be a positive integer"
                 )
                 return
+            # An optional cross-key target: when present it must be a
+            # canonical lowercase UUID4 (an empty value, null or a wrong
+            # type is a plain unaudited 400 naming the field). Omitted, or
+            # equal to the path key, keeps the same-key behavior.
+            target_key_id = payload.get("target_key_id")
+            if "target_key_id" in payload and not is_valid_key_id(
+                target_key_id
+            ):
+                self._bad_request("field target_key_id must be a UUID4")
+                return
+            if target_key_id == key_id:
+                target_key_id = None
             token = payload.get("envelope")
             if not isinstance(token, str) or not token:
                 self._bad_request(
@@ -2647,13 +2679,50 @@ def make_handler(
                 return
             if not self._enforce(tenant_id, key_id, action, operator):
                 return
-            # Step 1: resolve both VERSION records under one key lock with no
-            # provider contact, so the 404/409/400 answers below never depend
-            # on a KMS/HSM being reachable.
-            status, _record, source_ver, target_ver = store.rewrap_versions(
-                key_id, tenant_id, opened.version,
-                target_version=target_version,
-            )
+            # A cross-key rewrap additionally requires the operator's
+            # rewrap permission in the TARGET key's scope. Authorization
+            # still precedes every existence check, and a denial here is
+            # the same single rewrap/rejected event carrying the SOURCE
+            # key_id (never a second event on the target).
+            if target_key_id is not None:
+                try:
+                    target_allowed = policy_store.is_allowed(
+                        tenant_id, action, operator, target_key_id
+                    )
+                except PolicyStoreUnavailable:
+                    self._send_json(
+                        500, {"error": "policy store is unavailable"}
+                    )
+                    return
+                if not target_allowed:
+                    if not self._record_attempt(
+                        tenant_id, key_id, action, audit_mod.OUTCOME_REJECTED
+                    ):
+                        return
+                    self._send_json(
+                        403, {"error": "action not permitted by policy"}
+                    )
+                    return
+            # Step 1: resolve both VERSION records with no provider contact,
+            # so the 404/409/400 answers below never depend on a KMS/HSM
+            # being reachable. A cross-key pair is resolved under BOTH key
+            # locks in one committed view (a corrupt/unreadable record on
+            # either side raises LedgerError for the fixed 500); the
+            # same-key path keeps its single-lock read.
+            if target_key_id is None:
+                status, _record, source_ver, target_ver = (
+                    store.rewrap_versions(
+                        key_id, tenant_id, opened.version,
+                        target_version=target_version,
+                    )
+                )
+            else:
+                status, _record, _target_record, source_ver, target_ver = (
+                    store.rewrap_versions_cross(
+                        key_id, target_key_id, tenant_id, opened.version,
+                        target_version=target_version,
+                    )
+                )
             if status == store.REWRAP_NOT_FOUND:
                 self._reject_crypto(
                     tenant_id, key_id, action, 404, "key not found"
@@ -2672,12 +2741,27 @@ def make_handler(
                     "field envelope algorithm does not match the source key version"
                 )
                 return
-            if target_ver.version == source_ver.version:
+            if target_key_id is None and (
+                target_ver.version == source_ver.version
+            ):
+                # Only a SAME-key rewrap back onto the envelope's own
+                # version conflicts; equal version NUMBERS on two different
+                # keys are unrelated and never conflict.
                 self._reject_crypto(
                     tenant_id, key_id, action, 409,
                     "target_version is the envelope's current key version",
                 )
                 return
+            # A cross-key rewrap is supported only between versions bound to
+            # the SAME provider_id (any AES256/RSA2048 combination): a pair
+            # split across providers is the fixed 503, not audited, exactly
+            # like a provider fault.
+            if target_key_id is not None and (
+                source_ver.provider_id != target_ver.provider_id
+            ):
+                raise ProviderUnavailable(
+                    "cross-key rewrap requires both versions on one provider"
+                )
             # Step 2: when BOTH versions are owned by the same provider_id,
             # resolve the native binding: a declared rewrap_key runs the
             # whole rewrap inside the KMS/HSM; otherwise per-side
@@ -2693,9 +2777,16 @@ def make_handler(
             # fully export-based path below.
             native = None
             if source_ver.provider_id == target_ver.provider_id:
-                native_status, native = store.native_rewrap_binding(
-                    key_id, tenant_id, source_ver.version, target_ver.version
-                )
+                if target_key_id is None:
+                    native_status, native = store.native_rewrap_binding(
+                        key_id, tenant_id,
+                        source_ver.version, target_ver.version,
+                    )
+                else:
+                    native_status, native = store.native_rewrap_binding_cross(
+                        key_id, target_key_id, tenant_id,
+                        source_ver.version, target_ver.version,
+                    )
                 if native_status == store.REWRAP_NOT_FOUND:
                     self._reject_crypto(
                         tenant_id, key_id, action, 404, "key not found"
@@ -2706,6 +2797,9 @@ def make_handler(
                         tenant_id, key_id, action, 409, "key is revoked"
                     )
                     return
+            # The key each side's material is resolved under: identical for
+            # a same-key rewrap, distinct across a cross-key one.
+            dst_key_id = key_id if target_key_id is None else target_key_id
             if isinstance(native, NativeRewrap):
                 try:
                     with provider_mod.provider_call():
@@ -2716,6 +2810,7 @@ def make_handler(
                             target_version=target_ver.version,
                             target_algorithm=target_ver.algorithm,
                             envelope_bytes=envelope.raw_token_bytes(token),
+                            target_key_id=dst_key_id,
                         )
                 except envelope.EnvelopeError as exc:
                     # The source envelope did not authenticate inside the
@@ -2758,7 +2853,7 @@ def make_handler(
                 else:
                     tgt_status, _r2, _tgt_ver, target_kek = (
                         store.crypto_material(
-                            key_id, tenant_id, target_ver.version
+                            dst_key_id, tenant_id, target_ver.version
                         )
                     )
                     if tgt_status == store.CRYPTO_NOT_FOUND:
@@ -2778,6 +2873,7 @@ def make_handler(
                             opened, source_material, target_material,
                             target_version=target_ver.version,
                             target_algorithm=target_ver.algorithm,
+                            target_key_id=dst_key_id,
                         )
                 except envelope.EnvelopeError as exc:
                     # The source wrapping key or content tag did not
@@ -2786,9 +2882,9 @@ def make_handler(
                     return
             else:
                 # Export each KEK (one crypto_material call per distinct
-                # version). Provider/material faults propagate to do_POST's
-                # fixed 503 and are deliberately NOT audited; nothing has
-                # been written.
+                # version, each under its own key's locks). Provider/material
+                # faults propagate to do_POST's fixed 503 and are
+                # deliberately NOT audited; nothing has been written.
                 src_status, _r1, _src_ver, source_kek = store.crypto_material(
                     key_id, tenant_id, source_ver.version
                 )
@@ -2803,7 +2899,7 @@ def make_handler(
                     )
                     return
                 tgt_status, _r2, _tgt_ver, target_kek = store.crypto_material(
-                    key_id, tenant_id, target_ver.version
+                    dst_key_id, tenant_id, target_ver.version
                 )
                 if tgt_status == store.CRYPTO_NOT_FOUND:
                     self._reject_crypto(
@@ -2821,6 +2917,7 @@ def make_handler(
                         target_version=target_ver.version,
                         target_algorithm=target_ver.algorithm,
                         target_kek=target_kek,
+                        target_key_id=dst_key_id,
                     )
                 except envelope.EnvelopeError as exc:
                     # The source envelope did not authenticate: 400, no event.
