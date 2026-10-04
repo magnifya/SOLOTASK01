@@ -4640,7 +4640,172 @@ class KeyStore:
                 )
             return self.REWRAP_OK, None
 
-    # -- sign / verify ------------------------------------------------------
+    # Additional outcomes of rewrap_across_keys (the cross-key rewrap): the
+    # envelope's algorithm disagrees with the resolved SOURCE version, or the
+    # two selected versions are owned by different providers.
+    REWRAP_ALGORITHM_MISMATCH = "algorithm_mismatch"
+    REWRAP_PROVIDER_MISMATCH = "provider_mismatch"
+
+    def _committed_view(self, key_id: str, tenant_id: str):
+        """The committed record of one key visible to a tenant, else None.
+
+        The caller holds the key's locks (directly or via multi_key_locks).
+        None covers an unknown key, a foreign tenant and an uncommitted
+        record alike (existence never leaks). A raw legacy record is adopted
+        exactly like export.
+        """
+        on_disk = self._read_record(self._path_for(key_id))
+        if on_disk is None or on_disk.tenant_id != tenant_id:
+            return None
+        record = self._committed_record(on_disk)
+        if record is None:
+            return None
+        self._take_over_legacy(record)
+        return record
+
+    def _export_kek(self, provider, ver: VersionRecord):
+        """Export one version's KEK through its owning provider.
+
+        The caller holds the key's locks. A record owned by an inactive
+        provider raises ProviderUnavailable (503), never a silent fallback;
+        corrupt stored material is a backend inconsistency surfaced as
+        ProviderUnavailable, never a client-visible 400.
+        """
+        exported = provider.export_material(ver.handle)
+        return self._kek_for_version(ver, exported.encrypted_material)
+
+    @_provider_session
+    def rewrap_across_keys(
+        self,
+        source_key_id: str,
+        target_key_id: str,
+        tenant_id: str,
+        source_version: int,
+        target_version: Optional[int],
+        envelope_algorithm: str,
+        perform,
+    ) -> tuple:
+        """Resolve two versions on TWO keys of one tenant and rewrap.
+
+        Returns ``(status, token)``; ``token`` is None unless the status is
+        REWRAP_OK, when it is ``perform``'s return value. Statuses:
+
+        * REWRAP_NOT_FOUND -- either key is unknown or belongs to another
+          tenant, or either selected version is unknown (indistinct, so
+          existence never leaks);
+        * REWRAP_REVOKED -- both keys exist and either whole key or either
+          selected version is revoked;
+        * REWRAP_ALGORITHM_MISMATCH -- ``envelope_algorithm`` disagrees with
+          the resolved SOURCE version (a client validation failure the
+          caller surfaces as a 400 without any provider contact);
+        * REWRAP_PROVIDER_MISMATCH -- the two versions are owned by
+          different provider_ids (cross-key rewrap requires one shared
+          provider; the caller surfaces the fixed 503);
+        * REWRAP_OK -- ``perform`` produced the re-sealed token.
+
+        Both keys are locked together (sorted order, shared with the restore
+        transaction) for the WHOLE operation -- version resolution, provider
+        binding, material export and the ``perform`` callback (which runs
+        the native or in-memory re-wrap) -- so a concurrent rotation,
+        revocation or migration on either key commits entirely before or
+        entirely after this rewrap: the two sides can never be read at
+        different commit instants and no resolved handle can go stale
+        mid-call. ``target_version`` None selects the target key's current
+        committed version; equal version NUMBERS on different keys are not
+        a conflict. ``perform`` is invoked as
+        ``perform(source_ver, target_ver, native, source_material,
+        target_material)`` where ``native``/the materials follow the
+        same-provider binding rules of :meth:`native_rewrap_binding` (a
+        declared ``rewrap_key`` runs natively, per-side declarations export
+        only the undeclared side, no declarations export both KEKs). Nothing
+        is persisted and no audit event is written here.
+        """
+        if not is_valid_key_id(source_key_id) or not is_valid_key_id(
+            target_key_id
+        ):
+            return self.REWRAP_NOT_FOUND, None
+        with self.multi_key_locks((source_key_id, target_key_id)):
+            # Existence of BOTH keys and BOTH selected versions is settled
+            # before any revocation answer: an unknown/cross-tenant key or
+            # an unknown version on either side is uniformly not-found, and
+            # only once both sides exist does a revocation refuse the call.
+            source_record = self._committed_view(source_key_id, tenant_id)
+            if source_record is None:
+                return self.REWRAP_NOT_FOUND, None
+            source_ver = source_record.get_version(source_version)
+            if source_ver is None:
+                return self.REWRAP_NOT_FOUND, None
+            target_record = self._committed_view(target_key_id, tenant_id)
+            if target_record is None:
+                return self.REWRAP_NOT_FOUND, None
+            if target_version is None:
+                target_ver = target_record.current
+            else:
+                target_ver = target_record.get_version(target_version)
+                if target_ver is None:
+                    return self.REWRAP_NOT_FOUND, None
+            # Either whole key or either selected version being revoked
+            # refuses the rewrap; no provider is contacted for either KEK.
+            if (
+                source_record.status == "revoked"
+                or target_record.status == "revoked"
+                or source_ver.is_revoked
+                or target_ver.is_revoked
+            ):
+                return self.REWRAP_REVOKED, None
+            # The source-algorithm check is pure validation: it precedes any
+            # provider contact, exactly like the same-key rewrap.
+            if envelope_algorithm != source_ver.algorithm:
+                return self.REWRAP_ALGORITHM_MISMATCH, None
+            if source_ver.provider_id != target_ver.provider_id:
+                # A cross-key rewrap is supported only between versions bound
+                # to ONE provider; different providers are the fixed 503.
+                return self.REWRAP_PROVIDER_MISMATCH, None
+            provider = self._provider_for(source_ver.provider_id)
+            native = None
+            source_material = None
+            target_material = None
+            if provider_mod.declares_rewrap_key(provider):
+                native = NativeRewrap(
+                    provider=provider,
+                    source_handle=source_ver.handle,
+                    target_handle=target_ver.handle,
+                )
+            else:
+                # No combined operation: each side independently keeps its
+                # DEK native when it declares the matching per-side
+                # operation; only an undeclared side exports its KEK. A
+                # provider declaring NEITHER exports both (the fully
+                # export-based path).
+                native_unwrap = provider_mod.declares_unwrap_key(provider)
+                native_wrap = provider_mod.declares_wrap_key(provider)
+                if native_unwrap or native_wrap:
+                    native = NativeRewrapSplit(
+                        provider=provider,
+                        source_handle=source_ver.handle,
+                        target_handle=target_ver.handle,
+                        native_unwrap=native_unwrap,
+                        native_wrap=native_wrap,
+                    )
+                    if not native_unwrap:
+                        source_material = self._export_kek(
+                            provider, source_ver
+                        )
+                    if not native_wrap:
+                        target_material = self._export_kek(
+                            provider, target_ver
+                        )
+                else:
+                    source_material = self._export_kek(provider, source_ver)
+                    target_material = self._export_kek(provider, target_ver)
+            token = perform(
+                source_ver=source_ver,
+                target_ver=target_ver,
+                native=native,
+                source_material=source_material,
+                target_material=target_material,
+            )
+            return self.REWRAP_OK, token
     # Outcomes shared by sign_message and verification_key: the version
     # is usable, the key/version is not found for this tenant, the key is
     # revoked (every version refuses), or the version is not an RSA2048 one.

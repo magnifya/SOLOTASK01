@@ -2541,14 +2541,19 @@ def make_handler(
         def _rewrap_key(self, key_id: str, parts, operator: str) -> None:
             """POST /v1/keys/{key_id}/rewrap.
 
-            Body is exactly ``{tenant_id, envelope, target_version?, aad?}``
-            (non-idempotent, no Idempotency-Key). ``envelope`` and ``aad``
-            are canonical standard base64; ``target_version`` defaults to the
-            key's current version. An unparseable/non-object body, the UUID4
-            key_id, the base64 fields, the envelope structure and an envelope
-            key_id differing from the path are all parameter validation: a
-            400 naming the field, written to no ledger. Only a wrong/missing
-            tenant *source* records the invisible tenant_conflict.
+            Body is exactly ``{tenant_id, envelope, target_version?, aad?,
+            target_key_id?}`` (non-idempotent, no Idempotency-Key).
+            ``envelope`` and ``aad`` are canonical standard base64;
+            ``target_version`` defaults to the key's current version. The
+            optional ``target_key_id`` (a lowercase UUID4 when present)
+            selects a same-tenant cross-key rewrap under
+            :meth:`_rewrap_across_keys`; omitted, or equal to the path key,
+            keeps the same-key behavior below. An unparseable/non-object
+            body, the UUID4 key_id/target_key_id, the base64 fields, the
+            envelope structure and an envelope key_id differing from the
+            path are all parameter validation: a 400 naming the field,
+            written to no ledger. Only a wrong/missing tenant *source*
+            records the invisible tenant_conflict.
 
             Authorization (``rewrap``) precedes existence: a denial is 403
             with a ``rewrap/rejected`` event carrying key_id. After that an
@@ -2595,13 +2600,29 @@ def make_handler(
                 return
             extra = [
                 f for f in payload
-                if f not in ("tenant_id", "envelope", "target_version", "aad")
+                if f not in (
+                    "tenant_id", "envelope", "target_version", "aad",
+                    "target_key_id",
+                )
             ]
             if extra:
                 self._bad_request(
                     "field %s is not accepted by this endpoint" % extra[0]
                 )
                 return
+            # The optional target_key_id selects a same-tenant CROSS-KEY
+            # rewrap. When present it must be a canonical lowercase UUID4
+            # (null, an empty value or a wrong type are all rejected here);
+            # a malformed value is parameter validation: 400 with no event.
+            # A target equal to the path key keeps the same-key behavior.
+            target_key_id = None
+            if "target_key_id" in payload:
+                raw_target_key_id = payload["target_key_id"]
+                if not is_valid_key_id(raw_target_key_id):
+                    self._bad_request("field target_key_id must be a UUID4")
+                    return
+                if raw_target_key_id != key_id:
+                    target_key_id = raw_target_key_id
             target_version = payload.get("target_version")
             if target_version is not None and (
                 not isinstance(target_version, int)
@@ -2644,6 +2665,12 @@ def make_handler(
                 return
             if opened.aad != aad:
                 self._bad_request("field aad does not match the envelope")
+                return
+            if target_key_id is not None:
+                self._rewrap_across_keys(
+                    key_id, target_key_id, tenant_id, opened, token,
+                    target_version, action, operator,
+                )
                 return
             if not self._enforce(tenant_id, key_id, action, operator):
                 return
@@ -2826,6 +2853,138 @@ def make_handler(
                     # The source envelope did not authenticate: 400, no event.
                     self._bad_request(str(exc))
                     return
+            if not self._record_attempt(
+                tenant_id, key_id, action, audit_mod.OUTCOME_SUCCESS
+            ):
+                return
+            self._send_json(200, {"format": envelope.FORMAT, "envelope": new_token})
+
+        def _rewrap_across_keys(self, key_id, target_key_id, tenant_id,
+                                opened, token, target_version, action,
+                                operator) -> None:
+            """Same-tenant cross-key rewrap (body carried target_key_id).
+
+            The source key is still fixed by the path and the envelope (the
+            envelope key_id check already ran); the SAME authenticated data
+            key is re-wrapped under the TARGET key's selected version and the
+            new envelope is re-identified to the target key_id while nonce,
+            tag, ciphertext and aad bytes carry over unchanged.
+            ``target_version`` None selects the target key's current
+            committed version; equal version numbers on different keys are
+            not a conflict.
+
+            Authorization precedes existence and is checked per key scope:
+            the operator needs ``rewrap`` on BOTH keys and either denial is
+            one 403 with a single ``rewrap/rejected`` event carrying the
+            SOURCE key_id. After that an unknown/cross-tenant key (either
+            side) or an unknown version is 404, a revoked key or selected
+            version is 409 (both rejections record that one source-key
+            event), an envelope algorithm mismatch with the SOURCE version
+            or a failed authentication is a 400 naming the envelope (not
+            audited), versions bound to different providers are the fixed
+            503 (not audited), and a provider/material failure keeps the
+            existing fixed-503/no-audit contract. Success records one
+            ``rewrap/success`` on the source key. Both keys stay locked for
+            the whole resolution + provider + rewrap window, so a concurrent
+            rotation, revocation or migration commits entirely before or
+            after this call and no resolved handle can go stale mid-call.
+            """
+            try:
+                allowed = policy_store.is_allowed(
+                    tenant_id, action, operator, key_id
+                )
+                if allowed:
+                    allowed = policy_store.is_allowed(
+                        tenant_id, action, operator, target_key_id
+                    )
+            except PolicyStoreUnavailable:
+                # Backend corruption must never fail open: fixed 500 with no
+                # success or rejection audit event.
+                self._send_json(
+                    500, {"error": "policy store is unavailable"}
+                )
+                return
+            if not allowed:
+                if not self._record_attempt(
+                    tenant_id, key_id, action, audit_mod.OUTCOME_REJECTED
+                ):
+                    return
+                self._send_json(
+                    403, {"error": "action not permitted by policy"}
+                )
+                return
+
+            def perform(source_ver, target_ver, native, source_material,
+                        target_material):
+                # Runs inside the store's two-key lock window and provider
+                # session; an EnvelopeError (authentication) propagates to
+                # the 400 below, a provider fault to do_POST's fixed 503.
+                if isinstance(native, NativeRewrap):
+                    return envelope.rewrap_envelope_native(
+                        opened, native.provider,
+                        src=native.source_handle,
+                        dst=native.target_handle,
+                        target_version=target_ver.version,
+                        target_algorithm=target_ver.algorithm,
+                        envelope_bytes=envelope.raw_token_bytes(token),
+                        target_key_id=target_key_id,
+                    )
+                if isinstance(native, NativeRewrapSplit):
+                    source = (
+                        (native.provider, native.source_handle)
+                        if native.native_unwrap else source_material
+                    )
+                    target = (
+                        (native.provider, native.target_handle)
+                        if native.native_wrap else target_material
+                    )
+                    return envelope.rewrap_envelope_split(
+                        opened, source, target,
+                        target_version=target_ver.version,
+                        target_algorithm=target_ver.algorithm,
+                        target_key_id=target_key_id,
+                    )
+                return envelope.rewrap_envelope(
+                    opened, source_material,
+                    target_version=target_ver.version,
+                    target_algorithm=target_ver.algorithm,
+                    target_kek=target_material,
+                    target_key_id=target_key_id,
+                )
+
+            try:
+                status, new_token = store.rewrap_across_keys(
+                    key_id, target_key_id, tenant_id, opened.version,
+                    target_version, opened.algorithm, perform,
+                )
+            except envelope.EnvelopeError as exc:
+                # The source wrapping key or content tag did not
+                # authenticate: 400 naming the envelope, no event.
+                self._bad_request(str(exc))
+                return
+            if status == store.REWRAP_NOT_FOUND:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 404, "key not found"
+                )
+                return
+            if status == store.REWRAP_REVOKED:
+                self._reject_crypto(
+                    tenant_id, key_id, action, 409, "key is revoked"
+                )
+                return
+            if status == store.REWRAP_ALGORITHM_MISMATCH:
+                # A 400 after authorization is still a parameter/validation
+                # failure: per the rewrap contract it is NOT audited.
+                self._bad_request(
+                    "field envelope algorithm does not match the source key "
+                    "version"
+                )
+                return
+            if status == store.REWRAP_PROVIDER_MISMATCH:
+                # Cross-key rewrap requires both versions bound to ONE
+                # provider: the fixed 503 text, not audited.
+                self._provider_unavailable(None)
+                return
             if not self._record_attempt(
                 tenant_id, key_id, action, audit_mod.OUTCOME_SUCCESS
             ):

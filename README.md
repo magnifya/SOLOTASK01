@@ -325,7 +325,8 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   绝不落盘、不入审计或错误，仅可在解包成功体中返回。
 - `POST /v1/keys/{key_id}/rewrap`，**非幂等**（无需
   `Idempotency-Key`），body 仅
-  `{tenant_id, envelope, target_version?, aad?}`；`envelope`、`aad` 为
+  `{tenant_id, envelope, target_version?, aad?, target_key_id?}`；
+  `envelope`、`aad` 为
   标准带填充 base64，`target_version` 缺省为 current（须正整数）。把已
   认证信封内的数据密钥从源版本重新包装到目标版本：先以源版本 KEK 完整
   认证原信封（解包数据密钥并校验内容 GCM tag），再仅把**同一数据密钥**
@@ -356,6 +357,25 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   时均为固定文案 `503` 且不记账，原生失败绝不回退导出。其余情形（分属
   不同提供者，或同一提供者三者均未声明）沿用导出两侧 KEK 在内存中改包
   的旧路径。
+  跨键重包装：body 另含可选 `target_key_id`（提供时须为小写 UUID4，空
+  值、null 或类型错误为指出该字段的 `400` 且不记账；省略或等于路径
+  key_id 时保持上述同键行为）。提供且异于路径 key 时为同租户跨键重包
+  装：源键仍由路径与信封共同确定，`target_version` 省略或为 null 时取
+  目标键当前已提交版本；成功仍 `200` 仅返 `{format, envelope}`，信封改
+  用目标 key_id、版本、算法与包装字段，保留同一数据密钥及原 nonce、
+  tag、ciphertext、aad 字节，可在目标键下 decrypt，原信封仍可在源键下
+  使用，不同密钥的相同版本号不构成冲突。校验顺序沿用身份、正文、源标
+  识与 AAD，再按各键范围分别检查操作者的 `rewrap` 权限（任一拒绝
+  `403`，授权先于存在性）；任一键或版本未知/属于其他租户统一 `404`，
+  两侧均存在后任一整键或选中版本吊销 `409`——`403`/`404`/`409` 只记一
+  条源键的 `rewrap/rejected`，成功只记一条 `rewrap/success`。算法与源
+  版本不符或认证失败仍为指出 envelope 的 `400`（不记账）。本次仅支持两
+  侧版本绑定同一提供者的 AES256/RSA2048 任意组合，绑定不同提供者返回固
+  定文案 `503`（不记账）；原生优先、失败不回退导出、门限与固定错误体
+  等约定与上述同键路径一致。整个操作（版本解析、提供者绑定、材料导出
+  与重包装）在两把键锁共同持有期间完成，并发轮换、吊销或迁移整体发生
+  在此次重包装之前或之后，不混用两侧不同提交时刻的状态，也不使用已失
+  效句柄。仍非幂等，不创建操作记录；CLI 及其他接口行为不变。
 - `POST /v1/keys/{key_id}/sign`，**非幂等**（无需 `Idempotency-Key`），
   body 仅 `{tenant_id, version?, message}`；`message` 为标准 base64（可空），
   `version` 缺省为 current。用 RSASSA-PKCS1-v1_5/SHA-256 **确定性**签名，
