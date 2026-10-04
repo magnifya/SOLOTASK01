@@ -668,11 +668,16 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
 
 ## 审计
 
-- 事件字段 `{event_id, tenant_id, action, key_id, outcome, timestamp}`；
-  `action` 为 `create/read/rotate/batch_rotate/revoke/revoke_version/import/export/
+- 事件字段 `{event_id, tenant_id, action, key_id, outcome, timestamp,
+  operator_id}`；`action` 为 `create/read/rotate/batch_rotate/revoke/revoke_version/import/export/
   migrate/encrypt/decrypt/rewrap/wrap_key/unwrap_key/sign/verify/audit/list/
   tenant_conflict/
   policy_read/policy_update/policy_delete`，`outcome` 为 `success/rejected`。
+  `operator_id` 为当次请求已校验的操作者身份（HTTP `X-Operator-Id`，CLI
+  `--operator`），原值保留、区分大小写；成功、拒绝与 `tenant_conflict`
+  事件均记录。它只表示请求主体，不取吊销正文的 `operator`、策略规则的
+  `subject` 或导入包信息。升级前写入的旧事件无此字段，查询返回
+  `operator_id: null`（不推断历史身份）。
   版本级吊销只记一条 `revoke_version/success`（首次吊销随 outbox 提交；重复/
   并发吊销保留首次值且不写第二条事件），403/404/409 业务拒绝记同名 rejected，
   均带 key_id；参数 `400` 不记账。
@@ -739,8 +744,11 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   原样、无末行，键序 `schema_version,legacy_bytes,legacy_mac`，值为 1、旧日志
   字节数、`HMAC-SHA256(audit.secret, "legacy\0"+原始字节)` 的 64 位小写 hex）。
   之后每行追加 `prev_mac,mac` 两键（首行 `prev_mac` 为 `legacy_mac`，其后取前一
-  行 `mac`；`mac` 为前八键按同口径编码的 HMAC-SHA256 小写 hex），紧凑 JSON 并
-  换行。每次读写在锁内验证锚点、前缀与全链；校验失败抛 LedgerError，不跳过、
+  行 `mac`；`mac` 为全部事件键加 `prev_mac` 按同口径编码的 HMAC-SHA256 小写
+  hex），紧凑 JSON 并换行。升级后新事件在行内 `seq` 之后携带
+  `operator_id`（非空字符串，受 MAC 保护）；旧行保持原七事件键形状，其
+  字节、锚点与签名绝不因升级重写。`operator_id` 既非字符串也非 null、
+  为空字符串或被篡改（MAC 不符）均按账本损坏处理。每次读写在锁内验证锚点、前缀与全链；校验失败抛 LedgerError，不跳过、
   不重签，HTTP 固定 `500` `{"error":"audit ledger is unavailable"}`，CLI 同体
   退出 `1`，均零副作用。变更走 outbox 事务：密钥
   /策略文件先携带待提交事件原子落盘 → 耐久追加账本（提交点）→ 清标记；账本

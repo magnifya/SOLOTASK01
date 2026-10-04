@@ -1188,14 +1188,19 @@ class KeyStore:
             raise
 
     # -- audit bookkeeping -------------------------------------------------
-    def audit_conflict(self) -> None:
-        """Record an invisible tenant_conflict event (both ids null)."""
+    def audit_conflict(self, operator_id: Optional[str] = None) -> None:
+        """Record an invisible tenant_conflict event (both ids null).
+
+        The validated operator identity of the rejected request is still
+        recorded; only the tenant/key ids collapse to null.
+        """
         self.audit.append(
             self.audit.new_event(
                 None,
                 audit_mod.ACTION_TENANT_CONFLICT,
                 None,
                 audit_mod.OUTCOME_REJECTED,
+                operator_id=operator_id,
             )
         )
 
@@ -1206,13 +1211,15 @@ class KeyStore:
         action: str,
         outcome: str,
         event_id: Optional[str] = None,
+        operator_id: Optional[str] = None,
     ) -> None:
         """Record one attempt against a key.
 
         When the tenant is known and non-empty and the key_id is either
         absent (create) or a legal UUID4, both identifiers are recorded and
         the event is visible to that tenant only. A missing/empty/illegal
-        identifier collapses to an invisible tenant_conflict with null ids.
+        identifier collapses to an invisible tenant_conflict with null ids;
+        the validated operator identity is recorded either way.
 
         ``event_id`` names the event explicitly: an idempotent mutation's
         terminal rejection uses its operation_id, so the failure event is
@@ -1244,7 +1251,8 @@ class KeyStore:
             )
         ):
             event = self.audit.new_event(
-                tenant_id, action, key_id, outcome, event_id=event_id
+                tenant_id, action, key_id, outcome, event_id=event_id,
+                operator_id=operator_id,
             )
         else:
             event = self.audit.new_event(
@@ -1252,6 +1260,7 @@ class KeyStore:
                 audit_mod.ACTION_TENANT_CONFLICT,
                 None,
                 audit_mod.OUTCOME_REJECTED,
+                operator_id=operator_id,
             )
         self.audit.append(event)
 
@@ -1614,6 +1623,7 @@ class KeyStore:
         pre_commit=None,
         mirror=None,
         key_id: Optional[str] = None,
+        operator_id: Optional[str] = None,
     ) -> KeyRecord:
         """Generate, persist and return a new key record (version 1).
 
@@ -1650,7 +1660,7 @@ class KeyStore:
             ):
                 return self._create_idempotent(
                     tenant_id, algorithm, label, key_id, event_id,
-                    pre_commit, mirror,
+                    pre_commit, mirror, operator_id,
                 )
         provider = self._provider()
         triple = provider.generate(algorithm)
@@ -1676,6 +1686,7 @@ class KeyStore:
         event = self.audit.new_event(
             tenant_id, audit_mod.ACTION_CREATE, key_id,
             audit_mod.OUTCOME_SUCCESS, timestamp=created_at,
+            operator_id=operator_id,
         )
         # The key_id is fresh, but take the same locks as rotation so a
         # concurrent rotate cannot observe a half-written create.
@@ -1688,7 +1699,7 @@ class KeyStore:
 
     def _create_idempotent(
         self, tenant_id, algorithm, label, key_id, event_id,
-        pre_commit, mirror,
+        pre_commit, mirror, operator_id=None,
     ) -> KeyRecord:
         """The mirrored, journaled create body; caller holds the key locks."""
         from .artifacts import ArtifactStrandUnavailable
@@ -1699,6 +1710,7 @@ class KeyStore:
             tenant_id, audit_mod.ACTION_CREATE, key_id,
             audit_mod.OUTCOME_SUCCESS, timestamp=created_at,
             event_id=event_id,
+            operator_id=operator_id,
         )
         journal_id, journal_path = self._new_provision_journal(
             event.event_id, event.tenant_id, event.action
@@ -2268,6 +2280,7 @@ class KeyStore:
         pre_commit=None,
         mirror=None,
         expected_version: Optional[int] = None,
+        operator_id: Optional[str] = None,
     ) -> Optional[KeyRecord]:
         """Append a new version with fresh material.
 
@@ -2325,6 +2338,7 @@ class KeyStore:
                 tenant_id, audit_mod.ACTION_ROTATE, key_id,
                 audit_mod.OUTCOME_SUCCESS, timestamp=created_at,
                 event_id=event_id,
+                operator_id=operator_id,
             )
             journal_id, journal_path = self._new_provision_journal(
                 event.event_id, event.tenant_id, event.action
@@ -2608,6 +2622,7 @@ class KeyStore:
         lock_timeout: Optional[float] = None,
         pre_commit=None,
         mirror=None,
+        operator_id: Optional[str] = None,
     ) -> Optional[Tuple[KeyRecord, str, list]]:
         """Migrate every version of one key to the ready chain provider.
 
@@ -2646,6 +2661,7 @@ class KeyStore:
             event = self.audit.new_event(
                 tenant_id, audit_mod.ACTION_MIGRATE, key_id,
                 audit_mod.OUTCOME_SUCCESS, event_id=event_id,
+                operator_id=operator_id,
             )
             # Snapshot the old record bytes and every old handle BEFORE the
             # first provider call: rollback can restore verbatim and a
@@ -3178,6 +3194,7 @@ class KeyStore:
         pre_commit=None,
         mirror=None,
         expected_versions: Optional[dict] = None,
+        operator_id: Optional[str] = None,
     ) -> Tuple[str, object]:
         """Atomically append one fresh version to many keys.
 
@@ -3255,6 +3272,7 @@ class KeyStore:
                 tenant_id, audit_mod.ACTION_BATCH_ROTATE, None,
                 audit_mod.OUTCOME_SUCCESS, timestamp=created_at,
                 event_id=event_id,
+                operator_id=operator_id,
             )
             journal_id, journal_path = self._new_provision_journal(
                 event.event_id, event.tenant_id, event.action
@@ -4169,7 +4187,8 @@ class KeyStore:
         return cleaned
 
     def revoke(
-        self, key_id: str, tenant_id: str, reason: str, operator: str
+        self, key_id: str, tenant_id: str, reason: str, operator: str,
+        operator_id: Optional[str] = None,
     ) -> Optional[KeyRecord]:
         """Mark a key as revoked, keeping the first revocation's values.
 
@@ -4177,6 +4196,10 @@ class KeyStore:
         runs under the same per-key locks as rotation and is committed
         atomically, so repeated or concurrent revokes are idempotent: the
         first reason/operator/revoked_at win and are never overwritten.
+
+        ``operator`` is the revocation body fact stored on the key;
+        ``operator_id`` is the validated requesting operator recorded on the
+        audit event -- two distinct identities that never substitute.
         """
         if not _KEY_ID_RE.fullmatch(key_id):
             return None
@@ -4189,6 +4212,7 @@ class KeyStore:
             event = self.audit.new_event(
                 tenant_id, audit_mod.ACTION_REVOKE, key_id,
                 audit_mod.OUTCOME_SUCCESS,
+                operator_id=operator_id,
             )
             if record.status != "revoked":
                 previous = record.to_json()
@@ -4220,6 +4244,7 @@ class KeyStore:
         version: int,
         reason: str,
         operator: str,
+        operator_id: Optional[str] = None,
     ) -> tuple:
         """Revoke one key version, keeping the first revocation's values.
 
@@ -4260,6 +4285,7 @@ class KeyStore:
             event = self.audit.new_event(
                 tenant_id, audit_mod.ACTION_REVOKE_VERSION, key_id,
                 audit_mod.OUTCOME_SUCCESS,
+                operator_id=operator_id,
             )
             previous = record.to_json()
             ver.status = "revoked"
@@ -5000,6 +5026,7 @@ class KeyStore:
         lock_timeout: Optional[float] = None,
         pre_commit=None,
         mirror=None,
+        operator_id: Optional[str] = None,
     ) -> tuple:
         """Persist a validated export payload under the importing tenant.
 
@@ -5030,6 +5057,7 @@ class KeyStore:
             event = self.audit.new_event(
                 tenant_id, audit_mod.ACTION_IMPORT, key_id,
                 audit_mod.OUTCOME_SUCCESS, event_id=event_id,
+                operator_id=operator_id,
             )
             journal_id, journal_path = self._new_provision_journal(
                 event.event_id, event.tenant_id, event.action

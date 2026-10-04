@@ -606,6 +606,7 @@ class OperationStore:
                 desc.get("key_id"),
                 desc.get("outcome"),
                 event_id=record.operation_id,
+                operator_id=desc.get("operator_id", record.operator_id),
             )
         )
 

@@ -80,6 +80,9 @@ _ANCHOR_NAME = "audit-anchor.json"
 
 # Key order of a pre-chain (legacy) ledger line; chained lines append
 # ``prev_mac`` and ``mac``. The anchor file fixes its own key order.
+# Post-upgrade chained lines carry one more event field, ``operator_id``,
+# appended after ``seq``; lines written before the upgrade keep the
+# seven-field shape and are still accepted (their operator reads as null).
 _EVENT_FIELDS = (
     "event_id",
     "tenant_id",
@@ -90,6 +93,8 @@ _EVENT_FIELDS = (
     "seq",
 )
 _CHAIN_FIELDS = _EVENT_FIELDS + ("prev_mac", "mac")
+_EVENT_FIELDS_V2 = _EVENT_FIELDS + ("operator_id",)
+_CHAIN_FIELDS_V2 = _EVENT_FIELDS_V2 + ("prev_mac", "mac")
 _ANCHOR_FIELDS = ("schema_version", "legacy_bytes", "legacy_mac")
 _ANCHOR_SCHEMA_VERSION = 1
 _HEX64 = frozenset("0123456789abcdef")
@@ -150,7 +155,13 @@ class InvalidCursor(Exception):
 
 @dataclass
 class AuditEvent:
-    """One immutable audit record. Never carries key material."""
+    """One immutable audit record. Never carries key material.
+
+    ``operator_id`` is the validated operator identity of the request that
+    produced the event (HTTP ``X-Operator-Id`` / CLI ``--operator``), kept
+    verbatim and case-sensitive. Events written before the field existed
+    carry None and are reported as null; no historical identity is inferred.
+    """
 
     event_id: str
     tenant_id: Optional[str]
@@ -159,10 +170,16 @@ class AuditEvent:
     outcome: str
     timestamp: str
     seq: int = 0
+    operator_id: Optional[str] = None
 
     def to_json(self) -> dict:
-        """Serialize to a plain dict suitable for JSON storage."""
-        return {
+        """Serialize to a plain dict suitable for JSON storage.
+
+        ``operator_id`` is included only when set, so an event minted
+        without it (a pre-upgrade record or marker) keeps the exact legacy
+        seven-key shape and its MAC/bytes are never rewritten by an upgrade.
+        """
+        record = {
             "event_id": self.event_id,
             "tenant_id": self.tenant_id,
             "action": self.action,
@@ -171,6 +188,9 @@ class AuditEvent:
             "timestamp": self.timestamp,
             "seq": self.seq,
         }
+        if self.operator_id is not None:
+            record["operator_id"] = self.operator_id
+        return record
 
     @classmethod
     def from_json(cls, data: dict) -> "AuditEvent":
@@ -182,10 +202,14 @@ class AuditEvent:
             outcome=data["outcome"],
             timestamp=data["timestamp"],
             seq=int(data.get("seq", 0)),
+            operator_id=data.get("operator_id"),
         )
 
     def to_response(self) -> dict:
-        """Projection for GET /v1/audit: ledger-internal seq is omitted."""
+        """Projection for GET /v1/audit: ledger-internal seq is omitted.
+
+        ``operator_id`` is always present; pre-upgrade events report null.
+        """
         return {
             "event_id": self.event_id,
             "tenant_id": self.tenant_id,
@@ -193,6 +217,7 @@ class AuditEvent:
             "key_id": self.key_id,
             "outcome": self.outcome,
             "timestamp": self.timestamp,
+            "operator_id": self.operator_id,
         }
 
 
@@ -353,7 +378,12 @@ class AuditLog:
     def _check_event_fields(
         obj: dict, expected_seq: int, seen_ids: set
     ) -> AuditEvent:
-        """Type-check the seven event fields of one parsed line."""
+        """Type-check the event fields of one parsed line.
+
+        ``operator_id`` is absent on pre-upgrade lines (read as null); when
+        present it must be a non-empty string. A null, non-string or empty
+        value is ledger corruption, exactly like a tampered MAC.
+        """
         event_id = obj["event_id"]
         tenant_id = obj["tenant_id"]
         action = obj["action"]
@@ -361,6 +391,7 @@ class AuditLog:
         outcome = obj["outcome"]
         timestamp = obj["timestamp"]
         seq = obj["seq"]
+        operator_id = obj.get("operator_id")
         if not isinstance(event_id, str):
             raise LedgerError("audit log event_id is not a string")
         if tenant_id is not None and not isinstance(tenant_id, str):
@@ -377,6 +408,12 @@ class AuditLog:
             raise LedgerError("audit log seq is not a positive integer")
         if seq != expected_seq:
             raise LedgerError("audit log seq is not consecutive from 1")
+        if operator_id is not None and (
+            not isinstance(operator_id, str) or not operator_id
+        ):
+            raise LedgerError(
+                "audit log operator_id is not a non-empty string or null"
+            )
         if event_id in seen_ids:
             raise LedgerError("audit log event_id is duplicated")
         seen_ids.add(event_id)
@@ -388,6 +425,7 @@ class AuditLog:
             outcome=outcome,
             timestamp=timestamp,
             seq=seq,
+            operator_id=operator_id,
         )
 
     def _parse_legacy_line(
@@ -436,7 +474,13 @@ class AuditLog:
             obj = json.loads(line)
         except ValueError as exc:
             raise LedgerError("audit log line is not valid JSON") from exc
-        if not isinstance(obj, dict) or tuple(obj.keys()) != _CHAIN_FIELDS:
+        # Pre-upgrade chained lines carry the seven original event fields;
+        # post-upgrade lines add operator_id after seq. Both orders are
+        # fixed; anything else is corruption.
+        if not isinstance(obj, dict) or tuple(obj.keys()) not in (
+            _CHAIN_FIELDS,
+            _CHAIN_FIELDS_V2,
+        ):
             raise LedgerError("audit log line has unknown or misordered keys")
         prev_mac = obj["prev_mac"]
         mac = obj["mac"]
@@ -633,6 +677,7 @@ class AuditLog:
         outcome: str,
         timestamp: Optional[str] = None,
         event_id: Optional[str] = None,
+        operator_id: Optional[str] = None,
     ) -> AuditEvent:
         """Mint an event with a fresh (or supplied) id and UTC timestamp.
 
@@ -640,6 +685,11 @@ class AuditLog:
         is named after its ``operation_id``; crash recovery then resolves both
         by the same identifier. The ledger dedupes on event_id, so reusing an
         id never appends twice.
+
+        ``operator_id`` is the validated operator identity of the request
+        (HTTP ``X-Operator-Id`` / CLI ``--operator``), stored verbatim. It is
+        the requesting principal only -- never a revocation body's operator,
+        a policy rule's subject or an imported bundle's metadata.
         """
         # Imported lazily to avoid a module import cycle at package import.
         from datetime import datetime, timezone
@@ -652,6 +702,7 @@ class AuditLog:
             outcome=outcome,
             timestamp=timestamp
             or datetime.now(timezone.utc).isoformat(),
+            operator_id=operator_id,
         )
 
     def append(self, event: AuditEvent) -> AuditEvent:
