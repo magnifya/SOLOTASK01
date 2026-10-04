@@ -3036,13 +3036,25 @@ def make_handler(
             version is 409 (both rejections record that one source-key
             event), an envelope algorithm mismatch with the SOURCE version
             or a failed authentication is a 400 naming the envelope (not
-            audited), versions bound to different providers are the fixed
-            503 (not audited), and a provider/material failure keeps the
-            existing fixed-503/no-audit contract. Success records one
+            audited); a provider/material failure keeps the existing fixed-
+            503/no-audit contract. Versions on the SAME provider keep the
+            established native boundary (a declared ``rewrap_key`` runs
+            natively; otherwise per-side declarations keep that side's KEK
+            unexported). Versions on DIFFERENT providers are supported too:
+            each side must uniquely match one HEALTHY entry of the valid
+            ``KEYMGR_PROVIDER_CHAIN`` (an inactive standby may participate but
+            is never activated -- no failover and no key migration),
+            ``rewrap_key`` is never used across providers, a source
+            ``unwrap_key``/target ``wrap_key`` declaration keeps that side's
+            KEK unexported and only an undeclared side exports; an identity
+            mismatch, an unhealthy entry, a contract violation or the shared
+            five-second budget is the fixed 503 (not audited), and a native
+            failure never falls back to an export. Success records one
             ``rewrap/success`` on the source key. Both keys stay locked for
             the whole resolution + provider + rewrap window, so a concurrent
-            rotation, revocation or migration commits entirely before or
-            after this call and no resolved handle can go stale mid-call.
+            rotation, revocation, migration or reconnect commits entirely
+            before or after this call and no resolved handle can go stale
+            mid-call.
             """
             try:
                 allowed = policy_store.is_allowed(
@@ -3099,6 +3111,21 @@ def make_handler(
                         target_algorithm=target_ver.algorithm,
                         target_key_id=target_key_id,
                     )
+                # Cross-provider rewrap (native is None): each material is
+                # already a (provider, handle) native pair when that side
+                # declares its per-side operation, else an exported in-memory
+                # KEK. rewrap_envelope_split routes each side independently;
+                # when both sides exported, it is byte-identical to the fully
+                # export-based rewrap_envelope path.
+                if isinstance(source_material, tuple) or isinstance(
+                    target_material, tuple
+                ):
+                    return envelope.rewrap_envelope_split(
+                        opened, source_material, target_material,
+                        target_version=target_ver.version,
+                        target_algorithm=target_ver.algorithm,
+                        target_key_id=target_key_id,
+                    )
                 return envelope.rewrap_envelope(
                     opened, source_material,
                     target_version=target_ver.version,
@@ -3134,11 +3161,6 @@ def make_handler(
                     "field envelope algorithm does not match the source key "
                     "version"
                 )
-                return
-            if status == store.REWRAP_PROVIDER_MISMATCH:
-                # Cross-key rewrap requires both versions bound to ONE
-                # provider: the fixed 503 text, not audited.
-                self._provider_unavailable(None)
                 return
             if not self._record_attempt(
                 tenant_id, key_id, action, audit_mod.OUTCOME_SUCCESS

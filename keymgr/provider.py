@@ -3531,15 +3531,19 @@ def get_provider():
 def migration_peer_provider(provider_id: str):
     """Resolve a healthy chain entry for a whole-key migration.
 
-    Called only inside a :func:`provider_call` lease (the migrate data path
-    and the post-commit/startup old-handle cleanup): the bound READY entry is
-    returned directly -- it was admitted and health-probed by the lease. Any
-    other id must name an entry of the configured primary/standby chain; that
-    entry is built, configured with the bound data directory and health-probed
-    under the SAME attempt's shared non-resettable five-second budget (one
-    probe capped at one second). A chain that is not configured, an id no
-    chain entry builds, or an unhealthy/missing/contract-broken entry all raise
-    :class:`ProviderUnavailable` (the fixed 503); no fallback is ever used.
+    Called only inside a :func:`provider_call` lease (the migrate data path,
+    the post-commit/startup old-handle cleanup and the cross-provider
+    cross-key rewrap): the bound READY entry is returned directly -- it was
+    admitted and health-probed by the lease. Any other id must name an entry
+    of the configured primary/standby chain; that entry is built, configured
+    with the bound data directory and health-probed under the SAME attempt's
+    shared non-resettable five-second budget (one probe capped at one
+    second). A chain that is not configured, an id no chain entry builds, or
+    an unhealthy/missing/contract-broken entry all raise
+    :class:`ProviderUnavailable` (the fixed 503); no fallback is ever used
+    and nothing is activated: a standby entry resolved here never becomes
+    the committed active provider, so a cross-provider rewrap neither fails
+    over nor migrates a key.
     """
     ready = get_provider()
     if provider_id == ready.provider_id:

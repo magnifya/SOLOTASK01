@@ -5060,10 +5060,12 @@ class KeyStore:
             return self.REWRAP_OK, None
 
     # Additional outcomes of rewrap_across_keys (the cross-key rewrap): the
-    # envelope's algorithm disagrees with the resolved SOURCE version, or the
-    # two selected versions are owned by different providers.
+    # envelope's algorithm disagrees with the resolved SOURCE version.
+    # Versions bound to different providers are no longer a distinct status:
+    # a cross-provider cross-key rewrap resolves each side through the
+    # configured provider chain, and any identity/health/contract/budget
+    # failure there raises ProviderUnavailable (the fixed 503).
     REWRAP_ALGORITHM_MISMATCH = "algorithm_mismatch"
-    REWRAP_PROVIDER_MISMATCH = "provider_mismatch"
 
     def _committed_view(self, key_id: str, tenant_id: str):
         """The committed record of one key visible to a tenant, else None.
@@ -5117,18 +5119,34 @@ class KeyStore:
         * REWRAP_ALGORITHM_MISMATCH -- ``envelope_algorithm`` disagrees with
           the resolved SOURCE version (a client validation failure the
           caller surfaces as a 400 without any provider contact);
-        * REWRAP_PROVIDER_MISMATCH -- the two versions are owned by
-          different provider_ids (cross-key rewrap requires one shared
-          provider; the caller surfaces the fixed 503);
         * REWRAP_OK -- ``perform`` produced the re-sealed token.
+
+        Versions on the SAME provider keep the established native boundary:
+        a declared ``rewrap_key`` runs the whole rewrap inside that one
+        provider, otherwise per-side ``unwrap_key``/``wrap_key`` declarations
+        export only the undeclared side and no declarations export both
+        KEKs. Versions on DIFFERENT providers are supported as well: each
+        side's registered provider_id must uniquely match ONE entry of the
+        configured, valid ``KEYMGR_PROVIDER_CHAIN`` and that entry is built
+        and health-probed on the attempt's shared non-resettable five-second
+        budget (a single probe capped at one second); an inactive (standby)
+        entry may take part but is NEVER activated -- no failover and no key
+        migration. Across providers ``rewrap_key`` is never used (it is a
+        one-provider operation): the source side stays native exactly when
+        its provider declares ``unwrap_key`` and the target side exactly
+        when its provider declares ``wrap_key``; only an undeclared side
+        exports its KEK, and a native failure never falls back to that
+        export. An identity that no chain entry builds, a non-unique chain,
+        a contract violation, an unhealthy peer or a budget timeout raises
+        ProviderUnavailable (the fixed 503).
 
         Both keys are locked together (sorted order, shared with the restore
         transaction) for the WHOLE operation -- version resolution, provider
         binding, material export and the ``perform`` callback (which runs
         the native or in-memory re-wrap) -- so a concurrent rotation,
-        revocation or migration on either key commits entirely before or
-        entirely after this rewrap: the two sides can never be read at
-        different commit instants and no resolved handle can go stale
+        revocation, migration or reconnect on either key commits entirely
+        before or entirely after this rewrap: the two sides can never be read
+        at different commit instants and no resolved handle can go stale
         mid-call. ``target_version`` None selects the target key's current
         committed version; equal version NUMBERS on different keys are not
         a conflict. ``perform`` is invoked as
@@ -5136,8 +5154,10 @@ class KeyStore:
         target_material)`` where ``native``/the materials follow the
         same-provider binding rules of :meth:`native_rewrap_binding` (a
         declared ``rewrap_key`` runs natively, per-side declarations export
-        only the undeclared side, no declarations export both KEKs). Nothing
-        is persisted and no audit event is written here.
+        only the undeclared side, no declarations export both KEKs); across
+        providers ``native`` is None and each material is already either a
+        ``(provider, handle)`` native pair or an exported in-memory KEK.
+        Nothing is persisted and no audit event is written here.
         """
         if not is_valid_key_id(source_key_id) or not is_valid_key_id(
             target_key_id
@@ -5176,47 +5196,79 @@ class KeyStore:
             # provider contact, exactly like the same-key rewrap.
             if envelope_algorithm != source_ver.algorithm:
                 return self.REWRAP_ALGORITHM_MISMATCH, None
-            if source_ver.provider_id != target_ver.provider_id:
-                # A cross-key rewrap is supported only between versions bound
-                # to ONE provider; different providers are the fixed 503.
-                return self.REWRAP_PROVIDER_MISMATCH, None
-            provider = self._provider_for(source_ver.provider_id)
             native = None
             source_material = None
             target_material = None
-            if provider_mod.declares_rewrap_key(provider):
-                native = NativeRewrap(
-                    provider=provider,
-                    source_handle=source_ver.handle,
-                    target_handle=target_ver.handle,
-                )
-            else:
-                # No combined operation: each side independently keeps its
-                # DEK native when it declares the matching per-side
-                # operation; only an undeclared side exports its KEK. A
-                # provider declaring NEITHER exports both (the fully
-                # export-based path).
-                native_unwrap = provider_mod.declares_unwrap_key(provider)
-                native_wrap = provider_mod.declares_wrap_key(provider)
-                if native_unwrap or native_wrap:
-                    native = NativeRewrapSplit(
+            if source_ver.provider_id == target_ver.provider_id:
+                # Both versions share one registered identity. That entry may
+                # be the bound READY provider or a HEALTHY INACTIVE (standby)
+                # chain entry: either way it is resolved WITHOUT activation --
+                # a ready hit returns the admitted instance, any other id is
+                # built/membership-checked/health-probed on the attempt's
+                # shared budget and never committed as active. An id no chain
+                # entry builds, an unhealthy entry or a budget timeout is the
+                # fixed 503 (never a silent switch, never a local fallback).
+                provider = self._migration_peer(source_ver.provider_id)
+                if provider_mod.declares_rewrap_key(provider):
+                    native = NativeRewrap(
                         provider=provider,
                         source_handle=source_ver.handle,
                         target_handle=target_ver.handle,
-                        native_unwrap=native_unwrap,
-                        native_wrap=native_wrap,
                     )
-                    if not native_unwrap:
-                        source_material = self._export_kek(
-                            provider, source_ver
-                        )
-                    if not native_wrap:
-                        target_material = self._export_kek(
-                            provider, target_ver
-                        )
                 else:
-                    source_material = self._export_kek(provider, source_ver)
-                    target_material = self._export_kek(provider, target_ver)
+                    # No combined operation: each side independently keeps its
+                    # DEK native when it declares the matching per-side
+                    # operation; only an undeclared side exports its KEK. A
+                    # provider declaring NEITHER exports both (the fully
+                    # export-based path).
+                    native_unwrap = provider_mod.declares_unwrap_key(provider)
+                    native_wrap = provider_mod.declares_wrap_key(provider)
+                    if native_unwrap or native_wrap:
+                        native = NativeRewrapSplit(
+                            provider=provider,
+                            source_handle=source_ver.handle,
+                            target_handle=target_ver.handle,
+                            native_unwrap=native_unwrap,
+                            native_wrap=native_wrap,
+                        )
+                        if not native_unwrap:
+                            source_material = self._export_kek(
+                                provider, source_ver
+                            )
+                        if not native_wrap:
+                            target_material = self._export_kek(
+                                provider, target_ver
+                            )
+                    else:
+                        source_material = self._export_kek(provider, source_ver)
+                        target_material = self._export_kek(provider, target_ver)
+            else:
+                # Cross-provider rewrap. Each side's registered provider_id
+                # must uniquely match one HEALTHY entry of the configured
+                # chain; an inactive standby may participate but is never
+                # activated (no failover, no migration). rewrap_key is a
+                # one-provider operation and is never used across providers:
+                # each side independently stays native only when ITS provider
+                # declares the matching per-side operation, and only the
+                # undeclared side exports its KEK. Both peer resolutions and
+                # all probes share the attempt's one non-resettable
+                # five-second budget; a missing/non-unique/contract-broken/
+                # unhealthy entry or a budget timeout is the fixed 503, and a
+                # native failure below never falls back to an export.
+                source_provider = self._migration_peer(source_ver.provider_id)
+                target_provider = self._migration_peer(target_ver.provider_id)
+                if provider_mod.declares_unwrap_key(source_provider):
+                    source_material = (source_provider, source_ver.handle)
+                else:
+                    source_material = self._export_kek(
+                        source_provider, source_ver
+                    )
+                if provider_mod.declares_wrap_key(target_provider):
+                    target_material = (target_provider, target_ver.handle)
+                else:
+                    target_material = self._export_kek(
+                        target_provider, target_ver
+                    )
             token = perform(
                 source_ver=source_ver,
                 target_ver=target_ver,
