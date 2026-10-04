@@ -4102,15 +4102,20 @@ def make_handler(
             status fields and flags ``current``. A whole-key revocation does
             not hide the history: its revocation facts project onto every
             item. The single tenant comes from one source (single header or
-            single parameter); ``limit`` is 1-1000 (default 100) and
-            ``cursor`` follows the signed snapshot cursor rules. All
-            parameter failures (including a malformed key_id or cursor) are
-            400s with no audit event -- only a missing/conflicting tenant
-            source records ``tenant_conflict`` as usual -- and validation
-            precedes authorization. A policy denial is 403 with one
-            ``read/rejected`` event carrying the key_id; an unknown or
-            cross-tenant key is an indistinct 404; success is 200 with one
-            ``read/success`` event and ``{items,next_cursor}``.
+            single parameter); the optional ``status`` (active|revoked) and
+            ``algorithm`` (AES256|RSA2048) filters match each item's
+            effective status and algorithm and intersect when both are
+            given, ``limit`` is 1-1000 (default 100) and ``cursor`` follows
+            the signed snapshot cursor rules (bound to both filters, so a
+            cursor is rejected when a condition is added, dropped or
+            changed). All parameter failures (including a malformed key_id
+            or cursor) are 400s with no audit event -- only a
+            missing/conflicting tenant source records ``tenant_conflict``
+            as usual -- and validation precedes authorization. A policy
+            denial is 403 with one ``read/rejected`` event carrying the
+            key_id; an unknown or cross-tenant key is an indistinct 404;
+            success is 200 with one ``read/success`` event and
+            ``{items,next_cursor}``.
             """
             tenant_id = self._audit_tenant(parts)
             if tenant_id is None:
@@ -4119,6 +4124,27 @@ def make_handler(
                 self._bad_request("field key_id must be a UUID4")
                 return
             qs = parse_qs(parts.query, keep_blank_values=True)
+
+            values, errored = self._single_param(qs, "status")
+            if errored:
+                return
+            status = values[0] if values else None
+            if status is not None and status not in ("active", "revoked"):
+                self._bad_request(
+                    "field status must be one of: active, revoked"
+                )
+                return
+
+            values, errored = self._single_param(qs, "algorithm")
+            if errored:
+                return
+            algorithm = values[0] if values else None
+            if algorithm is not None and algorithm not in SUPPORTED_ALGORITHMS:
+                self._bad_request(
+                    "unsupported value for field algorithm: %r (supported: %s)"
+                    % (algorithm, ", ".join(SUPPORTED_ALGORITHMS))
+                )
+                return
 
             limit = 100
             values, errored = self._single_param(qs, "limit")
@@ -4162,7 +4188,8 @@ def make_handler(
 
             try:
                 page = store.versions_page(
-                    key_id, tenant_id, limit=limit, cursor=cursor,
+                    key_id, tenant_id, status=status, algorithm=algorithm,
+                    limit=limit, cursor=cursor,
                     strict=True,
                 )
             except InvalidCursor:

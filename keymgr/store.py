@@ -5419,6 +5419,8 @@ class KeyStore:
         self,
         key_id: str,
         tenant_id: str,
+        status: Optional[str] = None,
+        algorithm: Optional[str] = None,
         limit: int = 100,
         cursor: Optional[str] = None,
         strict: bool = False,
@@ -5427,12 +5429,20 @@ class KeyStore:
 
         Items are the committed versions of the key in ascending version
         order, each merging the single-version read and the version status
-        projections and flagging the current version. Cursors follow the
-        audit/key-list rules: HMAC-signed and bound to the tenant, the
-        key_id, the limit and the visible history, so a tampered,
-        cross-tenant, key/limit-mismatched or stale cursor (after a
-        rotation, a version revocation or a whole-key revocation) raises
-        InvalidCursor instead of duplicating or skipping an item.
+        projections and flagging the current version. The optional
+        ``status``/``algorithm`` filters match each item's effective status
+        (whole-key revocation projects onto every version) and its
+        algorithm, intersecting when both are given; filtering never
+        re-marks ``current``, which always names the key's true current
+        version. Cursors follow the audit/key-list rules: HMAC-signed and
+        bound to the tenant, the key_id, both filters (their omitted state
+        included), the limit and the FULL committed history, so a tampered,
+        cross-tenant, key/filter/limit-mismatched or stale cursor (after a
+        rotation, a version revocation or a whole-key revocation -- even of
+        a version the filters exclude) raises InvalidCursor instead of
+        duplicating or skipping an item. A cursor minted before the filters
+        existed carries no filter bindings and is accepted only while both
+        filters are omitted.
 
         Returns None for an unknown key, a cross-tenant access or a key
         whose committed view is hidden, all indistinguishable.
@@ -5450,6 +5460,11 @@ class KeyStore:
                     raise InvalidCursor("cursor does not match tenant_id")
                 if payload.get("k") != key_id:
                     raise InvalidCursor("cursor does not match key_id")
+                # A missing binding (a pre-filter cursor) only matches an
+                # omitted filter; adding, dropping or changing a condition
+                # rejects the cursor.
+                if payload.get("s") != status or payload.get("a") != algorithm:
+                    raise InvalidCursor("cursor does not match filters")
                 if int(payload.get("l", -1)) != limit:
                     raise InvalidCursor("cursor does not match limit")
                 anchor = int(payload["vn"])
@@ -5460,6 +5475,9 @@ class KeyStore:
                 raise InvalidCursor("malformed cursor")
 
         items = record.to_version_history()
+        # The snapshot is the key's FULL committed history, not the filtered
+        # view: any committed change to this key invalidates the cursor even
+        # when the changed version falls outside the filters.
         current_fingerprint = self._version_history_fingerprint(
             record, items
         )
@@ -5469,7 +5487,12 @@ class KeyStore:
             if not any(item["version"] == anchor for item in items):
                 raise InvalidCursor("cursor anchor is no longer valid")
 
-        selected = items
+        selected = [
+            item
+            for item in items
+            if (status is None or item["status"] == status)
+            and (algorithm is None or item["algorithm"] == algorithm)
+        ]
         if anchor is not None:
             selected = [
                 item for item in selected if item["version"] > anchor
@@ -5483,6 +5506,8 @@ class KeyStore:
                     "v": 1,
                     "t": tenant_id,
                     "k": key_id,
+                    "s": status,
+                    "a": algorithm,
                     "l": limit,
                     "vn": last["version"],
                     "f": current_fingerprint,

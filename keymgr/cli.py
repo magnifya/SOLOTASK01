@@ -154,6 +154,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="list all committed versions of a key (paginated history)",
     )
     p_versions.add_argument("--key-id", required=True)
+    p_versions.add_argument("--status", default=None,
+                            help="one of: active, revoked")
+    p_versions.add_argument("--algorithm", default=None,
+                            help="one of: %s" % ", ".join(SUPPORTED_ALGORITHMS))
     p_versions.add_argument("--limit", type=int, default=100,
                             help="page size, 1-1000 (default: %(default)s)")
     p_versions.add_argument("--cursor", default=None,
@@ -1412,6 +1416,14 @@ def _run(argv: Optional[List[str]] = None) -> int:
             return _fail("field tenant_id must be a non-empty string", 2)
         if not is_valid_key_id(args.key_id):
             return _fail("field key_id must be a UUID4", 2)
+        if args.status is not None and args.status not in ("active", "revoked"):
+            return _fail("field status must be one of: active, revoked", 2)
+        if args.algorithm is not None and args.algorithm not in SUPPORTED_ALGORITHMS:
+            return _fail(
+                "unsupported value for field algorithm: %r (supported: %s)"
+                % (args.algorithm, ", ".join(SUPPORTED_ALGORITHMS)),
+                2,
+            )
         if not 1 <= args.limit <= 1000:
             return _fail(
                 "field limit must be an integer between 1 and 1000", 2
@@ -1420,15 +1432,17 @@ def _run(argv: Optional[List[str]] = None) -> int:
         if cursor is not None and not cursor:
             return _fail("field cursor must be a non-empty string", 2)
         # Every cursor failure (empty handled above, tampered, expired or
-        # bound to another tenant/key/limit) is a parameter error that must
-        # precede authorization, so it exits 2 and never writes a rejected
-        # read -- including the snapshot checks inside versions_page.
+        # bound to another tenant/key/filter/limit) is a parameter error
+        # that must precede authorization, so it exits 2 and never writes a
+        # rejected read -- including the snapshot checks inside
+        # versions_page.
         prefetched = None
         if cursor is not None:
             try:
                 store.audit._decode_cursor(cursor)
                 prefetched = store.versions_page(
                     args.key_id, args.tenant_id,
+                    status=args.status, algorithm=args.algorithm,
                     limit=args.limit, cursor=cursor, strict=True,
                 )
             except InvalidCursor:
@@ -1444,6 +1458,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
             try:
                 page = store.versions_page(
                     args.key_id, args.tenant_id,
+                    status=args.status, algorithm=args.algorithm,
                     limit=args.limit, cursor=cursor, strict=True,
                 )
             except InvalidCursor:
