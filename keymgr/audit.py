@@ -80,6 +80,8 @@ _ANCHOR_NAME = "audit-anchor.json"
 
 # Key order of a pre-chain (legacy) ledger line; chained lines append
 # ``prev_mac`` and ``mac``. The anchor file fixes its own key order.
+# Post-upgrade chained lines insert ``operator_id`` after ``seq``; both
+# chained shapes verify, and a line's MAC always covers its own key set.
 _EVENT_FIELDS = (
     "event_id",
     "tenant_id",
@@ -90,6 +92,8 @@ _EVENT_FIELDS = (
     "seq",
 )
 _CHAIN_FIELDS = _EVENT_FIELDS + ("prev_mac", "mac")
+_EVENT_FIELDS_V2 = _EVENT_FIELDS + ("operator_id",)
+_CHAIN_FIELDS_V2 = _EVENT_FIELDS_V2 + ("prev_mac", "mac")
 _ANCHOR_FIELDS = ("schema_version", "legacy_bytes", "legacy_mac")
 _ANCHOR_SCHEMA_VERSION = 1
 _HEX64 = frozenset("0123456789abcdef")
@@ -150,7 +154,13 @@ class InvalidCursor(Exception):
 
 @dataclass
 class AuditEvent:
-    """One immutable audit record. Never carries key material."""
+    """One immutable audit record. Never carries key material.
+
+    ``operator_id`` is the validated identity the request ran under (HTTP
+    ``X-Operator-Id``, CLI ``--operator``), preserved case-sensitively.
+    Events written before the field existed carry None and are reported as
+    null; no historical identity is ever inferred.
+    """
 
     event_id: str
     tenant_id: Optional[str]
@@ -159,6 +169,7 @@ class AuditEvent:
     outcome: str
     timestamp: str
     seq: int = 0
+    operator_id: Optional[str] = None
 
     def to_json(self) -> dict:
         """Serialize to a plain dict suitable for JSON storage."""
@@ -170,6 +181,7 @@ class AuditEvent:
             "outcome": self.outcome,
             "timestamp": self.timestamp,
             "seq": self.seq,
+            "operator_id": self.operator_id,
         }
 
     @classmethod
@@ -182,6 +194,7 @@ class AuditEvent:
             outcome=data["outcome"],
             timestamp=data["timestamp"],
             seq=int(data.get("seq", 0)),
+            operator_id=data.get("operator_id"),
         )
 
     def to_response(self) -> dict:
@@ -193,6 +206,7 @@ class AuditEvent:
             "key_id": self.key_id,
             "outcome": self.outcome,
             "timestamp": self.timestamp,
+            "operator_id": self.operator_id,
         }
 
 
@@ -339,13 +353,18 @@ class AuditLog:
         """HMAC-SHA256 of the anchored pre-chain bytes (``legacy\\0`` tag)."""
         return hmac.new(secret, b"legacy\0" + raw, hashlib.sha256).hexdigest()
 
-    def _event_mac(self, secret: bytes, event: AuditEvent, prev_mac: str) -> str:
-        """HMAC-SHA256 of the line's first eight keys, same encoding."""
-        payload = event.to_json()
-        payload["prev_mac"] = prev_mac
+    @staticmethod
+    def _event_mac(secret: bytes, payload: dict) -> str:
+        """HMAC-SHA256 of a line's event fields plus ``prev_mac``.
+
+        ``payload`` is the line's own ordered key set (event fields then
+        ``prev_mac``), so a pre-upgrade chained line (no ``operator_id``)
+        and a current one each verify against exactly the bytes their
+        writer signed.
+        """
         return hmac.new(
             secret,
-            self._dumps_compact(payload).encode("utf-8"),
+            AuditLog._dumps_compact(payload).encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
 
@@ -353,7 +372,7 @@ class AuditLog:
     def _check_event_fields(
         obj: dict, expected_seq: int, seen_ids: set
     ) -> AuditEvent:
-        """Type-check the seven event fields of one parsed line."""
+        """Type-check the event fields of one parsed line."""
         event_id = obj["event_id"]
         tenant_id = obj["tenant_id"]
         action = obj["action"]
@@ -361,6 +380,7 @@ class AuditLog:
         outcome = obj["outcome"]
         timestamp = obj["timestamp"]
         seq = obj["seq"]
+        operator_id = obj.get("operator_id")
         if not isinstance(event_id, str):
             raise LedgerError("audit log event_id is not a string")
         if tenant_id is not None and not isinstance(tenant_id, str):
@@ -377,6 +397,12 @@ class AuditLog:
             raise LedgerError("audit log seq is not a positive integer")
         if seq != expected_seq:
             raise LedgerError("audit log seq is not consecutive from 1")
+        if operator_id is not None and (
+            not isinstance(operator_id, str) or not operator_id
+        ):
+            raise LedgerError(
+                "audit log operator_id is not a non-empty string or null"
+            )
         if event_id in seen_ids:
             raise LedgerError("audit log event_id is duplicated")
         seen_ids.add(event_id)
@@ -388,6 +414,7 @@ class AuditLog:
             outcome=outcome,
             timestamp=timestamp,
             seq=seq,
+            operator_id=operator_id,
         )
 
     def _parse_legacy_line(
@@ -436,7 +463,13 @@ class AuditLog:
             obj = json.loads(line)
         except ValueError as exc:
             raise LedgerError("audit log line is not valid JSON") from exc
-        if not isinstance(obj, dict) or tuple(obj.keys()) != _CHAIN_FIELDS:
+        # Both chained generations verify: pre-upgrade lines carry no
+        # operator_id (reported as null), current lines carry it between
+        # ``seq`` and ``prev_mac``. Anything else is corruption.
+        if not isinstance(obj, dict) or tuple(obj.keys()) not in (
+            _CHAIN_FIELDS,
+            _CHAIN_FIELDS_V2,
+        ):
             raise LedgerError("audit log line has unknown or misordered keys")
         prev_mac = obj["prev_mac"]
         mac = obj["mac"]
@@ -445,9 +478,9 @@ class AuditLog:
         event = self._check_event_fields(obj, expected_seq, seen_ids)
         if prev_mac != expected_prev:
             raise LedgerError("audit log chain is broken")
-        if not hmac.compare_digest(
-            self._event_mac(secret, event, prev_mac), mac
-        ):
+        # The MAC covers the line's own key set, exactly as written.
+        payload = {key: obj[key] for key in obj if key != "mac"}
+        if not hmac.compare_digest(self._event_mac(secret, payload), mac):
             raise LedgerError("audit log line MAC mismatch")
         return event, mac
 
@@ -633,13 +666,16 @@ class AuditLog:
         outcome: str,
         timestamp: Optional[str] = None,
         event_id: Optional[str] = None,
+        operator_id: Optional[str] = None,
     ) -> AuditEvent:
         """Mint an event with a fresh (or supplied) id and UTC timestamp.
 
         ``event_id`` may be supplied so an idempotent operation's audit event
         is named after its ``operation_id``; crash recovery then resolves both
         by the same identifier. The ledger dedupes on event_id, so reusing an
-        id never appends twice.
+        id never appends twice. ``operator_id`` is the validated identity the
+        request ran under; it is stored verbatim (case-sensitive) and is null
+        only for events written before operator attribution existed.
         """
         # Imported lazily to avoid a module import cycle at package import.
         from datetime import datetime, timezone
@@ -652,16 +688,18 @@ class AuditLog:
             outcome=outcome,
             timestamp=timestamp
             or datetime.now(timezone.utc).isoformat(),
+            operator_id=operator_id,
         )
 
     def append(self, event: AuditEvent) -> AuditEvent:
         """Append one event durably, assigning the next monotonic seq.
 
-        The line carries the seven event fields plus ``prev_mac``/``mac``:
-        the first chained line links to the anchor's ``legacy_mac``, every
-        later one to the previous line's ``mac``. Raises LedgerError if the
-        chain cannot be verified or the line cannot be committed. The fsync
-        before release means a returned event is on disk.
+        The line carries the event fields (including ``operator_id``) plus
+        ``prev_mac``/``mac``: the first chained line links to the anchor's
+        ``legacy_mac``, every later one to the previous line's ``mac``.
+        Raises LedgerError if the chain cannot be verified or the line
+        cannot be committed. The fsync before release means a returned
+        event is on disk.
         """
         with self._append_lock:
             fd = self._locked_file()
@@ -679,7 +717,7 @@ class AuditLog:
                 record = event.to_json()
                 record["prev_mac"] = prev_mac
                 record["mac"] = self._event_mac(
-                    self._signing_secret_locked(), event, prev_mac
+                    self._signing_secret_locked(), record
                 )
                 line = self._dumps_compact(record) + "\n"
                 try:

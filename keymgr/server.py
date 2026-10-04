@@ -117,6 +117,11 @@ def make_handler(
 
     class KeyHandler(BaseHTTPRequestHandler):
         server_version = "KeyMgr/1.0"
+        # The validated X-Operator-Id of the request currently being handled
+        # (one handler instance serves one request at a time). Every audit
+        # event the request writes is attributed to exactly this identity;
+        # concurrent requests on other connections never share it.
+        _operator_id = None
 
         # -- helpers ------------------------------------------------------
         def _send_json(self, status: int, payload: dict) -> None:
@@ -270,13 +275,14 @@ def make_handler(
                 "outcome": audit_mod.OUTCOME_REJECTED,
                 "tenant_id": tenant_id,
                 "key_id": audit_key_id,
+                "operator_id": operation.operator_id,
             }
             operation_store.stage_terminal(
                 operation, http_status, body, audit=audit_desc
             )
             store.audit_attempt(
                 tenant_id, audit_key_id, action, audit_mod.OUTCOME_REJECTED,
-                event_id=op_id,
+                event_id=op_id, operator_id=operation.operator_id,
             )
             return http_status, body
 
@@ -330,11 +336,13 @@ def make_handler(
                     "outcome": audit_mod.OUTCOME_REJECTED,
                     "tenant_id": operation.tenant_id,
                     "key_id": audit_key_id,
+                    "operator_id": operation.operator_id,
                 },
             )
             store.audit_attempt(
                 operation.tenant_id, audit_key_id, action,
                 audit_mod.OUTCOME_REJECTED, event_id=op_id,
+                operator_id=operation.operator_id,
             )
             operation_store.finish(
                 operation, operations_mod.STATUS_FAILED, http_status, body
@@ -626,7 +634,7 @@ def make_handler(
         def _record_conflict(self) -> bool:
             """Write the invisible tenant_conflict event. False = 500 sent."""
             try:
-                store.audit_conflict()
+                store.audit_conflict(operator_id=self._operator_id)
             except LedgerError as exc:
                 self._server_error(exc)
                 return False
@@ -635,7 +643,10 @@ def make_handler(
         def _record_attempt(self, tenant_id, key_id, action, outcome) -> bool:
             """Write one attempt event. False means a 500 was already sent."""
             try:
-                store.audit_attempt(tenant_id, key_id, action, outcome)
+                store.audit_attempt(
+                    tenant_id, key_id, action, outcome,
+                    operator_id=self._operator_id,
+                )
             except LedgerError as exc:
                 self._server_error(exc)
                 return False
@@ -861,6 +872,7 @@ def make_handler(
             operator = self._operator()
             if operator is None:
                 return
+            self._operator_id = operator
             try:
                 if path == "/v1/keys":
                     self._create_key(operator, parts)
@@ -1114,6 +1126,7 @@ def make_handler(
                     pre_commit=stage_success,
                     mirror=mirror,
                     key_id=key_id,
+                    operator_id=operator,
                 )
                 # The single success event committed in the same outbox
                 # transaction (event_id == operation_id).
@@ -1171,6 +1184,7 @@ def make_handler(
                 tenant_id=tenant_id,
                 algorithm=algorithm,
                 label=payload["label"],
+                operator_id=operator,
             )
             self._send_json(201, record.to_create_response())
 
@@ -1281,6 +1295,7 @@ def make_handler(
                     pre_commit=stage_success,
                     mirror=mirror,
                     expected_version=expected_version,
+                    operator_id=operator,
                 )
                 if record == store.ROTATE_VERSION_CONFLICT:
                     # The optimistic-concurrency precondition disagreed with
@@ -1441,6 +1456,7 @@ def make_handler(
                     pre_commit=stage_success,
                     mirror=mirror,
                     expected_versions=expected_versions or None,
+                    operator_id=operator,
                 )
                 if status == store.BATCH_VERSION_CONFLICT:
                     # One item's expected_version disagreed with the committed
@@ -1510,7 +1526,8 @@ def make_handler(
             ):
                 return
             record = store.revoke(
-                key_id, tenant_id, payload["reason"], payload["operator"]
+                key_id, tenant_id, payload["reason"], payload["operator"],
+                operator_id=operator,
             )
             if record is None:
                 if not self._record_attempt(
@@ -1588,6 +1605,7 @@ def make_handler(
                 status, record, ver = store.revoke_version(
                     key_id, tenant_id, version,
                     payload["reason"], payload["operator"],
+                    operator_id=operator,
                 )
             except (LedgerError, OSError) as exc:
                 # The outbox transaction already restored the prior file;
@@ -1915,6 +1933,7 @@ def make_handler(
                         "outcome": audit_mod.OUTCOME_SUCCESS,
                         "tenant_id": tenant_id,
                         "key_id": key_id,
+                        "operator_id": operation.operator_id,
                     },
                 )
                 if mirror is not None:
@@ -2013,6 +2032,7 @@ def make_handler(
                         lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                         pre_commit=stage_success,
                         mirror=mirror,
+                        operator_id=operator,
                     )
                 except KeyAlreadyMigrated:
                     # Bound 409: every version is already on the ready
@@ -3098,6 +3118,7 @@ def make_handler(
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                     pre_commit=stage_success,
                     mirror=mirror,
+                    operator_id=operator,
                 )
                 if status == IMPORT_CONFLICT:
                     if record.tenant_id == tenant_id:
@@ -3192,6 +3213,7 @@ def make_handler(
                     store.audit_attempt(
                         tenant_id, key_id, audit_mod.ACTION_IMPORT,
                         audit_mod.OUTCOME_REJECTED,
+                        operator_id=operator,
                     )
                 except LedgerError:
                     self._import_preflight_unavailable()
@@ -3353,6 +3375,7 @@ def make_handler(
                     store.audit_attempt(
                         tenant_id, None, audit_mod.ACTION_EXPORT,
                         audit_mod.OUTCOME_REJECTED,
+                        operator_id=operator,
                     )
                 except LedgerError:
                     self._backup_verify_unavailable()
@@ -3503,6 +3526,7 @@ def make_handler(
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                     pre_commit=stage_success,
                     mirror=mirror,
+                    operator_id=operator,
                 )
                 if result.status == restore_mod.RESTORE_CREATED:
                     # The single success event committed with the files.
@@ -3599,6 +3623,7 @@ def make_handler(
                     store.audit_attempt(
                         tenant_id, None, audit_mod.ACTION_IMPORT,
                         audit_mod.OUTCOME_REJECTED,
+                        operator_id=operator,
                     )
                 except LedgerError:
                     self._preflight_unavailable()
@@ -3858,6 +3883,7 @@ def make_handler(
             operator = self._operator()
             if operator is None:
                 return
+            self._operator_id = operator
 
             operation_match = _OPERATIONS_PATH_RE.match(path)
             if operation_match is not None:
@@ -4553,6 +4579,7 @@ def make_handler(
             operator = self._operator()
             if operator is None:
                 return
+            self._operator_id = operator
             try:
                 self._put_policy(parts)
             except LedgerError as exc:
@@ -4572,6 +4599,7 @@ def make_handler(
             operator = self._operator()
             if operator is None:
                 return
+            self._operator_id = operator
             try:
                 self._delete_policy(parts)
             except LedgerError as exc:
@@ -4637,7 +4665,7 @@ def make_handler(
             if rules is None:
                 self._send_json(404, {"error": "policy not found"})
                 return
-            policy_store.audit_read(tenant_id)
+            policy_store.audit_read(tenant_id, operator_id=self._operator_id)
             self._send_json(
                 200,
                 {
@@ -4759,7 +4787,8 @@ def make_handler(
             if expected is _MISSING:
                 return
             rules, new_revision = policy_store.put(
-                tenant_id, rules, expected_revision=expected
+                tenant_id, rules, expected_revision=expected,
+                operator_id=self._operator_id,
             )
             self._send_json(
                 200,
@@ -4777,7 +4806,10 @@ def make_handler(
             expected = self._expected_revision(parts)
             if expected is _MISSING:
                 return
-            policy_store.delete(tenant_id, expected_revision=expected)
+            policy_store.delete(
+                tenant_id, expected_revision=expected,
+                operator_id=self._operator_id,
+            )
             self._send_json(200, {"tenant_id": tenant_id, "deleted": True})
 
     return KeyHandler

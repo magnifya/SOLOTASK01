@@ -129,6 +129,17 @@ def _event_matches_operation(record: "OperationRecord", event) -> bool:
         outcome = audit_desc.get("outcome")
         if isinstance(outcome, str) and outcome and event.outcome != outcome:
             return False
+        # A descriptor staged after operator attribution existed also binds
+        # the operator: a durable event naming another identity belongs to a
+        # different mutation. Descriptors staged before the upgrade carry no
+        # operator and keep the legacy matching rules.
+        operator_id = audit_desc.get("operator_id")
+        if (
+            isinstance(operator_id, str)
+            and operator_id
+            and event.operator_id != operator_id
+        ):
+            return False
         return True
     if event.outcome != "success":
         return False
@@ -606,6 +617,7 @@ class OperationStore:
                 desc.get("key_id"),
                 desc.get("outcome"),
                 event_id=record.operation_id,
+                operator_id=record.operator_id,
             )
         )
 

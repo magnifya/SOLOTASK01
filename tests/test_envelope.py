@@ -429,7 +429,8 @@ def test_http_policy_denial_audits_rejected(http_server):
     # The rejected event carries metadata only.
     event = page[0].to_response()
     assert set(event) == {
-        "event_id", "tenant_id", "action", "key_id", "outcome", "timestamp"
+        "event_id", "tenant_id", "action", "key_id", "outcome", "timestamp",
+        "operator_id",
     }
     assert event["key_id"] == kid
 
@@ -454,7 +455,7 @@ def test_http_success_audits_metadata_only_and_no_material(http_server):
     for event in events:
         assert set(event.to_response()) == {
             "event_id", "tenant_id", "action", "key_id", "outcome",
-            "timestamp",
+            "timestamp", "operator_id",
         }
     # And nothing about the plaintext/aad is in the ledger bytes.
     with open(_store.audit.path, "rb") as fh:

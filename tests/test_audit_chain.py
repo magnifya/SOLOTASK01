@@ -39,6 +39,9 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIELDS = ["event_id", "tenant_id", "action", "key_id", "outcome",
           "timestamp", "seq"]
 CHAIN_FIELDS = FIELDS + ["prev_mac", "mac"]
+# Post-upgrade chained lines insert operator_id after seq; both shapes verify.
+FIELDS_V2 = FIELDS + ["operator_id"]
+CHAIN_FIELDS_V2 = FIELDS_V2 + ["prev_mac", "mac"]
 
 
 def _secret(data_dir):
@@ -53,7 +56,8 @@ def _legacy_mac(data_dir, raw):
 
 
 def _event_mac(data_dir, obj):
-    payload = {k: obj[k] for k in FIELDS + ["prev_mac"]}
+    # A line's MAC covers its own key set (event fields then prev_mac).
+    payload = {k: obj[k] for k in obj if k != "mac"}
     raw = json.dumps(payload, separators=(",", ":"),
                      ensure_ascii=False).encode("utf-8")
     return hmac.new(_secret(data_dir), raw, hashlib.sha256).hexdigest()
@@ -144,7 +148,8 @@ def test_appended_lines_are_chained(tmp_path):
     assert _log_bytes(data_dir).startswith(raw)
     legacy_mac = _legacy_mac(data_dir, raw)
     for i, obj in enumerate(lines[1:], start=2):
-        assert list(obj.keys()) == CHAIN_FIELDS
+        assert list(obj.keys()) == CHAIN_FIELDS_V2
+        assert obj["operator_id"] is None
         assert obj["seq"] == i
         assert obj["prev_mac"] == (legacy_mac if i == 2
                                    else lines[i - 2]["mac"])

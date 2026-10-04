@@ -598,6 +598,7 @@ class PolicyStore:
     def _check_expected(
         self, tenant_id: str, action: str,
         expected: Optional[str], current_revision: Optional[str],
+        operator_id: Optional[str] = None,
     ) -> bool:
         """Compare a precondition inside the tenant lock.
 
@@ -611,6 +612,7 @@ class PolicyStore:
             return True
         event = self.audit.new_event(
             tenant_id, action, None, audit_mod.OUTCOME_REJECTED,
+            operator_id=operator_id,
         )
         self.audit.append(event)
         return False
@@ -618,6 +620,7 @@ class PolicyStore:
     def put(
         self, tenant_id: str, rules: List[Rule],
         expected_revision: Optional[str] = None,
+        operator_id: Optional[str] = None,
     ) -> tuple:
         """Replace (or create) the tenant's document and audit policy_update.
 
@@ -637,6 +640,7 @@ class PolicyStore:
             if not self._check_expected(
                 tenant_id, audit_mod.ACTION_POLICY_UPDATE,
                 expected_revision, current_revision,
+                operator_id=operator_id,
             ):
                 raise PolicyRevisionConflict(current_revision)
             previous = None
@@ -650,7 +654,7 @@ class PolicyStore:
                     ) from exc
             event = self.audit.new_event(
                 tenant_id, audit_mod.ACTION_POLICY_UPDATE, None,
-                audit_mod.OUTCOME_SUCCESS,
+                audit_mod.OUTCOME_SUCCESS, operator_id=operator_id,
             )
             self._commit_put(tenant_id, rules, event, existed, previous)
         return rules, revision_for_rules(rules)
@@ -658,6 +662,7 @@ class PolicyStore:
     def delete(
         self, tenant_id: str,
         expected_revision: Optional[str] = None,
+        operator_id: Optional[str] = None,
     ) -> None:
         """Delete the tenant's document and audit policy_delete.
 
@@ -677,11 +682,12 @@ class PolicyStore:
             if not self._check_expected(
                 tenant_id, audit_mod.ACTION_POLICY_DELETE,
                 expected_revision, current_revision,
+                operator_id=operator_id,
             ):
                 raise PolicyRevisionConflict(current_revision)
             event = self.audit.new_event(
                 tenant_id, audit_mod.ACTION_POLICY_DELETE, None,
-                audit_mod.OUTCOME_SUCCESS,
+                audit_mod.OUTCOME_SUCCESS, operator_id=operator_id,
             )
             if not existed:
                 self.audit.append(event)
@@ -718,11 +724,13 @@ class PolicyStore:
             except OSError:
                 pass
 
-    def audit_read(self, tenant_id: str) -> None:
+    def audit_read(
+        self, tenant_id: str, operator_id: Optional[str] = None
+    ) -> None:
         """Record a successful policy_read (the document is never modified)."""
         event = self.audit.new_event(
             tenant_id, audit_mod.ACTION_POLICY_READ, None,
-            audit_mod.OUTCOME_SUCCESS,
+            audit_mod.OUTCOME_SUCCESS, operator_id=operator_id,
         )
         self.audit.append(event)
 

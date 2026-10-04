@@ -290,6 +290,7 @@ class RestoreCoordinator:
         lock_timeout: Optional[float] = None,
         pre_commit=None,
         mirror=None,
+        operator_id: Optional[str] = None,
     ) -> RestoreResult:
         """Atomically restore a validated tenant payload.
 
@@ -324,6 +325,7 @@ class RestoreCoordinator:
             event = self.store.audit.new_event(
                 tenant_id, audit_mod.ACTION_IMPORT, None,
                 audit_mod.OUTCOME_SUCCESS, event_id=event_id,
+                operator_id=operator_id,
             )
             journal_id, journal_path = self.store._new_provision_journal(
                 event.event_id, event.tenant_id, event.action

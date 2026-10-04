@@ -420,49 +420,9 @@ def _ledger_failure_text(exc: Exception) -> str:
     return "audit ledger failure: %s" % exc
 
 
-def _attempt(store, tenant_id, key_id, action, outcome) -> bool:
-    """Record one attempt; False means a ledger failure was reported."""
-    try:
-        store.audit_attempt(tenant_id, key_id, action, outcome)
-    except LedgerError as exc:
-        _ledger_fail(exc)
-        return False
-    return True
-
-
-def _conflict(store) -> bool:
-    """Record an invisible tenant_conflict; False on ledger failure."""
-    try:
-        store.audit_conflict()
-    except LedgerError as exc:
-        _ledger_fail(exc)
-        return False
-    return True
-
-
 def _identifiers_ok(tenant_id, key_id) -> bool:
     """Whether both identifiers are usable for a tenant-visible event."""
     return bool(tenant_id) and (key_id is None or is_valid_key_id(key_id))
-
-
-def _deny(store, tenant_id, key_id, action) -> int:
-    """Audit and report a policy rejection (HTTP 403 -> exit code 3)."""
-    if not _identifiers_ok(tenant_id, key_id):
-        if not _conflict(store):
-            return 1
-    elif not _attempt(store, tenant_id, key_id, action,
-                      audit_mod.OUTCOME_REJECTED):
-        return 1
-    return _fail("action not permitted by policy", 3)
-
-
-def _crypto_reject(store, tenant_id, key_id, action, http_status,
-                   message) -> int:
-    """Audit a rejected encrypt/decrypt attempt and report its exit code."""
-    if not _attempt(store, tenant_id, key_id, action,
-                    audit_mod.OUTCOME_REJECTED):
-        return 1
-    return _fail(message, _http_to_cli(http_status))
 
 
 def _http_to_cli(http_status: int) -> int:
@@ -501,11 +461,12 @@ def _terminal_rejection(
             "outcome": audit_mod.OUTCOME_REJECTED,
             "tenant_id": tenant_id,
             "key_id": audit_key_id,
+            "operator_id": operation.operator_id,
         },
     )
     store.audit_attempt(
         tenant_id, audit_key_id, action, audit_mod.OUTCOME_REJECTED,
-        event_id=op_id,
+        event_id=op_id, operator_id=operation.operator_id,
     )
     return http_status, body
 
@@ -553,11 +514,13 @@ def _provider_terminal(
             "outcome": audit_mod.OUTCOME_REJECTED,
             "tenant_id": operation.tenant_id,
             "key_id": audit_key_id,
+            "operator_id": operation.operator_id,
         },
     )
     store.audit_attempt(
         operation.tenant_id, audit_key_id, action,
         audit_mod.OUTCOME_REJECTED, event_id=op_id,
+        operator_id=operation.operator_id,
     )
     op_store.finish(operation, operations_mod.STATUS_FAILED, http_status, body)
     return http_status, body
@@ -712,7 +675,7 @@ def idempotent_run(op_store, store, path, tenant_id, operator, body, key,
         # Mirror HTTP: even before the idempotency key is bound, a missing or
         # invalid tenant source records the invisible tenant_conflict event.
         try:
-            store.audit_conflict()
+            store.audit_conflict(operator_id=operator)
         except LedgerError:
             return _fail("audit ledger is unavailable", 1)
         return _fail("field tenant_id must be a non-empty string", 2)
@@ -720,7 +683,7 @@ def idempotent_run(op_store, store, path, tenant_id, operator, body, key,
         # A body tenant_id disagreeing with --tenant-id is a 400 naming
         # tenant_id and, like HTTP, records an invisible tenant_conflict.
         try:
-            store.audit_conflict()
+            store.audit_conflict(operator_id=operator)
         except LedgerError:
             return _fail("audit ledger is unavailable", 1)
         return _fail(
@@ -981,6 +944,47 @@ def _run(argv: Optional[List[str]] = None) -> int:
             "field operator must be a non-empty string", 2
         )
 
+    # Every audit event this invocation writes is attributed to the validated
+    # --operator, preserved verbatim and case-sensitively.
+    def _attempt(store, tenant_id, key_id, action, outcome) -> bool:
+        """Record one attempt; False means a ledger failure was reported."""
+        try:
+            store.audit_attempt(
+                tenant_id, key_id, action, outcome,
+                operator_id=args.operator,
+            )
+        except LedgerError as exc:
+            _ledger_fail(exc)
+            return False
+        return True
+
+    def _conflict(store) -> bool:
+        """Record an invisible tenant_conflict; False on ledger failure."""
+        try:
+            store.audit_conflict(operator_id=args.operator)
+        except LedgerError as exc:
+            _ledger_fail(exc)
+            return False
+        return True
+
+    def _deny(store, tenant_id, key_id, action) -> int:
+        """Audit and report a policy rejection (HTTP 403 -> exit code 3)."""
+        if not _identifiers_ok(tenant_id, key_id):
+            if not _conflict(store):
+                return 1
+        elif not _attempt(store, tenant_id, key_id, action,
+                          audit_mod.OUTCOME_REJECTED):
+            return 1
+        return _fail("action not permitted by policy", 3)
+
+    def _crypto_reject(store, tenant_id, key_id, action, http_status,
+                       message) -> int:
+        """Audit a rejected encrypt/decrypt attempt; report its exit code."""
+        if not _attempt(store, tenant_id, key_id, action,
+                        audit_mod.OUTCOME_REJECTED):
+            return 1
+        return _fail(message, _http_to_cli(http_status))
+
     def allowed(action, key_id=None) -> bool:
         """Policy gate; on denial the response/audit was already handled.
 
@@ -1014,7 +1018,8 @@ def _run(argv: Optional[List[str]] = None) -> int:
         if not allowed(audit_mod.ACTION_CREATE):
             return _deny(store, args.tenant_id, None, audit_mod.ACTION_CREATE)
         try:
-            record = store.create(args.tenant_id, args.algorithm, args.label)
+            record = store.create(args.tenant_id, args.algorithm, args.label,
+                                  operator_id=args.operator)
         except LedgerError as exc:
             return _ledger_fail(exc)
         _print(record.to_create_response())
@@ -1111,6 +1116,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 pre_commit=stage_success,
                 mirror=mirror,
                 expected_version=args.expected_version,
+                operator_id=args.operator,
             )
             if record == store.ROTATE_VERSION_CONFLICT:
                 # The precondition disagreed with the committed
@@ -1186,6 +1192,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                     lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                     pre_commit=stage_success,
                     mirror=mirror,
+                    operator_id=args.operator,
                 )
             except KeyAlreadyMigrated:
                 return _terminal_rejection(
@@ -1323,6 +1330,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 pre_commit=stage_success,
                 mirror=mirror,
                 expected_versions=expected_versions or None,
+                operator_id=args.operator,
             )
             if status == store.BATCH_VERSION_CONFLICT:
                 # One item's expected_version disagreed with the committed
@@ -1480,7 +1488,8 @@ def _run(argv: Optional[List[str]] = None) -> int:
                          audit_mod.ACTION_REVOKE)
         try:
             record = store.revoke(
-                args.key_id, args.tenant_id, args.reason, args.operator
+                args.key_id, args.tenant_id, args.reason, args.operator,
+                operator_id=args.operator,
             )
         except LedgerError as exc:
             return _ledger_fail(exc)
@@ -1631,6 +1640,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                 pre_commit=stage_success,
                 mirror=mirror,
+                operator_id=args.operator,
             )
             if status == IMPORT_CONFLICT:
                 if record.tenant_id == args.tenant_id:
@@ -1837,6 +1847,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                     args.tenant_id, None,
                     audit_mod.ACTION_EXPORT,
                     audit_mod.OUTCOME_REJECTED,
+                    operator_id=args.operator,
                 )
             except LedgerError:
                 return _fail("backup verify unavailable", 1)
@@ -1980,6 +1991,7 @@ def _run(argv: Optional[List[str]] = None) -> int:
                 lock_timeout=operations_mod.LOCK_WAIT_SECONDS,
                 pre_commit=stage_success,
                 mirror=mirror,
+                operator_id=args.operator,
             )
             if result.status == restore_mod.RESTORE_CREATED:
                 return (
@@ -2250,7 +2262,7 @@ def _policy_command(args, policies: PolicyStore) -> int:
         if rules is None:
             return _fail("policy not found", 4)
         try:
-            policies.audit_read(tenant_id)
+            policies.audit_read(tenant_id, operator_id=args.operator)
         except LedgerError as exc:
             return _ledger_fail(exc)
         _print(
@@ -2279,7 +2291,8 @@ def _policy_command(args, policies: PolicyStore) -> int:
             return _fail(str(exc), 2)
         try:
             rules, new_revision = policies.put(
-                tenant_id, rules, expected_revision=expected
+                tenant_id, rules, expected_revision=expected,
+                operator_id=args.operator,
             )
         except PolicyRevisionConflict as exc:
             return _revision_conflict(exc)
@@ -2300,7 +2313,8 @@ def _policy_command(args, policies: PolicyStore) -> int:
         except PolicyError as exc:
             return _fail(str(exc), 2)
     try:
-        policies.delete(tenant_id, expected_revision=expected)
+        policies.delete(tenant_id, expected_revision=expected,
+                        operator_id=args.operator)
     except PolicyRevisionConflict as exc:
         return _revision_conflict(exc)
     except LedgerError as exc:
