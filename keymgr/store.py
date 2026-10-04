@@ -5419,6 +5419,8 @@ class KeyStore:
         self,
         key_id: str,
         tenant_id: str,
+        status: Optional[str] = None,
+        algorithm: Optional[str] = None,
         limit: int = 100,
         cursor: Optional[str] = None,
         strict: bool = False,
@@ -5427,12 +5429,19 @@ class KeyStore:
 
         Items are the committed versions of the key in ascending version
         order, each merging the single-version read and the version status
-        projections and flagging the current version. Cursors follow the
-        audit/key-list rules: HMAC-signed and bound to the tenant, the
-        key_id, the limit and the visible history, so a tampered,
-        cross-tenant, key/limit-mismatched or stale cursor (after a
-        rotation, a version revocation or a whole-key revocation) raises
-        InvalidCursor instead of duplicating or skipping an item.
+        projections and flagging the current version. The optional ``status``
+        (active|revoked) and ``algorithm`` (AES256|RSA2048) filters match on
+        the projected item fields -- so a whole-key revocation makes every
+        version match ``revoked`` -- and combine as an intersection; filtering
+        happens before pagination and never re-marks which version is
+        ``current``. Cursors follow the audit/key-list rules: HMAC-signed and
+        bound to the tenant, the key_id, both filters (their omission state
+        and value), the limit and the visible history, so a tampered,
+        cross-tenant, filter/key/limit-mismatched or stale cursor (after a
+        rotation, a version revocation or a whole-key revocation -- even of a
+        version the filters exclude) raises InvalidCursor instead of
+        duplicating or skipping an item. A pre-upgrade cursor without the
+        filter bindings stays valid only while both filters are omitted.
 
         Returns None for an unknown key, a cross-tenant access or a key
         whose committed view is hidden, all indistinguishable.
@@ -5443,6 +5452,10 @@ class KeyStore:
 
         anchor = None
         fingerprint = None
+        # Distinguish a cursor with no bound status/algorithm (issued before
+        # that filtering existed) from one explicitly bound to it omitted.
+        no_bound_status = object()
+        no_bound_algorithm = object()
         if cursor is not None:
             payload = self.audit._decode_cursor(cursor)
             try:
@@ -5450,6 +5463,22 @@ class KeyStore:
                     raise InvalidCursor("cursor does not match tenant_id")
                 if payload.get("k") != key_id:
                     raise InvalidCursor("cursor does not match key_id")
+                # Each filter is bound as its absence/presence and value
+                # together: a pre-upgrade cursor (no "st"/"al") is only
+                # reusable with the filter omitted, while a cursor bound to
+                # an omitted filter rejects an explicit value and vice versa.
+                bound_status = payload.get("st", no_bound_status)
+                if bound_status is no_bound_status:
+                    if status is not None:
+                        raise InvalidCursor("cursor does not match filters")
+                elif bound_status != status:
+                    raise InvalidCursor("cursor does not match filters")
+                bound_algorithm = payload.get("al", no_bound_algorithm)
+                if bound_algorithm is no_bound_algorithm:
+                    if algorithm is not None:
+                        raise InvalidCursor("cursor does not match filters")
+                elif bound_algorithm != algorithm:
+                    raise InvalidCursor("cursor does not match filters")
                 if int(payload.get("l", -1)) != limit:
                     raise InvalidCursor("cursor does not match limit")
                 anchor = int(payload["vn"])
@@ -5460,16 +5489,29 @@ class KeyStore:
                 raise InvalidCursor("malformed cursor")
 
         items = record.to_version_history()
+        # The snapshot covers the key's COMPLETE committed history, not the
+        # filtered view: a rotation, a per-version revocation or a whole-key
+        # revocation invalidates every issued cursor even when the changed
+        # version falls outside the filters.
         current_fingerprint = self._version_history_fingerprint(
             record, items
         )
+        # Filter first, then paginate ascending. The projection already
+        # defers to the whole-key revocation facts, so a revoked key's every
+        # version matches status=revoked here.
+        visible = [
+            item
+            for item in items
+            if (status is None or item["status"] == status)
+            and (algorithm is None or item["algorithm"] == algorithm)
+        ]
         if fingerprint is not None:
             if fingerprint != current_fingerprint:
                 raise InvalidCursor("cursor snapshot is no longer valid")
-            if not any(item["version"] == anchor for item in items):
+            if not any(item["version"] == anchor for item in visible):
                 raise InvalidCursor("cursor anchor is no longer valid")
 
-        selected = items
+        selected = visible
         if anchor is not None:
             selected = [
                 item for item in selected if item["version"] > anchor
@@ -5483,6 +5525,8 @@ class KeyStore:
                     "v": 1,
                     "t": tenant_id,
                     "k": key_id,
+                    "st": status,
+                    "al": algorithm,
                     "l": limit,
                     "vn": last["version"],
                     "f": current_fingerprint,

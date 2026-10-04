@@ -161,22 +161,31 @@ curl -s -X POST http://127.0.0.1:8080/v1/keys \
   `500` `{"error":"audit ledger is unavailable"}`，不伪装成 `404`。
 - `GET /v1/keys/{key_id}/versions`：按版本号从小到大返回该键全部**已提交**
   版本的完整历史。单一租户来源（单一头或单一 `?tenant_id=`）；可选单值参数
-  `limit`(1–1000，默认 100)、`cursor`，重复/空/非法/越界均 `400` 并指出字段，
-  校验先于授权。`200` → `{items, next_cursor}`，每项键序固定
+  `status`(active|revoked)、`algorithm`(AES256|RSA2048)、
+  `limit`(1–1000，默认 100)、`cursor`，重复/空/非法/越界均 `400` 并指出字段
+  （不接受大小写变体或首尾空白），校验先于授权。`status`/`algorithm` 省略表示
+  不限，组合时取交集，按每个已提交版本的算法与历史响应中的有效状态匹配（整键
+  吊销后所有版本都按 revoked 匹配，吊销信息仍以整键事实为准）；先筛选再按版本
+  号升序分页。`200` → `{items, next_cursor}`，每项键序固定
   `key_id,version,created_at,algorithm,public_key,status,reason,operator,
   revoked_at,current`：前五项同单版本读取，中间四项同版本状态查询（active
-  版本后三项为 null），`current` 标出当前版本；整键吊销优先于任何版本级吊
+  版本后三项为 null），`current` 标出该键真正的当前版本（绝不把筛选后的末版
+  标为当前）；整键吊销优先于任何版本级吊
   销——整键被吊销时历史仍可读（不返回 `409`），每项沿用整键 status 查询口径
-  的 `revoked` 与整键 reason/operator/revoked_at，末页 `next_cursor:null`。
-  游标沿用审计游标规则（HMAC 签名，绑定租户/key_id/limit/发起查询时的可见版
-  本集合与状态），篡改、跨租户、limit 不符、轮换、单版本吊销或整键吊销后旧
-  游标均 `400`，并发变更使旧游标失效而非重漏。`limit`/`cursor`/`key_id` 的
+  的 `revoked` 与整键 reason/operator/revoked_at；无匹配返回 `200` 空页
+  （`items:[]`），末页 `next_cursor:null`。
+  游标沿用审计游标规则（HMAC 签名，绑定租户/key_id/两个筛选的省略状态与值/
+  limit/发起查询时的可见版本集合与状态），篡改、跨租户、增删或改变任一筛选、
+  limit 不符、轮换、单版本吊销或整键吊销后旧游标均 `400`（即使变化的版本不符
+  合筛选），并发变更使旧游标失效而非重漏；升级前签发的无筛选游标仅在两个新条
+  件都省略时继续可用。其他键的变更不影响翻页，同一有效快照下翻页不重不漏。
+  `status`/`algorithm`/`limit`/`cursor`/`key_id` 的
   非法请求不记账（仅租户来源缺失/冲突照旧记 `tenant_conflict`）；策略拒绝
   `403` 记一条带 key_id 的 `read/rejected`，成功记一条带 key_id 的
   `read/success`；未知 key 或跨租户访问统一 `404`，不泄露存在性；存储/账本
   失败固定 `500` `{"error":"audit ledger is unavailable"}`；密钥记录文件存在
   却损坏或不可读同样固定该 `500`，而不是 `404`。CLI 下空、非法（含篡改）、
-  过期或不匹配（租户/key_id/limit/快照不符）的 `--cursor` 都在策略检查前
+  过期或不匹配（租户/key_id/筛选/limit/快照不符）的 `--cursor` 都在策略检查前
   退出 2 且不写拒绝审计。
 - `POST /v1/keys/{key_id}/versions/{version}/revoke`（无 CLI、非幂等键），
   正文**仅** `{tenant_id, reason, operator}` 且三项均为非空字符串；吊销**单个
@@ -769,6 +778,7 @@ python -m keymgr list     --tenant-id t --operator alice \
 python -m keymgr current  --tenant-id t --key-id <id> --operator alice
 python -m keymgr version  --tenant-id t --key-id <id> --version 1 --operator alice
 python -m keymgr versions --tenant-id t --key-id <id> --operator alice \
+                          [--status active|revoked] [--algorithm AES256|RSA2048] \
                           [--limit 100] [--cursor <cursor>]
 python -m keymgr rotate   --tenant-id t --key-id <id> --algorithm AES256 \
                           --operator alice --idempotency-key rotate-0001 \
