@@ -3528,18 +3528,23 @@ def get_provider():
         return _provider
 
 
-def migration_peer_provider(provider_id: str):
-    """Resolve a healthy chain entry for a whole-key migration.
+def chain_member_provider(provider_id: str):
+    """Resolve one healthy entry of the configured provider chain by its
+    REGISTERED provider_id, without activating anything.
 
-    Called only inside a :func:`provider_call` lease (the migrate data path
-    and the post-commit/startup old-handle cleanup): the bound READY entry is
-    returned directly -- it was admitted and health-probed by the lease. Any
-    other id must name an entry of the configured primary/standby chain; that
-    entry is built, configured with the bound data directory and health-probed
-    under the SAME attempt's shared non-resettable five-second budget (one
-    probe capped at one second). A chain that is not configured, an id no
-    chain entry builds, or an unhealthy/missing/contract-broken entry all raise
-    :class:`ProviderUnavailable` (the fixed 503); no fallback is ever used.
+    Called only inside a :func:`provider_call` lease (whole-key migration and
+    the cross-provider cross-key rewrap): an inactive-but-healthy standby is a
+    first-class participant, and resolving one never activates a standby,
+    fails over or migrates a key. The bound READY entry is returned directly
+    (it was admitted and health-probed by the lease); any other id must name
+    exactly one entry of the configured chain, which is built, configured with
+    the bound data directory and health-probed under the SAME attempt's shared
+    non-resettable five-second budget (one probe capped at one second). Chain
+    entries and their built ``provider_id`` values must be unique, so the
+    identity match is unambiguous. A missing/global-invalid configuration, an
+    id no chain entry builds, a non-unique match, or an unhealthy/contract-
+    broken entry all raise :class:`ProviderUnavailable` (the fixed 503); no
+    fallback is ever used.
     """
     ready = get_provider()
     if provider_id == ready.provider_id:
@@ -3550,16 +3555,20 @@ def migration_peer_provider(provider_id: str):
         )
     budget = getattr(_tls, "budget", None)
     deadline = budget.deadline if budget is not None else None
-    peer = None
-    for candidate in _build_candidates(_specs()):
-        if candidate.provider_id == provider_id:
-            peer = candidate
-            break
-    if peer is None:
+    matches = [
+        candidate for candidate in _build_candidates(_specs())
+        if candidate.provider_id == provider_id
+    ]
+    if len(matches) != 1:
+        # Zero matches: the registered identity is not in the valid chain.
+        # More than one: the chain's provider_id uniqueness contract was
+        # violated (_build_candidates raises on duplicate ids, so this branch
+        # is defensive). Either way the identity cannot be matched uniquely.
         raise ProviderUnavailable(
-            "record provider %r is not in the configured provider chain"
-            % provider_id
+            "provider %r is not a unique entry of the configured provider "
+            "chain" % provider_id
         )
+    peer = matches[0]
     if budget is not None:
         healthy = _healthy_within(peer, budget)
     else:
@@ -3568,9 +3577,21 @@ def migration_peer_provider(provider_id: str):
         )
     if not healthy:
         raise ProviderUnavailable(
-            "migration peer provider %r is unavailable" % provider_id
+            "chain provider %r is unavailable" % provider_id
         )
     return peer
+
+
+def migration_peer_provider(provider_id: str):
+    """Resolve a healthy chain entry for a whole-key migration.
+
+    A thin migration-named wrapper over :func:`chain_member_provider`: the
+    semantics (chain-only identity match, inactive-but-healthy entries may
+    participate, one shared five-second budget and one-second probe cap, no
+    activation and no fallback) are identical for every cross-entry provider
+    resolution.
+    """
+    return chain_member_provider(provider_id)
 
 
 def _build_spec(spec: str):

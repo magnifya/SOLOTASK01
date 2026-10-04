@@ -47,6 +47,7 @@ from .store import (
     LockTimeout,
     MigrationTransferParked,
     NativeRewrap,
+    NativeRewrapCrossProviders,
     NativeRewrapSplit,
     NativeUnwrap,
     NativeWrap,
@@ -3036,13 +3037,22 @@ def make_handler(
             version is 409 (both rejections record that one source-key
             event), an envelope algorithm mismatch with the SOURCE version
             or a failed authentication is a 400 naming the envelope (not
-            audited), versions bound to different providers are the fixed
-            503 (not audited), and a provider/material failure keeps the
-            existing fixed-503/no-audit contract. Success records one
-            ``rewrap/success`` on the source key. Both keys stay locked for
-            the whole resolution + provider + rewrap window, so a concurrent
-            rotation, revocation or migration commits entirely before or
-            after this call and no resolved handle can go stale mid-call.
+            audited), and a provider/material failure keeps the existing
+            fixed-503/no-audit contract. Versions owned by DIFFERENT
+            providers are supported as a cross-provider rewrap: each owning
+            provider must be a unique, healthy entry of the valid
+            ``KEYMGR_PROVIDER_CHAIN`` (an inactive-but-healthy standby may
+            participate without being activated), the per-side
+            ``unwrap_key``/``wrap_key`` declarations keep the declared
+            side's KEK unexported (native failures never fall back to an
+            export), and ``rewrap_key`` is never used across providers.
+            Success records one ``rewrap/success`` on the source key. Both
+            keys stay locked for the whole resolution + provider + rewrap
+            window inside one provider-call session (one non-resettable
+            five-second budget shared by every wait, probe and crypto
+            operation), so a concurrent rotation, revocation, migration or
+            reconnect commits entirely before or after this call and no
+            resolved handle can go stale mid-call.
             """
             try:
                 allowed = policy_store.is_allowed(
@@ -3071,9 +3081,10 @@ def make_handler(
 
             def perform(source_ver, target_ver, native, source_material,
                         target_material):
-                # Runs inside the store's two-key lock window and provider
-                # session; an EnvelopeError (authentication) propagates to
-                # the 400 below, a provider fault to do_POST's fixed 503.
+                # Runs inside the store's two-key lock window and the single
+                # provider-call session; an EnvelopeError (authentication)
+                # propagates to the 400 below, a provider fault to do_POST's
+                # fixed 503.
                 if isinstance(native, NativeRewrap):
                     return envelope.rewrap_envelope_native(
                         opened, native.provider,
@@ -3082,6 +3093,29 @@ def make_handler(
                         target_version=target_ver.version,
                         target_algorithm=target_ver.algorithm,
                         envelope_bytes=envelope.raw_token_bytes(token),
+                        target_key_id=target_key_id,
+                    )
+                if isinstance(native, NativeRewrapCrossProviders):
+                    # Two DIFFERENT chain providers: rewrap_key is never used
+                    # across providers. Each side stays native on its own
+                    # provider when it declares the matching operation; an
+                    # undeclared side is the already-exported in-memory KEK.
+                    # The source wrapped DEK and the content GCM tag are
+                    # authenticated BEFORE the target wrap is called, inside
+                    # rewrap_envelope_split; a native fault is never papered
+                    # over by exporting that side's KEK.
+                    source = (
+                        (native.source_provider, native.source_handle)
+                        if native.native_unwrap else source_material
+                    )
+                    target = (
+                        (native.target_provider, native.target_handle)
+                        if native.native_wrap else target_material
+                    )
+                    return envelope.rewrap_envelope_split(
+                        opened, source, target,
+                        target_version=target_ver.version,
+                        target_algorithm=target_ver.algorithm,
                         target_key_id=target_key_id,
                     )
                 if isinstance(native, NativeRewrapSplit):
@@ -3134,11 +3168,6 @@ def make_handler(
                     "field envelope algorithm does not match the source key "
                     "version"
                 )
-                return
-            if status == store.REWRAP_PROVIDER_MISMATCH:
-                # Cross-key rewrap requires both versions bound to ONE
-                # provider: the fixed 503 text, not audited.
-                self._provider_unavailable(None)
                 return
             if not self._record_attempt(
                 tenant_id, key_id, action, audit_mod.OUTCOME_SUCCESS

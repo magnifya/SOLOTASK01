@@ -427,3 +427,307 @@ def test_cross_key_different_providers_503(tmp_path, monkeypatch):
     finally:
         httpd.shutdown()
         provider_mod.reset_for_tests()
+
+
+# -- cross-provider rewrap over a provider chain -----------------------------
+CHAIN = "local,fake_kms:make_provider"
+
+
+@pytest.fixture()
+def chain_stack(tmp_path, monkeypatch):
+    """A local/fakekms provider chain; local activates first (healthy)."""
+    data_dir = str(tmp_path / "data")
+    os.makedirs(data_dir, exist_ok=True)
+    faults_path = str(tmp_path / "kms-faults.json")
+    state_path = str(tmp_path / "kms-state.json")
+    sys.path.insert(0, os.path.dirname(__file__))
+    monkeypatch.delenv("KEYMGR_PROVIDER", raising=False)
+    monkeypatch.setenv("KEYMGR_PROVIDER_CHAIN", CHAIN)
+    monkeypatch.setenv("FAKE_KMS_STATE", state_path)
+    monkeypatch.setenv("FAKE_KMS_FAULTS", faults_path)
+    import fake_kms
+
+    fake_kms.reset()
+    provider_mod.reset_for_tests()
+    audit_log = AuditLog(data_dir)
+    store = KeyStore(data_dir, audit_log)
+    policies = PolicyStore(data_dir, audit_log)
+    coordinator = restore_mod.RestoreCoordinator(store, policies)
+    op_store = OperationStore(data_dir, audit_log)
+    artifact_store = ArtifactStore(data_dir, store, audit_log)
+    artifact_store.settle_pending(op_store)
+    op_store.recover_pending(is_parked=artifact_store.is_parked)
+    handler = make_handler(store, policies, coordinator, op_store,
+                           artifact_store)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    httpd.daemon_threads = True
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    client = Client("http://127.0.0.1:%d" % httpd.server_address[1])
+    # Touch the chain so local is the committed active (first healthy) entry.
+    status, reply = client.call("GET", "/v1/provider/status")
+    assert status == 200 and reply["provider_id"] == "local", reply
+    yield types.SimpleNamespace(
+        client=client, store=store, policies=policies, audit=audit_log,
+        data_dir=data_dir, faults_path=faults_path,
+    )
+    httpd.shutdown()
+    provider_mod.reset_for_tests()
+
+
+def _switchover(client, provider_id):
+    return client.call(
+        "POST", "/v1/provider/switchover",
+        {"provider_id": provider_id},
+    )
+
+
+def _provider_status(client):
+    status, body = client.call("GET", "/v1/provider/status")
+    assert status == 200, body
+    return body["provider_id"]
+
+
+def _key_on(client, provider_id, algorithm):
+    """Make ``provider_id`` active, create one key, return its id."""
+    assert _switchover(client, provider_id)[0] == 200
+    return _make_key(client, algorithm=algorithm)
+
+
+def _assert_key_provider(st, key_id, provider_id):
+    path = os.path.join(st.data_dir, key_id + ".json")
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    assert {v["provider_id"] for v in data["versions"]} == {provider_id}
+
+
+@pytest.mark.parametrize(
+    "src_algorithm,dst_algorithm",
+    [
+        ("AES256", "AES256"),
+        ("AES256", "RSA2048"),
+        ("RSA2048", "AES256"),
+        ("RSA2048", "RSA2048"),
+    ],
+)
+def test_cross_provider_four_algorithm_combinations(
+    chain_stack, src_algorithm, dst_algorithm
+):
+    # Source key on the (then active) fakekms entry, target key on local:
+    # at rewrap time local is active and fakekms is a healthy STANDBY that
+    # participates without being activated. fakekms declares neither native
+    # op here, so its source KEK is exported once; local stays fully native.
+    import fake_kms
+
+    client = chain_stack.client
+    message = ("combo-%s-%s" % (src_algorithm, dst_algorithm)).encode()
+    src = _key_on(client, "fakekms", src_algorithm)
+    # The same-key encrypt endpoint needs the source provider active.
+    token = _encrypt(client, src, message, aad=b64(b"z"))
+    dst = _key_on(client, "local", dst_algorithm)  # local now active
+    exports_before = fake_kms.call_count("export_material")
+    status, body = _rewrap(client, src, token, target_key_id=dst,
+                           aad=b64(b"z"))
+    assert status == 200, body
+    assert fake_kms.call_count("export_material") == exports_before + 1
+    before, after = _inner(token), _inner(body["envelope"])
+    assert after["key_id"] == dst and after["version"] == 1
+    assert after["algorithm"] == dst_algorithm
+    for field in ("nonce", "tag", "ciphertext", "aad"):
+        assert after[field] == before[field], field
+    # The new envelope decrypts under the target (active) key ...
+    status, reply = _decrypt(client, dst, body["envelope"], aad=b64(b"z"))
+    assert status == 200, reply
+    assert base64.b64decode(reply["plaintext"]) == message
+    # ... and the original envelope still decrypts under the source key once
+    # its provider is active again.
+    assert _switchover(client, "fakekms")[0] == 200
+    status, reply = _decrypt(client, src, token, aad=b64(b"z"))
+    assert status == 200, reply
+    assert base64.b64decode(reply["plaintext"]) == message
+    # Exactly one source-key success event; the rewrap neither activated the
+    # standby nor migrated either key.
+    assert _switchover(client, "local")[0] == 200
+    events = _rewrap_events(chain_stack)
+    assert len(events) == 1 and events[0].outcome == "success"
+    assert events[0].key_id == src
+    assert _provider_status(client) == "local"
+    _assert_key_provider(chain_stack, src, "fakekms")
+    _assert_key_provider(chain_stack, dst, "local")
+
+
+def test_cross_provider_inactive_target_participates(chain_stack):
+    # local active; the target lives on the fakekms standby, which is
+    # resolved/probed for the rewrap but never activated.
+    client = chain_stack.client
+    src = _key_on(client, "local", "AES256")
+    token = _encrypt(client, src, b"to-standby")
+    dst = _key_on(client, "fakekms", "RSA2048")
+    assert _switchover(client, "local")[0] == 200
+    status, body = _rewrap(client, src, token, target_key_id=dst)
+    assert status == 200, body
+    assert _inner(body["envelope"])["key_id"] == dst
+    assert _provider_status(client) == "local"
+    events = _rewrap_events(chain_stack)
+    assert len(events) == 1 and events[0].key_id == src
+    _assert_key_provider(chain_stack, src, "local")
+    _assert_key_provider(chain_stack, dst, "fakekms")
+
+
+def test_cross_provider_both_sides_native(chain_stack):
+    # Source fakekms declares unwrap_key; target local always declares
+    # wrap_key: neither KEK is exported.
+    import fake_kms
+
+    _set_faults(chain_stack, {"declare_unwrap_key": True})
+    client = chain_stack.client
+    src = _key_on(client, "fakekms", "AES256")
+    token = _encrypt(client, src, b"both-native")
+    dst = _key_on(client, "local", "AES256")
+    exports_before = fake_kms.call_count("export_material")
+    unwraps_before = fake_kms.call_count("unwrap_key")
+    status, body = _rewrap(client, src, token, target_key_id=dst)
+    assert status == 200, body
+    assert fake_kms.call_count("unwrap_key") == unwraps_before + 1
+    assert fake_kms.call_count("export_material") == exports_before
+    status, reply = _decrypt(client, dst, body["envelope"])
+    assert status == 200
+    assert base64.b64decode(reply["plaintext"]) == b"both-native"
+
+
+def test_cross_provider_target_native_wrap(chain_stack):
+    # local source (native unwrap) -> fakekms standby target declaring
+    # wrap_key: the target KEK is wrapped inside the standby, never exported.
+    import fake_kms
+
+    client = chain_stack.client
+    src = _key_on(client, "local", "AES256")
+    token = _encrypt(client, src, b"target-native")
+    dst = _key_on(client, "fakekms", "RSA2048")
+    assert _switchover(client, "local")[0] == 200
+    _set_faults(chain_stack, {"declare_wrap_key": True})
+    exports_before = fake_kms.call_count("export_material")
+    wraps_before = fake_kms.call_count("wrap_key")
+    status, body = _rewrap(client, src, token, target_key_id=dst)
+    assert status == 200, body
+    assert fake_kms.call_count("wrap_key") == wraps_before + 1
+    assert fake_kms.call_count("export_material") == exports_before
+    assert _switchover(client, "fakekms")[0] == 200
+    status, reply = _decrypt(client, dst, body["envelope"])
+    assert status == 200
+    assert base64.b64decode(reply["plaintext"]) == b"target-native"
+
+
+def test_cross_provider_target_wrap_failure_503_no_fallback(chain_stack):
+    # A declared wrap_key faulting on the standby target is the fixed 503;
+    # it never falls back to exporting the target KEK.
+    import fake_kms
+
+    client = chain_stack.client
+    src = _key_on(client, "local", "AES256")
+    token = _encrypt(client, src, b"x")
+    dst = _key_on(client, "fakekms", "AES256")
+    assert _switchover(client, "local")[0] == 200
+    _set_faults(chain_stack, {"declare_wrap_key": True, "wrap_fail": True})
+    exports_before = fake_kms.call_count("export_material")
+    status, body = _rewrap(client, src, token, target_key_id=dst)
+    assert status == 503, body
+    assert body == {"error": "key management provider is unavailable"}
+    assert fake_kms.call_count("export_material") == exports_before
+    assert _rewrap_events(chain_stack) == []
+    assert _provider_status(client) == "local"
+
+
+def test_cross_provider_source_unwrap_failure_503_no_fallback(chain_stack):
+    # A declared unwrap_key faulting on the standby source is the fixed 503;
+    # it never falls back to exporting the source KEK.
+    import fake_kms
+
+    client = chain_stack.client
+    src = _key_on(client, "fakekms", "AES256")
+    token = _encrypt(client, src, b"x")
+    dst = _key_on(client, "local", "AES256")
+    _set_faults(chain_stack, {"declare_unwrap_key": True,
+                              "unwrap_fail": True})
+    exports_before = fake_kms.call_count("export_material")
+    status, body = _rewrap(client, src, token, target_key_id=dst)
+    assert status == 503, body
+    assert body == {"error": "key management provider is unavailable"}
+    assert fake_kms.call_count("export_material") == exports_before
+    assert _rewrap_events(chain_stack) == []
+
+
+def test_cross_provider_standby_unhealthy_503(chain_stack):
+    # The standby owning the target fails its (one-second, shared-budget)
+    # health probe: fixed 503, not audited, no failover, no activation.
+    client = chain_stack.client
+    src = _key_on(client, "local", "AES256")
+    token = _encrypt(client, src, b"x")
+    dst = _key_on(client, "fakekms", "AES256")
+    assert _switchover(client, "local")[0] == 200
+    _set_faults(chain_stack, {"health": False})
+    status, body = _rewrap(client, src, token, target_key_id=dst)
+    assert status == 503, body
+    assert body == {"error": "key management provider is unavailable"}
+    assert _rewrap_events(chain_stack) == []
+    assert _provider_status(client) == "local"
+
+
+def test_cross_provider_auth_failure_400_not_audited(chain_stack):
+    client = chain_stack.client
+    src = _key_on(client, "fakekms", "AES256")
+    token = _encrypt(client, src, b"x")
+    dst = _key_on(client, "local", "AES256")
+    obj = _inner(token)
+    wrapped = bytearray(base64.b64decode(obj["wrapped_key"]))
+    wrapped[0] ^= 0x01
+    obj["wrapped_key"] = b64(bytes(wrapped))
+    tampered = b64(json.dumps(obj, sort_keys=True).encode())
+    status, err = _rewrap(client, src, tampered, target_key_id=dst)
+    assert status == 400 and "field envelope" in err["error"], err
+    assert _rewrap_events(chain_stack) == []
+
+
+def test_cross_provider_same_version_number_ok(chain_stack):
+    # Equal version NUMBERS on two keys on two providers are not a conflict.
+    client = chain_stack.client
+    src = _key_on(client, "fakekms", "AES256")
+    token = _encrypt(client, src, b"v", version=1)
+    dst = _key_on(client, "local", "AES256")
+    status, body = _rewrap(client, src, token, target_key_id=dst,
+                           target_version=1)
+    assert status == 200, body
+    after = _inner(body["envelope"])
+    assert after["key_id"] == dst and after["version"] == 1
+
+
+def test_cross_provider_authorization_403(chain_stack):
+    client = chain_stack.client
+    src = _key_on(client, "fakekms", "AES256")
+    token = _encrypt(client, src, b"x")
+    dst = _key_on(client, "local", "AES256")
+    chain_stack.policies.put(
+        "t", [Rule(subject="alice", actions=["rewrap"], effect="deny",
+                   key_ids=frozenset({dst}))]
+    )
+    status, _ = _rewrap(client, src, token, target_key_id=dst)
+    assert status == 403
+    events = _rewrap_events(chain_stack)
+    assert len(events) == 1 and events[0].outcome == "rejected"
+    assert events[0].key_id == src
+
+
+def test_cross_provider_revoked_target_409(chain_stack):
+    client = chain_stack.client
+    src = _key_on(client, "fakekms", "AES256")
+    token = _encrypt(client, src, b"x")
+    dst = _key_on(client, "local", "AES256")
+    status, _ = client.call(
+        "POST", "/v1/keys/%s/revoke" % dst,
+        {"tenant_id": "t", "reason": "done", "operator": "alice"},
+    )
+    assert status == 200
+    status, _ = _rewrap(client, src, token, target_key_id=dst)
+    assert status == 409
+    events = _rewrap_events(chain_stack)
+    assert len(events) == 1 and events[0].outcome == "rejected"
+    assert events[0].key_id == src
